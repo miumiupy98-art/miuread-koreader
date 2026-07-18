@@ -1,8 +1,8 @@
 {
-  "version": "0.1.0-dev.15",
-  "name": "觅阅 MiuRead v0.1.0-dev.15",
-  "notes": "修复修改下载目录时需要手写路径、键盘遮挡按钮且难以退出的问题。改用 KOReader 原生文件夹选择器，支持返回退出、创建文件夹和可写性验证。",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v0.1.0-dev.15/miuread-v0.1.0-dev.15-ota.zip",
-  "sha256": "089f3db411fed55755f79f320bd749e6644e06c429eb53a191ac62e6741b7363",
+  "version": "1.0.0",
+  "name": "觅阅 MiuRead v1.0.0",
+  "notes": "首个正式版本。修复想法卡片右上角 × 被翻页逻辑接管的问题；改善含脚注、HTML 排版空白、emoji 或扩展字符书籍中的评论定位偏移。已下载的旧划线与想法版需要删除后重新下载。",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.0/miuread-v1.0.0-ota.zip",
+  "sha256": "80c96d8ee5b767013a26295d659b326b34bcb1f423e5971c4437c839b9d31aed",
   "delete_list": []
 }
