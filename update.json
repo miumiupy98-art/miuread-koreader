@@ -1,8 +1,8 @@
 {
-  "version": "1.0.0",
-  "name": "觅阅 MiuRead v1.0.0",
-  "notes": "首个正式版本。修复想法卡片右上角 × 被翻页逻辑接管的问题；改善含脚注、HTML 排版空白、emoji 或扩展字符书籍中的评论定位偏移。已下载的旧划线与想法版需要删除后重新下载。",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.0/miuread-v1.0.0-ota.zip",
-  "sha256": "80c96d8ee5b767013a26295d659b326b34bcb1f423e5971c4437c839b9d31aed",
+  "version": "1.0.1",
+  "name": "觅阅 MiuRead v1.0.1",
+  "notes": "修复想法卡片右上角 × 点击后仍翻页的问题；保留评论位置校准改动。已生成的旧划线与想法版需要删除后重新下载。",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.1/miuread-v1.0.1-ota.zip",
+  "sha256": "4a2049da4b7915ba1cfa31faa859b122b03ac3c83dcaca88c40359d4dd352210",
   "delete_list": []
 }
