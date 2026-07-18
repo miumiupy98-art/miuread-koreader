@@ -5,9 +5,11 @@ local Dispatcher=require("dispatcher")
 local InfoMessage=require("ui/widget/infomessage")
 local InputDialog=require("ui/widget/inputdialog")
 local Menu=require("ui/widget/menu")
+local PathChooser=require("ui/widget/pathchooser")
 local UIManager=require("ui/uimanager")
 local WidgetContainer=require("ui/widget/container/widgetcontainer")
 local logger=require("logger")
+local lfs=require("libs/libkoreader-lfs")
 local Config=require("miuread.config")
 local Text=require("miuread.text")
 local U=require("miuread.util")
@@ -837,7 +839,7 @@ function Plugin:download_settings_menu()
         {text=_("Images"),checked_func=function() return self.store:preferences().images end,keep_menu_open=true,callback=function() self:_toggle_preference("images") end},
         {text=_("Official account images"),checked_func=function() return self.store:preferences().mp_images end,keep_menu_open=true,callback=function() self:_toggle_preference("mp_images") end},
         {text="下载时保持设备唤醒",checked_func=function() return self.store:preferences().download_keep_awake~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("download_keep_awake") end},
-        {text=_("Change download directory"),callback=function() self:directory_dialog() end},
+        {text="下载目录",post_text=self:_download_dir_label(),callback=function() self:directory_dialog() end},
     }
 end
 function Plugin:reading_settings_menu()
@@ -894,7 +896,52 @@ function Plugin:thought_font_menu()
     end
     return rows
 end
-function Plugin:directory_dialog() local d; d=InputDialog:new{title=_("Change download directory"),input=self.store:preferences().download_dir or "",buttons={{text=_("Cancel"),callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local p=self.store:preferences(); local x=U.trim(d:getInputText()); if x~="" and x:sub(1,1)~="/" then self:info("必须使用绝对路径"); return end; p.download_dir=x; self.store:save_preferences(p); UIManager:close(d) end}}}; UIManager:show(d); d:onShowKeyboard() end
+function Plugin:_download_dir_path()
+    local custom=U.trim((self.store:preferences() or {}).download_dir or "")
+    if custom~="" then return custom end
+    return self.store.default_books_dir
+end
+function Plugin:_download_dir_label()
+    local path=self:_download_dir_path()
+    if path==self.store.default_books_dir then return "默认 · "..tostring(path) end
+    return tostring(path)
+end
+function Plugin:_validate_download_dir(path)
+    path=U.trim(path)
+    if path=="" or path:sub(1,1)~="/" then return nil,"路径无效" end
+    local attr=lfs.attributes(path)
+    if not attr or attr.mode~="directory" then return nil,"文件夹不存在" end
+    local probe=path.."/.miuread-write-test-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
+    local f=io.open(probe,"wb")
+    if not f then return nil,"该文件夹不可写" end
+    f:write("ok"); f:close(); os.remove(probe)
+    return true
+end
+function Plugin:directory_dialog()
+    local current=self:_download_dir_path()
+    if lfs.attributes(current,"mode")~="directory" then
+        if lfs.attributes("/mnt/us/documents","mode")=="directory" then current="/mnt/us/documents"
+        elseif lfs.attributes("/mnt/us","mode")=="directory" then current="/mnt/us"
+        else current="/" end
+    end
+    local chooser=PathChooser:new{
+        title="选择下载文件夹（长按文件夹名称确认）",
+        select_directory=true,
+        select_file=false,
+        show_files=false,
+        path=current,
+        onConfirm=function(path)
+            local ok,err=self:_validate_download_dir(path)
+            if not ok then self:info("无法使用此文件夹：\n"..tostring(err)); return end
+            local old=self:_download_dir_path()
+            local p=self.store:preferences(); p.download_dir=path; self.store:save_preferences(p)
+            local note="下载目录已设置为：\n"..tostring(path)
+            if old~=path then note=note.."\n\n只影响以后下载的书籍；已下载内容保留在原位置。" end
+            self:info(note)
+        end,
+    }
+    UIManager:show(chooser)
+end
 function Plugin:check_update()
     self:online("update",function()
         local m,e=self.updater:check()
