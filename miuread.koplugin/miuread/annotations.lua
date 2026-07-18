@@ -175,43 +175,261 @@ local function utf8_len_at(text, i)
     return 4
 end
 
+local NAMED_ENTITIES = {
+    amp = "&", lt = "<", gt = ">", quot = '"', apos = "'",
+    nbsp = " ", ensp = " ", emsp = " ", thinsp = " ",
+    hellip = "…", mdash = "—", ndash = "–",
+    lsquo = "‘", rsquo = "’", ldquo = "“", rdquo = "”",
+    zwnj = "", zwj = "",
+}
+
+local function utf8_encode(codepoint)
+    codepoint = tonumber(codepoint)
+    if not codepoint or codepoint < 0 or codepoint > 0x10FFFF
+        or (codepoint >= 0xD800 and codepoint <= 0xDFFF) then
+        return nil
+    end
+    if codepoint < 0x80 then
+        return string.char(codepoint)
+    elseif codepoint < 0x800 then
+        return string.char(0xC0 + math.floor(codepoint / 0x40), 0x80 + (codepoint % 0x40))
+    elseif codepoint < 0x10000 then
+        return string.char(
+            0xE0 + math.floor(codepoint / 0x1000),
+            0x80 + (math.floor(codepoint / 0x40) % 0x40),
+            0x80 + (codepoint % 0x40)
+        )
+    end
+    return string.char(
+        0xF0 + math.floor(codepoint / 0x40000),
+        0x80 + (math.floor(codepoint / 0x1000) % 0x40),
+        0x80 + (math.floor(codepoint / 0x40) % 0x40),
+        0x80 + (codepoint % 0x40)
+    )
+end
+
+local function decode_html_unit(unit)
+    unit = tostring(unit or "")
+    local decimal = unit:match("^&#(%d+);$")
+    if decimal then return utf8_encode(tonumber(decimal, 10)) or unit end
+    local hexadecimal = unit:match("^&#[xX]([%x]+);$")
+    if hexadecimal then return utf8_encode(tonumber(hexadecimal, 16)) or unit end
+    local named = unit:match("^&([%w]+);$")
+    if named and NAMED_ENTITIES[named] ~= nil then return NAMED_ENTITIES[named] end
+    return unit
+end
+
+local function split_units(raw)
+    local units, p = {}, 1
+    while p <= #raw do
+        local entity = raw:sub(p):match("^&[#%w]+;")
+        if entity then
+            units[#units + 1] = entity
+            p = p + #entity
+        else
+            local n = utf8_len_at(raw, p)
+            units[#units + 1] = raw:sub(p, p + n - 1)
+            p = p + n
+        end
+    end
+    return units
+end
+
+local function is_ignorable_text(value)
+    if value == nil or value == "" then return true end
+    if value:match("^%s+$") then return true end
+    return value == "\194\160"       -- non-breaking space
+        or value == "\227\128\128" -- ideographic space
+        or value == "\226\128\139" -- zero-width space
+        or value == "\226\128\140" -- zero-width non-joiner
+        or value == "\226\128\141" -- zero-width joiner
+        or value == "\239\187\191" -- UTF-8 BOM
+end
+
+local SKIP_TEXT_TAGS = {
+    script = true, style = true, noscript = true, template = true, svg = true,
+}
+
+local function tag_info(raw)
+    local slash, name = tostring(raw or ""):match("^<%s*(/?)%s*([%w:_%-]+)")
+    if not name then return false, "", false end
+    return slash == "/", name:lower(), tostring(raw):match("/%s*>$") ~= nil
+end
+
 local function tokenize(html)
     local tokens, visible = {}, 0
-    local i = 1
+    local i, skip_depth = 1, 0
     while i <= #html do
         if html:sub(i, i) == "<" then
             local j = html:find(">", i + 1, true)
-            if not j then tokens[#tokens + 1] = {kind="text", raw=html:sub(i), start=visible}; break end
-            tokens[#tokens + 1] = {kind="tag", raw=html:sub(i, j)}
+            if not j then
+                local raw = html:sub(i)
+                tokens[#tokens + 1] = {kind="text", raw=raw, units=split_units(raw), start=visible, skip=skip_depth > 0}
+                if skip_depth == 0 then visible = visible + #tokens[#tokens].units end
+                break
+            end
+            local raw = html:sub(i, j)
+            tokens[#tokens + 1] = {kind="tag", raw=raw}
+            local closing, name, self_closing = tag_info(raw)
+            if closing and SKIP_TEXT_TAGS[name] then
+                skip_depth = math.max(0, skip_depth - 1)
+            elseif not closing and not self_closing and SKIP_TEXT_TAGS[name] then
+                skip_depth = skip_depth + 1
+            end
             i = j + 1
         else
             local j = html:find("<", i, true) or (#html + 1)
             local raw = html:sub(i, j - 1)
-            local units, p = {}, 1
-            while p <= #raw do
-                local entity = raw:sub(p):match("^&[#%w]+;")
-                if entity then
-                    units[#units + 1] = entity; p = p + #entity
-                else
-                    local n = utf8_len_at(raw, p)
-                    units[#units + 1] = raw:sub(p, p + n - 1); p = p + n
-                end
-            end
-            tokens[#tokens + 1] = {kind="text", raw=raw, units=units, start=visible, stop=visible + #units}
-            visible = visible + #units
+            local units = split_units(raw)
+            local skipped = skip_depth > 0
+            tokens[#tokens + 1] = {
+                kind="text", raw=raw, units=units, start=visible,
+                stop=skipped and visible or (visible + #units), skip=skipped,
+            }
+            if not skipped then visible = visible + #units end
             i = j
         end
     end
     return tokens, visible
 end
 
-local function intervals(data, visible_count)
+local function utf16_width(value)
+    local first = tostring(value or ""):byte(1) or 0
+    return first >= 0xF0 and 2 or 1
+end
+
+local function build_text_index(tokens)
+    local pieces, starts, ends, ordinals = {}, {}, {}, {}
+    local compact_bounds, utf16_bounds = {}, {}
+    local byte_pos, compact_count, utf16_count = 1, 0, 0
+
+    for _, token in ipairs(tokens or {}) do
+        if token.kind == "text" and not token.skip then
+            for index, unit in ipairs(token.units or {}) do
+                local raw_pos = token.start + index - 1
+                local decoded = decode_html_unit(unit)
+
+                if utf16_bounds[utf16_count] == nil then utf16_bounds[utf16_count] = raw_pos end
+                local width = utf16_width(decoded)
+                if width > 1 then
+                    for extra = 1, width - 1 do utf16_bounds[utf16_count + extra] = raw_pos end
+                end
+                utf16_count = utf16_count + width
+                utf16_bounds[utf16_count] = raw_pos + 1
+
+                if not is_ignorable_text(decoded) then
+                    compact_bounds[compact_count] = compact_bounds[compact_count] or raw_pos
+                    pieces[#pieces + 1] = decoded
+                    starts[byte_pos] = raw_pos
+                    ordinals[byte_pos] = compact_count
+                    local end_byte = byte_pos + #decoded - 1
+                    ends[end_byte] = raw_pos + 1
+                    byte_pos = end_byte + 1
+                    compact_count = compact_count + 1
+                    compact_bounds[compact_count] = raw_pos + 1
+                end
+            end
+        end
+    end
+
+    return {
+        text = table.concat(pieces), starts = starts, ends = ends, ordinals = ordinals,
+        compact_bounds = compact_bounds, compact_count = compact_count,
+        utf16_bounds = utf16_bounds, utf16_count = utf16_count,
+    }
+end
+
+local function normalize_text(value)
+    local raw = tostring(value or ""):gsub("<[^>]+>", "")
+    local out, count = {}, 0
+    for _, unit in ipairs(split_units(raw)) do
+        local decoded = decode_html_unit(unit)
+        if not is_ignorable_text(decoded) then
+            out[#out + 1] = decoded
+            count = count + 1
+        end
+    end
+    return table.concat(out), count
+end
+
+local function quote_candidates(row, data)
+    local values, seen = {}, {}
+    local function add(value)
+        local normalized, count = normalize_text(value)
+        if count >= 2 and count <= 800 and normalized ~= "" and not seen[normalized] then
+            seen[normalized] = true
+            values[#values + 1] = normalized
+        end
+    end
+
+    row = type(row) == "table" and row or {}
+    for _, key in ipairs({"markText", "bookmarkText", "rangeText", "abstract", "text", "content"}) do
+        add(row[key])
+    end
+    local reviews = data and data.review_map and data.review_map[range_key(row)] or nil
+    for _, review in ipairs(reviews or {}) do add(review.abstract) end
+    return values
+end
+
+local function locate_quote(index, needle, expected)
+    if not index or tostring(index.text or "") == "" or tostring(needle or "") == "" then return nil end
+    local best_a, best_b, best_score
+    local from = 1
+    while true do
+        local first, last = index.text:find(needle, from, true)
+        if not first then break end
+        local a, b = index.starts[first], index.ends[last]
+        if a ~= nil and b ~= nil and b > a then
+            local compact_a = index.ordinals[first] or a
+            local score = math.min(math.abs(a - expected), math.abs(compact_a - expected))
+            if best_score == nil or score < best_score then
+                best_a, best_b, best_score = a, b, score
+            end
+        end
+        from = first + 1
+    end
+    return best_a, best_b
+end
+
+local function numeric_interval(a, b, visible_count, index)
+    -- WeRead ranges are generated by JavaScript and may use UTF-16 offsets.
+    -- Mapping through decoded text preserves positions after emoji/non-BMP text.
+    local mapped_a = index and index.utf16_bounds and index.utf16_bounds[a]
+    local mapped_b = index and index.utf16_bounds and index.utf16_bounds[b]
+    if mapped_a ~= nil and mapped_b ~= nil and mapped_b > mapped_a then
+        return mapped_a, mapped_b
+    end
+    a, b = math.max(0, a), math.min(visible_count, b)
+    if b > a then return a, b end
+end
+
+local function intervals(data, visible_count, index)
     local out = {}
+    local stats = {quote_aligned=0, numeric=0, dropped=0}
     for _, row in ipairs(data.underlines or {}) do
-        local a, b = parse_range(range_key(row))
-        if a then
-            a, b = math.max(0, a), math.min(visible_count, b)
-            if b > a then out[#out + 1] = {a=a,b=b,key=range_key(row),thought=#(data.review_map[range_key(row)] or {})>0} end
+        local raw_a, raw_b = parse_range(range_key(row))
+        if raw_a then
+            local a, b
+            for _, quote in ipairs(quote_candidates(row, data)) do
+                a, b = locate_quote(index, quote, raw_a)
+                if a then break end
+            end
+            if a then
+                stats.quote_aligned = stats.quote_aligned + 1
+            else
+                a, b = numeric_interval(raw_a, raw_b, visible_count, index)
+                stats.numeric = stats.numeric + 1
+            end
+            if a and b and b > a then
+                out[#out + 1] = {
+                    a=a, b=b, key=range_key(row),
+                    thought=#(data.review_map[range_key(row)] or {}) > 0,
+                }
+            else
+                stats.dropped = stats.dropped + 1
+            end
+        else
+            stats.dropped = stats.dropped + 1
         end
     end
     table.sort(out, function(x,y) if x.a==y.a then return x.b<y.b end return x.a<y.a end)
@@ -219,11 +437,11 @@ local function intervals(data, visible_count)
     for _, it in ipairs(out) do
         if it.a >= cursor then clean[#clean + 1] = it; cursor = it.b end
     end
-    return clean
+    return clean, stats
 end
 
 local function render_text_token(token, marks, data)
-    if not token.units or #token.units == 0 then return token.raw end
+    if token.skip or not token.units or #token.units == 0 then return token.raw end
     local out, pos = {}, token.start
     local active, active_id_written = nil, false
     local function close_active()
@@ -262,21 +480,30 @@ end
 
 local function inject(html, data)
     local tokens, visible_count = tokenize(html)
-    local marks = intervals(data, visible_count)
-    if #marks == 0 then return html end
+    local index = build_text_index(tokens)
+    local marks, stats = intervals(data, visible_count, index)
+    if #marks == 0 then return html, stats end
     local out = {}
     for _, token in ipairs(tokens) do
         if token.kind == "text" then out[#out + 1] = render_text_token(token, marks, data)
         else out[#out + 1] = token.raw end
     end
-    return table.concat(out)
+    return table.concat(out), stats
 end
 
 function Annotations:apply(html, data)
     if not data or data.underline_count == 0 then return html, "", {underlines=0,thoughts=0} end
-    return inject(html, data), CSS, {
+    local rendered, alignment = inject(html, data)
+    logger.info("[MiuRead][Annotations] alignment",
+        "book=", tostring(data.book_id or ""), "chapter=", tostring(data.chapter_uid or ""),
+        "quote=", tostring(alignment and alignment.quote_aligned or 0),
+        "numeric=", tostring(alignment and alignment.numeric or 0),
+        "dropped=", tostring(alignment and alignment.dropped or 0))
+    return rendered, CSS, {
         underlines=data.underline_count, thoughts=data.thought_count,
         thought_entries=data.thought_entry_count or 0, errors=#(data.errors or {}),
+        quote_aligned=alignment and alignment.quote_aligned or 0,
+        dropped=alignment and alignment.dropped or 0,
     }
 end
 

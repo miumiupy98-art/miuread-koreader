@@ -1,6 +1,7 @@
 local Config=require("miuread.config")
 local Digests=require("miuread.digests")
 local U=require("miuread.util")
+local logger=require("logger")
 local Updater={}; Updater.__index=Updater
 
 function Updater:new(http,store,version,plugin_root)
@@ -14,6 +15,16 @@ end
 local function package_url(manifest)
     if type(manifest)~="table" then return nil end
     return manifest.package_url or manifest.url
+end
+
+local function command_ok(rc)
+    return rc==true or rc==0
+end
+
+local function file_bytes(path)
+    local data=U.read_file(path,true)
+    if type(data)~="string" then return nil end
+    return data
 end
 
 function Updater:check()
@@ -35,37 +46,44 @@ function Updater:check()
     return m
 end
 
+local function curl_download(url,path)
+    local cmd="curl -L --fail --silent --show-error --connect-timeout 20 --max-time 150 -o "
+        ..U.shell_quote(path).." "..U.shell_quote(url).." 2>/dev/null"
+    logger.info("[MiuRead][Updater] curl fallback download",url)
+    return command_ok(os.execute(cmd))
+end
+
 function Updater:download(m)
     local url=package_url(m)
     if type(url)~="string" or not url:match("^https://") then error("更新包地址无效") end
-    local data=self.http:download(url,{auth=false,retries=3,redirects=6,timeout={20,90}})
-    if type(data)~="string" or data=="" then error("下载的更新包为空") end
-    local expected=tostring(m.sha256 or ""):lower():gsub("%s+","")
-    if expected=="" then error("更新清单缺少 SHA-256") end
-    local actual=Digests.sha256(data):lower()
-    if actual~=expected then error("更新包校验失败") end
     local p=self.store.updates_dir.."/miuread-"..U.id_name(m.version)..".zip"
-    local ok,err=U.atomic_write(p,data,true); if not ok then error(err or "无法保存更新包") end
-    return p
-end
+    os.remove(p)
 
-local function archive_entries(path)
-    local cmd="unzip -Z1 "..U.shell_quote(path).." 2>/dev/null"
-    local f=io.popen(cmd,"r"); if not f then return nil,"设备缺少 unzip" end
-    local rows={}
-    for line in f:lines() do
-        line=tostring(line or "")
-        if line=="" or line:sub(1,1)=="/" or line:find("\\",1,true) then
-            f:close(); return nil,"更新包包含不安全路径"
-        end
-        for part in line:gmatch("[^/]+") do
-            if part==".." then f:close(); return nil,"更新包包含不安全路径" end
-        end
-        rows[#rows+1]=line
+    local downloaded=false
+    local ok,data=pcall(function()
+        return self.http:download(url,{auth=false,retries=3,redirects=8,timeout={20,120}})
+    end)
+    if ok and type(data)=="string" and #data>0 then
+        local wrote,err=U.atomic_write(p,data,true)
+        if not wrote then error(err or "无法保存更新包") end
+        downloaded=true
+    else
+        logger.warn("[MiuRead][Updater] Lua download unavailable or empty; using curl",tostring(data))
+        downloaded=curl_download(url,p)
     end
-    f:close()
-    if #rows==0 then return nil,"更新包为空" end
-    return rows
+
+    local raw=file_bytes(p)
+    if not downloaded or type(raw)~="string" or #raw==0 then
+        os.remove(p)
+        error("更新包下载失败或文件为空")
+    end
+
+    local expected=tostring(m.sha256 or ""):lower():gsub("%s+","")
+    if expected=="" then os.remove(p); error("更新清单缺少 SHA-256") end
+    local actual=Digests.sha256(raw):lower()
+    if actual~=expected then os.remove(p); error("更新包校验失败") end
+    logger.info("[MiuRead][Updater] package downloaded", "bytes=", tostring(#raw), "version=", tostring(m.version))
+    return p
 end
 
 local function safe_relative(rel)
@@ -75,23 +93,23 @@ local function safe_relative(rel)
 end
 
 function Updater:install(path,manifest)
-    local rows,err=archive_entries(path); if not rows then return nil,err end
-    local prefix="miuread.koplugin/"; local found=false
-    for _,x in ipairs(rows) do
-        if x=="miuread.koplugin/" or x:sub(1,#prefix)==prefix then found=true
-        else return nil,"更新包根目录必须是 miuread.koplugin" end
-    end
-    if not found then return nil,"更新包缺少插件目录" end
-
     local stamp=tostring(os.time()).."-"..tostring(math.random(1000,9999))
     local stage=self.store.updates_dir.."/stage-"..stamp
+    local unpacked=stage.."/unpacked"
     local backup=self.store.updates_dir.."/backup-"..stamp
-    U.remove_tree(stage); U.remove_tree(backup); U.mkdir(stage)
-    local rc=os.execute("unzip -qq "..U.shell_quote(path).." -d "..U.shell_quote(stage))
-    if rc~=0 and rc~=true then U.remove_tree(stage); return nil,"解压更新包失败" end
-    local incoming=stage.."/miuread.koplugin"
+    U.remove_tree(stage); U.remove_tree(backup); U.mkdir(unpacked)
+
+    -- Kindle 上的 unzip 不一定支持 `-Z1`。沿用旧版已验证的方法，直接解压后检查目录。
+    local rc=os.execute("unzip -q "..U.shell_quote(path).." -d "..U.shell_quote(unpacked).." 2>/dev/null")
+    if not command_ok(rc) then U.remove_tree(stage); return nil,"解压更新包失败" end
+
+    local incoming=unpacked.."/miuread.koplugin"
     if not U.file_exists(incoming.."/main.lua") or not U.file_exists(incoming.."/_meta.lua") then
-        U.remove_tree(stage); return nil,"更新包不是有效的 KOReader 插件"
+        U.remove_tree(stage); return nil,"更新包缺少 miuread.koplugin 或插件文件不完整"
+    end
+    local roots=U.list(unpacked)
+    if #roots~=1 or roots[1]~=incoming then
+        U.remove_tree(stage); return nil,"更新包根目录必须只包含 miuread.koplugin"
     end
 
     local ok,e=U.copy_tree(self.plugin_root,backup)
@@ -127,6 +145,7 @@ function Updater:install(path,manifest)
 
     U.remove_tree(stage)
     self.store:save_update_state({pending=true,expected=manifest.version,backup=backup,installed_at=os.time()})
+    logger.info("[MiuRead][Updater] update installed", "version=", tostring(manifest.version), "backup=", tostring(backup))
     return true
 end
 

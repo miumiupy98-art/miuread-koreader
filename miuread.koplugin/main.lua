@@ -960,7 +960,7 @@ function Plugin:check_update()
         end})
     end)
 end
-function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."开发验证版 · 单通道 OTA".."\n".."阅读时间上报沿用 0.3.6.7 兼容链路".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
+function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."正式版 · 单通道 OTA".."\n".."阅读时间上报沿用 0.3.6.7 兼容链路".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
 function Plugin:onShowMiuRead() self:show_shelf(false) end
 local function extract_thought_href(value,seen,depth)
     if depth>4 or value==nil then return nil end

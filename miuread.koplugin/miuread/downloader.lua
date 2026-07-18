@@ -10,7 +10,7 @@ local logger = require("logger")
 local Downloader = {}
 Downloader.__index = Downloader
 
-local CACHE_SCHEMA = 2
+local CACHE_SCHEMA = 3
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }
@@ -530,11 +530,10 @@ function Downloader:book(input, opt, progress)
                 session = state or session
                 body = Codec.body(downloaded)
                 body, new_assets = namespace_assets(body, downloaded_assets, uid)
-                progress("footnotes", index, expected, chapter.title, {underlines=annotation_summary.underlines, thoughts=annotation_summary.thoughts})
-                local foot_body, foot_section = Footnotes.process(body, {is_txt=(state and state.content_format == "txt") or format == "txt"})
-                body = foot_body .. (foot_section or "")
                 style = downloaded_style
-                if foot_section and foot_section ~= "" then style = tostring(style or "") .. "\n" .. Footnotes.FOOTNOTES_CSS end
+                -- Save the untouched chapter body. Annotation ranges refer to
+                -- this original text, not to the visible markers and endnotes
+                -- later inserted by Footnotes.process().
                 entry = cache_save_base(cache, chapter, body, style, new_assets, state)
             end
 
@@ -565,8 +564,25 @@ function Downloader:book(input, opt, progress)
                 local extra_css
                 body, extra_css = self.annotations:apply(body, annotation)
                 style = tostring(style or "") .. "\n" .. tostring(extra_css or "")
-                progress("images", index, expected, chapter.title, {underlines=annotation_summary.underlines, thoughts=annotation_summary.thoughts})
             end
+
+            -- Footnote conversion must happen after range injection. In the
+            -- old order, added [1] markers and endnote text shifted every
+            -- later underline/comment in books containing footnotes.
+            progress("footnotes", index, expected, chapter.title, {
+                underlines=annotation_summary.underlines,
+                thoughts=annotation_summary.thoughts,
+            })
+            local content_format = entry and entry.content_format or format
+            local foot_body, foot_section = Footnotes.process(body, {is_txt=content_format == "txt" or format == "txt"})
+            body = foot_body .. (foot_section or "")
+            if foot_section and foot_section ~= "" then
+                style = tostring(style or "") .. "\n" .. Footnotes.FOOTNOTES_CSS
+            end
+            progress("images", index, expected, chapter.title, {
+                underlines=annotation_summary.underlines,
+                thoughts=annotation_summary.thoughts,
+            })
 
             body = prepare_chapter_body(body, chapter.title or ("第 " .. tostring(index) .. " 章"))
             entry = cache_save_final(cache, chapter, body, annotation, style)

@@ -1,7 +1,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local Button = require("ui/widget/button")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
-local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -9,7 +9,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size = require("ui/size")
-local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
 local Screen = Device.screen
 
@@ -81,10 +80,9 @@ end
 
 function Popup:_free_widgets()
     if self.htmlwidget then pcall(function() self.htmlwidget:free() end) end
-    if self.close_widget then pcall(function() self.close_widget:free() end) end
+    if self.close_button then pcall(function() self.close_button:free() end) end
     self.htmlwidget = nil
-    self.close_widget = nil
-    self.close_frame = nil
+    self.close_button = nil
 end
 
 function Popup:_build()
@@ -117,23 +115,23 @@ function Popup:_build()
         self.htmlwidget,
     }
 
-    self.close_widget = TextBoxWidget:new{
+    -- Use a real KOReader Button instead of a painted TextBox. The previous
+    -- implementation relied on a separately calculated hit box; on Kindle
+    -- Voyage that tap could fall through to the card-wide page-turn handler.
+    self.close_button = Button:new{
         text = "×",
-        face = Font:getFace("cfont", math.max(19, math.floor(self.font_size * 1.02))),
-        bold = true,
         width = close_size,
         height = close_size,
-        height_adjust = false,
-        alignment = "center",
-    }
-    self.close_frame = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        bordersize = 0,
         margin = 0,
         padding = 0,
-        self.close_widget,
+        bordersize = 0,
+        text_font_face = "cfont",
+        text_font_size = math.max(19, math.floor(self.font_size * 1.02)),
+        text_font_bold = true,
+        show_parent = self,
+        callback = function() self:_request_close() end,
     }
-    self.close_frame.overlap_offset = {
+    self.close_button.overlap_offset = {
         self.width - close_size - border - close_inset,
         border + close_inset,
     }
@@ -149,7 +147,7 @@ function Popup:_build()
         dimen = Geom:new{w=self.width, h=self.height},
         allow_mirroring = false,
         body_frame,
-        self.close_frame,
+        self.close_button,
     }
 
     -- The full-screen parent is only responsible for centering and input
@@ -204,7 +202,11 @@ function Popup:onTapPage(_, ges)
     local pos = ges and ges.pos
     if not pos then return true end
 
-    if self.close_dimen and not pos:notIntersectWith(self.close_dimen) then
+    -- The Button normally consumes this tap itself. Keep an absolute-screen
+    -- fallback for older KOReader event ordering and for the first paint.
+    local button_dimen = self.close_button and self.close_button.dimen
+    if (button_dimen and not pos:notIntersectWith(button_dimen))
+        or (self.close_dimen and not pos:notIntersectWith(self.close_dimen)) then
         return self:_request_close()
     end
 

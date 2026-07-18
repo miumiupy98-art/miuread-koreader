@@ -258,7 +258,9 @@ local function looks_like_footnote_ref(attrs, href, inner)
     local file, anchor = split_href(href)
     if not anchor or anchor == "" then return false end
     local lower_anchor = anchor:lower()
-    if lower_anchor:find("wrthought-", 1, true) == 1 or lower_anchor:find("wt_") == 1 then return false end
+    if lower_anchor:find("wrthought-", 1, true) == 1
+        or lower_anchor:find("miuthought-", 1, true) == 1
+        or lower_anchor:find("wt_", 1, true) == 1 then return false end
     local epub_type = (get_attr(attrs, "epub:type") or ""):lower()
     local role = (get_attr(attrs, "role") or ""):lower()
     local class = (get_attr(attrs, "class") or ""):lower()
