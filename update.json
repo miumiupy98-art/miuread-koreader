@@ -1,9 +1,8 @@
 {
-  "version": "1.0.5",
-  "name": "觅阅 MiuRead v1.0.5",
-  "notes": "评论弹窗调整为页面下半部分的宽幅浮层；缩小用户名与点赞信息；评论正文跟随阅读字号；保留进度同步和登录超时修复。",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.5/miuread-v1.0.5-ota.zip",
-  "size": 132758,
-  "sha256": "a6b9234505fcdccd53b76ef59a3024fdd7edef38ce9345a93a5687145a8c268f",
+  "version": "1.0.6",
+  "name": "觅阅 MiuRead v1.0.6",
+  "notes": "优化想法弹窗：底部宽面板、高度随内容自适应，最大约占屏幕60%；同一划线下可连续显示多条评论；缩小用户名和点赞信息，减少内部留白并提高内容显示量。",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.6/miuread-v1.0.6-ota.zip",
+  "sha256": "edbcf15c5cb58190e2dc34b952cdc7a7268c126612e2caa4249a8aea57d4af7a",
   "delete_list": []
 }
