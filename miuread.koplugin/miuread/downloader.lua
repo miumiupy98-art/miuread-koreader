@@ -10,7 +10,7 @@ local logger = require("logger")
 local Downloader = {}
 Downloader.__index = Downloader
 
-local CACHE_SCHEMA = 3
+local CACHE_SCHEMA = 4
 
 local BASE_CSS = [[
 body { line-height: 1.75; margin: 5%; }

@@ -25,6 +25,10 @@ local function dirty_region(widget, dimen)
     end)
 end
 
+local function contains(dimen, pos)
+    return dimen and pos and dimen:contains(pos)
+end
+
 local Popup = InputContainer:extend{
     html = nil,
     font_size = Screen:scaleBySize(22),
@@ -34,6 +38,8 @@ local Popup = InputContainer:extend{
     dialog = nil,
     on_close_callback = nil,
     closing = false,
+    close_dimen = nil,
+    close_hit_dimen = nil,
 }
 
 function Popup:init()
@@ -143,6 +149,19 @@ function Popup:_build()
         h = close_size,
     }
 
+    -- Kindle touch coordinates can be slightly imprecise near the bezel. Keep
+    -- the visible button compact, but use a larger hit target fully contained
+    -- in the card's top-right corner.
+    local hit_pad = Screen:scaleBySize(12)
+    self.close_hit_dimen = Geom:new{
+        x = math.max(self.popup_dimen.x, self.close_dimen.x - hit_pad),
+        y = math.max(self.popup_dimen.y, self.close_dimen.y - hit_pad),
+        w = math.min(self.popup_dimen.x + self.popup_dimen.w, self.close_dimen.x + self.close_dimen.w + hit_pad)
+            - math.max(self.popup_dimen.x, self.close_dimen.x - hit_pad),
+        h = math.min(self.popup_dimen.y + self.popup_dimen.h, self.close_dimen.y + self.close_dimen.h + hit_pad)
+            - math.max(self.popup_dimen.y, self.close_dimen.y - hit_pad),
+    }
+
     self.container = OverlapGroup:new{
         dimen = Geom:new{w=self.width, h=self.height},
         allow_mirroring = false,
@@ -177,10 +196,30 @@ end
 function Popup:_request_close()
     if self.closing then return true end
     self.closing = true
-    UIManager:scheduleIn(0, function()
-        pcall(function() UIManager:close(self) end)
-    end)
+    UIManager:close(self)
     return true
+end
+
+function Popup:_tap_hits_close(pos)
+    -- The button's painted dimension is absolute after the first paint. The
+    -- explicit fallback dimensions are available even before that.
+    return contains(self.close_button and self.close_button.dimen, pos)
+        or contains(self.close_dimen, pos)
+        or contains(self.close_hit_dimen, pos)
+end
+
+-- WidgetContainer normally sends events to children before the parent. The
+-- ScrollHtmlWidget consumes taps first, so the card-wide page-turn handler can
+-- run before the overlaid close button ever sees the event. Intercept the raw
+-- tap at the popup boundary before child propagation.
+function Popup:handleEvent(event)
+    if not self.closing and event and event.handler == "onGesture" then
+        local ges = event.args and event.args[1]
+        if ges and ges.ges == "tap" and self:_tap_hits_close(ges.pos) then
+            return self:_request_close()
+        end
+    end
+    return InputContainer.handleEvent(self, event)
 end
 
 function Popup:onClose() return self:_request_close() end
@@ -204,9 +243,7 @@ function Popup:onTapPage(_, ges)
 
     -- The Button normally consumes this tap itself. Keep an absolute-screen
     -- fallback for older KOReader event ordering and for the first paint.
-    local button_dimen = self.close_button and self.close_button.dimen
-    if (button_dimen and not pos:notIntersectWith(button_dimen))
-        or (self.close_dimen and not pos:notIntersectWith(self.close_dimen)) then
+    if self:_tap_hits_close(pos) then
         return self:_request_close()
     end
 

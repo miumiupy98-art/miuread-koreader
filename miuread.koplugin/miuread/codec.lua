@@ -72,22 +72,63 @@ function Codec.mp_body(html)
     start=s:find(">",start,true); if not start then return Codec.body(s) end
     local tail=s:sub(start+1); local stop=tail:find("</div>",1,true); return stop and tail:sub(1,stop-1) or tail
 end
+local function tar_text(value)
+    return tostring(value or ""):match("^[^%z]*") or ""
+end
+local function tar_octal(value)
+    value = tar_text(value):gsub("^%s+", ""):gsub("%s+$", "")
+    return tonumber(value, 8) or 0
+end
+local function tar_pax_path(body)
+    for line in tostring(body or ""):gmatch("[^\n]+") do
+        local path = line:match("%d+ path=(.*)")
+        if path and path ~= "" then return path end
+    end
+end
 function Codec.tar(data)
-    local out={}; local p=1
-    while p+511<=#data do
-        local h=data:sub(p,p+511); if h:gsub("\0","")=="" then break end
-        local name=(h:sub(1,100):match("^[^%z]*") or ""); local size=tonumber((h:sub(125,136):match("[%d]+") or "0"),8) or 0
-        local kind=h:sub(157,157); local body=data:sub(p+512,p+511+size)
-        if kind=="0" or kind=="\0" then out[name]=body end
-        p=p+512+math.ceil(size/512)*512
+    local out, p = {}, 1
+    local long_name, pax_name
+    data = tostring(data or "")
+    while p + 511 <= #data do
+        local h = data:sub(p, p + 511)
+        if h:gsub("\0", "") == "" then break end
+        local name = tar_text(h:sub(1, 100))
+        local prefix = tar_text(h:sub(346, 500))
+        if prefix ~= "" then name = prefix .. "/" .. name end
+        local size = tar_octal(h:sub(125, 136))
+        local kind = h:sub(157, 157)
+        local body = data:sub(p + 512, p + 511 + size)
+        if kind == "L" then
+            long_name = tar_text(body)
+        elseif kind == "x" then
+            pax_name = tar_pax_path(body)
+        elseif kind == "0" or kind == "\0" or kind == "" then
+            local final_name = pax_name or long_name or name
+            if final_name ~= "" and size > 0 then out[final_name] = body end
+            long_name, pax_name = nil, nil
+        end
+        p = p + 512 + math.ceil(size / 512) * 512
     end
     return out
 end
-function Codec.media(data)
+function Codec.media(data, hint)
+    data = tostring(data or "")
     if data:sub(1,8)=="\137PNG\r\n\26\n" then return ".png","image/png" end
     if data:sub(1,3)=="\255\216\255" then return ".jpg","image/jpeg" end
     if data:sub(1,6)=="GIF87a" or data:sub(1,6)=="GIF89a" then return ".gif","image/gif" end
     if data:sub(1,4)=="RIFF" and data:sub(9,12)=="WEBP" then return ".webp","image/webp" end
+    if data:sub(1,2)=="BM" then return ".bmp","image/bmp" end
+    local head = data:sub(1,512):lower()
+    if head:find("<svg", 1, true) then return ".svg","image/svg+xml" end
+    if data:sub(5,12)=="ftypavif" or data:sub(5,12)=="ftypavis" then return ".avif","image/avif" end
+    local clean_hint = tostring(hint or ""):lower():match("^[^%?#]+") or ""
+    local ext = clean_hint:match("%.([%w]+)$")
+    local by_ext = {
+        png={".png","image/png"}, jpg={".jpg","image/jpeg"}, jpeg={".jpg","image/jpeg"},
+        gif={".gif","image/gif"}, webp={".webp","image/webp"}, svg={".svg","image/svg+xml"},
+        bmp={".bmp","image/bmp"}, avif={".avif","image/avif"},
+    }
+    if ext and by_ext[ext] then return by_ext[ext][1], by_ext[ext][2] end
     return ".bin","application/octet-stream"
 end
 return Codec

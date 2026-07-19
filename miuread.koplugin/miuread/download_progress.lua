@@ -130,10 +130,10 @@ local function clean_status(value, limit)
 end
 
 function DownloadProgress:_redraw()
+    local target = (self.frame and self.frame.dimen) or self.dimen
     UIManager:setDirty(self, function()
-        return "fast", self.dimen
+        return "fast", target
     end)
-    if UIManager.forceRePaint then UIManager:forceRePaint() end
 end
 
 function DownloadProgress:set_state(state)
@@ -147,8 +147,6 @@ function DownloadProgress:set_state(state)
         percent = percent / 100
     end
     percent = clamp(percent, 0, 1)
-    self.progress:setPercentage(percent)
-    self.percent_widget:setText(tostring(math.floor(percent * 100 + 0.5)) .. "%")
 
     local labels = {
         prepare = "准备下载",
@@ -176,7 +174,14 @@ function DownloadProgress:set_state(state)
             .. "　想法组 " .. tostring(state.thoughts or 0)
     end
     if state.message and state.message ~= "" then rows[#rows + 1] = clean_status(state.message, 180) end
-    self.status_widget:setText(table.concat(rows, "\n"))
+    local percent_text = tostring(math.floor(percent * 100 + 0.5)) .. "%"
+    local status_text = table.concat(rows, "\n")
+    local signature = percent_text .. "\n" .. status_text
+    if signature == self._last_signature then return end
+    self._last_signature = signature
+    self.progress:setPercentage(percent)
+    self.percent_widget:setText(percent_text)
+    self.status_widget:setText(status_text)
     self:_redraw()
 end
 

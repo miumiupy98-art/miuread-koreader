@@ -104,7 +104,7 @@ function Auth:_schedule(uid,gen,otp)
 end
 function Auth:_otp(uid,gen,bad)
     local d
-    d=InputDialog:new{title=_("Verification code"),input="",description=(bad and "验证码不正确。\n\n" or "").._("Enter the four-digit code shown on your phone."),buttons={{text=_("Cancel"),callback=function() UIManager:close(d); self:cancel() end},{text=_("Confirm"),is_enter_default=true,callback=function() local otp=Util.trim(d:getInputText()); UIManager:close(d); self.dialog=nil; self:_schedule(uid,gen,otp) end}}}
+    d=InputDialog:new{title=_("Verification code"),input="",description=(bad and "验证码不正确。\n\n" or "").._("Enter the four-digit code shown on your phone."),buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d); self:cancel() end},{text=_("Confirm"),is_enter_default=true,callback=function() local otp=Util.trim(d:getInputText()); UIManager:close(d); self.dialog=nil; self:_schedule(uid,gen,otp) end}}}}
     UIManager:show(d); d:onShowKeyboard()
 end
 return Auth

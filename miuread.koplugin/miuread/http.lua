@@ -160,9 +160,18 @@ end
 
 function Http:json(opt)
     local text, code, headers, url = self:request(opt)
+    text = text or ""
+    if not code or code < 200 or code >= 300 then
+        local content_type = hget(headers, "content-type") or "unknown"
+        local preview = Util.first_line(text, 180)
+        local message = "HTTP " .. tostring(code or "nil")
+            .. ", content_type=" .. tostring(content_type)
+            .. ", body_bytes=" .. tostring(#text)
+        if preview ~= "" then message = message .. ": " .. preview end
+        error(message)
+    end
     local ok, data = pcall(Json.decode, text)
     if not ok then error("invalid JSON from " .. tostring(url) .. ": " .. Util.first_line(text, 180)) end
-    if code < 200 or code >= 300 then error("HTTP " .. tostring(code) .. ": " .. Util.first_line(text, 240)) end
     if type(data) == "table" then
         local ec = data.errCode or data.errcode
         if ec and tonumber(ec) ~= 0 then error(tostring(data.errMsg or data.errmsg or ec)) end

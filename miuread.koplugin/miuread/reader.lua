@@ -158,6 +158,213 @@ local function is_auth_error(value)
         or text:find("未登录", 1, true) or text:find("登录过期", 1, true)
 end
 
+
+local function image_trim(value)
+    return tostring(value or ""):gsub("&amp;", "&"):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function image_url_decode(value)
+    return tostring(value or ""):gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end)
+end
+
+local function image_basename(value)
+    local clean = tostring(value or ""):gsub("\\", "/"):gsub("/+$", "")
+    return clean:match("([^/]+)$") or clean
+end
+
+local function image_source_keys(value)
+    local clean = image_trim(value)
+    local path = clean:match("^[^%?#]+") or clean
+    local remote_path = path:match("^https?://[^/]+(/.*)$") or path:match("^//[^/]+(/.*)$")
+    path = remote_path or path
+    while path:sub(1, 3) == "../" do path = path:sub(4) end
+    while path:sub(1, 2) == "./" do path = path:sub(3) end
+    path = path:gsub("^/+", "")
+
+    local decoded_path = image_url_decode(path)
+    local base = image_basename(path)
+    local decoded_base = image_basename(decoded_path)
+    local candidates = {path, decoded_path, base, decoded_base}
+    for _, candidate in ipairs({path, decoded_path}) do
+        local parts = {}
+        for part in tostring(candidate or ""):gmatch("[^/]+") do parts[#parts + 1] = part end
+        for depth = 2, math.min(4, #parts) do
+            local suffix = {}
+            for index = #parts - depth + 1, #parts do suffix[#suffix + 1] = parts[index] end
+            candidates[#candidates + 1] = table.concat(suffix, "/")
+        end
+    end
+    local out, seen = {}, {}
+    for _, key in ipairs(candidates) do
+        key = tostring(key or ""):lower()
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = key
+        end
+    end
+    return out
+end
+
+local function image_map_add(source_map, source, href)
+    for _, key in ipairs(image_source_keys(source)) do
+        if source_map[key] == nil then
+            source_map[key] = href
+        elseif source_map[key] ~= href then
+            source_map[key] = false
+        end
+    end
+end
+
+local function image_map_get(source_map, source)
+    for _, key in ipairs(image_source_keys(source)) do
+        local href = source_map[key]
+        if href then return href end
+    end
+end
+
+local function image_attr(attrs, name_pattern)
+    attrs = tostring(attrs or "")
+    local _, value = attrs:match("%s" .. name_pattern .. "%s*=%s*([\"'])(.-)%1")
+    if value ~= nil then return value end
+    _, value = attrs:match("^" .. name_pattern .. "%s*=%s*([\"'])(.-)%1")
+    return value
+end
+
+local function image_remove_attr(attrs, name_pattern)
+    attrs = tostring(attrs or "")
+    attrs = attrs:gsub("%s" .. name_pattern .. "%s*=%s*([\"'])(.-)%1", "")
+    attrs = attrs:gsub("^" .. name_pattern .. "%s*=%s*([\"'])(.-)%1%s*", "")
+    return attrs
+end
+
+local function image_set_local_src(attrs, href)
+    attrs = image_remove_attr(attrs, "src")
+    for _, name in ipairs({"data%-src", "data%-original", "data%-lazy%-src", "data%-actualsrc", "srcset"}) do
+        attrs = image_remove_attr(attrs, name)
+    end
+    return ' src="' .. tostring(href or "") .. '"' .. attrs
+end
+
+local function image_remote_url(value)
+    local url = image_trim(value)
+    if url:sub(1, 2) == "//" then url = "https:" .. url end
+    if url:match("^https?://") then return url end
+end
+
+local function image_used_hrefs(assets)
+    local used = {}
+    for _, asset in ipairs(assets or {}) do used[tostring(asset.href or "")] = true end
+    return used
+end
+
+local function image_unique_href(used, prefix, index, ext)
+    local candidate = string.format("images/%s-%04d%s", prefix, index, ext)
+    while used[candidate] do
+        index = index + 1
+        candidate = string.format("images/%s-%04d%s", prefix, index, ext)
+    end
+    used[candidate] = true
+    return candidate, index
+end
+
+local function image_tar_assets(blob)
+    local entries = Codec.tar(blob)
+    local names = {}
+    for name in pairs(entries or {}) do names[#names + 1] = name end
+    table.sort(names)
+
+    local assets, source_map, used = {}, {}, {}
+    local index = 0
+    for _, name in ipairs(names) do
+        local data = entries[name]
+        local ext, mime = Codec.media(data, name)
+        if tostring(mime):match("^image/") and data and #data > 0 then
+            index = index + 1
+            local href
+            href, index = image_unique_href(used, "tar", index, ext)
+            assets[#assets + 1] = {href=href, data=data, mime=mime, source=name}
+            local local_src = "../" .. href
+            image_map_add(source_map, name, local_src)
+            image_map_add(source_map, image_basename(name), local_src)
+        end
+    end
+    return assets, source_map
+end
+
+local function localize_epub_images(reader, xhtml, assets, source_map, state)
+    assets = assets or {}
+    source_map = source_map or {}
+    local used = image_used_hrefs(assets)
+    local remote_cache, remote_failed = {}, {}
+    local remote_index = #assets
+    local summary = {tar=#assets, remote=0, localized=0, missing=0}
+
+    local function download_remote(url)
+        if remote_cache[url] then return remote_cache[url] end
+        if remote_failed[url] then return nil end
+        local ok, data = pcall(reader.http.download, reader.http, url, {
+            headers={
+                Referer=(state and state.url) or BASE .. "/",
+                Origin=BASE,
+                Accept="image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            },
+            retries=2,
+            timeout={12, 25},
+        })
+        if not ok or not data or #data == 0 then
+            remote_failed[url] = true
+            logger.warn("[MiuRead][Reader] remote image failed", "url=", tostring(url), "error=", ok and "empty" or tostring(data))
+            return nil
+        end
+        local ext, mime = Codec.media(data, url)
+        if not tostring(mime):match("^image/") then
+            remote_failed[url] = true
+            logger.warn("[MiuRead][Reader] remote asset is not an image", "url=", tostring(url), "mime=", tostring(mime))
+            return nil
+        end
+        remote_index = remote_index + 1
+        local href
+        href, remote_index = image_unique_href(used, "remote", remote_index, ext)
+        assets[#assets + 1] = {href=href, data=data, mime=mime, source=url}
+        local local_src = "../" .. href
+        remote_cache[url] = local_src
+        image_map_add(source_map, url, local_src)
+        summary.remote = summary.remote + 1
+        return local_src
+    end
+
+    xhtml = tostring(xhtml or ""):gsub("<[iI][mM][gG]([^>]*)>", function(attrs)
+        local srcset = image_attr(attrs, "srcset")
+        local source = image_attr(attrs, "data%-src")
+            or image_attr(attrs, "data%-original")
+            or image_attr(attrs, "data%-lazy%-src")
+            or image_attr(attrs, "data%-actualsrc")
+            or image_attr(attrs, "src")
+            or (srcset and srcset:match("^%s*([^,%s]+)"))
+        local clean_source = image_trim(source)
+        if clean_source == "" then return "<img" .. attrs .. ">" end
+        if clean_source:lower():match("^data:image/") then return "<img" .. attrs .. ">" end
+
+        local local_src = image_map_get(source_map, clean_source)
+        if not local_src then
+            local url = image_remote_url(clean_source)
+            if url then local_src = download_remote(url) end
+        end
+        if local_src then
+            summary.localized = summary.localized + 1
+            return "<img" .. image_set_local_src(attrs, local_src) .. ">"
+        end
+
+        summary.missing = summary.missing + 1
+        logger.warn("[MiuRead][Reader] image reference unresolved", "src=", tostring(clean_source))
+        return "<img" .. attrs .. ">"
+    end)
+
+    return xhtml, assets, summary
+end
+
 function Reader:new(http, store) return setmetatable({http=http, store=store}, self) end
 
 function Reader:renew()
@@ -245,18 +452,33 @@ function Reader:_epub_once(book, chapter, opt, state)
     end
 
     local assets = {}
-    local tar_url = chapter.tar
-    if opt.images ~= false and tar_url and tar_url ~= "" then
-        if tar_url:sub(1, 2) == "//" then tar_url = "https:" .. tar_url elseif tar_url:sub(1, 1) == "/" then tar_url = BASE .. tar_url end
-        local blob = self.http:download(tar_url, {headers={Referer=state.url}, retries=3})
-        for name, data in pairs(Codec.tar(blob)) do
-            local base = name:match("([^/]+)$") or name
-            local ext, mime = Codec.media(data)
-            local href = "images/" .. Util.id_name(base) .. ext
-            assets[#assets + 1] = {href=href, data=data, mime=mime, source=base}
-            local escaped = base:gsub("([^%w])", "%%%1")
-            xhtml = xhtml:gsub("https://res%.weread%.qq%.com/wrepub/" .. escaped .. "[^%s\"'<>]*", "../" .. href)
+    if opt.images ~= false then
+        local source_map = {}
+        local tar_url = chapter.tar
+        if tar_url and tar_url ~= "" then
+            tar_url = tostring(tar_url)
+            if tar_url:sub(1, 2) == "//" then
+                tar_url = "https:" .. tar_url
+            elseif tar_url:sub(1, 1) == "/" then
+                tar_url = BASE .. tar_url
+            end
+            local ok_tar, blob = pcall(self.http.download, self.http, tar_url, {
+                headers={Referer=state.url, Origin=BASE, Accept="application/octet-stream,*/*"},
+                retries=3,
+            })
+            if ok_tar and blob and #blob > 0 then
+                local tar_assets, tar_map = image_tar_assets(blob)
+                for _, asset in ipairs(tar_assets) do assets[#assets + 1] = asset end
+                for key, href in pairs(tar_map) do source_map[key] = href end
+            else
+                logger.warn("[MiuRead][Reader] chapter image archive failed", "chapter=", tostring(uid),
+                    "url=", tostring(tar_url), "error=", ok_tar and "empty" or tostring(blob))
+            end
         end
+        xhtml, assets, state.image_summary = localize_epub_images(self, xhtml, assets, source_map, state)
+        logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
+            "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
+            "localized=", tostring(state.image_summary.localized), "missing=", tostring(state.image_summary.missing))
     end
     state.content_format = "epub"
     return xhtml, css, assets, state
@@ -417,6 +639,9 @@ Reader._visible_text = visible_text
 Reader._is_structure_chapter = is_structure_chapter
 Reader._is_empty_error = is_empty_error
 Reader._is_auth_error = is_auth_error
+Reader._image_source_keys = image_source_keys
+Reader._image_tar_assets = image_tar_assets
+Reader._localize_epub_images = localize_epub_images
 Reader.PART_CSS = PART_CSS
 
 return Reader

@@ -82,21 +82,29 @@ end
 
 function Api:new(http, store) return setmetatable({http = http, store = store}, self) end
 
-function Api:call(name, params)
+function Api:call(name, params, request_options)
     local auth = self.store:auth()
     if tostring(auth.api_key or "") == "" then error("API key is not configured") end
     local payload = sanitize(U.copy(params or {}))
     payload.api_name = tostring(name)
     payload.skill_version = Protocol.SKILL_VERSION
+    local options = U.copy(request_options or {})
+    options.auth = false
+    options.headers = options.headers or {}
+    options.headers.Authorization = "Bearer " .. auth.api_key
+    if options.retries == nil then options.retries = 2 end
     local ok, data = pcall(self.http.post_json, self.http,
-        "https://i.weread.qq.com/api/agent/gateway", payload,
-        {auth=false, headers={Authorization="Bearer " .. auth.api_key}, retries=2})
+        "https://i.weread.qq.com/api/agent/gateway", payload, options)
     if not ok then error(tostring(name) .. ": " .. tostring(data)) end
     return unwrap(data)
 end
 
-function Api:shelf() return self:call("/shelf/sync", {}) end
-function Api:search(q, offset, count) return self:call("/store/search", {keyword=tostring(q or ""), scope=10, maxIdx=offset or 0, count=count or 30}) end
+function Api:shelf()
+    return self:call("/shelf/sync", {}, {retries=1, timeout={10, 18}})
+end
+function Api:search(q, offset, count)
+    return self:call("/store/search", {keyword=tostring(q or ""), scope=10, maxIdx=offset or 0, count=count or 30}, {retries=1, timeout={10, 18}})
+end
 function Api:book(id) return self:call("/book/info", {bookId=tostring(id)}) end
 function Api:chapters(id) return self:call("/book/chapterinfo", {bookId=tostring(id)}) end
 function Api:progress(id) return self:call("/book/getprogress", {bookId=tostring(id), _t=os.time()}) end

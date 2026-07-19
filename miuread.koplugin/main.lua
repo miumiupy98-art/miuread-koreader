@@ -36,7 +36,7 @@ local source=debug.getinfo(1,"S").source:gsub("^@",""); local ROOT=source:match(
 local Plugin=WidgetContainer:extend{name="miuread",is_doc_only=false,version=Config.VERSION}
 local function normalize(v) local b=v.bookInfo or v.book or v; return {bookId=tostring(b.bookId or v.bookId or ""),title=b.title or v.title or "未命名",author=b.author or v.author or "",cover=b.cover or v.cover,category=b.category or v.category,progress=tonumber(v.progress or b.progress or 0) or 0,updateTime=tonumber(v.updateTime or b.updateTime or 0) or 0} end
 function Plugin:init()
-    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.5}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false
+    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0
     self:onDispatcherRegisterActions(); self.ui.menu:registerToMainMenu(self); local state=self.updater:startup(); if state=="updated" then UIManager:scheduleIn(1,function() self:toast(_("Update installed"),3) end) end
 end
 function Plugin:onDispatcherRegisterActions() Dispatcher:registerAction("miuread_show",{category="none",event="ShowMiuRead",title=Config.NAME,filemanager=true,reader=true}) end
@@ -75,10 +75,10 @@ function Plugin:account_menu()
     if self:logged_in() then out[#out+1]={text=_("Clear account data"),callback=function() UIManager:show(ConfirmBox:new{text="清除当前账户信息？\n\n将退出微信读书账户，但不会删除已下载书籍。",ok_callback=function() self.auth_flow:cancel(); self.store:clear_auth(); self:toast(_("Logout")) end}) end} end; return out
 end
 function Plugin:manual_credentials()
-    local d; d=InputDialog:new{title=_("Enter API key"),input=self.store:auth().api_key or "",buttons={{text=_("Cancel"),callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local key=U.trim(d:getInputText()); UIManager:close(d); self:manual_cookie(key) end}}}; UIManager:show(d); d:onShowKeyboard()
+    local d; d=InputDialog:new{title=_("Enter API key"),input=self.store:auth().api_key or "",buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local key=U.trim(d:getInputText()); UIManager:close(d); self:manual_cookie(key) end}}}}; UIManager:show(d); d:onShowKeyboard()
 end
 function Plugin:manual_cookie(key)
-    local d; d=InputDialog:new{title=_("Enter Cookie header"),input="",buttons={{text=_("Cancel"),callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local jar=Cookies.parse_header(d:getInputText()); self.store:save_auth({api_key=key,cookies=jar,account={name="Manual",vid=jar.wr_vid or "",logged_at=os.time()}}); UIManager:close(d); self:toast(_("Logged in")) end}}}; UIManager:show(d); d:onShowKeyboard()
+    local d; d=InputDialog:new{title=_("Enter Cookie header"),input="",buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local jar=Cookies.parse_header(d:getInputText()); self.store:save_auth({api_key=key,cookies=jar,account={name="Manual",vid=jar.wr_vid or "",logged_at=os.time()}}); UIManager:close(d); self:toast(_("Logged in")) end}}}}; UIManager:show(d); d:onShowKeyboard()
 end
 local SORT_LABELS={update="最近更新",title="书名",author="作者",progress="阅读进度"}
 local FILTER_LABELS={downloaded="已下载",unread="未读",reading="阅读中",finished="已读完"}
@@ -97,8 +97,81 @@ function Plugin:show_shelf_tabs()
         {text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(self._last_shelf_mode or false) end},
     })
 end
-function Plugin:load_shelf(cb)
-    self:online("shelf",function() local ok,books,mp=pcall(function() return self.library:refresh() end); if ok then cb(books,mp) else local b,m,t=self.library:cached(); if #b+#m>0 then self:toast("网络失败，显示缓存 · "..U.now_text(t),3); cb(b,m) else error(books) end end end)
+function Plugin:_friendly_remote_error(err, context)
+    local text=tostring(err or "未知错误")
+    local lower=text:lower()
+    if lower:find("http 401",1,true) or lower:find("http 403",1,true)
+        or lower:find("api key",1,true) or lower:find("authorization",1,true) then
+        return "登录凭证已失效或被拒绝，请在账户设置中重新扫码登录。"
+    end
+    if lower:find("timeout",1,true) then return "网络请求超时，请检查 Wi-Fi 后重试。" end
+    if lower:find("network request failed",1,true) then return "网络连接失败，请检查 Wi-Fi 后重试。" end
+    return tostring(context or "请求").."失败：\n"..U.first_line(text,180)
+end
+
+function Plugin:_refresh_shelf_async(on_ready,silent)
+    local function fail(err)
+        local message=self:_friendly_remote_error(err,"书架加载")
+        if on_ready then
+            on_ready({}, {}, message)
+        elseif not silent or message:find("重新扫码登录",1,true) then
+            self:toast(message,4)
+        end
+        return false,err
+    end
+    if not self:is_online() then
+        return fail("network request failed: offline")
+    end
+    if not self.shelf_async or not self.shelf_async:available() then
+        return fail("当前设备不支持后台书架刷新。")
+    end
+    if self.shelf_async:busy() then
+        return fail("书架正在刷新，请稍后重试。")
+    end
+    self._shelf_refresh_generation=(tonumber(self._shelf_refresh_generation) or 0)+1
+    local generation=self._shelf_refresh_generation
+    local auth=U.copy(self.store:auth())
+    local started,err=self.shelf_async:run("shelf_refresh",function()
+        local HttpChild=require("miuread.http")
+        local ApiChild=require("miuread.api")
+        local UtilChild=require("miuread.util")
+        local child_store={
+            auth=function() return UtilChild.copy(auth) end,
+            save_auth=function() end,
+        }
+        return ApiChild:new(HttpChild:new(child_store),child_store):shelf()
+    end,function(result)
+        if generation~=self._shelf_refresh_generation then return end
+        if result and result.ok==true then
+            local books,mp=self.library:normalize(result.value or {})
+            self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time()})
+            if on_ready then on_ready(books,mp,nil) end
+            return
+        end
+        fail(result and result.error or "未知错误")
+    end,32)
+    if not started then return fail(err or "无法启动异步任务") end
+    return true
+end
+
+function Plugin:load_shelf(cb,force_remote)
+    if not force_remote then
+        local books,mp=self.library:cached()
+        if #books+#mp>0 then
+            cb(books,mp,nil)
+            self:_refresh_shelf_async(nil,true)
+            return
+        end
+        local library_snapshot=self.store:library()
+        local local_books,local_mp=self.library:local_books(library_snapshot)
+        if #local_books+#local_mp>0 then
+            self:toast("云端书架暂未加载，先显示本地书籍。",3)
+            cb(local_books,local_mp,nil)
+            self:_refresh_shelf_async(nil,true)
+            return
+        end
+    end
+    self:_refresh_shelf_async(cb,false)
 end
 function Plugin:_cancel_cover_loading()
     self._cover_generation=(tonumber(self._cover_generation) or 0)+1
@@ -171,21 +244,36 @@ end
 function Plugin:_reopen_shelf(mp_mode)
     UIManager:scheduleIn(0,function() self:_close_current_shelf(); self:show_shelf(mp_mode) end)
 end
-function Plugin:show_shelf(mp_mode)
+function Plugin:show_shelf(mp_mode,force_remote)
     if not self:require_login() then return end
     self._last_shelf_mode=mp_mode==true
-    self:load_shelf(function(books,mp)
-        local rows=self.library:sort_filter(mp_mode and mp or books)
-        for _,b in ipairs(rows) do b.downloaded=self.library:is_downloaded(b.bookId); b.cover_path=self.library:cached_cover_path(b.bookId) end
+    self:load_shelf(function(books,mp,remote_error)
+        local library_snapshot=self.store:library()
+        local cover_index=self.store:get("cover_index",{})
+        local rows=self.library:sort_filter(mp_mode and mp or books,library_snapshot)
+        for _,b in ipairs(rows) do b.downloaded=self.library:is_downloaded(b.bookId,library_snapshot); b.cover_path=self.library:cached_cover_path(b.bookId,cover_index) end
         local title=(mp_mode and _("Official accounts") or _("Books")).." · "..self:_shelf_summary()
         local prefs=self.store:preferences()
+        if remote_error or #rows==0 then
+            local items={}
+            if remote_error then items[#items+1]={text=remote_error,enabled=false} end
+            if remote_error and remote_error:find("重新扫码登录",1,true) then
+                items[#items+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
+            end
+            items[#items+1]={text="重新加载书架",callback=function() self:show_shelf(mp_mode,true) end}
+            for _,b in ipairs(rows) do
+                items[#items+1]={text=(b.downloaded and "✓ " or "")..b.title,post_text=(b.progress and b.progress>0 and (math.floor(b.progress).."%") or ""),callback=self:safe(b.title,function() self:book_menu(b) end)}
+            end
+            self:list(title,items,remote_error or "书架为空")
+            return
+        end
         if prefs.shelf_covers and not prefs.low_resource then
             local ok,view=pcall(ShelfView.show,{
                 title=title,books=rows,
                 on_select=function(b) self:book_menu(b) end,
                 on_hold=function() self:show_shelf_controls(mp_mode) end,
                 on_page_changed=function(page,first,last,current) self:_on_shelf_page(rows,current,page,first,last) end,
-                on_close=function(current) if self._shelf_view==current then self._shelf_view=nil end; self:_cancel_cover_loading(); collectgarbage("collect") end,
+                on_close=function(current) if self._shelf_view==current then self._shelf_view=nil end; self:_cancel_cover_loading(); collectgarbage("step",160) end,
             })
             if ok and view then self._shelf_view=view; return end
             logger.warn("[MiuRead][Shelf] cover view unavailable",tostring(view))
@@ -193,13 +281,13 @@ function Plugin:show_shelf(mp_mode)
         local items={{text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(mp_mode) end}}
         for _,b in ipairs(rows) do items[#items+1]={text=(b.downloaded and "✓ " or "")..b.title,post_text=(b.progress and b.progress>0 and (math.floor(b.progress).."%") or ""),callback=self:safe(b.title,function() self:book_menu(b) end),hold_callback=function() self:show_shelf_controls(mp_mode) end} end
         self:list(title,items)
-    end)
+    end,force_remote)
 end
 function Plugin:show_shelf_controls(mp_mode)
     local menu
     local items={{text=self:_shelf_summary(),enabled=false}}
     items[#items+1]={text=mp_mode and "查看普通书籍" or "查看公众号",callback=function() if menu then UIManager:close(menu) end; self:_reopen_shelf(not mp_mode) end}
-    items[#items+1]={text="刷新书架",callback=function() if menu then UIManager:close(menu) end; self:_reopen_shelf(mp_mode) end}
+    items[#items+1]={text="刷新书架",callback=function() if menu then UIManager:close(menu) end; UIManager:scheduleIn(0,function() self:_close_current_shelf(); self:show_shelf(mp_mode,true) end) end}
     local function apply(change)
         change()
         if menu then pcall(function() UIManager:close(menu) end) end
@@ -224,14 +312,14 @@ function Plugin:search_dialog()
     local d
     d=InputDialog:new{
         title=_("Search books"), input="",
-        buttons={
-            {text=_("Cancel"),callback=function() UIManager:close(d) end},
+        buttons={{
+            {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
             {text=_("Search"),is_enter_default=true,callback=function()
                 local q=U.trim(d:getInputText())
                 UIManager:close(d)
                 if q~="" then self:search(q) end
             end},
-        },
+        }},
     }
     UIManager:show(d)
     d:onShowKeyboard()
@@ -286,12 +374,16 @@ function Plugin:search(q)
     self._search_dialog=dialog
     UIManager:show(dialog)
 
+    local auth=U.copy(self.store:auth())
     local started,err=self.search_async:run("book_search",function()
-        local StoreChild=require("miuread.store")
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
-        local store=StoreChild:new()
-        local api=ApiChild:new(HttpChild:new(store),store)
+        local UtilChild=require("miuread.util")
+        local child_store={
+            auth=function() return UtilChild.copy(auth) end,
+            save_auth=function() end,
+        }
+        local api=ApiChild:new(HttpChild:new(child_store),child_store)
         return api:search(q,0,40)
     end,function(result)
         if generation~=self._search_generation then return end
@@ -299,7 +391,7 @@ function Plugin:search(q)
         self._search_dialog=nil
         UIManager:close(dialog)
         if not result or result.ok~=true then
-            self:info("搜索失败：\n"..U.first_line(result and result.error or "未知错误"))
+            self:info(self:_friendly_remote_error(result and result.error or "未知错误","搜索"))
             return
         end
         local data=result.value or {}
@@ -314,7 +406,7 @@ function Plugin:search(q)
             if g.books then for _,r in ipairs(g.books) do add(r) end else add(g) end
         end
         self:list(_("Search").." · "..q,items,"没有找到相关书籍")
-    end,25)
+    end,32)
     if not started then
         closing=true
         self._search_dialog=nil
@@ -779,7 +871,7 @@ end
 function Plugin:on_read_report_ready() self:toast("阅读时间同步开始运行",3) end
 function Plugin:on_read_report_success(path) self:toast("阅读时间首次上传成功 · "..tostring(path or "initial"),4) end
 function Plugin:on_read_report_failure(err) self:toast("阅读时间连续上传失败，请查看同步状态",5) end
-function Plugin:jump_dialog() local d; d=InputDialog:new{title=_("Enter percentage"),input="",buttons={{text=_("Cancel"),callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local p=tonumber(d:getInputText()); UIManager:close(d); if p then self.sync:jump(p) end end}}}; UIManager:show(d); d:onShowKeyboard() end
+function Plugin:jump_dialog() local d; d=InputDialog:new{title=_("Enter percentage"),input="",buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local p=tonumber(d:getInputText()); UIManager:close(d); if p then self.sync:jump(p) end end}}}}; UIManager:show(d); d:onShowKeyboard() end
 local ANNOTATION_MODE_LABEL={all="固定虚线"}
 function Plugin:_annotation_mode() return "all" end
 function Plugin:annotation_mode_label() return "系统默认" end

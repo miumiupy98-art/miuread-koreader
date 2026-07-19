@@ -18,17 +18,40 @@ function Library:refresh()
     local data=self.api:shelf(); local books,mp=self:normalize(data); self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time()}); return books,mp
 end
 function Library:cached() local c=self.store:shelf_cache(); return c.books or {},c.mp or {},c.updated_at end
-function Library:is_downloaded(id)
-    local b=self.store:book(id); if not b then return false end
+function Library:is_downloaded(id, library_snapshot)
+    local source = library_snapshot or self.store:library()
+    local b = source and source[tostring(id)]
+    if not b then return false end
     for _,r in pairs(b.variants or {}) do if r.file and U.file_exists(r.file) then return true end end
     for _,row in pairs(b.chapters or {}) do for _,r in pairs(row) do if r.file and U.file_exists(r.file) then return true end end end
     return false
 end
-function Library:sort_filter(rows)
+
+function Library:local_books(library_snapshot)
+    local source = library_snapshot or self.store:library()
+    local books, mp = {}, {}
+    for id, row in pairs(source or {}) do
+        local b = {
+            bookId=tostring(row.book_id or id or ""),
+            title=row.title or "未命名",
+            author=row.author or "",
+            cover=row.cover,
+            category=row.category,
+            updateTime=tonumber(row.updated_at or row.downloaded_at or 0) or 0,
+            progress=tonumber(row.progress or 0) or 0,
+            local_only=true,
+        }
+        if b.bookId ~= "" then
+            if Protocol.is_mp(b.bookId) then mp[#mp+1]=b else books[#books+1]=b end
+        end
+    end
+    return books, mp
+end
+function Library:sort_filter(rows, library_snapshot)
     local p=self.store:preferences(); local filters=p.shelf_filters or {}; local out={}
     for _,b in ipairs(rows or {}) do
         local pass=true; local prog=tonumber(b.progress or 0) or 0
-        if filters.downloaded and not self:is_downloaded(b.bookId) then pass=false end
+        if filters.downloaded and not self:is_downloaded(b.bookId, library_snapshot) then pass=false end
         if filters.unread and prog>0 then pass=false end
         if filters.reading and (prog<=0 or prog>=100) then pass=false end
         if filters.finished and prog<100 then pass=false end
@@ -41,8 +64,8 @@ function Library:sort_filter(rows)
     end); return out
 end
 
-function Library:cached_cover_path(id)
-    local index = self.store:get("cover_index", {})
+function Library:cached_cover_path(id, cover_index)
+    local index = cover_index or self.store:get("cover_index", {})
     local path = index[tostring(id)]
     if path and U.file_exists(path) then return path end
 end
