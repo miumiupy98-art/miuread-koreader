@@ -1,9 +1,8 @@
 {
-  "version": "1.0.10",
-  "name": "觅阅 MiuRead v1.0.10",
-  "notes": "保持1.0.9已确认的居中弹窗尺寸、字体和留白；点赞数不再右对齐，改为紧跟在用户名后面显示；无点赞时不显示赞0。",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.0.10/miuread-v1.0.10-ota.zip",
-  "size": 133575,
-  "sha256": "d3e40bab40e4d8c9c5cee839da360f7154631348612e5a606c33786e97a4c0de",
+  "version": "1.1.0",
+  "name": "觅阅 MiuRead v1.1.0",
+  "notes": "书架升级：新增双列封面和紧凑列表、本地书架搜索、本地与云端书籍合并、已下载/阅读中/已读完筛选、最近阅读/最近下载排序；修复从 KOReader 历史记录、文件管理器或移动后的路径打开时无法识别觅阅书籍的问题。",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.0/miuread-v1.1.0-ota.zip",
+  "sha256": "942e3dfb99a4b0aec7f0f15ffda58cf1ccabcb171fd6f529f4d93b33eca43aa0",
   "delete_list": []
 }
