@@ -33,6 +33,42 @@ end
 local function position(context, ratio)
     local chapters = type(context.chapters) == "table" and context.chapters or {}
     ratio = normalize_ratio(ratio)
+
+    if context.source_is_standalone == true and context.source_chapter_uid ~= nil then
+        local source_uid = tostring(context.source_chapter_uid)
+        local selected, total, before = nil, 0, 0
+        for _, chapter in ipairs(chapters) do
+            local words = math.max(1, tonumber(chapter.wordCount or chapter.word_count or 0) or 0)
+            local uid = chapter.chapterUid or chapter.uid or chapter.chapter_uid
+            if not selected and tostring(uid or "") == source_uid then
+                selected = chapter
+            elseif not selected then
+                before = before + words
+            end
+            total = total + words
+        end
+        if selected and total > 0 then
+            local words = math.max(1, tonumber(selected.wordCount or selected.word_count or 0) or 0)
+            local offset = math.max(0, math.min(words, math.floor(ratio * words + 0.5)))
+            return {
+                progress = math.floor(((before + offset) / total) * 100 + 0.5),
+                chapter_uid = selected.chapterUid or selected.uid or source_uid,
+                chapter_index = tonumber(selected.chapterIdx or selected.index or context.source_chapter_index) or 0,
+                offset = offset,
+                source = "standalone_chapter",
+            }
+        end
+        if context.remote_progress_loaded == true then
+            return {
+                progress = math.floor(normalize_ratio(context.remote_progress or context.progress) * 100 + 0.5),
+                chapter_uid = context.remote_chapter_uid or context.chapter_uid or 0,
+                chapter_index = tonumber(context.remote_chapter_idx or context.chapter_idx) or 0,
+                offset = tonumber(context.remote_chapter_offset or context.chapter_offset) or 0,
+                source = "remote_fallback",
+            }
+        end
+    end
+
     local selected, within
     if #chapters > 0 then
         local scaled = ratio * #chapters
@@ -78,7 +114,7 @@ function Adapter.run(job)
         path = path,
         legacy_context = context,
         context_changed = result.context_changed == true,
-        position = position(context, job.progress_ratio),
+        position = result.position or position(context, job.progress_ratio),
         cookies_changed = result.cookies_changed == true,
         cookies = result.cookies,
         wr_ticket_changed = result.wr_ticket_changed == true,

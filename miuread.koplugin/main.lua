@@ -30,19 +30,41 @@ local Updater=require("miuread.updater")
 local Cookies=require("miuread.cookies")
 local Thoughts=require("miuread.thoughts")
 local ThoughtPopup=require("miuread.thought_popup")
+local StatusToast=require("miuread.status_toast")
 local _=Text.tr
 local unpack_args=unpack or table.unpack
 local source=debug.getinfo(1,"S").source:gsub("^@",""); local ROOT=source:match("^(.*)/main%.lua$") or "."
 local Plugin=WidgetContainer:extend{name="miuread",is_doc_only=false,version=Config.VERSION}
 local function normalize(v) local b=v.bookInfo or v.book or v; return {bookId=tostring(b.bookId or v.bookId or ""),title=b.title or v.title or "未命名",author=b.author or v.author or "",cover=b.cover or v.cover,category=b.category or v.category,progress=tonumber(v.progress or b.progress or 0) or 0,updateTime=tonumber(v.updateTime or b.updateTime or 0) or 0} end
+local function sanitize_saved_auth(store)
+    local auth=store:auth()
+    local cleaned,changed=Cookies.sanitize(auth.cookies or {})
+    if changed then
+        auth.cookies=cleaned
+        store:save_auth(auth)
+        logger.info("[MiuRead][Auth] startup cookie cleanup",
+            "names=",table.concat(Cookies.names(cleaned),","))
+    end
+end
 function Plugin:init()
-    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0
+    math.randomseed(os.time()+math.floor(collectgarbage("count"))); self.store=Store:new(); sanitize_saved_auth(self.store); self.http=Http:new(self.store); self.api=Api:new(self.http,self.store); self.reader=Reader:new(self.http,self.store); self.annotations=Annotations:new(self.api); self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http); self.download_task=DownloadTask:new(self.store); self.library=Library:new(self.api,self.http,self.store); self.async=Async:new(self.store); self.search_async=Async:new(self.store,{poll_interval=.4}); self.shelf_async=Async:new(self.store,{poll_interval=.4}); self.cover_async=Async:new(self.store); self.auth_flow=Auth:new(self.http,self.store,self); self.sync=Sync:new(self.reader,self.api,self.store,self,self.async); self.updater=Updater:new(self.http,self.store,self.version,ROOT); self._suspended_at=nil; self._cover_generation=0; self._shelf_view=nil; self._last_shelf_mode=false; self._shelf_refresh_generation=0
     self:onDispatcherRegisterActions(); self.ui.menu:registerToMainMenu(self); local state=self.updater:startup(); if state=="updated" then UIManager:scheduleIn(1,function() self:toast(_("Update installed"),3) end) end
 end
 function Plugin:onDispatcherRegisterActions() Dispatcher:registerAction("miuread_show",{category="none",event="ShowMiuRead",title=Config.NAME,filemanager=true,reader=true}) end
 function Plugin:addToMainMenu(items) items.miuread={text=Config.NAME,sorting_hint="tools",sub_item_table_func=function() return self.ui.document and self:reader_menu() or self:home_menu() end} end
 function Plugin:info(t) UIManager:show(InfoMessage:new{text=tostring(t or "")}) end
 function Plugin:toast(t,s) UIManager:show(InfoMessage:new{text=tostring(t or ""),timeout=s or 2}) end
+function Plugin:status_toast(title,text,timeout)
+    local ok,err=pcall(StatusToast.show,{
+        title=tostring(title or ""),
+        text=tostring(text or ""),
+        timeout=timeout or 3,
+    })
+    if not ok then
+        logger.warn("[MiuRead] status toast failed",tostring(err))
+        self:toast(tostring(title or "").."\n"..tostring(text or ""),timeout or 3)
+    end
+end
 function Plugin:safe(label,fn) return function(...) local a={...}; local ok,e=xpcall(function() return fn(unpack_args(a)) end,debug.traceback); if not ok then logger.err("[MiuRead]",label,e); self:info(_("Operation failed")..":\n"..U.first_line(e)) end end end
 function Plugin:is_online() local ok,N=pcall(require,"ui/network/manager"); if not ok or not N or not N.isOnline then return true end; local g,v=pcall(N.isOnline,N); return not g or v==true end
 function Plugin:online(label,fn) if not self:is_online() then self:info(_("Network unavailable")); return end; UIManager:scheduleIn(.05,self:safe(label,fn)) end
@@ -53,7 +75,8 @@ function Plugin:require_login() if not self:logged_in() then self:info(_("Not lo
 function Plugin:home_menu()
     return {
         {text=_("My bookshelf"),callback=self:safe("shelf",function() self:show_shelf(false) end)},
-        {text=_("Search books"),callback=self:safe("search",function() self:search_dialog() end)},
+        {text="搜索书架",callback=self:safe("shelf_search",function() self:show_shelf_search_dialog(false) end)},
+        {text="搜索微信读书",callback=self:safe("search",function() self:search_dialog() end)},
         {text=_("Downloads and cache"),callback=self:safe("cache",function() self:show_downloads() end)},
         {text=_("Reading sync"),sub_item_table_func=function() return self:sync_menu() end},
         {text=_("Settings"),sub_item_table_func=function() return self:settings_menu() end},
@@ -80,20 +103,18 @@ end
 function Plugin:manual_cookie(key)
     local d; d=InputDialog:new{title=_("Enter Cookie header"),input="",buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local jar=Cookies.parse_header(d:getInputText()); self.store:save_auth({api_key=key,cookies=jar,account={name="Manual",vid=jar.wr_vid or "",logged_at=os.time()}}); UIManager:close(d); self:toast(_("Logged in")) end}}}}; UIManager:show(d); d:onShowKeyboard()
 end
-local SORT_LABELS={update="最近更新",title="书名",author="作者",progress="阅读进度"}
-local FILTER_LABELS={downloaded="已下载",unread="未读",reading="阅读中",finished="已读完"}
+local SORT_LABELS={read="最近阅读",download="最近下载",update="最近更新",title="书名",author="作者",progress="阅读进度"}
+local SCOPE_LABELS={all="全部",downloaded="已下载",unread="未开始",reading="阅读中",finished="已读完"}
 function Plugin:_shelf_summary()
     local p=self.store:preferences()
-    local filters={}
-    for key,label in pairs(FILTER_LABELS) do if p.shelf_filters and p.shelf_filters[key] then filters[#filters+1]=label end end
-    table.sort(filters)
-    return "排序："..tostring(SORT_LABELS[p.shelf_sort] or "最近更新").." · 筛选："..(#filters>0 and table.concat(filters,"/") or "全部")
+    return tostring(SCOPE_LABELS[p.shelf_scope] or "全部").." · "
+        ..tostring(SORT_LABELS[p.shelf_sort] or "最近阅读")
 end
 function Plugin:show_shelf_tabs()
-    if not self:require_login() then return end
     self:list(_("My bookshelf"),{
         {text=_("Books"),post_text=self:_shelf_summary(),callback=function() self:show_shelf(false) end},
         {text=_("Official accounts"),callback=function() self:show_shelf(true) end},
+        {text="搜索书架",callback=function() self:show_shelf_search_dialog(self._last_shelf_mode or false) end},
         {text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(self._last_shelf_mode or false) end},
     })
 end
@@ -155,23 +176,112 @@ function Plugin:_refresh_shelf_async(on_ready,silent)
 end
 
 function Plugin:load_shelf(cb,force_remote)
+    local cached_books,cached_mp=self.library:cached()
+    local library_snapshot=self.store:library()
+    local local_books,local_mp=self.library:local_books(library_snapshot,self.store:get("sessions",{}))
     if not force_remote then
-        local books,mp=self.library:cached()
-        if #books+#mp>0 then
-            cb(books,mp,nil)
-            self:_refresh_shelf_async(nil,true)
+        if #cached_books+#cached_mp>0 then
+            cb(cached_books,cached_mp,nil)
+            if self:logged_in() then self:_refresh_shelf_async(nil,true) end
             return
         end
-        local library_snapshot=self.store:library()
-        local local_books,local_mp=self.library:local_books(library_snapshot)
         if #local_books+#local_mp>0 then
             self:toast("云端书架暂未加载，先显示本地书籍。",3)
-            cb(local_books,local_mp,nil)
-            self:_refresh_shelf_async(nil,true)
+            cb({}, {}, nil)
+            if self:logged_in() then self:_refresh_shelf_async(nil,true) end
             return
         end
     end
-    self:_refresh_shelf_async(cb,false)
+    if not self:logged_in() then
+        cb(cached_books,cached_mp,"当前未登录，只显示本地和已缓存书架。")
+        return
+    end
+    self:_refresh_shelf_async(function(books,mp,err)
+        if err and #cached_books+#cached_mp>0 then cb(cached_books,cached_mp,err) else cb(books,mp,err) end
+    end,false)
+end
+
+function Plugin:_combined_shelf_rows(mp_mode,remote_books,remote_mp)
+    if remote_books==nil or remote_mp==nil then remote_books,remote_mp=self.library:cached() end
+    local library_snapshot=self.store:library()
+    local sessions=self.store:get("sessions",{})
+    local books,mp=self.library:combined(remote_books or {},remote_mp or {},library_snapshot,sessions)
+    return mp_mode and mp or books
+end
+
+function Plugin:_prepare_shelf_rows(rows)
+    local cover_index=self.store:get("cover_index",{})
+    for _,b in ipairs(rows or {}) do
+        b.cover_path=self.library:cached_cover_path(b.bookId,cover_index)
+    end
+    return rows
+end
+
+function Plugin:_shelf_status_text(b)
+    local state=b.file_missing and "文件丢失" or (b.downloaded and "已下载" or (b.local_only and "仅本地" or "仅云端"))
+    local progress=tonumber(b.progress or 0) or 0
+    if progress>=100 then return state.." · 已读完" end
+    if progress>0 then return state.." · "..tostring(math.floor(progress+.5)).."%" end
+    return state
+end
+
+function Plugin:_shelf_select(b)
+    local available={}
+    for _,kind in ipairs({"notes","clean"}) do
+        local r=self.store:variant(b.bookId,kind)
+        if r and r.file and U.file_exists(r.file) then available[#available+1]=r end
+    end
+    if #available==1 then self:open_file(available[1].file) else self:book_menu(b) end
+end
+
+function Plugin:show_shelf_search_dialog(mp_mode,source_rows)
+    source_rows=source_rows or self:_combined_shelf_rows(mp_mode)
+    local d
+    d=InputDialog:new{
+        title="搜索书架",input="",
+        buttons={{
+            {text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},
+            {text=_("Search"),is_enter_default=true,callback=function()
+                local q=U.trim(d:getInputText())
+                UIManager:close(d)
+                if q=="" then return end
+                local results=self.library:search(source_rows,q)
+                if #results==0 then self:info("没有找到相关书籍") return end
+                self:_prepare_shelf_rows(results)
+                local prefs=self.store:preferences()
+                local ok,view=pcall(ShelfView.show,{
+                    title="搜索 · "..q.." · "..tostring(#results).."本",
+                    books=results,
+                    show_actions=false,
+                    show_covers=prefs.shelf_covers~=false and not prefs.low_resource,
+                    on_select=function(b) self:_shelf_select(b) end,
+                    on_hold=function(b) self:book_menu(b) end,
+                    on_page_changed=function(page,first,last,current)
+                        if prefs.shelf_covers~=false and not prefs.low_resource then self:_on_shelf_page(results,current,page,first,last) end
+                    end,
+                    on_close=function()
+                        self:_cancel_cover_loading()
+                        collectgarbage("step",120)
+                    end,
+                })
+                if ok and view then return end
+                logger.warn("[MiuRead][ShelfSearch] custom view unavailable",tostring(view))
+                local items={}
+                for _,book in ipairs(results) do
+                    local b=book
+                    items[#items+1]={
+                        text=(b.downloaded and "✓ " or "")..tostring(b.title or "未命名"),
+                        post_text=(tostring(b.author or "")~="" and (tostring(b.author).." · ") or "")..self:_shelf_status_text(b),
+                        callback=function() self:_shelf_select(b) end,
+                        hold_callback=function() self:book_menu(b) end,
+                    }
+                end
+                self:list("搜索书架 · "..q,items)
+            end},
+        }},
+    }
+    UIManager:show(d)
+    d:onShowKeyboard()
 end
 function Plugin:_cancel_cover_loading()
     self._cover_generation=(tonumber(self._cover_generation) or 0)+1
@@ -245,67 +355,157 @@ function Plugin:_reopen_shelf(mp_mode)
     UIManager:scheduleIn(0,function() self:_close_current_shelf(); self:show_shelf(mp_mode) end)
 end
 function Plugin:show_shelf(mp_mode,force_remote)
-    if not self:require_login() then return end
     self._last_shelf_mode=mp_mode==true
-    self:load_shelf(function(books,mp,remote_error)
-        local library_snapshot=self.store:library()
-        local cover_index=self.store:get("cover_index",{})
-        local rows=self.library:sort_filter(mp_mode and mp or books,library_snapshot)
-        for _,b in ipairs(rows) do b.downloaded=self.library:is_downloaded(b.bookId,library_snapshot); b.cover_path=self.library:cached_cover_path(b.bookId,cover_index) end
-        local title=(mp_mode and _("Official accounts") or _("Books")).." · "..self:_shelf_summary()
+    self:load_shelf(function(remote_books,remote_mp,remote_error)
+        local all_rows=self:_combined_shelf_rows(mp_mode,remote_books,remote_mp)
+        local rows=self.library:sort_filter(all_rows)
+        self:_prepare_shelf_rows(rows)
         local prefs=self.store:preferences()
-        if remote_error or #rows==0 then
-            local items={}
-            if remote_error then items[#items+1]={text=remote_error,enabled=false} end
-            if remote_error and remote_error:find("重新扫码登录",1,true) then
-                items[#items+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
-            end
-            items[#items+1]={text="重新加载书架",callback=function() self:show_shelf(mp_mode,true) end}
-            for _,b in ipairs(rows) do
-                items[#items+1]={text=(b.downloaded and "✓ " or "")..b.title,post_text=(b.progress and b.progress>0 and (math.floor(b.progress).."%") or ""),callback=self:safe(b.title,function() self:book_menu(b) end)}
-            end
-            self:list(title,items,remote_error or "书架为空")
+        local base_title=mp_mode and "公众号" or "书架"
+        local scope_label=SCOPE_LABELS[prefs.shelf_scope] or "全部"
+        local title=base_title.." · "..scope_label
+        if remote_error and #rows>0 then self:toast(remote_error,3) end
+        if #rows==0 then
+            local items={
+                {text="搜索书架",callback=function() self:show_shelf_search_dialog(mp_mode,all_rows) end},
+                {text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(mp_mode) end},
+            }
+            if self:logged_in() then items[#items+1]={text="重新加载书架",callback=function() self:show_shelf(mp_mode,true) end}
+            else items[#items+1]={text="扫码登录",callback=function() self.auth_flow:start() end} end
+            if remote_error then table.insert(items,1,{text=remote_error,enabled=false}) end
+            self:list(title,items,"书架为空")
             return
         end
-        if prefs.shelf_covers and not prefs.low_resource then
-            local ok,view=pcall(ShelfView.show,{
-                title=title,books=rows,
-                on_select=function(b) self:book_menu(b) end,
-                on_hold=function() self:show_shelf_controls(mp_mode) end,
-                on_page_changed=function(page,first,last,current) self:_on_shelf_page(rows,current,page,first,last) end,
-                on_close=function(current) if self._shelf_view==current then self._shelf_view=nil end; self:_cancel_cover_loading(); collectgarbage("step",160) end,
-            })
-            if ok and view then self._shelf_view=view; return end
-            logger.warn("[MiuRead][Shelf] cover view unavailable",tostring(view))
+        local ok,view=pcall(ShelfView.show,{
+            title=title.." · "..tostring(#rows).."本",
+            books=rows,
+            show_covers=prefs.shelf_covers~=false and not prefs.low_resource,
+            on_search=function() self:show_shelf_search_dialog(mp_mode,all_rows) end,
+            on_sort=function() self:show_shelf_controls(mp_mode) end,
+            on_select=function(b) self:_shelf_select(b) end,
+            on_hold=function(b) self:book_menu(b) end,
+            on_page_changed=function(page,first,last,current)
+                if prefs.shelf_covers~=false and not prefs.low_resource then self:_on_shelf_page(rows,current,page,first,last) end
+            end,
+            on_close=function(current)
+                if self._shelf_view==current then self._shelf_view=nil end
+                self:_cancel_cover_loading()
+                collectgarbage("step",160)
+            end,
+        })
+        if ok and view then self._shelf_view=view; return end
+        logger.warn("[MiuRead][Shelf] custom view unavailable",tostring(view))
+        local items={{text="搜索书架",callback=function() self:show_shelf_search_dialog(mp_mode,all_rows) end},{text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(mp_mode) end}}
+        for _,b in ipairs(rows) do
+            local book=b
+            items[#items+1]={text=(book.downloaded and "✓ " or "")..book.title,post_text=self:_shelf_status_text(book),callback=function() self:_shelf_select(book) end,hold_callback=function() self:book_menu(book) end}
         end
-        local items={{text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(mp_mode) end}}
-        for _,b in ipairs(rows) do items[#items+1]={text=(b.downloaded and "✓ " or "")..b.title,post_text=(b.progress and b.progress>0 and (math.floor(b.progress).."%") or ""),callback=self:safe(b.title,function() self:book_menu(b) end),hold_callback=function() self:show_shelf_controls(mp_mode) end} end
         self:list(title,items)
     end,force_remote)
 end
+
 function Plugin:show_shelf_controls(mp_mode)
     local menu
-    local items={{text=self:_shelf_summary(),enabled=false}}
-    items[#items+1]={text=mp_mode and "查看普通书籍" or "查看公众号",callback=function() if menu then UIManager:close(menu) end; self:_reopen_shelf(not mp_mode) end}
-    items[#items+1]={text="刷新书架",callback=function() if menu then UIManager:close(menu) end; UIManager:scheduleIn(0,function() self:_close_current_shelf(); self:show_shelf(mp_mode,true) end) end}
+    local prefs=self.store:preferences()
+    local current_scope=tostring(prefs.shelf_scope or "all")
+    local current_sort=tostring(prefs.shelf_sort or "read")
+
+    local function close_menu()
+        if menu then pcall(function() UIManager:close(menu) end) end
+    end
     local function apply(change)
         change()
-        if menu then pcall(function() UIManager:close(menu) end) end
+        close_menu()
         self:_reopen_shelf(mp_mode)
     end
-    for _,row in ipairs({{"update","最近更新"},{"title","书名"},{"author","作者"},{"progress","阅读进度"}}) do
+
+    local shelf_type_items={
+        {
+            text=(not mp_mode and "✓ " or "").."普通书籍",
+            radio=true,
+            checked_func=function() return not mp_mode end,
+            callback=function()
+                close_menu()
+                if mp_mode then self:_reopen_shelf(false) end
+            end,
+        },
+        {
+            text=(mp_mode and "✓ " or "").."公众号",
+            radio=true,
+            checked_func=function() return mp_mode end,
+            callback=function()
+                close_menu()
+                if not mp_mode then self:_reopen_shelf(true) end
+            end,
+        },
+    }
+
+    local scope_items={}
+    for _,row in ipairs({{"all","全部"},{"downloaded","已下载"},{"unread","未开始"},{"reading","阅读中"},{"finished","已读完"}}) do
         local key,label=row[1],row[2]
-        items[#items+1]={text="排序 · "..label,radio=true,checked_func=function() return self.store:preferences().shelf_sort==key end,callback=function() apply(function() local prefs=self.store:preferences(); prefs.shelf_sort=key; self.store:save_preferences(prefs) end) end}
+        local selected=current_scope==key
+        scope_items[#scope_items+1]={
+            text=(selected and "✓ " or "")..label,
+            radio=true,
+            checked_func=function() return tostring(self.store:preferences().shelf_scope or "all")==key end,
+            callback=function()
+                apply(function()
+                    local next_prefs=self.store:preferences()
+                    next_prefs.shelf_scope=key
+                    next_prefs.shelf_filters={}
+                    self.store:save_preferences(next_prefs)
+                end)
+            end,
+        }
     end
-    for _,row in ipairs({{"downloaded","仅已下载"},{"unread","仅未读"},{"reading","仅阅读中"},{"finished","仅已读完"}}) do
+
+    local sort_items={}
+    for _,row in ipairs({{"read","最近阅读"},{"download","最近下载"},{"update","最近更新"},{"progress","阅读进度（高到低）"},{"title","书名"},{"author","作者"}}) do
         local key,label=row[1],row[2]
-        items[#items+1]={text="筛选 · "..label,checked_func=function() return self.store:preferences().shelf_filters[key]==true end,callback=function() apply(function() local prefs=self.store:preferences(); prefs.shelf_filters[key]=not prefs.shelf_filters[key]; self.store:save_preferences(prefs) end) end}
+        local selected=current_sort==key
+        sort_items[#sort_items+1]={
+            text=(selected and "✓ " or "")..label,
+            radio=true,
+            checked_func=function() return tostring(self.store:preferences().shelf_sort or "read")==key end,
+            callback=function()
+                apply(function()
+                    local next_prefs=self.store:preferences()
+                    next_prefs.shelf_sort=key
+                    self.store:save_preferences(next_prefs)
+                end)
+            end,
+        }
     end
-    items[#items+1]={text="清除全部筛选",callback=function() apply(function() local prefs=self.store:preferences(); prefs.shelf_filters={}; self.store:save_preferences(prefs) end) end}
-    menu=Menu:new{title="书架排序和筛选",item_table=items,is_borderless=true,title_bar_fm_style=true}
+
+    local items={
+        {
+            text="书架类型",
+            post_text=mp_mode and "公众号" or "普通书籍",
+            sub_item_table=shelf_type_items,
+        },
+        {
+            text="筛选范围",
+            post_text=SCOPE_LABELS[current_scope] or "全部",
+            sub_item_table=scope_items,
+        },
+        {
+            text="排序方式",
+            post_text=SORT_LABELS[current_sort] or "最近阅读",
+            sub_item_table=sort_items,
+        },
+        {
+            text="刷新书架",
+            enabled=self:logged_in(),
+            callback=function()
+                close_menu()
+                UIManager:scheduleIn(0,function() self:_close_current_shelf(); self:show_shelf(mp_mode,true) end)
+            end,
+        },
+    }
+    menu=Menu:new{title="书架选项",item_table=items,is_borderless=true,title_bar_fm_style=true}
     UIManager:show(menu)
 end
-function Plugin:sort_menu() return {{text="请在书架中长按任意书籍设置",callback=function() self:show_shelf_controls(self._last_shelf_mode or false) end}} end
+function Plugin:sort_menu() return {{text="打开书架排序与筛选",callback=function() self:show_shelf_controls(self._last_shelf_mode or false) end}} end
 function Plugin:filter_menu() return self:sort_menu() end
 function Plugin:search_dialog()
     if not self:require_login() then return end
@@ -336,11 +536,7 @@ end
 function Plugin:search(q)
     if not self:require_login() then return end
     if not self:is_online() then self:info(_("Network unavailable")); return end
-    if not self.search_async or not self.search_async:available() then
-        self:info("当前设备不支持异步搜索。")
-        return
-    end
-    if self.search_async:busy() then self:_cancel_search("new_search") end
+    if self.search_async and self.search_async:busy() then self:_cancel_search("new_search") end
 
     self._search_generation=(tonumber(self._search_generation) or 0)+1
     local generation=self._search_generation
@@ -364,8 +560,8 @@ function Plugin:search(q)
                 closing=true
                 if generation==self._search_generation and self.search_async then
                     self.search_async:cancel("user_cancelled")
-                    self._search_generation=self._search_generation+1
                 end
+                self._search_generation=self._search_generation+1
                 self._search_dialog=nil
                 UIManager:close(dialog)
             end}},
@@ -374,18 +570,7 @@ function Plugin:search(q)
     self._search_dialog=dialog
     UIManager:show(dialog)
 
-    local auth=U.copy(self.store:auth())
-    local started,err=self.search_async:run("book_search",function()
-        local HttpChild=require("miuread.http")
-        local ApiChild=require("miuread.api")
-        local UtilChild=require("miuread.util")
-        local child_store={
-            auth=function() return UtilChild.copy(auth) end,
-            save_auth=function() end,
-        }
-        local api=ApiChild:new(HttpChild:new(child_store),child_store)
-        return api:search(q,0,40)
-    end,function(result)
+    local function finish(result)
         if generation~=self._search_generation then return end
         closing=true
         self._search_dialog=nil
@@ -406,12 +591,36 @@ function Plugin:search(q)
             if g.books then for _,r in ipairs(g.books) do add(r) end else add(g) end
         end
         self:list(_("Search").." · "..q,items,"没有找到相关书籍")
-    end,32)
+    end
+
+    local function run_on_main_thread()
+        UIManager:scheduleIn(.10,function()
+            if generation~=self._search_generation then return end
+            local ok,value=xpcall(function() return self.api:search(q,0,40) end,debug.traceback)
+            finish(ok and {ok=true,value=value} or {ok=false,error=tostring(value)})
+        end)
+    end
+
+    if not self.search_async or not self.search_async:available() then
+        run_on_main_thread()
+        return
+    end
+
+    local auth=U.copy(self.store:auth())
+    local started,err=self.search_async:run("book_search",function()
+        local HttpChild=require("miuread.http")
+        local ApiChild=require("miuread.api")
+        local UtilChild=require("miuread.util")
+        local child_store={
+            auth=function() return UtilChild.copy(auth) end,
+            save_auth=function() end,
+        }
+        local api=ApiChild:new(HttpChild:new(child_store),child_store)
+        return api:search(q,0,40)
+    end,finish,32)
     if not started then
-        closing=true
-        self._search_dialog=nil
-        UIManager:close(dialog)
-        self:info("无法启动搜索：\n"..tostring(err or "异步任务忙"))
+        logger.warn("[MiuRead][Search] async unavailable; falling back",tostring(err or "worker busy"))
+        run_on_main_thread()
     end
 end
 function Plugin:_variant_exists(book_id,kind)
@@ -469,16 +678,19 @@ function Plugin:choose_download(b,limit,open_after,uid)
     self:list(_("Download"),{{text=_("Clean version"),callback=function() self:download(b,{annotations=false,limit=limit,chapter_uid=uid},open_after) end},{text=_("Notes version"),callback=function() self:download(b,{annotations=true,limit=limit,chapter_uid=uid},open_after) end},{text=_("Both versions"),callback=function() self:download_both(b,limit,uid,open_after) end}})
 end
 function Plugin:_download_summary(rec,opt)
-    local lines={"下载完成","保存位置："..tostring(rec.file or ""),"打开一次后会出现在 KOReader 最近阅读中"}
-    if #(rec.failures or {})>0 then lines[#lines+1]="失败章节："..tostring(#rec.failures) end
+    local lines={
+        "下载完成",
+        "保存位置："..tostring(rec.file or ""),
+        "打开一次后会出现在 KOReader 最近阅读中",
+    }
     if opt and opt.annotations then
         local a=rec.annotation_summary or {}
         lines[#lines+1]="划线："..tostring(a.underlines or 0)
         lines[#lines+1]="含想法的划线："..tostring(a.thoughts or 0)
-        if (a.chapters_failed or 0)>0 then lines[#lines+1]="批注失败章节："..tostring(a.chapters_failed) end
     end
     return table.concat(lines,"\n")
 end
+
 function Plugin:_refresh_local_files()
     local ui=self.ui
     if not ui then return end
@@ -580,7 +792,12 @@ function Plugin:chapter_menu(b,ch)
     end
     self:list(ch.title or tostring(uid),items)
 end
-function Plugin:open_file(path) if not path or not U.file_exists(path) then self:info(_("No cached file")); return end; if self.ui.document then self.ui:switchDocument(path) else self.ui:openFile(path) end end
+function Plugin:open_file(path)
+    if not path or not U.file_exists(path) then self:info(_("No cached file")); return end
+    local b=self.store:file_record(path)
+    if b then self.store:mark_last_read(b.book_id,path) end
+    if self.ui.document then self.ui:switchDocument(path) else self.ui:openFile(path) end
+end
 function Plugin:_variant_label(kind)
     return kind=="notes" and "划线与想法版" or "纯净版"
 end
@@ -644,7 +861,7 @@ function Plugin:progress_sync_label()
     local r=self.sync:record()
     local session=r and self.store:session(r.book.book_id) or {}
     local state=session and session.progress_sync_state or nil
-    local labels={checking="正在检查",aligned="已同步",local_ahead="使用本机位置",local_selected="使用本机位置",remote_selected="已采用云端位置",remote_ahead="等待选择",deferred="本次暂不处理",remote_unavailable="稍后重试",remote_jump_unconfirmed="跳转待确认"}
+    local labels={checking="正在检查",mapping_pending="等待章节换算",aligned="已同步",local_ahead="使用本机位置",local_selected="使用本机位置",remote_selected="已采用云端位置",remote_ahead="等待选择",deferred="本次暂不处理",remote_unavailable="稍后重试",remote_jump_unconfirmed="跳转待确认"}
     return labels[state] or "已开启"
 end
 function Plugin:sync_advanced_menu(from_reader)
@@ -691,11 +908,15 @@ function Plugin:toggle_progress_sync()
 end
 function Plugin:test_read_report()
     local r=self.sync:record(); if not r then self:info("请先打开一本觅阅下载的书籍再测试。"); return end
-    self:toast("正在测试阅读时间上传……",3)
+    self:status_toast("正在测试","正在上传 30 秒阅读时间……",3)
     local started=self.sync:test_upload(function(ok,result,position,detail)
         if ok then
-            local path=detail and detail.path or "initial"
-            self:info("测试成功\n\n微信读书已确认接收 30 秒阅读时间。\n当前本机位置："..tostring(position and position.progress or "—").."%\n成功路径："..tostring(path))
+            local progress=tostring(position and position.progress or "—")
+            self:status_toast(
+                "阅读时间测试成功",
+                "已确认接收 30 秒阅读时间\n当前位置："..progress.."%",
+                4
+            )
         else
             self:info("测试失败\n\n"..tostring(result or "未知错误").."\n\n可在‘同步状态’中查看当前阶段。")
         end
@@ -728,7 +949,19 @@ function Plugin:ensure_read_report_progress(reason,automatic)
         return false
     end
     self._progress_check_running=true
-    local localp=math.floor((self.sync:local_ratio() or 0)*100+.5)
+    local local_position=self.sync:local_position()
+    if not local_position or local_position.safe~=true or local_position.progress==nil then
+        local chapter_percent=local_position and local_position.chapter_percent
+            or math.floor((self.sync:local_ratio() or 0)*100+.5)
+        self:_save_progress_state(id,"mapping_pending","正在取得完整目录以换算单章进度",chapter_percent,nil)
+        self._progress_check_running=false
+        self.sync:end_progress_sync("单章位置等待完整目录；阅读时间继续运行")
+        if not automatic then
+            self:info("当前打开的是单章文件。\n\n正在等待完整目录用于换算整书进度；在换算完成前，不会把本章百分比直接上传成整书百分比。阅读时间同步不受影响。")
+        end
+        return false
+    end
+    local localp=math.floor((tonumber(local_position.progress) or 0)+.5)
     self:_save_progress_state(id,"checking","正在读取云端位置",localp,nil)
     self.sync:begin_progress_sync(reason or "读取云端进度")
     self.sync:remote(id,function(remote,remote_err)
@@ -782,13 +1015,16 @@ function Plugin:on_remote_progress(id,localp,remote,automatic)
         {{text="跳到云端位置",callback=function()
             closing_for_action=true
             UIManager:close(dialog)
-            if not self.sync:jump(remotep) then
+            local jumped,jump_error=self.sync:jump_remote(remote)
+            if not jumped then
                 self:_save_progress_state(id,"remote_jump_unconfirmed","无法跳转到云端位置",localp,remotep)
-                self:info("无法跳转到云端位置。\n\n阅读时间同步仍会继续运行。")
+                self:info(tostring(jump_error or "无法跳转到云端位置。").."\n\n阅读时间同步仍会继续运行。")
                 return
             end
             UIManager:scheduleIn(1.2,function()
-                local actual=math.floor((self.sync:local_ratio() or 0)*100+.5)
+                local actual_position=self.sync:local_position()
+                local actual=actual_position and actual_position.progress
+                    and math.floor(actual_position.progress+.5) or localp
                 local threshold=tonumber(self.store:preferences().sync.threshold) or 2
                 if math.abs(actual-remotep)<=threshold then
                     self.sync:mark_verified(id,"remote_position_selected",actual,remotep)
@@ -830,6 +1066,8 @@ function Plugin:show_sync_status(detail)
     local prefs=self.store:preferences().sync or {}
     local remote=s.remote and math.floor((s.remote.percent or 0)+.5) or nil
     local session=s.record and self.store:session(s.record.book.book_id) or {}
+    local local_text=s.local_percent~=nil and (tostring(s.local_percent).."%")
+        or (s.local_chapter_percent~=nil and ("本章 "..tostring(s.local_chapter_percent).."% · 等待整书换算") or "—")
     if detail then
         local next_text=(tonumber(s.next_due or 0)>os.time()) and (tostring(math.max(0,s.next_due-os.time())).." 秒后") or "—"
         local t="阅读同步诊断\n\n"
@@ -837,7 +1075,7 @@ function Plugin:show_sync_status(detail)
             .."阅读进度开关："..(prefs.progress_enabled~=false and "已开启" or "已关闭").."\n"
             .."当前状态："..tostring(s.state_label or s.state).."\n"
             .."当前书籍："..tostring(s.record and s.record.book and s.record.book.title or "未识别").."\n"
-            .."本机位置："..tostring(s.local_percent).."%\n"
+            .."本机位置："..local_text.."\n"
             .."云端位置："..tostring(remote and (remote.."%") or "未获取").."\n"
             .."进度状态："..tostring(session.progress_sync_state or "—").."\n"
             .."本次成功上传："..tostring(s.session_uploads).." 次\n"
@@ -862,14 +1100,26 @@ function Plugin:show_sync_status(detail)
     elseif s.state=="uploading" then time_text="正在同步"
     else time_text="运行中" end
     local progress_text=self:progress_sync_label()
-    local lines={"阅读同步","","阅读时间："..time_text,"阅读进度："..progress_text,"当前位置："..tostring(s.local_percent).."%"}
+    local lines={"阅读同步","","阅读时间："..time_text,"阅读进度："..progress_text,"当前位置："..local_text}
     if remote then lines[#lines+1]="云端位置："..remote.."%" end
     lines[#lines+1]="上次同步："..self:_relative_time(s.last_upload)
     if time_text=="暂时同步失败" then lines[#lines+1]="将在稍后自动重试" end
     self:info(table.concat(lines,"\n"))
 end
-function Plugin:on_read_report_ready() self:toast("阅读时间同步开始运行",3) end
-function Plugin:on_read_report_success(path) self:toast("阅读时间首次上传成功 · "..tostring(path or "initial"),4) end
+function Plugin:on_read_report_ready()
+    self:status_toast("阅读时间同步","已开始后台运行",3)
+end
+function Plugin:on_read_report_success(path)
+    self:status_toast("阅读时间同步","首次上传成功",3)
+    local r=self.sync:record()
+    local session=r and self.store:session(r.book.book_id) or {}
+    if r and session.progress_sync_state=="mapping_pending"
+        and self.store:preferences().sync.progress_enabled~=false then
+        UIManager:scheduleIn(.5,function()
+            if self.ui and self.ui.document then self:ensure_read_report_progress("catalog_ready",true) end
+        end)
+    end
+end
 function Plugin:on_read_report_failure(err) self:toast("阅读时间连续上传失败，请查看同步状态",5) end
 function Plugin:jump_dialog() local d; d=InputDialog:new{title=_("Enter percentage"),input="",buttons={{{text=_("Cancel"),id="close",callback=function() UIManager:close(d) end},{text=_("Confirm"),is_enter_default=true,callback=function() local p=tonumber(d:getInputText()); UIManager:close(d); if p then self.sync:jump(p) end end}}}}; UIManager:show(d); d:onShowKeyboard() end
 local ANNOTATION_MODE_LABEL={all="固定虚线"}
@@ -942,10 +1192,7 @@ function Plugin:reading_settings_menu()
 end
 function Plugin:shelf_settings_menu()
     return {
-        {text=_("Show shelf covers"),checked_func=function() return self.store:preferences().shelf_covers end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
-        {text="打开普通书籍书架",callback=function() self:show_shelf(false) end},
-        {text="打开公众号书架",callback=function() self:show_shelf(true) end},
-        {text="排序和筛选",post_text=self:_shelf_summary(),callback=function() self:show_shelf_controls(self._last_shelf_mode or false) end},
+        {text=_("Show shelf covers"),checked_func=function() return self.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() self:_toggle_preference("shelf_covers") end},
     }
 end
 function Plugin:performance_settings_menu()
@@ -978,7 +1225,7 @@ function Plugin:settings_menu()
     }
 end
 function Plugin:thought_font_menu()
-    local choices={{"standard","标准（默认）"},{"large","大"},{"xlarge","特大"}}
+    local choices={{"standard","较小（默认）"},{"large","跟随正文"},{"xlarge","稍大"}}
     local rows={}
     for _,choice in ipairs(choices) do
         local key,label=choice[1],choice[2]
@@ -1052,7 +1299,7 @@ function Plugin:check_update()
         end})
     end)
 end
-function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."正式版 · 单通道 OTA".."\n".."阅读时间上报沿用 0.3.6.7 兼容链路".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
+function Plugin:show_about() self:info(Config.NAME.." "..self.version.."\n\n".."过渡版 · 后续采用 Release 全量更新".."\n".."阅读时间上报沿用 0.3.6.7 兼容链路".."\n".._("Unofficial client").."\n\n".._("This build has not been verified with every Kindle model or every WeRead book.")) end
 function Plugin:onShowMiuRead() self:show_shelf(false) end
 local function extract_thought_href(value,seen,depth)
     if depth>4 or value==nil then return nil end
@@ -1066,16 +1313,45 @@ function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
 end
+function Plugin:_thought_font_size(level)
+    local Device=require("device")
+    local doc=self.ui and self.ui.document
+    local configurable=doc and doc.configurable or {}
+    local candidates={
+        configurable.font_size,
+        configurable.fontsize,
+        self.ui and self.ui.rolling and self.ui.rolling.font_size,
+    }
+    local base
+    for _,value in ipairs(candidates) do
+        value=tonumber(value)
+        if value and value>=10 and value<=80 then base=value; break end
+    end
+    if not base and _G.G_reader_settings and _G.G_reader_settings.readSetting then
+        local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"cre_font_size",22)
+        if ok then base=tonumber(value) end
+    end
+    base=math.max(14,math.min(48,base or 22))
+    local factors={standard=0.86,large=1.00,xlarge=1.15}
+    local factor=factors[tostring(level or "standard")] or 1
+    return Device.screen:scaleBySize(math.floor(base*factor+.5))
+end
 function Plugin:_show_thought_href(href)
     local info=Thoughts.parse_href(href); if not info then return false end
     local group,err=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
     if not group then self:info(tostring(err or "没有想法内容")); return true end
     local prefs=self.store:preferences().thoughts or {}
-    local html=Thoughts.full_html(group)
+    local source_html,html,metrics=Thoughts.popup_parts(group)
     if html=="" then self:info("没有想法内容"); return true end
-    local profile=Thoughts.font_profile(prefs.font)
-    local Device=require("device")
-    ThoughtPopup.show{html=html,font_size=Device.screen:scaleBySize(profile.font_size),css=Thoughts.popup_css()}
+    ThoughtPopup.show{
+        source_html=source_html,
+        html=html,
+        font_size=self:_thought_font_size(prefs.font),
+        width_ratio=tonumber(prefs.width_ratio) or 0.91,
+        height_ratio=tonumber(prefs.height_ratio) or 0.60,
+        css=Thoughts.popup_css(),
+        metrics=metrics,
+    }
     return true
 end
 function Plugin:_on_thought_tap(ges)
@@ -1104,6 +1380,8 @@ function Plugin:onReaderReady()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
     self.sync:on_reader_ready()
+    local current=self.sync:record()
+    if current and current.book then self.store:mark_last_read(current.book.book_id,current.path) end
     if self.store:preferences().sync.progress_enabled~=false then
         UIManager:scheduleIn(1,function()
             if self.ui and self.ui.document then self:ensure_read_report_progress("reader_ready",true) end

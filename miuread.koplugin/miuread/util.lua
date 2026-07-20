@@ -16,6 +16,7 @@ function U.xml(s) return (tostring(s or ""):gsub("&","&amp;"):gsub("<","&lt;"):g
 function U.url_decode(s) return (tostring(s or ""):gsub("+"," "):gsub("%%(%x%x)",function(h) return string.char(tonumber(h,16)) end)) end
 function U.file_exists(p) local f=io.open(p,"rb"); if not f then return false end f:close(); return true end
 function U.read_file(p,b) local f,e=io.open(p,b and "rb" or "r"); if not f then return nil,e end local d=f:read("*a"); f:close(); return d end
+function U.file_size(p) local f=io.open(p,"rb"); if not f then return nil end local n=f:seek("end"); f:close(); return n end
 function U.mkdir(p)
     if not p or p=="" then return false end
     if lfs.attributes(p,"mode")=="directory" then return true end

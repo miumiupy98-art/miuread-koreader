@@ -85,8 +85,9 @@ function DownloadTask:_read_progress(job)
     if not raw or raw == job.last_progress_raw then return end
     job.last_progress_raw = raw
     local ok, state = pcall(Json.decode, raw)
-    if ok and type(state) == "table" and job.on_progress then
-        job.on_progress(state)
+    if ok and type(state) == "table" then
+        job.last_progress_state = state
+        if job.on_progress then job.on_progress(state) end
     end
 end
 
@@ -97,7 +98,12 @@ function DownloadTask:_finish(job, forced_error)
     if forced_error then
         result = {ok = false, error = forced_error}
     elseif not raw then
-        result = {ok = false, error = "下载子进程没有返回结果"}
+        local stage = job.last_progress_state and job.last_progress_state.stage
+        if stage == "package" then
+            result = {ok = false, error = "EPUB 生成进程异常退出；原有完整书未被覆盖，已下载章节仍保存在断点缓存。请再次下载继续。"}
+        else
+            result = {ok = false, error = "下载子进程异常退出；已完成的下载进度会继续保留。"}
+        end
     else
         local ok, decoded = pcall(Json.decode, raw)
         result = ok and decoded or {ok = false, error = "下载结果无法解析"}
@@ -168,6 +174,7 @@ function DownloadTask:start(book, options, on_progress, on_done)
         local Downloader = require("miuread.downloader")
         local JsonChild = require("miuread.json")
         local UChild = require("miuread.util")
+        local LoggerChild = require("logger")
 
         local function emit(state)
             state = state or {}
@@ -203,6 +210,9 @@ function DownloadTask:start(book, options, on_progress, on_done)
                     elseif stage == "images" then step = 0.88 end
                     percent = math.min(0.94, base * 0.94 + step / total)
                 end
+                if stage == "package" then
+                    detail.message = detail.message or "正在低内存生成并验证 EPUB"
+                end
                 emit{
                     stage = stage,
                     current = current,
@@ -223,8 +233,14 @@ function DownloadTask:start(book, options, on_progress, on_done)
             emit{stage = "done", current = 1, total = 1, percent = 1, chapter = clean_book.title or ""}
             payload = {ok = true, value = serializable_copy(value)}
         else
-            emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error", message = tostring(value)}
-            payload = {ok = false, error = tostring(value)}
+            local raw_error = tostring(value)
+            LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
+            local display_error = raw_error:match("^(.-)\nstack traceback:") or raw_error
+            if raw_error:lower():find("not enough memory", 1, true) then
+                display_error = "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
+            end
+            emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error", message = display_error}
+            payload = {ok = false, error = display_error}
         end
         local encoded = JsonChild.encode(payload)
         UChild.atomic_write(result_path, encoded, true)
@@ -243,6 +259,7 @@ function DownloadTask:start(book, options, on_progress, on_done)
         on_progress = on_progress,
         on_done = on_done,
         last_progress_raw = nil,
+        last_progress_state = nil,
         last_keepalive = 0,
     }
     self:_hold_awake()

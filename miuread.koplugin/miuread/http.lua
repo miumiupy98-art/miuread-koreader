@@ -54,13 +54,24 @@ end
 
 function Http:_jar()
     local auth = self.store:auth()
-    return auth.cookies or {}
+    local original = auth.cookies or {}
+    local jar, changed = Cookies.sanitize(original)
+    if changed then
+        auth.cookies = jar
+        self.store:save_auth(auth)
+        logger.info("[MiuRead][HTTP] removed temporary cookies from saved login",
+            "names=", table.concat(Cookies.names(jar), ","))
+    end
+    return jar
 end
 
 function Http:_save_jar(jar)
     local auth = self.store:auth()
-    auth.cookies = jar
-    self.store:save_auth(auth)
+    local cleaned = Cookies.sanitize(jar or {})
+    if not Cookies.same(auth.cookies or {}, cleaned) then
+        auth.cookies = cleaned
+        self.store:save_auth(auth)
+    end
 end
 
 function Http:_request_once(opt)
@@ -110,8 +121,9 @@ function Http:_request_once(opt)
 
         local set_cookie = hget(resp_headers, "set-cookie")
         if set_cookie and opt.auth ~= false then
-            jar = Cookies.absorb(jar, set_cookie)
-            self:_save_jar(jar)
+            local before = Cookies.sanitize(jar)
+            jar = Cookies.absorb(jar, set_cookie, {protect_core=true})
+            if not Cookies.same(before, jar) then self:_save_jar(jar) end
             headers["Cookie"] = Cookies.header(jar)
         end
 
@@ -158,6 +170,20 @@ function Http:request(opt)
     error("network request failed: " .. tostring(last_error or "unknown"))
 end
 
+local function service_error(data, url)
+    local code = data.errCode or data.errcode or data.code
+    local message = tostring(data.errMsg or data.errmsg or data.message or data.msg or code or "")
+    local lower = message:lower()
+    if tonumber(code) == -2012 or lower:find("login timeout", 1, true)
+        or message:find("登录超时", 1, true) then
+        return "登录状态已失效（可能被另一台设备的新扫码登录替换）"
+    end
+    if is_weread_url(url) and (message == "用户不存在" or lower == "user not found") then
+        return "登录状态已失效（服务端未识别当前用户）"
+    end
+    return message
+end
+
 function Http:json(opt)
     local text, code, headers, url = self:request(opt)
     text = text or ""
@@ -174,7 +200,7 @@ function Http:json(opt)
     if not ok then error("invalid JSON from " .. tostring(url) .. ": " .. Util.first_line(text, 180)) end
     if type(data) == "table" then
         local ec = data.errCode or data.errcode
-        if ec and tonumber(ec) ~= 0 then error(tostring(data.errMsg or data.errmsg or ec)) end
+        if ec and tonumber(ec) ~= 0 then error(service_error(data, url)) end
     end
     local meta = {
         code = code,

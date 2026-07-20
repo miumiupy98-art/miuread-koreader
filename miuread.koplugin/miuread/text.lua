@@ -2,7 +2,7 @@ local Text = {}
 local lang = (os.getenv("LANG") or ""):lower()
 local zh = lang:find("zh", 1, true) ~= nil or lang == ""
 local M = {
-["MiuRead"]="觅阅——微信读书助手",["Independent WeRead client for KOReader."]="独立实现的 KOReader 微信读书客户端。",
+["MiuRead"]="觅阅 · 微信读书助手",["Independent WeRead client for KOReader."]="独立实现的 KOReader 微信读书客户端。",
 ["Account"]="账户",["QR login"]="扫码登录",["Manual credentials"]="手动导入凭据",["Account status"]="账户状态",["Clear account data"]="清除账号数据",["Logout"]="退出登录",
 ["My bookshelf"]="我的书架",["Books"]="书籍",["Official accounts"]="公众号",["Search books"]="搜索书籍",["Paste reader link"]="粘贴阅读链接",
 ["Reading sync"]="阅读同步",["Sync current book position"]="同步当前书籍位置",["Reading time sync"]="阅读时间同步",["Sync status"]="查看同步状态",["Automatic detection"]="自动检测设置",["Advanced"]="高级功能",

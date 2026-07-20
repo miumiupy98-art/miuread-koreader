@@ -1,7 +1,15 @@
 {
-  "version": "1.1.4",
-  "name": "觅阅 MiuRead v1.1.4",
-  "notes": "重做书架排序与筛选菜单：主菜单精简为书架类型、筛选范围、排序方式和刷新书架；范围与排序分别进入独立子菜单，当前选项显示勾选；阅读进度按从高到低排序。",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.4/miuread-v1.1.4-ota.zip",
-  "sha256": "d0b4fcdc1406a7680187a872ceaab7d7dd90e9488c07da4295da58f8de420b45"
+  "version": "1.1.13",
+  "name": "觅阅 · 微信读书助手 1.1.13",
+  "package_type": "full",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.13/miuread-v1.1.13-full.zip",
+  "package_urls": [
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.13/miuread-v1.1.13-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.13/miuread-v1.1.13-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.13/miuread-v1.1.13-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.13/miuread-v1.1.13-full.zip"
+  ],
+  "size": 136140,
+  "sha256": "4afe9c4c5cec8a1a68a874a1fc1a5ca737aa05989f3ba6ce99cefc4daaf5cbef",
+  "notes": "过渡到 GitHub Actions 自动发布与 Release 全量更新；增加 GitHub 资源镜像回退；显示名称更新为“觅阅 · 微信读书助手”。"
 }

@@ -2,12 +2,13 @@ local DataStorage=require("datastorage")
 local lfs=require("libs/libkoreader-lfs")
 local LuaSettings=require("luasettings")
 local Config=require("miuread.config")
+local Json=require("miuread.json")
 local U=require("miuread.util")
 local Store={}; Store.__index=Store
 local defaults={
  schema=Config.SCHEMA,
  auth={api_key="",cookies={},account={name="",vid="",logged_at=0}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,show_annotations=true,annotation_mode="all",low_resource=false,download_dir="",shelf_sort="update",shelf_filters={},thoughts={font="standard",width_ratio=0.74,height_ratio=0.64},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,progress_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,show_annotations=true,annotation_mode="all",low_resource=false,download_dir="",shelf_sort="read",shelf_scope="all",shelf_view="compact",shelf_filters={},thoughts={font="standard",width_ratio=0.91,height_ratio=0.60},update={manifest=Config.UPDATE_MANIFEST},sync={time_enabled=false,progress_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0},cover_index={},update_state={},
 }
 local function public_documents_root(data_dir)
@@ -74,6 +75,73 @@ function Store:migrate()
             -- Public builds use one fixed OTA manifest. Legacy channel/URL
             -- preferences are ignored and replaced by the repository address.
             p.update={manifest=Config.UPDATE_MANIFEST}
+        end
+        if schema<18 then
+            -- Replace the legacy centered comment card with the compact
+            -- bottom-sheet layout. These dimensions were never user-facing,
+            -- so migrate existing installations instead of preserving the
+            -- oversized saved values.
+            p.thoughts=p.thoughts or {}
+            p.thoughts.width_ratio=0.92
+            p.thoughts.height_ratio=0.42
+        end
+        if schema<19 then
+            -- v1.0.6 treats the saved height as a maximum, not a fixed card
+            -- height. Give the comments room to show several entries while
+            -- allowing short content to shrink to its actual rendered size.
+            p.thoughts=p.thoughts or {}
+            p.thoughts.width_ratio=0.94
+            p.thoughts.height_ratio=0.60
+        end
+        if schema<20 then
+            -- v1.0.7 uses a near-full-width comments sheet with compact outer
+            -- and inner spacing. Migrate old saved dimensions so existing
+            -- installations receive the same layout without clearing data.
+            p.thoughts=p.thoughts or {}
+            p.thoughts.width_ratio=0.985
+            p.thoughts.height_ratio=0.60
+        end
+        if schema<21 then
+            -- v1.0.8 returns to a centered dialog and reallocates interior
+            -- space to the selected text and comments instead of leaving
+            -- large blank areas. Existing installs are migrated directly.
+            p.thoughts=p.thoughts or {}
+            p.thoughts.width_ratio=0.94
+            p.thoughts.height_ratio=0.68
+        end
+        if schema<22 then
+            -- v1.0.9 removes MuPDF's internal page margins and sizes short
+            -- comment dialogs from the actual rendered content height.
+            p.thoughts=p.thoughts or {}
+            p.thoughts.width_ratio=0.94
+            p.thoughts.height_ratio=0.68
+        end
+        if schema<23 then
+            -- v1.0.10 combines the lighter card proportions with the denser
+            -- comment list: slightly smaller dialog, balanced inner spacing,
+            -- framed source quote and compact inline like counts.
+            p.thoughts=p.thoughts or {}
+            p.thoughts.width_ratio=0.91
+            p.thoughts.height_ratio=0.60
+        end
+        if schema<24 then
+            -- v1.1.0 adds the combined local/cloud shelf, two-column cover
+            -- view, compact list, local shelf search and single-scope filters.
+            if previous.shelf_view==nil then p.shelf_view="grid" end
+            if previous.shelf_scope==nil then
+                local old=previous.shelf_filters or {}
+                if old.downloaded then p.shelf_scope="downloaded"
+                elseif old.reading then p.shelf_scope="reading"
+                elseif old.finished then p.shelf_scope="finished"
+                else p.shelf_scope="all" end
+                p.shelf_filters={}
+            end
+            if previous.shelf_sort==nil then p.shelf_sort="read" end
+        end
+        if schema<25 then
+            -- v1.1.1 removes the unstable custom two-column Menu layout and
+            -- returns every device to the proven one-column compact shelf.
+            p.shelf_view="compact"
         end
         self.db:saveSetting("preferences",p)
         self.db:saveSetting("schema",Config.SCHEMA)
@@ -150,12 +218,116 @@ function Store:all_books()
     local o={}; for id,b in pairs(self:library()) do local x=U.copy(b); x.book_id=x.book_id or id; o[#o+1]=x end
     table.sort(o,function(a,b) return tonumber(a.updated_at or a.downloaded_at or 0)>tonumber(b.updated_at or b.downloaded_at or 0) end); return o
 end
-function Store:file_record(path)
-    if not path then return nil end
-    for _,b in ipairs(self:all_books()) do
-        for kind,r in pairs(b.variants or {}) do if r.file==path then return b,r,kind end end
-        for uid,row in pairs(b.chapters or {}) do for kind,r in pairs(row) do if r.file==path then r.chapter_uid=uid; return b,r,kind end end end
+local function normalize_path(path)
+    local value=tostring(path or ""):gsub("\\","/"):gsub("/+","/")
+    value=value:gsub("/%./","/")
+    while value:find("/[^/]+/%.%./") do value=value:gsub("/[^/]+/%.%./","/") end
+    if #value>1 then value=value:gsub("/$","") end
+    return value
+end
+
+local function read_pipe(command)
+    local pipe=io.popen(command,"r")
+    if not pipe then return nil end
+    local data=pipe:read("*a")
+    pipe:close()
+    if data=="" then return nil end
+    return data
+end
+
+function Store:epub_identity(path)
+    if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
+    local quoted=U.shell_quote(path)
+    local raw=read_pipe("unzip -p "..quoted.." OEBPS/miuread.json 2>/dev/null")
+    if raw then
+        local ok,value=pcall(Json.decode,raw)
+        if ok and type(value)=="table" and tostring(value.book_id or "")~="" then return value end
     end
+    local opf=read_pipe("unzip -p "..quoted.." OEBPS/package.opf 2>/dev/null")
+    if opf then
+        local id=opf:match("miuread://book/([^<%s]+)") or opf:match("miuread%-([^<%s]+)")
+        if id then return {book_id=id} end
+    end
+    -- MiuRead-generated EPUB entries are stored without compression. If a
+    -- device lacks a usable unzip -p, the identity remains visible near the
+    -- end of the file, so inspect only the tail instead of loading a large
+    -- book into memory.
+    local file=io.open(path,"rb")
+    if file then
+        local size=file:seek("end") or 0
+        file:seek("set",math.max(0,size-1024*1024))
+        local tail=file:read("*a") or ""
+        file:close()
+        local id=tail:match('"book_id"%s*:%s*"([^"]+)"') or tail:match("miuread://book/([^<%s]+)")
+        if id then
+            local variant=tail:match('"variant"%s*:%s*"([^"]+)"')
+            local standalone=tail:match('"standalone"%s*:%s*true')~=nil
+            return {book_id=id,variant=variant,standalone=standalone}
+        end
+    end
+    return nil
+end
+
+function Store:identify_file(path,relink)
+    if not path then return nil end
+    local normalized=normalize_path(path)
+    local all=self:library()
+    local function match_record(record)
+        return type(record)=="table" and record.file and normalize_path(record.file)==normalized
+    end
+    for id,b in pairs(all) do
+        for kind,r in pairs(b.variants or {}) do
+            if match_record(r) then
+                if relink and r.file~=path then r.file=path; r.directory=path:match("^(.*)/[^/]+$"); self:set("library",all) end
+                return b,r,kind
+            end
+        end
+        for uid,row in pairs(b.chapters or {}) do
+            for kind,r in pairs(row or {}) do
+                if match_record(r) then
+                    r.chapter_uid=uid
+                    if relink and r.file~=path then r.file=path; r.directory=path:match("^(.*)/[^/]+$"); self:set("library",all) end
+                    return b,r,kind
+                end
+            end
+        end
+    end
+
+    local meta=self:epub_identity(path)
+    local id=meta and tostring(meta.book_id or "") or ""
+    local b=id~="" and all[id] or nil
+    if not b then return nil end
+    local kind=tostring(meta.variant or "")
+    local record
+    if meta.standalone==true then
+        local chapters=type(meta.chapters)=="table" and meta.chapters or {}
+        local uid=tostring((chapters[1] and (chapters[1].uid or chapters[1].chapter_uid)) or "")
+        local row=uid~="" and b.chapters and b.chapters[uid] or nil
+        record=row and (row[kind] or row.notes or row.clean)
+        if record then record.chapter_uid=uid end
+    else
+        record=b.variants and (b.variants[kind] or b.variants.notes or b.variants.clean)
+    end
+    if record and relink then
+        record.file=path
+        record.directory=path:match("^(.*)/[^/]+$")
+        b.directory=record.directory or b.directory
+        self:set("library",all)
+    end
+    return b,record,kind~="" and kind or nil
+end
+
+function Store:file_record(path)
+    return self:identify_file(path,true)
+end
+
+function Store:mark_last_read(id,path,progress)
+    id=tostring(id or "")
+    if id=="" then return end
+    local patch={last_read_at=os.time()}
+    if path then patch.last_read_path=path end
+    if progress~=nil then patch.progress_local_percent=tonumber(progress) end
+    self:save_session(id,patch)
 end
 function Store:session(id) return self:get("sessions",{})[tostring(id)] end
 function Store:save_session(id,patch) local a=self:get("sessions",{}); local k=tostring(id); a[k]=U.merge(a[k] or {},patch or {}); self:set("sessions",a); return a[k] end

@@ -1,0 +1,166 @@
+name: Release full package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.1.14"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate source and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d miuread.koplugin
+          test -f miuread.koplugin/main.lua
+          test -f miuread.koplugin/_meta.lua
+          test -f miuread.koplugin/miuread/config.lua
+
+          VERSION="${RELEASE_TAG#v}"
+          test -n "$VERSION"
+          grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
+          grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
+          grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
+
+          if find miuread.koplugin -type f \( -iname '*.md' -o -name '.DS_Store' \) | grep -q .; then
+            echo "Package contains forbidden files."
+            exit 1
+          fi
+
+          if find miuread.koplugin -type f \( -iname '*.epub' -o -iname '*.log' -o -name 'miuread.lua' -o -name 'settings.reader.lua' \) | grep -q .; then
+            echo "Package may contain user data or runtime files."
+            exit 1
+          fi
+
+      - name: Build deterministic full package and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          export VERSION
+          mkdir -p dist
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
+          import hashlib
+          import json
+          import os
+
+          version = os.environ["VERSION"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          root = Path("miuread.koplugin")
+          output = Path("dist") / f"miuread-v{version}-full.zip"
+          fixed = (2020, 1, 1, 0, 0, 0)
+
+          with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+              directories = [root] + sorted(
+                  [path for path in root.rglob("*") if path.is_dir()],
+                  key=lambda path: path.as_posix(),
+              )
+              for path in directories:
+                  name = path.as_posix().rstrip("/") + "/"
+                  info = ZipInfo(name, fixed)
+                  info.create_system = 3
+                  info.external_attr = (0o40755 << 16) | 0x10
+                  archive.writestr(info, b"")
+
+              files = sorted(
+                  [path for path in root.rglob("*") if path.is_file()],
+                  key=lambda path: path.as_posix(),
+              )
+              for path in files:
+                  if path.suffix.lower() == ".md" or path.name == ".DS_Store" or "__MACOSX" in path.parts:
+                      continue
+                  info = ZipInfo(path.as_posix(), fixed)
+                  info.create_system = 3
+                  info.external_attr = 0o100644 << 16
+                  info.compress_type = ZIP_DEFLATED
+                  archive.writestr(info, path.read_bytes())
+
+          payload = output.read_bytes()
+          sha256 = hashlib.sha256(payload).hexdigest()
+          size = len(payload)
+          filename = output.name
+          official = f"https://github.com/{repo}/releases/download/v{version}/{filename}"
+          mirrors = [
+              official,
+              f"https://ghfast.top/{official}",
+              f"https://gh-proxy.com/{official}",
+              f"https://ghproxy.net/{official}",
+          ]
+          manifest = {
+              "version": version,
+              "name": f"觅阅 · 微信读书助手 {version}",
+              "package_type": "full",
+              "package_url": official,
+              "package_urls": mirrors,
+              "size": size,
+              "sha256": sha256,
+              "notes": "由 GitHub Actions 自动生成并发布的全量更新包。",
+          }
+          Path("dist/update.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          Path(f"dist/{filename}.sha256").write_text(
+              f"{sha256}  {filename}\n",
+              encoding="utf-8",
+          )
+          PY
+
+          unzip -t "dist/miuread-v${VERSION}-full.zip"
+          test "$(unzip -Z1 "dist/miuread-v${VERSION}-full.zip" | grep -vc '^miuread\.koplugin/')" -eq 0
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          FILE="dist/miuread-v${VERSION}-full.zip"
+          SHA_FILE="${FILE}.sha256"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$FILE" "$SHA_FILE" dist/update.json --clobber
+          else
+            gh release create "$RELEASE_TAG" "$FILE" "$SHA_FILE" dist/update.json \
+              --title "觅阅 · 微信读书助手 ${VERSION}" \
+              --notes "全量更新包。安装与在线更新使用同一个文件。"
+          fi
+
+      - name: Publish legacy update entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git switch main
+          cp dist/update.json update.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add update.json
+          if git diff --cached --quiet; then
+            echo "update.json is unchanged."
+          else
+            git commit -m "Update release manifest to ${RELEASE_TAG}"
+            git push origin main
+          fi

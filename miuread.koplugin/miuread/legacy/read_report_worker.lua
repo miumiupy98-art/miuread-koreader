@@ -73,6 +73,48 @@ local function normalize_progress_ratio(value)
     return value
 end
 
+local function chapter_uid(chapter)
+    return chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid)
+end
+
+local function chapter_index(chapter, fallback)
+    return tonumber(chapter and (chapter.chapterIdx or chapter.index or chapter.chapter_index or chapter.chapter_idx))
+        or tonumber(fallback or 0) or 0
+end
+
+local function chapter_words(chapter)
+    return math.max(1, tonumber(chapter and (chapter.wordCount or chapter.word_count) or 0) or 0)
+end
+
+local function standalone_position(book, ratio)
+    local chapters = type(book.chapters) == "table" and book.chapters or {}
+    local source_uid = tostring(book.source_chapter_uid or "")
+    if source_uid == "" or #chapters == 0 then return nil, "standalone chapter catalog unavailable" end
+
+    local total, before, selected = 0, 0, nil
+    for _, chapter in ipairs(chapters) do
+        local words = chapter_words(chapter)
+        if not selected and tostring(chapter_uid(chapter) or "") == source_uid then
+            selected = chapter
+        elseif not selected then
+            before = before + words
+        end
+        total = total + words
+    end
+    if not selected or total <= 0 then return nil, "standalone chapter not found in full catalog" end
+
+    local words = chapter_words(selected)
+    local offset = math.max(0, math.min(words, math.floor(words * ratio + 0.5)))
+    local whole_ratio = (before + offset) / total
+    return {
+        chapter_uid = chapter_uid(selected) or source_uid,
+        chapter_idx = chapter_index(selected, book.source_chapter_index),
+        chapter_offset = offset,
+        progress = math.floor(whole_ratio * 100 + 0.5),
+        source = "standalone_chapter",
+    }
+end
+
 local function read_report_accepted(result)
     return type(result) == "table"
         and (result.succ == true or tonumber(result.succ) == 1)
@@ -119,9 +161,10 @@ local function select_context_chapter(book)
     local chapters = type(book.chapters) == "table" and book.chapters or {}
     local selected
 
-    if book.chapter_uid ~= nil then
+    local preferred_uid = book.source_is_standalone and book.source_chapter_uid or book.chapter_uid
+    if preferred_uid ~= nil then
         for _, chapter in ipairs(chapters) do
-            if tostring(chapter.chapterUid or "") == tostring(book.chapter_uid) then
+            if tostring(chapter_uid(chapter) or "") == tostring(preferred_uid) then
                 selected = chapter
                 break
             end
@@ -155,9 +198,11 @@ local function refresh_context(client, book_id, book, force)
 
     local now = os.time()
     local context_age = now - (tonumber(book.read_context_updated_at) or 0)
+    local standalone_catalog_missing = book.source_is_standalone == true and book.catalog_complete ~= true
     local context_ready = book.psvts ~= nil and tostring(book.psvts) ~= ""
         and book.chapter_uid ~= nil
         and type(book.chapters) == "table" and #book.chapters > 0
+        and not standalone_catalog_missing
 
     if not force and context_ready and context_age < CONTEXT_MAX_AGE_SECONDS then
         return book, false
@@ -165,8 +210,9 @@ local function refresh_context(client, book_id, book, force)
 
     Content.ensure_reader_state(client, book)
 
-    if force or type(book.chapters) ~= "table" or #book.chapters == 0 then
+    if force or standalone_catalog_missing or type(book.chapters) ~= "table" or #book.chapters == 0 then
         Content.fetch_catalog(client, book)
+        book.catalog_complete = true
     end
 
     local progress_ok, progress_result = pcall(function()
@@ -175,13 +221,21 @@ local function refresh_context(client, book_id, book, force)
     if progress_ok and type(progress_result) == "table" then
         local remote = type(progress_result.book) == "table"
             and progress_result.book or progress_result
-        book.progress = tonumber(remote.progress) or tonumber(book.progress) or 0
-        book.chapter_uid = remote.chapterUid or remote.chapterId
-            or remote.chapter_uid or book.chapter_uid
-        book.chapter_idx = tonumber(remote.chapterIdx or remote.chapterIndex or remote.chapter_idx)
-            or tonumber(book.chapter_idx)
-        book.chapter_offset = tonumber(remote.chapterOffset or remote.chapterPos or remote.offset)
-            or tonumber(book.chapter_offset) or 0
+        local remote_uid = remote.chapterUid or remote.chapterId or remote.chapter_uid
+        local remote_idx = tonumber(remote.chapterIdx or remote.chapterIndex or remote.chapter_idx)
+        local remote_offset = tonumber(remote.chapterOffset or remote.chapterPos or remote.offset)
+        local remote_progress = tonumber(remote.progress)
+        if remote_progress ~= nil or remote_uid ~= nil then
+            book.remote_progress = remote_progress or tonumber(book.progress) or 0
+            book.remote_chapter_uid = remote_uid or book.chapter_uid
+            book.remote_chapter_idx = remote_idx or tonumber(book.chapter_idx) or 0
+            book.remote_chapter_offset = remote_offset or tonumber(book.chapter_offset) or 0
+            book.progress = book.remote_progress
+            book.chapter_uid = book.remote_chapter_uid
+            book.chapter_idx = book.remote_chapter_idx
+            book.chapter_offset = book.remote_chapter_offset
+            book.remote_progress_loaded = true
+        end
     end
 
     local selected = select_context_chapter(book)
@@ -209,6 +263,21 @@ local function estimate_position(book, progress_ratio)
     local ratio = normalize_progress_ratio(progress_ratio)
         or normalize_progress_ratio(book.progress)
         or 0
+
+    if book.source_is_standalone == true then
+        local mapped, map_error = standalone_position(book, ratio)
+        if mapped then return mapped end
+        if book.remote_progress_loaded == true then
+            return {
+                chapter_uid = book.remote_chapter_uid or book.chapter_uid or 0,
+                chapter_idx = tonumber(book.remote_chapter_idx or book.chapter_idx) or 0,
+                chapter_offset = tonumber(book.remote_chapter_offset or book.chapter_offset) or 0,
+                progress = math.floor((normalize_progress_ratio(book.remote_progress or book.progress) or 0) * 100 + 0.5),
+                source = "remote_fallback",
+            }
+        end
+        return nil, map_error
+    end
 
     local chapter
     local within_chapter = 0
@@ -255,7 +324,8 @@ local function estimate_position(book, progress_ratio)
 end
 
 local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
-    local position = estimate_position(book, progress_ratio)
+    local position, position_error = estimate_position(book, progress_ratio)
+    if not position then return nil, position_error end
     return WeRead.make_read_payload{
         book_id = book_id,
         chapter_uid = position.chapter_uid,
@@ -268,11 +338,14 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio)
         psvts = book.psvts,
         pclts = book.pclts,
         token = book.token,
-    }
+    }, position
 end
 
 local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio)
-    local payload = build_payload(book_id, elapsed_seconds, book, progress_ratio)
+    local payload, position_or_error = build_payload(book_id, elapsed_seconds, book, progress_ratio)
+    if not payload then
+        return false, nil, tostring(position_or_error or "reading position unavailable"), "position"
+    end
     local referer = book.reader_url or WeRead.reader_url(book_id)
     local ok, result = pcall(function()
         return client:report_read(payload, referer)
@@ -281,7 +354,7 @@ local function attempt_report(client, book_id, elapsed_seconds, book, progress_r
         return false, nil, tostring(result), "transport"
     end
     if read_report_accepted(result) then
-        return true, result
+        return true, result, nil, nil, position_or_error
     end
     return false, result, result_summary(result), "server"
 end
@@ -290,6 +363,10 @@ local BOOK_PATCH_KEYS = {
     "book_id", "bookId", "title", "author", "reader_url",
     "psvts", "pclts", "token", "chapters", "progress",
     "chapter_uid", "chapter_idx", "chapter_offset", "chapter_word_count",
+    "source_is_standalone", "source_chapter_uid", "source_chapter_index",
+    "source_chapter_word_count", "source_chapter_title",
+    "catalog_complete", "remote_progress_loaded", "remote_progress",
+    "remote_chapter_uid", "remote_chapter_idx", "remote_chapter_offset",
     "app_id", "read_context_updated_at", "read_context_ready",
 }
 
@@ -370,7 +447,7 @@ function Worker.run(job)
     book = context_or_error
     context_changed = initial_context_changed == true
 
-    local accepted, result, first_error, first_kind = attempt_report(
+    local accepted, result, first_error, first_kind, first_position = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio
     )
     if accepted then
@@ -378,6 +455,7 @@ function Worker.run(job)
             ok = true,
             result = confirmation(result),
             path = "initial",
+            position = first_position,
         }, context_changed)
     end
     if first_kind == "transport" then
@@ -395,7 +473,7 @@ function Worker.run(job)
     if refresh_ok then
         book = refreshed_or_error
         context_changed = context_changed or refreshed_changed == true
-        local retry_accepted, retry_result, retry_error = attempt_report(
+        local retry_accepted, retry_result, retry_error, _, retry_position = attempt_report(
             client, book_id, elapsed_seconds, book, progress_ratio
         )
         if retry_accepted then
@@ -403,6 +481,7 @@ function Worker.run(job)
                 ok = true,
                 result = confirmation(retry_result),
                 path = "context_refresh",
+                position = retry_position,
         }, context_changed)
         end
         first_failure = "initial=" .. tostring(first_failure)
@@ -447,7 +526,7 @@ function Worker.run(job)
     book = final_book_or_error
     context_changed = context_changed or final_context_changed == true
 
-    local final_accepted, final_result, final_error, final_kind = attempt_report(
+    local final_accepted, final_result, final_error, final_kind, final_position = attempt_report(
         client, book_id, elapsed_seconds, book, progress_ratio
     )
     if final_accepted then
@@ -456,6 +535,7 @@ function Worker.run(job)
             result = confirmation(final_result),
             path = "cookie_renewal",
             renewal_attempted = true,
+            position = final_position,
         }, context_changed)
     end
 

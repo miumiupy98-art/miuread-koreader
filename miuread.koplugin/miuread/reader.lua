@@ -107,33 +107,46 @@ end
 local function is_structure_chapter(chapter)
     chapter = type(chapter) == "table" and chapter or {}
     if truthy(chapter.isPart) or truthy(chapter.isVolume) or truthy(chapter.isTitle)
-        or truthy(chapter.isSection) or truthy(chapter.isDivider) then
+        or truthy(chapter.isSection) or truthy(chapter.isDivider)
+        or truthy(chapter._miuread_has_children) or truthy(chapter.hasChildren) then
         return true
     end
+
+    local child_count = tonumber(chapter.childCount or chapter.childrenCount or chapter.subChapterCount or 0) or 0
+    if child_count > 0 then return true end
 
     local kind = tostring(chapter.chapterType or chapter.chapter_type or chapter.typeName or chapter.nodeType or ""):lower()
     if kind:find("part", 1, true) or kind:find("volume", 1, true)
-        or kind:find("divider", 1, true) or kind:find("section_title", 1, true) then
+        or kind:find("divider", 1, true) or kind:find("section_title", 1, true)
+        or kind:find("season", 1, true) then
         return true
     end
 
-    local words = tonumber(chapter.wordCount or chapter.word_count)
-    if not words or words > 120 then return false end
     local title = compact_title(chapter.title)
     if title == "" then return false end
 
+    -- These checks are used only after the server successfully returned an
+    -- empty decoded body in both EPUB and TXT formats. They therefore identify
+    -- intentional title pages rather than masking network or authentication
+    -- failures.
     if title:sub(1, #"第") == "第" then
-        for _, marker in ipairs({"部", "卷", "编", "篇", "辑", "册"}) do
+        for _, marker in ipairs({"部", "卷", "编", "篇", "辑", "册", "季"}) do
             local pos = title:find(marker, #"第" + 1, true)
-            if pos and pos <= 24 then return true end
+            if pos and pos <= 30 then return true end
         end
     end
+    if title:find("第[%d一二三四五六七八九十百零〇两]+季") then return true end
+
     local exact = {
         ["上部"]=true, ["中部"]=true, ["下部"]=true,
         ["上卷"]=true, ["中卷"]=true, ["下卷"]=true,
         ["上篇"]=true, ["中篇"]=true, ["下篇"]=true,
         ["上编"]=true, ["中编"]=true, ["下编"]=true,
         ["前篇"]=true, ["后篇"]=true,
+        ["序"]=true, ["序言"]=true, ["前言"]=true, ["引言"]=true,
+        ["楔子"]=true, ["尾声"]=true, ["后记"]=true, ["致谢"]=true,
+        ["鸣谢"]=true, ["附录"]=true, ["参考文献"]=true,
+        ["封底"]=true, ["扉页"]=true, ["版权页"]=true, ["版权信息"]=true, ["目录"]=true,
     }
     return exact[title] == true
 end
@@ -154,8 +167,17 @@ end
 local function is_auth_error(value)
     local text = tostring(value or ""):lower()
     return text:find("http 401", 1, true) or text:find("http 403", 1, true)
-        or text:find("login expired", 1, true) or text:find("not logged", 1, true)
+        or text:find("login expired", 1, true) or text:find("login timeout", 1, true)
+        or text:find("session expired", 1, true) or text:find("not logged", 1, true)
         or text:find("未登录", 1, true) or text:find("登录过期", 1, true)
+        or text:find("登录超时", 1, true) or text:find("登录失效", 1, true)
+end
+
+local function is_replaced_session_error(value)
+    local text = tostring(value or ""):lower()
+    return text:find("另一台设备", 1, true)
+        or text:find("服务端未识别当前用户", 1, true)
+        or text:find("error_code=-2012", 1, true)
 end
 
 
@@ -365,12 +387,37 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
     return xhtml, assets, summary
 end
 
-function Reader:new(http, store) return setmetatable({http=http, store=store}, self) end
+function Reader:new(http, store)
+    return setmetatable({http=http, store=store, _renewing_session=false}, self)
+end
 
 function Reader:renew()
     local data, _, meta = self.http:post_json(BASE .. "/web/login/renewal", {rq="%2Fweb%2Fbook%2Fread", ql=false},
         {headers={Origin=BASE, Referer=BASE .. "/", Accept="application/json, text/plain, */*"}, retries=2})
     return data, meta
+end
+
+function Reader:_recover_login_session()
+    if self._renewing_session then return false, "登录状态正在续期" end
+    self._renewing_session=true
+
+    local renewed, renew_result=pcall(self.renew,self)
+    if not renewed then
+        logger.warn("[MiuRead][Reader] cookie renewal failed", tostring(renew_result))
+        local repaired, repair_result=pcall(self.repair_login_session,self)
+        if repaired then
+            renewed, renew_result=pcall(self.renew,self)
+        else
+            renew_result=tostring(renew_result).."; repair="..tostring(repair_result)
+        end
+    end
+
+    self._renewing_session=false
+    if renewed then
+        logger.info("[MiuRead][Reader] login session renewed")
+        return true
+    end
+    return false, renew_result
 end
 
 function Reader:state(book_id, chapter_uid)
@@ -394,14 +441,31 @@ function Reader:state(book_id, chapter_uid)
 end
 
 function Reader:catalog(book_id)
-    local data = self.http:post_json(BASE .. "/web/book/chapterInfos", {bookIds={tostring(book_id)}},
-        {headers={Origin=BASE, Referer=Protocol.reader_url(book_id)}, retries=3})
-    local records = catalog_records(data)
-    for _, record in ipairs(records or {}) do
-        if tostring(record.bookId or "") == tostring(book_id) then return record end
+    local function load_catalog()
+        local data = self.http:post_json(BASE .. "/web/book/chapterInfos", {bookIds={tostring(book_id)}},
+            {headers={Origin=BASE, Referer=Protocol.reader_url(book_id)}, retries=3})
+        local records = catalog_records(data)
+        for _, record in ipairs(records or {}) do
+            if tostring(record.bookId or "") == tostring(book_id) then return record end
+        end
+        if #records == 1 and type(records[1]) == "table" then return records[1] end
+        error("book catalog not returned")
     end
-    if #records == 1 and type(records[1]) == "table" then return records[1] end
-    error("book catalog not returned")
+
+    local ok, result=pcall(load_catalog)
+    if ok then return result end
+    if is_auth_error(result) then
+        local renewed, renew_error=self:_recover_login_session()
+        logger.warn("[MiuRead][Reader] catalog authentication recovery", "ok=", tostring(renewed),
+            "error=", renewed and "" or tostring(renew_error))
+        if renewed then
+            local retry_ok, retry_result=pcall(load_catalog)
+            if retry_ok then return retry_result end
+            error(retry_result)
+        end
+        error(tostring(result).."; 自动续期失败："..tostring(renew_error))
+    end
+    error(result)
 end
 
 function Reader:shard(path, book_id, chapter_uid, psvts, style)
@@ -510,7 +574,7 @@ function Reader:_chapter_once(book, chapter, format, opt)
     logger.warn("[MiuRead][Reader] EPUB content empty; trying TXT fallback", "chapter=", tostring(uid), "title=", tostring(chapter.title or ""))
     local txt_ok, ta, tb, tc, td = pcall(self._txt_once, self, book, chapter, opt, state)
     if txt_ok then return ta, tb, tc, td end
-    if is_structure_chapter(chapter) and not is_auth_error(ta) then
+    if is_structure_chapter(chapter) and is_empty_error(ta) and not is_auth_error(ta) then
         state.content_format = "structure"
         state.structural = true
         logger.info("[MiuRead][Reader] structure page generated", "chapter=", tostring(uid), "title=", tostring(chapter.title or ""), "txt_fallback=", tostring(ta))
@@ -527,10 +591,19 @@ function Reader:chapter(book, chapter, format, opt)
         last = a
         logger.warn("[MiuRead][Reader] chapter retry", "chapter=", tostring(chapter.chapterUid or chapter.uid),
             "attempt=", tostring(attempt), "error=", tostring(a))
-        if is_auth_error(a) and not renewed then
+        if is_replaced_session_error(a) then
+            -- Do not rotate the account session automatically. On two devices
+            -- that would make them repeatedly invalidate each other.
+            break
+        elseif is_auth_error(a) and not renewed then
             renewed = true
-            local renew_ok, renew_error = pcall(self.renew, self)
-            logger.warn("[MiuRead][Reader] authentication renewal", "ok=", tostring(renew_ok), "error=", renew_ok and "" or tostring(renew_error))
+            local renew_ok, renew_error = self:_recover_login_session()
+            logger.warn("[MiuRead][Reader] authentication renewal", "ok=", tostring(renew_ok),
+                "error=", renew_ok and "" or tostring(renew_error))
+            if not renew_ok then
+                last=tostring(a).."; 自动续期失败："..tostring(renew_error)
+                break
+            end
         end
         if attempt < 3 then pause(attempt == 1 and 0.8 or 1.8) end
     end
@@ -568,10 +641,9 @@ local function response_header(headers, name)
     end
 end
 
--- Repair QR-login web cookies using the exact authenticated follow-up flow from
--- the user's working 0.3.6.7 build. This is not a login renewal and does not
--- rotate refresh tokens; it only preserves Set-Cookie values returned by
--- userInfo/apikeyGet that older MiuRead builds discarded.
+-- Repair QR-login web cookies using the authenticated follow-up flow from
+-- the working 0.3.6.7 build. Only stable wr_ / ptcz / RK / pgv_pvid cookies
+-- are retained; browser-session cookies are deliberately discarded.
 function Reader:repair_login_session()
     local auth = self.store:auth()
     local jar = Util.copy(auth.cookies or {})

@@ -151,6 +151,56 @@ local function map_position(chapters, ratio, fallback)
     end
 end
 
+local function chapter_uid(chapter)
+    return chapter and (chapter.chapterUid or chapter.uid or chapter.chapter_uid)
+end
+
+local function chapter_index(chapter, fallback)
+    return tonumber(chapter and (chapter.chapterIdx or chapter.index or chapter.chapter_index or chapter.chapter_idx))
+        or tonumber(fallback or 0) or 0
+end
+
+local function chapter_words(chapter)
+    return math.max(1, tonumber(chapter and (chapter.wordCount or chapter.word_count) or 0) or 0)
+end
+
+local function map_standalone_position(chapters, source_uid, ratio, fallback)
+    chapters = type(chapters) == "table" and chapters or {}
+    source_uid = tostring(source_uid or "")
+    ratio = U.clamp(tonumber(ratio) or 0, 0, 1)
+    fallback = fallback or {}
+    if source_uid == "" or #chapters == 0 then return nil end
+
+    local total, before, selected = 0, 0, nil
+    for _, chapter in ipairs(chapters) do
+        local words = chapter_words(chapter)
+        if not selected and tostring(chapter_uid(chapter) or "") == source_uid then
+            selected = chapter
+        elseif not selected then
+            before = before + words
+        end
+        total = total + words
+    end
+    if not selected or total <= 0 then return nil end
+
+    local words = chapter_words(selected)
+    local offset = math.max(0, math.min(words, math.floor(words * ratio + .5)))
+    local progress = U.clamp(((before + offset) / total) * 100, 0, 100)
+    return {
+        progress = progress,
+        chapter_uid = chapter_uid(selected) or source_uid,
+        chapter_index = chapter_index(selected, fallback.chapter_index),
+        offset = offset,
+        summary = selected.title or fallback.summary or "",
+        standalone = true,
+        safe = true,
+        chapter_percent = math.floor(ratio * 100 + .5),
+        chapter_word_count = words,
+        total_word_count = total,
+        words_before = before,
+    }
+end
+
 function Sync:new(reader, api, store, host, async)
     local object = setmetatable({
         reader=reader, api=api, store=store, host=host, async=async,
@@ -206,6 +256,105 @@ function Sync:position(record, ratio, chapters)
         chapter_uid = record.record and record.record.chapter_uid or 0,
         summary = record.book.title,
     })
+end
+
+function Sync:_decorate_legacy_context(context, record)
+    context = context or {}
+    local standalone_uid = record and record.record and record.record.chapter_uid
+    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
+        local local_map = record.record.chapter_map or {}
+        local local_chapter = local_map[1] or {}
+        context.source_is_standalone = true
+        context.source_chapter_uid = tostring(standalone_uid)
+        context.source_chapter_index = chapter_index(local_chapter, 0)
+        context.source_chapter_word_count = tonumber(local_chapter.word_count or local_chapter.wordCount or 0) or 0
+        context.source_chapter_title = local_chapter.title or record.book.title
+    else
+        context.source_is_standalone = nil
+        context.source_chapter_uid = nil
+        context.source_chapter_index = nil
+        context.source_chapter_word_count = nil
+        context.source_chapter_title = nil
+    end
+    return context
+end
+
+function Sync:local_position(ratio)
+    local record = self:record()
+    if not record then return nil end
+    ratio = ratio or self:local_ratio() or 0
+    local standalone_uid = record.record and record.record.chapter_uid
+    if standalone_uid ~= nil and tostring(standalone_uid) ~= "" then
+        local session = self.store:session(record.book.book_id) or {}
+        local context = self.daemon_context
+            or (type(session.legacy_report_context) == "table" and session.legacy_report_context)
+            or {}
+        local position = context.catalog_complete == true and map_standalone_position(context.chapters, standalone_uid, ratio, {
+            chapter_index = record.record and record.record.chapter_map
+                and record.record.chapter_map[1] and record.record.chapter_map[1].index,
+            summary = record.book.title,
+        }) or nil
+        if position then return position end
+        return {
+            progress = nil,
+            chapter_uid = tostring(standalone_uid),
+            standalone = true,
+            safe = false,
+            chapter_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5),
+            summary = record.book.title,
+        }
+    end
+    local position = self:position(record, ratio)
+    position.safe = true
+    position.standalone = false
+    position.chapter_percent = math.floor(U.clamp(ratio, 0, 1) * 100 + .5)
+    return position
+end
+
+function Sync:jump_remote(remote)
+    remote = remote or {}
+    local record = self:record()
+    if not record then return false, "未识别到当前觅阅书籍" end
+    local standalone_uid = record.record and record.record.chapter_uid
+    if standalone_uid == nil or tostring(standalone_uid) == "" then
+        return self:jump(remote.percent), nil
+    end
+
+    local remote_uid = remote.chapter_uid
+    if remote_uid == nil or tostring(remote_uid) ~= tostring(standalone_uid) then
+        return false, "云端位置不在当前下载章节中"
+    end
+
+    local session = self.store:session(record.book.book_id) or {}
+    local context = self.daemon_context
+        or (type(session.legacy_report_context) == "table" and session.legacy_report_context)
+        or {}
+    if context.catalog_complete ~= true then return false, "完整目录尚未准备好" end
+    local chapters = type(context.chapters) == "table" and context.chapters or {}
+    local selected, before, total
+    before, total = 0, 0
+    for _, chapter in ipairs(chapters) do
+        local words = chapter_words(chapter)
+        if not selected and tostring(chapter_uid(chapter) or "") == tostring(standalone_uid) then
+            selected = chapter
+        elseif not selected then
+            before = before + words
+        end
+        total = total + words
+    end
+    if not selected then return false, "暂时无法换算当前章节位置" end
+
+    local words = chapter_words(selected)
+    local local_ratio
+    if tonumber(remote.offset) then
+        local_ratio = tonumber(remote.offset) / words
+    elseif tonumber(remote.percent) and total > 0 then
+        local target = U.clamp(tonumber(remote.percent), 0, 100) / 100 * total
+        local_ratio = (target - before) / words
+    end
+    if local_ratio == nil then return false, "云端位置缺少章节内偏移" end
+    local_ratio = U.clamp(local_ratio, 0, 1)
+    return self:jump(local_ratio * 100), nil
 end
 
 function Sync:is_verified(book_id)
@@ -339,6 +488,7 @@ function Sync:upload(elapsed, callback, options)
         and session.legacy_report_context or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
+    self:_decorate_legacy_context(legacy_book, record)
 
     self.busy, self.state, self.last_attempt = true, "uploading", os.time()
     self.last_stage = "调用 0.3.6.7 原版阅读时长链路"
@@ -862,6 +1012,7 @@ function Sync:_start_daemon(reason)
         or {})
     legacy_book.book_id = book_id
     legacy_book.title = record.book.title
+    self:_decorate_legacy_context(legacy_book, record)
 
     local existing_control = read_json_file(daemon.paths.control) or {}
     local existing_status = read_json_file(daemon.paths.status) or {}
@@ -977,9 +1128,16 @@ function Sync:on_suspend()
     self.suspended = true
     local r = self:record()
     if r then
+        local position = self:local_position()
         self.store:save_session(r.book.book_id, {
-            pending={percent=math.floor((self:local_ratio() or 0) * 100 + .5), saved_at=os.time(), reason="suspend"}
+            pending={
+                percent=position and position.progress or nil,
+                chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
+                chapter_uid=position and position.chapter_uid or nil,
+                saved_at=os.time(), reason="suspend",
+            }
         })
+        self.store:mark_last_read(r.book.book_id,r.path,position and position.progress or nil)
     end
     self:stop("suspend")
 end
@@ -992,9 +1150,16 @@ end
 function Sync:on_close()
     local r = self:record()
     if r then
+        local position = self:local_position()
         self.store:save_session(r.book.book_id, {
-            pending={percent=math.floor((self:local_ratio() or 0) * 100 + .5), saved_at=os.time(), reason="close"}
+            pending={
+                percent=position and position.progress or nil,
+                chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
+                chapter_uid=position and position.chapter_uid or nil,
+                saved_at=os.time(), reason="close",
+            }
         })
+        self.store:mark_last_read(r.book.book_id,r.path,position and position.progress or nil)
     end
     self:stop("close")
     self.current = nil
@@ -1015,8 +1180,13 @@ function Sync:status()
     self:_import_daemon_status(false)
     local r = self:record()
     local session = r and self.store:session(r.book.book_id) or {}
+    local local_position = self:local_position()
     return {
-        record=r, local_percent=math.floor((self:local_ratio() or 0) * 100 + .5),
+        record=r,
+        local_percent=local_position and local_position.progress
+            and math.floor(local_position.progress + .5) or nil,
+        local_chapter_percent=local_position and local_position.chapter_percent or nil,
+        local_position_safe=local_position and local_position.safe == true or false,
         remote=session and session.remote, remote_checked_at=session and session.remote_checked_at,
         verified=self:is_current_verified(), verified_at=self.verified_at,
         verified_local_percent=self.verified_local_percent,

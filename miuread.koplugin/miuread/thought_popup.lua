@@ -1,6 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local Button = require("ui/widget/button")
-local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
@@ -10,12 +9,19 @@ local OverlapGroup = require("ui/widget/overlapgroup")
 local ScrollHtmlWidget = require("ui/widget/scrollhtmlwidget")
 local Size = require("ui/size")
 local UIManager = require("ui/uimanager")
+local VerticalGroup = require("ui/widget/verticalgroup")
+local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 
 local function screen_ratios()
+    return 0.91, 0.60
+end
+
+local function safe_margins()
     local w, h = Screen:getWidth(), Screen:getHeight()
-    if h >= w then return 0.88, 0.82 end
-    return 0.84, 0.86
+    local side = math.max(Screen:scaleBySize(6), math.floor(w * 0.02))
+    local vertical = math.max(Screen:scaleBySize(8), math.floor(h * 0.03))
+    return side, vertical
 end
 
 local function dirty_region(widget, dimen)
@@ -31,10 +37,12 @@ end
 
 local Popup = InputContainer:extend{
     html = nil,
-    font_size = Screen:scaleBySize(22),
+    source_html = nil,
+    font_size = Screen:scaleBySize(19),
     width_ratio = nil,
     height_ratio = nil,
     css = "",
+    metrics = nil,
     dialog = nil,
     on_close_callback = nil,
     closing = false,
@@ -44,20 +52,20 @@ local Popup = InputContainer:extend{
 
 function Popup:init()
     self.html = tostring(self.html or "")
+    self.source_html = tostring(self.source_html or "")
     if self.html == "" then self.html = "<p>没有想法内容</p>" end
 
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     local auto_w, auto_h = screen_ratios()
-    local width_ratio = math.max(0.68, math.min(0.92, tonumber(self.width_ratio) or auto_w))
-    local height_ratio = math.max(0.56, math.min(0.90, tonumber(self.height_ratio) or auto_h))
-    local margin = Screen:scaleBySize(18)
-    self.width = math.min(math.floor(Screen:getWidth() * width_ratio), Screen:getWidth() - margin * 2)
-    self.height = math.min(math.floor(Screen:getHeight() * height_ratio), Screen:getHeight() - margin * 2)
-    self.popup_dimen = Geom:new{
-        x = math.floor((Screen:getWidth() - self.width) / 2),
-        y = math.floor((Screen:getHeight() - self.height) / 2),
-        w = self.width,
-        h = self.height,
-    }
+    local width_ratio = math.max(0.86, math.min(0.92, tonumber(self.width_ratio) or auto_w))
+    local height_ratio = math.max(0.48, math.min(0.64, tonumber(self.height_ratio) or auto_h))
+    local side_margin, vertical_margin = safe_margins()
+
+    self.width = math.min(math.floor(screen_w * width_ratio), screen_w - side_margin * 2)
+    self.max_height = math.min(
+        math.floor(screen_h * height_ratio),
+        screen_h - vertical_margin * 2
+    )
     self.dialog = self
     self.closing = false
 
@@ -66,7 +74,7 @@ function Popup:init()
             TapPage = {
                 GestureRange:new{
                     ges = "tap",
-                    range = Geom:new{x=0, y=0, w=Screen:getWidth(), h=Screen:getHeight()},
+                    range = Geom:new{x=0, y=0, w=screen_w, h=screen_h},
                 },
             },
         }
@@ -85,32 +93,139 @@ function Popup:init()
 end
 
 function Popup:_free_widgets()
+    if self.sourcewidget then pcall(function() self.sourcewidget:free() end) end
     if self.htmlwidget then pcall(function() self.htmlwidget:free() end) end
     if self.close_button then pcall(function() self.close_button:free() end) end
+    self.sourcewidget = nil
     self.htmlwidget = nil
     self.close_button = nil
+end
+
+function Popup:_new_html_widget(width, height, html, scrollable)
+    return ScrollHtmlWidget:new{
+        html_body = tostring(html or ""),
+        is_xhtml = true,
+        css = self.css or "",
+        default_font_size = self.font_size,
+        width = width,
+        height = height,
+        scroll_bar_width = scrollable == false and 1 or math.max(1, Screen:scaleBySize(2)),
+        text_scroll_span = scrollable == false and 1 or math.max(1, Screen:scaleBySize(1)),
+        dialog = self,
+    }
+end
+
+local function single_page_height(widget)
+    local ok, value = pcall(function() return widget:getSinglePageHeight() end)
+    if ok then return tonumber(value) end
+end
+
+function Popup:_fit_widget(width, max_height, minimum, html, scrollable)
+    local probe = self:_new_html_widget(width, max_height, html, scrollable)
+    local used = single_page_height(probe)
+    local fitted = max_height
+    if used and used > 0 then
+        fitted = math.max(minimum, math.min(max_height, math.ceil(used + Screen:scaleBySize(2))))
+    end
+    if fitted < max_height then
+        pcall(function() probe:free() end)
+        return self:_new_html_widget(width, fitted, html, scrollable), fitted
+    end
+    return probe, fitted
+end
+
+
+function Popup:_source_height(width, max_height)
+    local metrics = type(self.metrics) == "table" and self.metrics or {}
+    local source_units = tonumber(metrics.source_units)
+        or tonumber(metrics.source_chars)
+        or 1
+
+    -- The source text is rendered at .68em. Account for the HTML body and
+    -- source-box horizontal padding, then estimate the actual wrapped lines.
+    local source_font = math.max(1, self.font_size * 0.68)
+    local horizontal_padding = self.font_size * (0.52 + 0.46) + Screen:scaleBySize(4)
+    local usable_width = math.max(source_font * 6, width - horizontal_padding)
+    local units_per_line = math.max(6, usable_width / source_font)
+    local lines = math.max(1, math.min(3, math.ceil(source_units / units_per_line - 0.001)))
+
+    -- Mirrors popup_css(): body vertical padding, panel heading, source-box
+    -- padding/border and the real number of source lines. A small safety pad
+    -- avoids clipping from font rounding without leaving a blank viewport.
+    local body_padding = self.font_size * (0.18 + 0.20)
+    local heading_height = self.font_size * (0.52 * 1.02 + 0.16)
+    local source_lines = lines * self.font_size * 0.68 * 1.15
+    local box_padding = self.font_size * (0.17 * 2) + 2
+    local safety = math.max(2, Screen:scaleBySize(3))
+    local estimated = math.ceil(body_padding + heading_height + source_lines + box_padding + safety)
+
+    return math.max(Screen:scaleBySize(38), math.min(max_height, estimated))
 end
 
 function Popup:_build()
     self:_free_widgets()
 
-    local border = tonumber(Size.border.window) or 1
-    local padding = tonumber(Size.padding.small) or Screen:scaleBySize(7)
-    local close_size = math.max(Screen:scaleBySize(34), math.floor(self.font_size * 1.32))
-    local close_inset = Screen:scaleBySize(3)
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local border = math.max(1, tonumber(Size.border.window) or 1)
+    local padding = math.max(4, Screen:scaleBySize(4))
+    local close_size = math.max(Screen:scaleBySize(18), math.floor(self.font_size * 0.62))
+    local close_inset = math.max(4, Screen:scaleBySize(5))
     local inner_w = self.width - padding * 2 - border * 2
-    local inner_h = self.height - padding * 2 - border * 2
+    local max_inner_h = self.max_height - padding * 2 - border * 2
+    local gap = 0
+    local source_h = 0
 
-    self.htmlwidget = ScrollHtmlWidget:new{
-        html_body = self.html,
-        is_xhtml = true,
-        css = self.css or "",
-        default_font_size = self.font_size,
-        width = inner_w,
-        height = inner_h,
-        scroll_bar_width = math.max(1, Screen:scaleBySize(4)),
-        text_scroll_span = Screen:scaleBySize(7),
-        dialog = self,
+    if self.source_html ~= "" then
+        local minimum_comments = math.max(Screen:scaleBySize(58), math.floor(self.font_size * 2.7))
+        gap = math.max(2, Screen:scaleBySize(3))
+        local source_max = math.max(
+            Screen:scaleBySize(38),
+            max_inner_h - minimum_comments - gap
+        )
+        source_h = self:_source_height(inner_w, source_max)
+        self.sourcewidget = self:_new_html_widget(
+            inner_w,
+            source_h,
+            self.source_html,
+            false
+        )
+    end
+
+    local comments_max_h = math.max(
+        math.max(Screen:scaleBySize(58), math.floor(self.font_size * 2.7)),
+        max_inner_h - source_h - gap
+    )
+    local comments_min_h = math.min(
+        comments_max_h,
+        math.max(Screen:scaleBySize(58), math.floor(self.font_size * 2.7))
+    )
+    self.htmlwidget, self.comments_height = self:_fit_widget(
+        inner_w,
+        comments_max_h,
+        comments_min_h,
+        self.html,
+        true
+    )
+
+    local body_content
+    if self.sourcewidget then
+        body_content = VerticalGroup:new{
+            align = "left",
+            self.sourcewidget,
+            VerticalSpan:new{width=gap},
+            self.htmlwidget,
+        }
+    else
+        body_content = self.htmlwidget
+    end
+
+    local inner_h = source_h + gap + self.comments_height
+    self.height = inner_h + padding * 2 + border * 2
+    self.popup_dimen = Geom:new{
+        x = math.floor((screen_w - self.width) / 2),
+        y = math.floor((screen_h - self.height) / 2),
+        w = self.width,
+        h = self.height,
     }
 
     local body_frame = FrameContainer:new{
@@ -118,12 +233,9 @@ function Popup:_build()
         bordersize = border,
         margin = 0,
         padding = padding,
-        self.htmlwidget,
+        body_content,
     }
 
-    -- Use a real KOReader Button instead of a painted TextBox. The previous
-    -- implementation relied on a separately calculated hit box; on Kindle
-    -- Voyage that tap could fall through to the card-wide page-turn handler.
     self.close_button = Button:new{
         text = "×",
         width = close_size,
@@ -132,7 +244,7 @@ function Popup:_build()
         padding = 0,
         bordersize = 0,
         text_font_face = "cfont",
-        text_font_size = math.max(19, math.floor(self.font_size * 1.02)),
+        text_font_size = math.max(13, math.floor(self.font_size * 0.50)),
         text_font_bold = true,
         show_parent = self,
         callback = function() self:_request_close() end,
@@ -149,10 +261,7 @@ function Popup:_build()
         h = close_size,
     }
 
-    -- Kindle touch coordinates can be slightly imprecise near the bezel. Keep
-    -- the visible button compact, but use a larger hit target fully contained
-    -- in the card's top-right corner.
-    local hit_pad = Screen:scaleBySize(12)
+    local hit_pad = Screen:scaleBySize(8)
     self.close_hit_dimen = Geom:new{
         x = math.max(self.popup_dimen.x, self.close_dimen.x - hit_pad),
         y = math.max(self.popup_dimen.y, self.close_dimen.y - hit_pad),
@@ -168,11 +277,10 @@ function Popup:_build()
         body_frame,
         self.close_button,
     }
-
-    -- The full-screen parent is only responsible for centering and input
-    -- capture. All e-ink updates remain limited to popup_dimen.
-    self[1] = CenterContainer:new{
+    self.container.overlap_offset = {self.popup_dimen.x, self.popup_dimen.y}
+    self[1] = OverlapGroup:new{
         dimen = Screen:getSize(),
+        allow_mirroring = false,
         self.container,
     }
 end
@@ -201,17 +309,11 @@ function Popup:_request_close()
 end
 
 function Popup:_tap_hits_close(pos)
-    -- The button's painted dimension is absolute after the first paint. The
-    -- explicit fallback dimensions are available even before that.
     return contains(self.close_button and self.close_button.dimen, pos)
         or contains(self.close_dimen, pos)
         or contains(self.close_hit_dimen, pos)
 end
 
--- WidgetContainer normally sends events to children before the parent. The
--- ScrollHtmlWidget consumes taps first, so the card-wide page-turn handler can
--- run before the overlaid close button ever sees the event. Intercept the raw
--- tap at the popup boundary before child propagation.
 function Popup:handleEvent(event)
     if not self.closing and event and event.handler == "onGesture" then
         local ges = event.args and event.args[1]
@@ -241,22 +343,15 @@ function Popup:onTapPage(_, ges)
     local pos = ges and ges.pos
     if not pos then return true end
 
-    -- The Button normally consumes this tap itself. Keep an absolute-screen
-    -- fallback for older KOReader event ordering and for the first paint.
     if self:_tap_hits_close(pos) then
         return self:_request_close()
     end
 
-    -- Tapping outside the visible card closes it without letting the event
-    -- reach the underlying EPUB.
     if not self.popup_dimen or pos:notIntersectWith(self.popup_dimen) then
         return self:_request_close()
     end
 
-    -- Comments are one continuous HTML document. A tap inside the card moves
-    -- to the next naturally rendered page; hardware back/forward keys move in
-    -- either direction.
-    return self:onScrollDown()
+    return true
 end
 
 local M = {}
@@ -265,10 +360,12 @@ function M.show(opts)
     opts = opts or {}
     return UIManager:show(Popup:new{
         html = opts.html,
+        source_html = opts.source_html,
         font_size = opts.font_size,
         width_ratio = opts.width_ratio,
         height_ratio = opts.height_ratio,
         css = opts.css or "",
+        metrics = opts.metrics,
         on_close_callback = opts.on_close,
     })
 end
