@@ -277,6 +277,21 @@ local function image_set_local_src(attrs, href)
     return ' src="' .. tostring(href or "") .. '"' .. attrs
 end
 
+local OPTIONAL_IMAGE_PLACEHOLDER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+
+local function image_is_optional_reference(attrs, source)
+    local clean = image_trim(source)
+    local path = clean:match("^[^%?#]+") or clean
+    local basename = image_basename(image_url_decode(path)):lower()
+    if basename == "note.png" then return true end
+
+    local class = tostring(image_attr(attrs, "class") or ""):lower()
+    for _, token in ipairs({"qqreader-footnote", "footnote-icon", "footnote-ref", "note-ref"}) do
+        if class:find(token, 1, true) then return true end
+    end
+    return false
+end
+
 local function image_remote_url(value)
     local url = image_trim(value)
     if url:sub(1, 2) == "//" then url = "https:" .. url end
@@ -329,7 +344,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
     local used = image_used_hrefs(assets)
     local remote_cache, remote_failed = {}, {}
     local remote_index = #assets
-    local summary = {tar=#assets, remote=0, localized=0, missing=0}
+    local summary = {tar=#assets, remote=0, localized=0, optional=0, missing=0}
 
     local function download_remote(url)
         if remote_cache[url] then return remote_cache[url] end
@@ -385,6 +400,12 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state)
         if local_src then
             summary.localized = summary.localized + 1
             return "<img" .. image_set_local_src(attrs, local_src) .. ">"
+        end
+
+        if image_is_optional_reference(attrs, clean_source) then
+            summary.optional = summary.optional + 1
+            logger.info("[MiuRead][Reader] optional image reference replaced", "src=", tostring(clean_source))
+            return "<img" .. image_set_local_src(attrs, OPTIONAL_IMAGE_PLACEHOLDER) .. ">"
         end
 
         summary.missing = summary.missing + 1
@@ -550,7 +571,8 @@ function Reader:_epub_once(book, chapter, opt, state)
         xhtml, assets, state.image_summary = localize_epub_images(self, xhtml, assets, source_map, state)
         logger.info("[MiuRead][Reader] chapter images", "chapter=", tostring(uid),
             "tar=", tostring(state.image_summary.tar), "remote=", tostring(state.image_summary.remote),
-            "localized=", tostring(state.image_summary.localized), "missing=", tostring(state.image_summary.missing))
+            "localized=", tostring(state.image_summary.localized), "optional=", tostring(state.image_summary.optional or 0),
+            "missing=", tostring(state.image_summary.missing))
         if tonumber(state.image_summary.missing or 0) > 0 then
             error("正文图片未完整获取：" .. tostring(state.image_summary.missing) .. " 个引用仍缺失")
         end
@@ -740,6 +762,7 @@ Reader._has_readable_content = has_readable_content
 Reader._is_empty_error = is_empty_error
 Reader._is_auth_error = is_auth_error
 Reader._image_source_keys = image_source_keys
+Reader._image_is_optional_reference = image_is_optional_reference
 Reader._image_tar_assets = image_tar_assets
 Reader._localize_epub_images = localize_epub_images
 Reader.PART_CSS = PART_CSS

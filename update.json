@@ -1,15 +1,15 @@
 {
-  "version": "1.1.15",
-  "name": "觅阅 · 微信读书助手 1.1.15",
+  "version": "1.1.16",
+  "name": "觅阅 · 微信读书助手 1.1.16",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.15/miuread-v1.1.15-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.15/miuread-v1.1.15-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.15/miuread-v1.1.15-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.15/miuread-v1.1.15-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.15/miuread-v1.1.15-full.zip"
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip"
   ],
-  "size": 141483,
-  "sha256": "c22c5bba6f89b1d5233fdd9cc12355fe6172452cf7f7ba07738ff397b7ade707",
-  "notes": "由 GitHub Actions 自动生成并发布的全量更新包。"
+  "size": 141748,
+  "sha256": "863a80356ce147439d0e2ec4538d38f9c073843dec3e35ddee9390346eb38071",
+  "notes": "修复脚注图标 note.png 缺失时被误判为正文图片不完整的问题；正文插图完整性检查保持不变。"
 }
