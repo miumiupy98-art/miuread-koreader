@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 {
   "version": "1.1.26",
   "name": "觅阅 · 微信读书助手 1.1.26",
@@ -12,8 +11,5 @@
   ],
   "size": 149244,
   "sha256": "69fc3dfb7ddcdebfdae3da6dbd9cc461979a0dce8d12c725a37945398fb07c0a",
-  "notes": "更新清单改为从仓库固定地址读取；Release 仅保留完整安装包。"
+  "notes": "由 GitHub Actions 自动生成并发布的全量更新包。"
 }
-=======
-
->>>>>>> 3e2d11ea0b979399b16faf3a275584e71bb875d6
