@@ -2,11 +2,6 @@ name: Release full package
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag, for example v1.1.26"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -18,56 +13,83 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ inputs.tag }}
 
     steps:
-      - name: Check out latest main
-        uses: actions/checkout@v4
+      - name: Check out main
+        uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Validate source and version
+      - name: Read plugin version
         shell: bash
         run: |
           set -euo pipefail
 
-          [[ "$RELEASE_TAG" == v* ]]
-          VERSION="${RELEASE_TAG#v}"
-          test -n "$VERSION"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
 
-          test -d miuread.koplugin
-          test -f miuread.koplugin/main.lua
-          test -f miuread.koplugin/_meta.lua
-          test -f miuread.koplugin/miuread/config.lua
+          config_path = Path("miuread.koplugin/miuread/config.lua")
+          meta_path = Path("miuread.koplugin/_meta.lua")
 
-          grep -Fq "version = \"$VERSION\"" miuread.koplugin/_meta.lua
-          grep -Fq "VERSION = \"$VERSION\"" miuread.koplugin/miuread/config.lua
-          grep -Fq '觅阅 · 微信读书助手' miuread.koplugin/_meta.lua
+          if not config_path.is_file():
+              print(f"::error::缺少文件：{config_path}")
+              sys.exit(1)
 
-          if find miuread.koplugin -type f \( -iname '*.md' -o -name '.DS_Store' \) | grep -q .; then
-            echo "Package contains forbidden files."
-            exit 1
-          fi
+          if not meta_path.is_file():
+              print(f"::error::缺少文件：{meta_path}")
+              sys.exit(1)
 
-          if find miuread.koplugin -type f \( \
-              -iname '*.epub' -o \
-              -iname '*.log' -o \
-              -name 'miuread.lua' -o \
-              -name 'settings.reader.lua' \
-          \) | grep -q .; then
-            echo "Package may contain user data or runtime files."
-            exit 1
-          fi
+          config_text = config_path.read_text(encoding="utf-8")
+          meta_text = meta_path.read_text(encoding="utf-8")
 
-      - name: Build full package and update manifest
+          config_match = re.search(
+              r'\bVERSION\s*=\s*["\']([0-9]+\.[0-9]+\.[0-9]+)["\']',
+              config_text,
+          )
+          meta_match = re.search(
+              r'\bversion\s*=\s*["\']([0-9]+\.[0-9]+\.[0-9]+)["\']',
+              meta_text,
+          )
+
+          if not config_match:
+              print("::error::无法从 config.lua 读取版本号。")
+              sys.exit(1)
+
+          if not meta_match:
+              print("::error::无法从 _meta.lua 读取版本号。")
+              sys.exit(1)
+
+          config_version = config_match.group(1)
+          meta_version = meta_match.group(1)
+
+          if config_version != meta_version:
+              print(
+                  "::error::版本号不一致："
+                  f"config.lua={config_version}, "
+                  f"_meta.lua={meta_version}"
+              )
+              sys.exit(1)
+
+          with Path("release.env").open("w", encoding="utf-8") as handle:
+              handle.write(f"VERSION={config_version}\n")
+              handle.write(f"RELEASE_TAG=v{config_version}\n")
+              handle.write(
+                  f"PACKAGE_NAME=miuread-v{config_version}-full.zip\n"
+              )
+
+          print(f"准备发布：v{config_version}")
+          PY
+
+          cat release.env >> "$GITHUB_ENV"
+
+      - name: Build full package
         shell: bash
         run: |
           set -euo pipefail
 
-          VERSION="${RELEASE_TAG#v}"
-          export VERSION
           mkdir -p dist
 
           python3 - <<'PY'
@@ -76,36 +98,68 @@ jobs:
           import hashlib
           import json
           import os
+          import sys
 
           version = os.environ["VERSION"]
+          package_name = os.environ["PACKAGE_NAME"]
           repo = os.environ["GITHUB_REPOSITORY"]
+
           root = Path("miuread.koplugin")
-          output = Path("dist") / f"miuread-v{version}-full.zip"
+          output = Path("dist") / package_name
           fixed_time = (2020, 1, 1, 0, 0, 0)
 
-          with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
-              directories = [root] + sorted(
-                  [path for path in root.rglob("*") if path.is_dir()],
-                  key=lambda path: path.as_posix(),
+          if not root.is_dir():
+              print(f"::error::缺少插件目录：{root}")
+              sys.exit(1)
+
+          excluded_names = {
+              ".DS_Store",
+              "miuread.lua",
+              "settings.reader.lua",
+          }
+          excluded_suffixes = {
+              ".md",
+              ".epub",
+              ".log",
+          }
+
+          def excluded(path):
+              return (
+                  "__MACOSX" in path.parts
+                  or path.name in excluded_names
+                  or path.suffix.lower() in excluded_suffixes
               )
+
+          with ZipFile(
+              output,
+              "w",
+              compression=ZIP_DEFLATED,
+              compresslevel=9,
+          ) as archive:
+              directories = [root] + sorted(
+                  [p for p in root.rglob("*") if p.is_dir()],
+                  key=lambda p: p.as_posix(),
+              )
+
               for path in directories:
-                  info = ZipInfo(path.as_posix().rstrip("/") + "/", fixed_time)
+                  info = ZipInfo(
+                      path.as_posix().rstrip("/") + "/",
+                      fixed_time,
+                  )
                   info.create_system = 3
                   info.external_attr = (0o40755 << 16) | 0x10
                   archive.writestr(info, b"")
 
               files = sorted(
-                  [path for path in root.rglob("*") if path.is_file()],
-                  key=lambda path: path.as_posix(),
+                  [
+                      p
+                      for p in root.rglob("*")
+                      if p.is_file() and not excluded(p)
+                  ],
+                  key=lambda p: p.as_posix(),
               )
-              for path in files:
-                  if (
-                      path.suffix.lower() == ".md"
-                      or path.name == ".DS_Store"
-                      or "__MACOSX" in path.parts
-                  ):
-                      continue
 
+              for path in files:
                   info = ZipInfo(path.as_posix(), fixed_time)
                   info.create_system = 3
                   info.external_attr = 0o100644 << 16
@@ -113,10 +167,9 @@ jobs:
                   archive.writestr(info, path.read_bytes())
 
           payload = output.read_bytes()
-          filename = output.name
           official = (
               f"https://github.com/{repo}/releases/download/"
-              f"v{version}/{filename}"
+              f"v{version}/{package_name}"
           )
 
           manifest = {
@@ -132,68 +185,155 @@ jobs:
               ],
               "size": len(payload),
               "sha256": hashlib.sha256(payload).hexdigest(),
-              "notes": "Release 仅发布完整安装包；更新清单保存在仓库根目录。",
+              "notes": (
+                  "Release 仅发布完整安装包；"
+                  "update.json 保存在仓库根目录。"
+              ),
           }
 
           Path("dist/update.json").write_text(
-              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              json.dumps(
+                  manifest,
+                  ensure_ascii=False,
+                  indent=2,
+              ) + "\n",
               encoding="utf-8",
           )
+
+          print(f"已生成：{output}")
+          print(f"大小：{len(payload)}")
+          print(f"SHA-256：{manifest['sha256']}")
           PY
 
-          unzip -t "dist/miuread-v${VERSION}-full.zip"
-          test "$(unzip -Z1 "dist/miuread-v${VERSION}-full.zip" \
-            | grep -vc '^miuread\.koplugin/')" -eq 0
+      - name: Verify package
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          test ! -e "dist/miuread-v${VERSION}-full.zip.sha256"
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import os
+          import sys
 
-      - name: Create or clean GitHub Release
+          package = Path("dist") / os.environ["PACKAGE_NAME"]
+
+          if not package.is_file():
+              print(f"::error::未生成完整包：{package}")
+              sys.exit(1)
+
+          required = {
+              "miuread.koplugin/_meta.lua",
+              "miuread.koplugin/main.lua",
+              "miuread.koplugin/miuread/config.lua",
+          }
+          forbidden_names = {
+              ".DS_Store",
+              "miuread.lua",
+              "settings.reader.lua",
+          }
+          forbidden_suffixes = {
+              ".md",
+              ".epub",
+              ".log",
+          }
+
+          with ZipFile(package) as archive:
+              names = archive.namelist()
+              bad_file = archive.testzip()
+
+          errors = []
+
+          if bad_file:
+              errors.append(f"ZIP 文件损坏：{bad_file}")
+
+          missing = sorted(required.difference(names))
+          errors.extend(f"缺少文件：{name}" for name in missing)
+
+          for name in names:
+              path = Path(name)
+
+              if not name.startswith("miuread.koplugin/"):
+                  errors.append(f"根目录错误：{name}")
+
+              if (
+                  path.name in forbidden_names
+                  or path.suffix.lower() in forbidden_suffixes
+                  or "__MACOSX" in path.parts
+              ):
+                  errors.append(f"不应进入安装包：{name}")
+
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+
+          print(f"安装包检查通过，共 {len(names)} 个条目。")
+          PY
+
+      - name: Create or update Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          VERSION="${RELEASE_TAG#v}"
-          FILE="dist/miuread-v${VERSION}-full.zip"
-          ASSET="$(basename "$FILE")"
+          FILE="dist/$PACKAGE_NAME"
 
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            while IFS= read -r OLD_ASSET; do
-              test -n "$OLD_ASSET" || continue
-              if [ "$OLD_ASSET" != "$ASSET" ]; then
-                gh release delete-asset "$RELEASE_TAG" "$OLD_ASSET" --yes
-              fi
+            while IFS= read -r asset; do
+              [ -n "$asset" ] || continue
+              echo "删除旧 Asset：$asset"
+              gh release delete-asset \
+                "$RELEASE_TAG" \
+                "$asset" \
+                --yes
             done < <(
               gh release view "$RELEASE_TAG" \
                 --json assets \
                 --jq '.assets[].name'
             )
 
-            gh release upload "$RELEASE_TAG" "$FILE" --clobber
+            gh release upload "$RELEASE_TAG" "$FILE"
           else
-            gh release create "$RELEASE_TAG" "$FILE" \
+            gh release create \
+              "$RELEASE_TAG" \
+              "$FILE" \
               --target main \
-              --title "觅阅 · 微信读书助手 ${VERSION}" \
-              --notes "全量更新包。安装与在线更新使用同一个文件。"
+              --title "觅阅 MiuRead v$VERSION" \
+              --notes "全量更新包"
           fi
 
-          mapfile -t RELEASE_ASSETS < <(
+          asset_count="$(
             gh release view "$RELEASE_TAG" \
               --json assets \
-              --jq '.assets[].name'
-          )
+              --jq '.assets | length'
+          )"
 
-          test "${#RELEASE_ASSETS[@]}" -eq 1
-          test "${RELEASE_ASSETS[0]}" = "$ASSET"
+          asset_name="$(
+            gh release view "$RELEASE_TAG" \
+              --json assets \
+              --jq '.assets[0].name'
+          )"
 
-      - name: Publish update.json to repository root
+          if [ "$asset_count" != "1" ]; then
+            echo "::error::Release 中存在 $asset_count 个上传文件，应为 1 个。"
+            exit 1
+          fi
+
+          if [ "$asset_name" != "$PACKAGE_NAME" ]; then
+            echo "::error::Release 文件名错误：$asset_name"
+            exit 1
+          fi
+
+          echo "Release 检查通过：$PACKAGE_NAME"
+
+      - name: Update repository manifest
         shell: bash
         run: |
           set -euo pipefail
 
-          git fetch origin main
-          git switch -C main origin/main
+          git pull --rebase origin main
           cp dist/update.json update.json
 
           git config user.name "github-actions[bot]"
@@ -203,8 +343,8 @@ jobs:
           git add update.json
 
           if git diff --cached --quiet; then
-            echo "update.json is unchanged."
+            echo "update.json 无变化。"
           else
-            git commit -m "Update release manifest to ${RELEASE_TAG}"
+            git commit -m "Update manifest to $RELEASE_TAG"
             git push origin main
           fi
