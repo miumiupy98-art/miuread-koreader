@@ -3,20 +3,7 @@
   "name": "觅阅 1.1.25",
   "notes": "阅读时间同步相关提醒统一改为底部正中间单行显示；新增“阅读时间同步弹窗提醒”开关，关闭后不再显示后台启动、上传成功和连续失败提醒。",
   "package_type": "full",
-<<<<<<< HEAD
   "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/latest/download/miuread-v1.1.25-full.zip",
   "sha256": "4777e836faac11a7b5fac0042168c76117e02b1594fb3e04756e38c149ec0b04",
   "size": 148618
-=======
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
-  "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.16/miuread-v1.1.16-full.zip"
-  ],
-  "size": 141748,
-  "sha256": "863a80356ce147439d0e2ec4538d38f9c073843dec3e35ddee9390346eb38071",
-  "notes": "由 GitHub Actions 自动生成并发布的全量更新包。"
->>>>>>> 9b67e898d24afaae9701300d38849ec72d804731
 }
