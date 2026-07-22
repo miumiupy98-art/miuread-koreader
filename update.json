@@ -9,7 +9,7 @@
     "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.27/miuread-v1.1.27-full.zip",
     "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v1.1.27/miuread-v1.1.27-full.zip"
   ],
-  "size": 149244,
-  "sha256": "7c33b57d8ec39cde8abf61aa3f420a49b33b48db653e815cdf69d894c30687db",
+  "size": 150942,
+  "sha256": "8a227647593bf15f3022f259560c903fdc1119dc41022b331c21c8833349d73f",
   "notes": "Release 仅发布完整安装包；更新清单保存在仓库根目录。"
 }
