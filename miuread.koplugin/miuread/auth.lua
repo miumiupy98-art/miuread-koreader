@@ -33,6 +33,9 @@ end
 local function merge_auth_headers(jar,vid,key)
     return {Accept="application/json, text/plain, */*",Referer=BASE.."/r/weread-skills",Cookie=Cookies.header(jar),["X-Vid"]=vid,["X-Skey"]=key}
 end
+local function skill_api_key(value)
+    return type(value)=="table" and type(value.apikey)=="string" and value.apikey or ""
+end
 function Auth:_close_dialog()
     if not self.dialog then return end
     local d=self.dialog; self.dialog=nil; self.closing=true; UIManager:close(d); self.closing=false
@@ -78,7 +81,15 @@ function Auth:_finish(data)
     jar=Cookies.absorb(jar,header_value(user_headers,"set-cookie"))
     local skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet?only_show=1",{auth=false,headers=merge_auth_headers(jar,vid,key)})
     jar=Cookies.absorb(jar,header_value(skill_headers,"set-cookie"))
-    local api_key=tostring(skill.apikey or ""); if api_key=="" then error("No WeRead Skill API key returned") end
+    local api_key=skill_api_key(skill)
+    if api_key=="" then
+        -- only_show=1 never creates a key. New Skills users receive
+        -- { isEmpty = true } until the creation endpoint is requested.
+        skill,skill_headers=self.http:get_json(BASE.."/api/skills/apikeyGet",{auth=false,headers=merge_auth_headers(jar,vid,key)})
+        jar=Cookies.absorb(jar,header_value(skill_headers,"set-cookie"))
+        api_key=skill_api_key(skill)
+    end
+    if api_key=="" then error("No WeRead Skill API key returned") end
     self.store:save_auth({api_key=api_key,cookies=jar,account={name=tostring(user.name or ""),vid=vid,logged_at=os.time()}})
     logger.info("[MiuRead][Auth] stable cookies saved", "names=", table.concat(Cookies.names(jar), ","))
     return user.name or vid
