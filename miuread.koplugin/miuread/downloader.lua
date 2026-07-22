@@ -2,6 +2,7 @@ local Protocol = require("miuread.protocol")
 local Codec = require("miuread.codec")
 local Footnotes = require("miuread.footnotes")
 local Thoughts = require("miuread.thoughts")
+local AnnotationStyle = require("miuread.annotation_style")
 local Epub = require("miuread.epub")
 local Json = require("miuread.json")
 local U = require("miuread.util")
@@ -18,10 +19,35 @@ Downloader.__index = Downloader
 local CACHE_SCHEMA = 5
 
 local BASE_CSS = [[
-body { line-height: 1.75; margin: 5%; }
+body { margin: 0; }
 img { max-width: 100%; height: auto; }
 .miu-chapter { display: block; page-break-before: always; break-before: page; }
 .miu-chapter-title { font-size: 1.55em; font-weight: bold; line-height: 1.35; margin: 1.2em 0 .9em 0; page-break-before: always; break-before: page; }
+]]
+
+-- WeRead serves publisher CSS for regular books, while official-account
+-- collections arrive as lightly styled HTML. Apply one final typography layer
+-- after both paths so KOReader remains in charge of the reading font, line
+-- spacing and CJK width/word spacing. Structural styles (alignment, indents,
+-- headings, images and page breaks) are intentionally preserved.
+local READER_CONTROL_CSS = [[
+/* MIUREAD_READER_CONTROL_BEGIN */
+html, body, article, section, div, p, span, li, blockquote,
+h1, h2, h3, h4, h5, h6, td, th {
+    font-family: inherit !important;
+    letter-spacing: normal !important;
+    word-spacing: normal !important;
+}
+body {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: normal !important;
+}
+p, div, article, section, li, blockquote, td, th {
+    line-height: inherit !important;
+}
+pre, code, kbd, samp { font-family: monospace !important; }
+/* MIUREAD_READER_CONTROL_END */
 ]]
 
 local function normalized_book(value)
@@ -39,6 +65,18 @@ end
 local function css_add(list, seen, css)
     css = tostring(css or "")
     if css ~= "" and not seen[css] then seen[css] = true; list[#list + 1] = css end
+end
+
+local function final_css(list, seen)
+    css_add(list, seen, READER_CONTROL_CSS)
+    -- A publisher may return a slightly different full stylesheet for each
+    -- chapter. Concatenating those styles also concatenates the annotation
+    -- rules, so a stale solid-underline rule can end up after the dashed one.
+    -- Normalize the completed stylesheet once, after every chapter style has
+    -- been collected, leaving exactly one annotation block at the true end.
+    local css = table.concat(list, "\n")
+    local rewritten = AnnotationStyle.rewrite_css(css)
+    return rewritten
 end
 
 local function plain(value)
@@ -816,7 +854,7 @@ function Downloader:book(input, opt, progress)
         progress("package", #chapters, expected, book.title)
         opt.expected_chapter_count = expected
         opt.checkpointed = true
-        local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
+        local record = self:_save(book, chapters, assets, final_css(css_list, css_seen), self:_cover(book, true), opt, failures, session)
         record.annotation_summary = annotation_summary
         U.remove_tree(cache.root)
         return record
@@ -828,7 +866,7 @@ function Downloader:book(input, opt, progress)
     progress("package", #chapters, expected, book.title)
     opt.expected_chapter_count = expected
     opt.checkpointed = false
-    local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session)
+    local record = self:_save(book, chapters, assets, final_css(css_list, css_seen), self:_cover(book, true), opt, failures, session)
     record.annotation_summary = annotation_summary
     return record
 end
@@ -838,5 +876,7 @@ Downloader._namespace_assets = namespace_assets
 Downloader._catalog_signature = catalog_signature
 Downloader._option_key = option_key
 Downloader._validate_epub = validate_epub
+Downloader._reader_control_css = READER_CONTROL_CSS
+Downloader._final_css = final_css
 
 return Downloader

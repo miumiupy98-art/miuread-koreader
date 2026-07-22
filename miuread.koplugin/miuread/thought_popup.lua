@@ -14,7 +14,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 
 local function screen_ratios()
-    return 0.91, 0.60
+    return 0.92, 0.68
 end
 
 local function safe_margins()
@@ -57,8 +57,8 @@ function Popup:init()
 
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     local auto_w, auto_h = screen_ratios()
-    local width_ratio = math.max(0.86, math.min(0.92, tonumber(self.width_ratio) or auto_w))
-    local height_ratio = math.max(0.48, math.min(0.64, tonumber(self.height_ratio) or auto_h))
+    local width_ratio = math.max(0.88, math.min(0.95, tonumber(self.width_ratio) or auto_w))
+    local height_ratio = math.max(0.54, math.min(0.72, tonumber(self.height_ratio) or auto_h))
     local side_margin, vertical_margin = safe_margins()
 
     self.width = math.min(math.floor(screen_w * width_ratio), screen_w - side_margin * 2)
@@ -141,10 +141,10 @@ function Popup:_source_height(width, max_height)
         or tonumber(metrics.source_chars)
         or 1
 
-    -- The source text is rendered at .68em. Account for the HTML body and
+    -- The source text is rendered at .88em. Account for the HTML body and
     -- source-box horizontal padding, then estimate the actual wrapped lines.
-    local source_font = math.max(1, self.font_size * 0.68)
-    local horizontal_padding = self.font_size * (0.52 + 0.46) + Screen:scaleBySize(4)
+    local source_font = math.max(1, self.font_size * 0.88)
+    local horizontal_padding = self.font_size * (0.52 + 1.16) + Screen:scaleBySize(6)
     local usable_width = math.max(source_font * 6, width - horizontal_padding)
     local units_per_line = math.max(6, usable_width / source_font)
     local lines = math.max(1, math.min(3, math.ceil(source_units / units_per_line - 0.001)))
@@ -153,9 +153,9 @@ function Popup:_source_height(width, max_height)
     -- padding/border and the real number of source lines. A small safety pad
     -- avoids clipping from font rounding without leaving a blank viewport.
     local body_padding = self.font_size * (0.18 + 0.20)
-    local heading_height = self.font_size * (0.52 * 1.02 + 0.16)
-    local source_lines = lines * self.font_size * 0.68 * 1.15
-    local box_padding = self.font_size * (0.17 * 2) + 2
+    local heading_height = self.font_size * (0.82 * 1.10 + 0.32 + 0.26)
+    local source_lines = lines * self.font_size * 0.88 * 1.42
+    local box_padding = self.font_size * (0.40 * 2) + 3
     local safety = math.max(2, Screen:scaleBySize(3))
     local estimated = math.ceil(body_padding + heading_height + source_lines + box_padding + safety)
 
@@ -167,8 +167,8 @@ function Popup:_build()
 
     local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
     local border = math.max(1, tonumber(Size.border.window) or 1)
-    local padding = math.max(4, Screen:scaleBySize(4))
-    local close_size = math.max(Screen:scaleBySize(18), math.floor(self.font_size * 0.62))
+    local padding = math.max(7, Screen:scaleBySize(7))
+    local close_size = math.max(Screen:scaleBySize(24), math.floor(self.font_size * 0.82))
     local close_inset = math.max(4, Screen:scaleBySize(5))
     local inner_w = self.width - padding * 2 - border * 2
     local max_inner_h = self.max_height - padding * 2 - border * 2
@@ -244,7 +244,7 @@ function Popup:_build()
         padding = 0,
         bordersize = 0,
         text_font_face = "cfont",
-        text_font_size = math.max(13, math.floor(self.font_size * 0.50)),
+        text_font_size = math.max(16, math.floor(self.font_size * 0.62)),
         text_font_bold = true,
         show_parent = self,
         callback = function() self:_request_close() end,

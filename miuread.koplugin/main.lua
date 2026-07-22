@@ -1644,6 +1644,42 @@ function Plugin:_thought_font_size(level)
     local factor=factors[tostring(level or "standard")] or 1
     return Device.screen:scaleBySize(math.floor(base*factor+.5))
 end
+function Plugin:_thought_font_face()
+    local ui=self.ui
+    local face=ui and ui.font and ui.font.font_face
+    if type(face)=="string" and U.trim(face)~="" then return U.trim(face) end
+    local doc=ui and ui.document
+    if doc and type(doc.getFontFace)=="function" then
+        local ok,value=pcall(doc.getFontFace,doc)
+        if ok and type(value)=="string" and U.trim(value)~="" then return U.trim(value) end
+    end
+    if _G.G_reader_settings and _G.G_reader_settings.readSetting then
+        local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"cre_font")
+        if ok and type(value)=="string" and U.trim(value)~="" then return U.trim(value) end
+    end
+    return "serif"
+end
+function Plugin:_thought_popup_css()
+    local face=self:_thought_font_face()
+    local definitions,seen={},{ }
+    local ok,cre=pcall(function() return require("document/credocument"):engineInit() end)
+    if ok and cre and type(cre.getFontFaceFilenameAndFaceIndex)=="function" then
+        for index=1,4 do
+            local bold=index>=3
+            local italic=index==2 or index==4
+            local got,path=pcall(cre.getFontFaceFilenameAndFaceIndex,face,bold,italic)
+            if got and type(path)=="string" and path~="" and not seen[path] then
+                seen[path]=true
+                local safe=path:gsub("\\","\\\\"):gsub('"','\\"'):gsub("[%c]","")
+                definitions[#definitions+1]='@font-face{font-family:"MiuReadThoughtFont";src:url("'..safe..'")'
+                    ..(bold and ";font-weight:bold" or "")
+                    ..(italic and ";font-style:italic" or "").."}"
+            end
+        end
+    end
+    if #definitions>0 then face="MiuReadThoughtFont" end
+    return Thoughts.popup_css(face,table.concat(definitions,"\n"))
+end
 function Plugin:_show_thought_href(href)
     local info=Thoughts.parse_href(href); if not info then return false end
     local group,err=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
@@ -1657,7 +1693,7 @@ function Plugin:_show_thought_href(href)
         font_size=self:_thought_font_size(prefs.font),
         width_ratio=tonumber(prefs.width_ratio) or 0.91,
         height_ratio=tonumber(prefs.height_ratio) or 0.60,
-        css=Thoughts.popup_css(),
+        css=self:_thought_popup_css(),
         metrics=metrics,
     }
     return true
