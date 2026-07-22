@@ -1,26 +1,30 @@
 local M = {}
 
-M.MARKER_BEGIN = "/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */"
-M.MARKER_END = "/* MIUREAD_ANNOTATION_STYLE_V2_END */"
+M.MARKER_BEGIN = "/* MIUREAD_ANNOTATION_STYLE_V4_BEGIN */"
+M.MARKER_END = "/* MIUREAD_ANNOTATION_STYLE_V4_END */"
+M.LINK_INLINE_STYLE = "text-decoration:none; border-bottom:0; color:inherit;"
+M.MARK_INLINE_STYLE = "text-decoration:none; border-bottom:2px dashed #555; padding-bottom:2px; color:inherit;"
 
--- Keep this intentionally close to the proven weread implementation.
--- The thought text uses its own class, so it can never inherit the solid
--- underline rule used by ordinary WeRead marks.
+-- Use one unmistakable style for every WeRead mark. Publisher styles and
+-- KOReader's default link decoration must not turn thought links into solid
+-- or double underlines.
 M.CSS = [[
-/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */
+/* MIUREAD_ANNOTATION_STYLE_V4_BEGIN */
 .miu-inline-mark {
-    text-decoration: underline;
+    text-decoration: none;
+    border-bottom: 2px dashed #555;
+    padding-bottom: 2px;
 }
 .miu-thought-link {
     text-decoration: none;
-    color: inherit;
-}
-.miu-thought-link .miu-thought-mark {
+    border-bottom: 0;
     color: inherit;
 }
 .miu-thought-mark {
-    border-bottom: 2px dashed #ff6b35;
+    text-decoration: none;
+    border-bottom: 2px dashed #555;
     padding-bottom: 2px;
+    color: inherit;
 }
 .miu-thought-star {
     font-size: 0;
@@ -29,11 +33,14 @@ M.CSS = [[
     padding: 0;
     color: transparent;
 }
-/* MIUREAD_ANNOTATION_STYLE_V2_END */
+/* MIUREAD_ANNOTATION_STYLE_V4_END */
 ]]
 
 local OLD_MARKERS = {
     {"/* MIUREAD_ANNOTATION_STYLE_REPAIR_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_REPAIR_END */"},
+    {"/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_V2_END */"},
+    {"/* MIUREAD_ANNOTATION_STYLE_V3_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_V3_END */"},
+    {"/* MIUREAD_UNIFIED_DASHED_MARKS_BEGIN */", "/* MIUREAD_UNIFIED_DASHED_MARKS_END */"},
     {M.MARKER_BEGIN, M.MARKER_END},
 }
 
@@ -150,11 +157,10 @@ end
 
 function M.css_is_current(css)
     css = tostring(css or "")
-    return css:find(M.MARKER_BEGIN, 1, true) ~= nil
-        and css:find(".miu-thought-mark", 1, true) ~= nil
-        and css:find("border-bottom: 2px dashed #ff6b35;", 1, true) ~= nil
-        and css:find(".miu-inline-mark.miu-has-thought", 1, true) == nil
-        and css:find(".miu-thought-link .miu-inline-mark", 1, true) == nil
+    local rewritten = M.rewrite_css(css)
+    return rewritten == css
+        and css:find(M.MARKER_BEGIN, 1, true) ~= nil
+        and css:find("border-bottom: 2px dashed #555;", 1, true) ~= nil
 end
 
 return M

@@ -444,12 +444,15 @@ local function render_text_token(token, marks, data)
             if active then
                 if active.thought then
                     local href = Thoughts.href(data.book_id, data.chapter_uid, active.key)
-                    out[#out + 1] = '<a class="miu-thought-link" href="' .. href .. '">'
+                    out[#out + 1] = '<a class="miu-thought-link" style="' .. AnnotationStyle.LINK_INLINE_STYLE
+                        .. '" href="' .. href .. '">'
                     active_id_written = true
                 end
                 local mark_class = Thoughts.mark_class(active.key)
                 local display_class = active.thought and "miu-thought-mark" or "miu-inline-mark"
-                out[#out + 1] = '<span class="' .. display_class .. ' ' .. mark_class .. '" data-miu-range="' .. active.key .. '">'
+                out[#out + 1] = '<span class="' .. display_class .. ' ' .. mark_class
+                    .. '" style="' .. AnnotationStyle.MARK_INLINE_STYLE .. '" data-miu-range="'
+                    .. active.key .. '">'
             end
         end
         out[#out + 1] = unit

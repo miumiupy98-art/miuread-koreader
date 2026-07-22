@@ -248,7 +248,8 @@ local function panel_head_html(title)
 end
 
 local function source_box_html(text)
-    return '<div class="miu-source"><div class="miu-source-box">' .. U.xml(text or "") .. '</div></div>'
+    return '<div class="miu-source"><div class="miu-source-box"><span class="miu-quote">&#8220;</span>'
+        .. U.xml(text or "") .. '<span class="miu-quote">&#8221;</span></div></div>'
 end
 
 local function entry_html(item)
@@ -302,17 +303,15 @@ function Thoughts.popup_parts(group)
         return "", "", {source_chars=0, source_units=0, comment_count=0, comment_chars={}}
     end
 
-    local fixed, body = {}, {}
+    local fixed, comments = {}, {}
     local metrics = {source_chars=0, source_units=0, comment_count=0, comment_chars={}}
     local abstract = Thoughts.group_abstract(group)
     if abstract ~= "" then
         local source = preview(abstract, 72)
         metrics.source_chars = codepoint_len(source)
         metrics.source_units = display_units(source)
-        fixed[#fixed + 1] = panel_head_html("正文")
+        fixed[#fixed + 1] = panel_head_html("原文")
         fixed[#fixed + 1] = source_box_html(source)
-    else
-        body[#body + 1] = panel_head_html("评论")
     end
 
     local seen = {}
@@ -327,13 +326,18 @@ function Thoughts.popup_parts(group)
                 seen[key] = true
                 metrics.comment_count = metrics.comment_count + 1
                 metrics.comment_chars[#metrics.comment_chars + 1] = codepoint_len(content)
-                body[#body + 1] = entry_html{
+                comments[#comments + 1] = entry_html{
                     author = author,
                     content = content,
                     likes = tonumber(item.likes or 0) or 0,
                 }
             end
         end
+    end
+    local body = {}
+    if metrics.comment_count > 0 then
+        body[1] = panel_head_html("想法 · " .. tostring(metrics.comment_count))
+        for _, html in ipairs(comments) do body[#body + 1] = html end
     end
     return table.concat(fixed), table.concat(body), metrics
 end
@@ -343,20 +347,30 @@ function Thoughts.full_html(group)
     return fixed .. body, metrics
 end
 
-function Thoughts.popup_css()
-    return [[
+local function css_font_family(value)
+    local face = clean(value)
+    if face == "" then return "serif" end
+    face = face:gsub("\\", "\\\\"):gsub('"', '\\"')
+    return '"' .. face .. '", serif'
+end
+
+function Thoughts.popup_css(font_face, font_definitions)
+    return tostring(font_definitions or "") .. [[
 @page{margin:0}
 html{margin:0!important;padding:0!important}
-body{margin:0!important;padding:.18em .26em .20em .26em!important;font-family:sans-serif;line-height:1.18;color:#000;background:#fff}
-.miu-panel-head{font-size:.52em;font-weight:normal;line-height:1.02;color:#555;margin:0 1.9em .16em 0;padding:0}
+body{margin:0!important;padding:.18em .26em .20em .26em!important;font-family:]]
+        .. css_font_family(font_face)
+        .. [[;line-height:1.18;color:#000;background:#fff}
+.miu-panel-head{font-size:.82em;font-weight:bold;line-height:1.10;color:#111;margin:0 2.4em .32em 0;padding:0 0 .26em 0;border-bottom:2px solid #222}
 .miu-source{margin:0;padding:0}
-.miu-source-box{font-size:.68em;line-height:1.15;color:#444;margin:0;padding:.17em .23em;border:1px solid #aaa}
-.miu-comment{margin:0;padding:.14em 0 .13em 0;border:0;page-break-inside:avoid;break-inside:avoid-page}
-.miu-comment+.miu-comment{margin-top:.13em;padding-top:.18em;border-top:1px solid #c8c8c8}
-.miu-meta{margin:0;padding:0;line-height:1.02;page-break-after:avoid}
-.miu-author{font-size:.49em;font-weight:normal;color:#666;line-height:1.02}
-.miu-likes{font-size:.47em;font-weight:normal;color:#777;line-height:1.02;white-space:nowrap}
-.miu-content{font-size:.80em;line-height:1.20;margin:.07em 0 0 0;padding:0 0 .08em 0;page-break-before:avoid;orphans:2;widows:2}
+.miu-source-box{font-size:.88em;line-height:1.42;color:#333;margin:0;padding:.40em .58em;background:#eee;border-left:3px solid #333}
+.miu-quote{font-weight:bold;color:#555}
+.miu-comment{margin:0;padding:.42em .08em .48em .08em;border:0;page-break-inside:avoid;break-inside:avoid-page}
+.miu-comment+.miu-comment{padding-top:.52em;border-top:1px solid #aaa}
+.miu-meta{margin:0;padding:0;line-height:1.12;page-break-after:avoid}
+.miu-author{font-size:.72em;font-weight:bold;color:#333;line-height:1.12}
+.miu-likes{font-size:.66em;font-weight:normal;color:#666;line-height:1.12;white-space:nowrap}
+.miu-content{font-size:1em;line-height:1.48;margin:.22em 0 0 0;padding:0;page-break-before:avoid;orphans:2;widows:2}
 ]]
 end
 return Thoughts
