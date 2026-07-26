@@ -33,6 +33,61 @@ local function serializable_copy(value, seen)
     return out
 end
 
+-- Android 12 起，系统会监控并杀死应用 fork() 出来的“幻影进程”（phantom
+-- process）。被 SIGKILL 杀掉的子进程不会留下任何 Lua 错误或崩溃日志，表现
+-- 就是下载跑几章后突然中断。更致命的是 EPUB 打包阶段无法断点续传，子进程
+-- 根本活不到打包结束，因此在 Android 上必须放弃 fork，改为主进程内协程分片。
+local function fork_is_reliable()
+    local ok, is_android = pcall(function() return Device:isAndroid() end)
+    if ok and is_android == true then return false end
+    return true
+end
+
+-- 进度状态构造：fork 模式与前台协程模式共用，保证两条路径产出的字段完全一致
+local function progress_state(stage, current, total, chapter, detail)
+    detail = detail or {}
+    local percent
+    if stage == "package" then
+        percent = 0.96
+    elseif total and total > 0 then
+        local base = (math.max(1, current) - 1) / total
+        local step = 0
+        if stage == "resume" then step = 0.90
+        elseif stage == "content" then step = 0.08
+        elseif stage == "underlines" then step = 0.35
+        elseif stage == "thoughts" then step = 0.55
+        elseif stage == "footnotes" then step = 0.75
+        elseif stage == "images" then step = 0.88 end
+        percent = math.min(0.94, base * 0.94 + step / total)
+    end
+    if stage == "package" then
+        detail.message = detail.message or "正在低内存生成并验证 EPUB"
+    end
+    return {
+        stage = stage,
+        current = current,
+        total = total,
+        chapter = chapter,
+        batch = detail.batch,
+        batch_total = detail.batches,
+        underlines = detail.underlines,
+        thoughts = detail.thoughts,
+        percent = percent,
+        message = detail.message,
+    }
+end
+
+-- 文件路径与行号在日志里有用，但在下载对话框里只会让人困惑，只保留原因
+local function friendly_error(raw)
+    local raw_error = tostring(raw)
+    local display = raw_error:match("^(.-)\nstack traceback:") or raw_error
+    display = display:gsub("^.-%.lua:%d+:%s*", "")
+    if raw_error:lower():find("not enough memory", 1, true) then
+        display = "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
+    end
+    return display
+end
+
 function DownloadTask:new(store)
     return setmetatable({
         store = store,
@@ -46,6 +101,15 @@ function DownloadTask:new(store)
         owner_path = store.temp_dir .. "/download-task-owner.json",
         owner_token = tostring(os.time()) .. "-" .. tostring(math.random(100000,999999)),
     }, self)
+end
+
+-- 是否使用前台协程模式。用户可在偏好里用 download_inline 强制开或强制关。
+function DownloadTask:_use_inline()
+    local ok, prefs = pcall(function() return self.store:preferences() end)
+    prefs = (ok and type(prefs) == "table") and prefs or {}
+    if prefs.download_inline == true then return true end
+    if prefs.download_inline == false then return false end
+    return not fork_is_reliable()
 end
 
 function DownloadTask:set_backgrounded(value)
@@ -99,6 +163,8 @@ end
 function DownloadTask:descriptor()
     local job=self.job
     if not job then return nil end
+    -- 前台协程任务不存在跨进程句柄，无法被其他实例接管
+    if job.inline then return nil end
     return {
         pid=job.pid,progress_path=job.progress_path,result_path=job.result_path,
         cancel_path=job.cancel_path,worker_settings_path=job.worker_settings_path,
@@ -137,6 +203,7 @@ function DownloadTask:_release_awake()
 end
 
 function DownloadTask:available()
+    if self:_use_inline() then return true end
     return type(FFIUtil.runInSubProcess) == "function"
         and type(FFIUtil.isSubProcessDone) == "function"
 end
@@ -204,12 +271,14 @@ function DownloadTask:_finish(job, forced_error)
     if self:_owns_job() then os.remove(self.owner_path) end
     self.job = nil
     self:_release_awake()
+    pcall(function() require("miuread.ratelimit").release() end)
     if job.on_done then job.on_done(result) end
 end
 
 function DownloadTask:_poll()
     local job = self.job
     if not job then return end
+    if job.inline then return end
     if not self:_owns_job() then
         logger.info("[MiuRead][DownloadTask] controller ownership transferred","pid=",tostring(job.pid))
         self.job=nil
@@ -273,13 +342,19 @@ end
 
 function DownloadTask:cancel()
     local job = self.job
-    if not job or job.cancel_requested_at or not self:_owns_job() then return end
+    if not job or job.cancel_requested_at then return end
+    if job.inline then
+        job.cancel_requested_at = os.time()
+        return
+    end
+    if not self:_owns_job() then return end
     job.cancel_requested_at = os.time()
     U.atomic_write(job.cancel_path, "1", true)
 end
 
 function DownloadTask:attach(descriptor,on_progress,on_done)
     if self.job then return false,"已有下载任务正在运行" end
+    if self:_use_inline() then return false,"当前平台使用前台下载，无后台任务可接管" end
     if not self:available() then return false,"当前 KOReader 不支持下载子进程" end
     descriptor=type(descriptor)=="table" and descriptor or nil
     local pid=descriptor and tonumber(descriptor.pid)
@@ -321,8 +396,143 @@ function DownloadTask:attach(descriptor,on_progress,on_done)
     return true
 end
 
+-- =====================================================================
+-- 前台协程模式：不 fork，在主进程内分片执行，规避 Android 幻影进程杀手
+-- =====================================================================
+function DownloadTask:_start_inline(book, options, on_progress, on_done)
+    local Http = require("miuread.http")
+    local Api = require("miuread.api")
+    local Reader = require("miuread.reader")
+    local Annotations = require("miuread.annotations")
+    local Downloader = require("miuread.downloader")
+
+    self.keep_awake_enabled = self.store:preferences().download_keep_awake ~= false
+
+    local store = self.store
+    local job = {
+        inline = true,
+        started_at = os.time(),
+        last_keepalive = 0,
+        last_progress_state = nil,
+        last_progress_at = nil,
+        cancel_requested_at = nil,
+        on_progress = on_progress,
+        on_done = on_done,
+    }
+    self.job = job
+
+    local http = Http:new(store)
+    local reader = Reader:new(http, store)
+    local api = Api:new(http, store, reader)
+    local annotations = Annotations:new(api)
+    local downloader = Downloader:new(reader, api, annotations, store, http)
+
+    -- 浅拷贝，避免把 cancelled 回调写回调用方的表里
+    local opts = {}
+    for k, v in pairs(options or {}) do opts[k] = v end
+    opts.cancelled = function() return job.cancel_requested_at ~= nil end
+
+    local function report(state)
+        state = state or {}
+        state.updated_at = os.time()
+        job.last_progress_state = state
+        job.last_progress_at = state.updated_at
+        if job.on_progress then pcall(job.on_progress, state) end
+    end
+
+    pcall(function()
+        require("miuread.ratelimit").configure{
+            cooperative = true,
+            interrupt = function() return job.cancel_requested_at ~= nil end,
+            notifier = function(remaining, attempt, total)
+                local snapshot = U.copy(job.last_progress_state or {}) or {}
+                snapshot.message = string.format(
+                    "接口访问过于频繁，%d 秒后自动重试（%d/%d）",
+                    math.floor(tonumber(remaining) or 0),
+                    tonumber(attempt) or 1, tonumber(total) or 1)
+                snapshot.updated_at = os.time()
+                if job.on_progress then pcall(job.on_progress, snapshot) end
+            end,
+        }
+    end)
+
+    local function finish(result)
+        if self.job ~= job then return end
+        self.job = nil
+        self:_release_awake()
+        pcall(function() require("miuread.ratelimit").release() end)
+        if job.on_done then job.on_done(result) end
+    end
+
+    local co = coroutine.create(function()
+        local ok, value = xpcall(function()
+            return downloader:book(book, opts, function(stage, current, total, chapter, detail)
+                report(progress_state(stage, current, total, chapter, detail))
+                -- 交还控制权，让界面重绘并处理“取消”点击。
+                -- LuaJIT 允许跨 pcall 让出；万一底层不支持，pcall 兜住后退化为
+                -- 纯阻塞执行，结果依然正确，只是界面在下载期间不响应。
+                pcall(coroutine.yield)
+            end)
+        end, debug.traceback)
+        return ok, value
+    end)
+
+    local pump
+    pump = function()
+        if self.job ~= job then return end
+        local now = os.time()
+        if not job.last_keepalive or now - job.last_keepalive >= 5 then
+            job.last_keepalive = now
+            self:_reset_device_timeout()
+        end
+
+        local resumed, ok, value = coroutine.resume(co)
+        if self.job ~= job then return end
+
+        if not resumed then
+            -- 协程自身出错（例如无法跨边界让出），ok 里是错误信息
+            local message = friendly_error(ok)
+            report{stage = "error", message = message}
+            finish{ok = false, error = message}
+            return
+        end
+
+        if coroutine.status(co) == "dead" then
+            if ok then
+                report{stage = "done", current = 1, total = 1, percent = 1,
+                       chapter = book.title or ""}
+                finish{
+                    ok = true,
+                    value = serializable_copy(value),
+                    auth = serializable_copy(store:auth()),
+                    session = serializable_copy(store:session(book.bookId)),
+                }
+            else
+                local message = friendly_error(value)
+                logger.warn("[MiuRead][DownloadTask] inline failed", tostring(value))
+                report{stage = job.cancel_requested_at and "cancelled" or "error",
+                       message = message}
+                finish{ok = false, error = message}
+            end
+            return
+        end
+
+        UIManager:scheduleIn(0.01, pump)
+    end
+
+    report(progress_state("prepare", 0, 1, book.title or "", nil))
+    self.backgrounded = false
+    self:_hold_awake()
+    logger.info("[MiuRead][DownloadTask] started inline (fork disabled on this platform)")
+    UIManager:scheduleIn(0, pump)
+    return true
+end
+
 function DownloadTask:start(book, options, on_progress, on_done)
     if self.job then return false, "已有下载任务正在运行" end
+    if self:_use_inline() then
+        return self:_start_inline(book, options, on_progress, on_done)
+    end
     if not self:available() then return false, "当前 KOReader 不支持下载子进程" end
 
     local stamp = tostring(os.time()) .. "-" .. tostring(math.random(10000, 99999))
@@ -352,13 +562,36 @@ function DownloadTask:start(book, options, on_progress, on_done)
         local UChild = require("miuread.util")
         local LoggerChild = require("logger")
 
-        local function emit(state)
+        local function write_progress(state)
             state = state or {}
             state.task_token = task_token
             state.updated_at = os.time()
             local ok, encoded = pcall(JsonChild.encode, state)
             if ok then UChild.atomic_write(progress_path, encoded, true) end
         end
+
+        local last_state = {}
+        local function emit(state)
+            state = state or {}
+            last_state = state
+            write_progress(state)
+        end
+
+        -- 限流退避期间每秒写一次进度，兼作心跳，避免父进程误判为“无响应”
+        pcall(function()
+            require("miuread.ratelimit").configure{
+                cooperative = false,
+                interrupt = function() return UChild.file_exists(cancel_path) end,
+                notifier = function(remaining, attempt, total)
+                    local snapshot = UChild.copy(last_state) or {}
+                    snapshot.message = string.format(
+                        "接口访问过于频繁，%d 秒后自动重试（%d/%d）",
+                        math.floor(tonumber(remaining) or 0),
+                        tonumber(attempt) or 1, tonumber(total) or 1)
+                    write_progress(snapshot)
+                end,
+            }
+        end)
 
         local ok, value = xpcall(function()
             local store = Store:new{
@@ -376,36 +609,7 @@ function DownloadTask:start(book, options, on_progress, on_done)
             end
             emit{stage = "prepare", current = 0, total = 1, chapter = clean_book.title or ""}
             local record = downloader:book(clean_book, clean_options, function(stage, current, total, chapter, detail)
-                detail = detail or {}
-                local percent
-                if stage == "package" then
-                    percent = 0.96
-                elseif total and total > 0 then
-                    local base = (math.max(1, current) - 1) / total
-                    local step = 0
-                    if stage == "resume" then step = 0.90
-                    elseif stage == "content" then step = 0.08
-                    elseif stage == "underlines" then step = 0.35
-                    elseif stage == "thoughts" then step = 0.55
-                    elseif stage == "footnotes" then step = 0.75
-                    elseif stage == "images" then step = 0.88 end
-                    percent = math.min(0.94, base * 0.94 + step / total)
-                end
-                if stage == "package" then
-                    detail.message = detail.message or "正在低内存生成并验证 EPUB"
-                end
-                emit{
-                    stage = stage,
-                    current = current,
-                    total = total,
-                    chapter = chapter,
-                    batch = detail.batch,
-                    batch_total = detail.batches,
-                    underlines = detail.underlines,
-                    thoughts = detail.thoughts,
-                    percent = percent,
-                    message = detail.message,
-                }
+                emit(progress_state(stage, current, total, chapter, detail))
             end)
             return {
                 record = record,
@@ -426,18 +630,19 @@ function DownloadTask:start(book, options, on_progress, on_done)
         else
             local raw_error = tostring(value)
             LoggerChild.warn("[MiuRead][DownloadTask] child failed", raw_error)
-            local display_error = raw_error:match("^(.-)\nstack traceback:") or raw_error
-            -- File paths and line numbers are useful in logs but confusing in
-            -- the download dialog. Keep the actual reason only.
-            display_error = display_error:gsub("^.-%.lua:%d+:%s*", "")
-            if raw_error:lower():find("not enough memory", 1, true) then
-                display_error = "设备内存不足，未生成新的 EPUB。原有完整书未被覆盖，已完成章节仍保存在断点缓存；再次下载时会继续。"
-            end
+            local display_error = friendly_error(raw_error)
             emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error", message = display_error}
             payload = {ok = false, error = display_error}
         end
-        local encoded = JsonChild.encode(payload)
-        UChild.atomic_write(result_path, encoded, true)
+        -- 结果写入必须绝对不能抛错，否则子进程会静默死亡、父进程只能报“异常退出”
+        local encoded_ok, encoded = pcall(JsonChild.encode, payload)
+        if not encoded_ok then
+            encoded_ok, encoded = pcall(JsonChild.encode,
+                {ok = false, error = "下载结果无法序列化：" .. tostring(encoded)})
+        end
+        if encoded_ok then
+            pcall(UChild.atomic_write, result_path, encoded, true)
+        end
     end
 
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
