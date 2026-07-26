@@ -269,5 +269,5 @@ end
 Http.auth_error_code = auth_error_code
 Http.auth_error_message = auth_error_message
 Http.is_auth_error = is_auth_error
-
+pcall(function() require("miuread.ratelimit").install(Http) end)
 return Http
