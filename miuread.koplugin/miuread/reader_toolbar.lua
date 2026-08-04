@@ -220,6 +220,7 @@ end
 function Toolbar:init()
     self.opts = self.opts or {}
     self.action_locked = false
+    self._swipe_armed = false -- 打开面板的同一次下滑仍会派发到面板，先禁用二次下滑
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
     local outer_margin = Skin.dp(10, 8, 18)
@@ -417,12 +418,32 @@ end
 
 function Toolbar:onSwipeDismiss(_, ges)
     if ges and ges.direction == "north" then return self:_close() end
+    if ges and ges.direction == "south" and self._swipe_armed == true
+        and type(self.opts.on_swipe_down) == "function" then
+        -- 觅阅面板已打开时再次从顶部下滑：交给原生 KOReader 菜单。
+        -- 限定在顶部条带内，避免占用面板下方区域的翻页下滑。
+        local start = ges.start_pos or ges.pos
+        local sh = Screen:getHeight()
+        local in_top = start and start.y >= 0 and start.y <= math.floor(sh * 0.12)
+        if in_top then
+            local ok, err = xpcall(self.opts.on_swipe_down, debug.traceback)
+            if not ok then logger.warn("[MiuRead][ReaderToolbar] on_swipe_down failed", tostring(err)) end
+            self:_close(nil, true)
+            return true
+        end
+    end
     return false
 end
 
 function Toolbar:onClose() return self:_close() end
 function Toolbar:onShow()
     UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.panel_dimen) end)
+    -- 打开面板的那次下滑仍可能再次派发到本面板；短暂延迟后才启用
+    -- "再次下滑打开原生 KOReader 菜单"，避免首次下滑就同时打开两个菜单。
+    self._swipe_armed = false
+    UIManager:scheduleIn(.3, function()
+        if not self.closed then self._swipe_armed = true end
+    end)
 end
 function Toolbar:onCloseWidget()
     local region = self.panel_dimen and Skin.expand_region(self.panel_dimen) or nil
