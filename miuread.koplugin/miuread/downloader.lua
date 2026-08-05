@@ -663,6 +663,17 @@ end
 function Downloader:catalog(id)
     local catalog = self.reader:catalog(id)
     local source = catalog.updated or catalog.chapterInfos or catalog.chapters or {}
+    -- The chapterInfos response does not report the book format. Read it from
+    -- the reader page context instead; on failure keep the raw titles rather
+    -- than guessing.
+    local book_format
+    local ok_state, state = pcall(self.reader.access_state, self.reader, id)
+    if ok_state and type(state) == "table" and type(state.book) == "table" then
+        book_format = state.book.format
+    else
+        logger.warn("[MiuRead][Download] book format unavailable; keeping raw catalog titles",
+            "book=", tostring(id), "error=", ok_state and "reader context has no book info" or tostring(state))
+    end
     local out, seen = {}, {}
     for index, chapter in ipairs(source) do
         local uid = tostring(chapter.chapterUid or chapter.uid or "")
@@ -675,6 +686,18 @@ function Downloader:catalog(id)
             and not self.reader._is_cover_chapter(chapter)
             and not self.reader._is_unavailable_chapter(chapter) then
             seen[uid] = true
+            -- The official web reader displays every catalog title of a txt
+            -- (web novel) book as "第{chapterIdx}章 {title}" and uses EPUB
+            -- titles as-is. Mirror that rule so headings and the TOC match
+            -- the official display.
+            if book_format == "txt" then
+                local idx = tonumber(chapter.chapterIdx)
+                if idx then
+                    local title = tostring(chapter.title or "")
+                    chapter.title = title == "" and ("第" .. tostring(idx) .. "章")
+                        or ("第" .. tostring(idx) .. "章 " .. title)
+                end
+            end
             if tostring(chapter.title or ""):gsub("%s+", "") == "" then
                 chapter.title = "第 " .. tostring(#out + 1) .. " 节"
             end
