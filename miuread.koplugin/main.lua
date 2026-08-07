@@ -7529,6 +7529,10 @@ function Plugin:show_reader_quick_panel()
         recent_buttons=self:_reader_recent_buttons(),
         footer_action={label="全部阅读功能  ›",callback=function() self:show_reader_control_center("reading") end},
         on_home=function() return self:return_to_miuread_home("reader surface") end,
+        on_swipe_down=function()
+            -- 首次下滑打开觅阅面板后，再次从顶部下滑直接进入 KOReader 原生菜单
+            return self:_show_koreader_reader_menu(function() self:show_reader_quick_panel() end)
+        end,
     }
     if not panel then
         logger.warn("[MiuRead][ReaderToolbar] unavailable",tostring(err or "unknown"))
