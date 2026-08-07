@@ -8108,6 +8108,21 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local hero=self:_home_recent_book(miuread_rows,local_rows,account_rows)
     if hero then
         hero=U.copy(hero)
+        -- 优先使用觅阅缓存的封面（高清原图），避免本地元数据生成的小封面
+        -- （如 79x117 缩略图）在锁屏/主页放大显示时模糊。封面索引可能因
+        -- 后台下载/重建而缺失，此时直接按标准路径探测高清封面文件。
+        local hero_cached_cover=self.library:cached_cover_path(hero.bookId or hero.book_id)
+        if not hero_cached_cover and self.store and self.store.covers_dir then
+            local cover_id=U.id_name(hero.bookId or hero.book_id)
+            for _,cover_ext in ipairs({"jpg","png","gif","webp","svg"}) do
+                local cover_candidate=self.store.covers_dir.."/"..cover_id.."."..cover_ext
+                if self.library:_valid_cover_path(cover_candidate) then
+                    hero_cached_cover=cover_candidate
+                    break
+                end
+            end
+        end
+        if hero_cached_cover then hero.cover_path=hero_cached_cover end
         hero.heading="最近阅读"
         hero.source_text=self:_home_source_text(hero)
         hero.last_read_text=self:_home_last_read_text(hero)
