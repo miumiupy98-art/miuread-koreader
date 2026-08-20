@@ -81,15 +81,20 @@ local function compact_group(group)
     if range == "" then return nil end
     local texts = {}
     for _, row in ipairs(group.texts or {}) do
-        if type(row) == "table" and tostring(row.content or "") ~= "" then
-            texts[#texts + 1] = {
-                content = tostring(row.content or ""),
-                abstract = tostring(row.abstract or ""),
-                author = tostring(row.author or ""),
-                likes = tonumber(row.likes or 0) or 0,
-                created = tonumber(row.created or 0) or 0,
-                review_id = tostring(row.review_id or ""),
-            }
+        if type(row) == "table" then
+            local content = tostring(row.content or "")
+            local abstract = tostring(row.abstract or "")
+            if content == "" and abstract ~= "" then content = abstract end
+            if content ~= "" then
+                texts[#texts + 1] = {
+                    content = content,
+                    abstract = abstract,
+                    author = tostring(row.author or ""),
+                    likes = tonumber(row.likes or 0) or 0,
+                    created = tonumber(row.created or 0) or 0,
+                    review_id = tostring(row.review_id or ""),
+                }
+            end
         end
     end
     if #texts == 0 then return nil end

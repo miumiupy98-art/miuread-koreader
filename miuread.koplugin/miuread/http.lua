@@ -633,6 +633,9 @@ local function service_error(data, url)
     if is_weread_url(url) and (message == "用户不存在" or lower == "user not found") then
         return auth_error_message(code or "user_not_found", message)
     end
+    if is_weread_url(url) and message:find("鉴权失败", 1, true) then
+        return auth_error_message(code or "auth_failed", message)
+    end
     return message
 end
 
@@ -662,6 +665,7 @@ local function is_auth_error(value)
         or text:find("登录超时", 1, true) ~= nil
         or text:find("登录失效", 1, true) ~= nil
         or text:find("登录状态已失效", 1, true) ~= nil
+        or text:find("鉴权失败", 1, true) ~= nil
 end
 
 local function is_forbidden_error(value)

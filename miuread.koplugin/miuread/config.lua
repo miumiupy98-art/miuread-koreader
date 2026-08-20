@@ -98,5 +98,10 @@ local C = {
     DOWNLOAD_NETWORK_IPV4_MIN_GAIN_SECONDS = 1,
     READ_REPORT_AUTH_RETRY_DELAYS = {120, 300, 900, 1800},
     READ_REPORT_CONTEXT_RETRY_DELAYS = {60, 120, 300, 900},
+
+    -- Stream reading: one chapter at a time, rebuilt EPUB in temp only.
+    STREAM_READING = true,
+    STREAM_TMP_DIR = "/tmp/miuread-stream",
+    -- Offline book download removed; only stream chapter EPUB build remains.
 }
 return C

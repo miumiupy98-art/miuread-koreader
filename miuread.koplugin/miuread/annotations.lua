@@ -93,43 +93,75 @@ local function legacy_parse_range(value)
     return a, b
 end
 
+local function review_rows_from_response(data)
+    if type(data) ~= "table" then return {} end
+    local raw
+    for _, name in ipairs({"reviews", "updated", "reviewList", "items"}) do
+        if type(data[name]) == "table" then raw = data[name]; break end
+    end
+    if not raw and #data > 0 then raw = data end
+    if type(raw) ~= "table" then return {} end
+
+    local rows = {}
+    if #raw > 0 then
+        for _, item in ipairs(raw) do
+            if type(item) == "table" then rows[#rows + 1] = item end
+        end
+        return rows
+    end
+    for key, item in pairs(raw) do
+        if type(item) == "table" then
+            local row = item
+            local range = range_key(row)
+            if range == "" and tostring(key):match("^%d+%-%d+$") then
+                row = U.copy(item)
+                row.range = tostring(key)
+            end
+            rows[#rows + 1] = row
+        end
+    end
+    return rows
+end
+
+local function collect_review_pages(group)
+    local pages, seen = {}, {}
+    local queue = { group }
+    local cursor = 1
+    local scanned = 0
+    local function push(page)
+        if type(page) ~= "table" or seen[page] then return end
+        seen[page] = true
+        pages[#pages + 1] = page
+    end
+    while cursor <= #queue and scanned < 256 do
+        local node = queue[cursor]
+        cursor = cursor + 1
+        scanned = scanned + 1
+        if type(node) == "table" then
+            local direct = array_from(node, {"pageReviews", "reviews", "updated", "reviewList", "items", "list"})
+            for _, item in ipairs(direct or {}) do
+                if type(item) == "table" then push(item) end
+            end
+            if rawget(node, "review") ~= nil or rawget(node, "content") ~= nil
+                or rawget(node, "abstract") ~= nil or rawget(node, "text") ~= nil then
+                push(node)
+            end
+            for _, nested in pairs(node) do
+                if type(nested) == "table" and not seen[nested] and #queue < 384 then
+                    queue[#queue + 1] = nested
+                end
+            end
+        end
+    end
+    return pages
+end
+
 local function review_texts(group,yield_check)
     local rows, seen, invalid = {}, {}, 0
-    local pages, skipped = table_entries(array_from(group, {"pageReviews", "reviews", "updated"}))
-    invalid = invalid + skipped
+    local pages = collect_review_pages(group)
     for page_index, page in ipairs(pages) do
         if yield_check and page_index%64==0 then yield_check() end
-        -- Review payloads occasionally contain placeholders, functions or tables
-        -- with surprising metatables. Keep each entry isolated so one malformed
-        -- review can never abort the whole book download.
-        local ok, item = pcall(function()
-            if type(page) ~= "table" then return nil end
-            local nested = rawget(page, "review")
-            local r = type(nested) == "table" and nested or page
-            if type(r) ~= "table" then return nil end
-            local content = scalar_str(rawget(r, "content") or rawget(r, "review") or rawget(r, "text"))
-            if content == "" then return nil end
-            local author = type(rawget(r, "author")) == "table" and rawget(r, "author") or {}
-            local author_name = scalar_str(rawget(author, "nick") or rawget(author, "name") or rawget(r, "authorName"))
-            local key = scalar_str(rawget(r, "reviewId") or rawget(r, "id"))
-            if key == "" then key = content .. "\0" .. author_name end
-            return {
-                key = key,
-                content = content,
-                abstract = scalar_str(rawget(r, "abstract") or rawget(r, "contextAbstract") or rawget(r, "markText")),
-                created = tonumber(rawget(r, "createTime") or rawget(r, "createdAt") or 0) or 0,
-                author = author_name,
-                likes = tonumber(rawget(page, "likesCount") or rawget(r, "likesCount") or 0) or 0,
-                review_id = scalar_str(rawget(r, "reviewId") or rawget(r, "id")),
-            }
-        end)
-        if ok and item and not seen[item.key] then
-            seen[item.key] = true
-            item.key = nil
-            rows[#rows + 1] = item
-        elseif not ok or item == nil then
-            invalid = invalid + 1
-        end
+        ingest_page(page)
     end
     return rows, invalid
 end
@@ -215,7 +247,8 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         return result
     end
 
-    local batches=self.api:review_batches(target_ranges,30)
+    local review_batch_size=math.max(1,math.min(30,tonumber(options.review_batch_size) or 5))
+    local batches=self.api:review_batches(target_ranges,review_batch_size)
     local completed,pending={},{}
     local review_map={}
     local group_count,entry_count,invalid_review_count=0,0,0
@@ -228,11 +261,17 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         end
     end
     local active_batch_index=0
-    local function merge_review_rows(rows)
+    local function merge_review_rows(rows, batch)
         local new_invalid=0
+        local new_entries=0
         for group_index,group in ipairs(rows or {}) do
             if group_index%8==0 then progress("thoughts",active_batch_index,#batches,"整理想法") end
             local key=range_key(group)
+            if key=="" and type(batch)=="table" then
+                local hint=batch[group_index]
+                key=range_key(hint) or scalar_str(hint and hint.range)
+                if key~="" and type(group)=="table" then group.range=key end
+            end
             if key~="" then
                 local texts,invalid=review_texts(group,function()
                     progress("thoughts",active_batch_index,#batches,"整理想法")
@@ -242,13 +281,14 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
                     if not review_map[key] then review_map[key]={}; group_count=group_count+1 end
                     for _,item in ipairs(texts) do review_map[key][#review_map[key]+1]=item end
                     entry_count=entry_count+#texts
+                    new_entries=new_entries+#texts
                 end
             else
                 new_invalid=new_invalid+1
             end
         end
         invalid_review_count=invalid_review_count+new_invalid
-        return new_invalid
+        return new_invalid,new_entries
     end
     local function rebuild_state()
         result.review_map=review_map
@@ -276,13 +316,36 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     end
 
     local function accept_response(batch,response,label)
-        local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
-        local entry_invalid=merge_review_rows(rows)
-        local skipped=invalid+entry_invalid
-        if skipped>0 then
-            result.error_kind=result.error_kind or "data"
-            result.errors[#result.errors+1]=tostring(label).." skipped malformed review entries"
-            invalid_review_count=invalid_review_count+invalid
+        local rows = review_rows_from_response(response)
+        local invalid = 0
+        local entry_invalid,new_entries=merge_review_rows(rows, batch)
+        logger.warn("[MiuRead][Annotations] readreviews payload",
+            "book=",result.book_id,"chapter=",result.chapter_uid,
+            "batch=",tostring(active_batch_index),"/",tostring(#batches),
+            "ranges=",tostring(#(batch or {})),
+            "rows=",tostring(#rows),
+            "entries=",tostring(new_entries),
+            "invalid=",tostring(invalid+entry_invalid),
+            "source=",tostring(response and response._annotation_source or "unknown"))
+        if new_entries == 0 and #rows > 0 and type(rows[1]) == "table" then
+            local keys = {}
+            for key in pairs(rows[1]) do keys[#keys + 1] = tostring(key) end
+            table.sort(keys)
+            logger.warn("[MiuRead][Annotations] readreviews row shape",
+                "book=", result.book_id, "chapter=", result.chapter_uid,
+                "keys=", table.concat(keys, ","),
+                "pageReviews=", tostring(type(rows[1].pageReviews) == "table" and #rows[1].pageReviews or 0))
+        end
+        if #rows==0 and #(batch or {})>0 then
+            logger.warn("[MiuRead][Annotations] readreviews empty payload",
+                "book=",result.book_id,"chapter=",result.chapter_uid,
+                "batch=",tostring(#batch),"label=",tostring(label or ""))
+        end
+        local skipped = entry_invalid
+        if skipped > 0 then
+            result.error_kind = result.error_kind or "data"
+            result.errors[#result.errors + 1] = tostring(label) .. " skipped malformed review entries"
+            invalid_review_count = invalid_review_count + entry_invalid
         end
         -- A successful response is complete even when a malformed optional
         -- review entry was skipped. Keeping the whole range pending caused
@@ -330,6 +393,15 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             return false,false
         end
 
+        if error_kind=="rate_limit" and depth<4 then
+            local wait=6.0+depth*4
+            logger.warn("[MiuRead][Annotations] thoughts batch rate limited; retrying",
+                "book=",result.book_id,"chapter=",result.chapter_uid,
+                "batch=",tostring(#batch),"wait_s=",tostring(wait))
+            pause(wait)
+            return fetch_adaptive(batch,label,depth+1)
+        end
+
         result.error_kind=error_kind or (network_down and "network") or "server"
         result.auth_required=error_kind=="authentication"
         result.forbidden=error_kind=="forbidden"
@@ -353,7 +425,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         logger.warn("[MiuRead][Annotations] malformed review entries skipped",
             "book=",result.book_id,"chapter=",result.chapter_uid,"count=",tostring(invalid_review_count))
     end
-    logger.info("[MiuRead][Annotations] chapter fetched","book=",result.book_id,"chapter=",result.chapter_uid,
+    logger.warn("[MiuRead][Annotations] chapter fetched","book=",result.book_id,"chapter=",result.chapter_uid,
         "underlines=",result.underline_count,"thought_groups=",result.thought_count,
         "thought_entries=",result.thought_entry_count,"pending_ranges=",#result.pending_ranges)
     return result
@@ -765,8 +837,9 @@ local function render_text_token(token, marks, data)
                 -- an existing footnote/noteref link, preserve the underline style but
                 -- leave the original link as the only clickable target.
                 if active.thought and not token.inside_anchor then
+                    local anchor = Thoughts.anchor(data.book_id, data.chapter_uid, active.key)
                     local href = Thoughts.href(data.book_id, data.chapter_uid, active.key)
-                    out[#out + 1] = '<a class="miu-thought-link" href="' .. href .. '">'
+                    out[#out + 1] = '<a class="miu-thought-link" id="' .. anchor .. '" href="' .. href .. '">'
                     thought_link_open = true
                 end
                 local mark_class = Thoughts.mark_class(active.key)

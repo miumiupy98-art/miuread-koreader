@@ -363,7 +363,7 @@ end
 
 function Api:review_batches(ranges, batch_size)
     local out = {}
-    batch_size = tonumber(batch_size) or 30
+    batch_size = tonumber(batch_size) or 5
     batch_size = math.max(1,math.min(30,math.floor(batch_size)))
     for first = 1, #(ranges or {}), batch_size do
         local batch = {}
@@ -374,6 +374,88 @@ function Api:review_batches(ranges, batch_size)
         out[#out + 1] = batch
     end
     return out
+end
+
+local function normalize_annotation_payload(data)
+    if type(data) ~= "table" then return data end
+    if type(data.reviews) == "table" or type(data.updated) == "table" then
+        return data
+    end
+    local current = data
+    for _ = 1, 4 do
+        if type(current.reviews) == "table" or type(current.updated) == "table" then
+            return current
+        end
+        local nested = type(current.data) == "table" and current.data
+            or type(current.result) == "table" and current.result
+            or type(current.payload) == "table" and current.payload
+        if not nested then break end
+        current = nested
+    end
+    return unwrap(data)
+end
+
+local function review_payload_groups(data)
+    if type(data) ~= "table" then return {} end
+    local raw
+    for _, name in ipairs({"reviews", "updated", "reviewList", "items"}) do
+        if type(data[name]) == "table" then raw = data[name]; break end
+    end
+    if not raw and #data > 0 then raw = data end
+    if type(raw) ~= "table" then return {} end
+
+    local groups = {}
+    if #raw > 0 then
+        for _, item in ipairs(raw) do
+            if type(item) == "table" then groups[#groups + 1] = item end
+        end
+        return groups
+    end
+    for key, item in pairs(raw) do
+        if type(item) == "table" then
+            local group = item
+            local range = tostring(group.range or group.markRange or group.bookmarkRange or "")
+            if range == "" and tostring(key):match("^%d+%-%d+$") then
+                group = U.copy(item)
+                group.range = tostring(key)
+            end
+            groups[#groups + 1] = group
+        end
+    end
+    return groups
+end
+
+local function annotation_payload_rows_count(data)
+    return #review_payload_groups(data)
+end
+
+local function review_entry_count_in_group(group)
+    if type(group) ~= "table" then return 0 end
+    local count = 0
+    local pages = group.pageReviews or group.page_reviews
+    if type(pages) == "table" then
+        for _, page in ipairs(pages) do
+            if type(page) == "table" then
+                local review = type(page.review) == "table" and page.review or page
+                local text = tostring(review.content or review.abstract or review.contextAbstract
+                    or review.text or review.reviewContent or "")
+                if text ~= "" then count = count + 1 end
+            end
+        end
+    end
+    if count > 0 then return count end
+    local review = type(group.review) == "table" and group.review or group
+    local text = tostring(review.content or review.abstract or review.contextAbstract
+        or review.text or review.reviewContent or "")
+    return text ~= "" and 1 or 0
+end
+
+local function annotation_payload_review_entries(data)
+    local total = 0
+    for _, group in ipairs(review_payload_groups(data)) do
+        total = total + review_entry_count_in_group(group)
+    end
+    return total
 end
 
 function Api:_web_readreviews(id,chapter_uid,batch)
@@ -391,6 +473,7 @@ function Api:_web_readreviews(id,chapter_uid,batch)
         local ok,value=pcall(self.http.post_json,self.http,
             "https://weread.qq.com/web/book/readReviews",payload,options)
         if ok and type(value)=="table" then
+            value=normalize_annotation_payload(value)
             value._annotation_source="web"
             return value
         end
@@ -408,7 +491,33 @@ end
 
 function Api:readreviews(id, chapter_uid, batch)
     local ok,value=pcall(self._web_readreviews,self,id,chapter_uid,batch)
-    if ok then return value end
+    if ok then
+        -- Some accounts occasionally get an empty-but-successful web payload
+        -- while the Skill Gateway still returns the actual review groups.
+        -- Prefer the richer source when web returns no usable rows.
+        local web_rows = annotation_payload_rows_count(value)
+        local web_entries = annotation_payload_review_entries(value)
+        logger.warn("[MiuRead][API] readReviews web payload",
+            "book=", tostring(id), "chapter=", tostring(chapter_uid),
+            "ranges=", tostring(#(batch or {})),
+            "rows=", tostring(web_rows), "entries=", tostring(web_entries))
+        if web_entries > 0 then return value end
+        local agent_ok, agent_value = pcall(self._agent_readreviews, self, id, chapter_uid, batch)
+        local agent_rows = agent_ok and annotation_payload_rows_count(agent_value) or 0
+        local agent_entries = agent_ok and annotation_payload_review_entries(agent_value) or 0
+        logger.warn("[MiuRead][API] readReviews agent fallback",
+            "book=", tostring(id), "chapter=", tostring(chapter_uid),
+            "ranges=", tostring(#(batch or {})),
+            "ok=", tostring(agent_ok),
+            "rows=", tostring(agent_rows), "entries=", tostring(agent_entries))
+        if agent_ok and agent_entries > 0 then
+            logger.warn("[MiuRead][API] web readReviews empty; using Skill Gateway payload",
+                "book=", tostring(id), "chapter=", tostring(chapter_uid),
+                "ranges=", tostring(#(batch or {})))
+            return agent_value
+        end
+        return value
+    end
     -- Batch-shape failures must go back to the adaptive splitter. Falling
     -- through to the Skill Gateway would repeat the same rejected payload and
     -- spend the tighter Agent request budget without improving the result.

@@ -32,6 +32,7 @@ local Annotations=require("miuread.annotations")
 local LocalAnnotationDatabase=require("miuread.local_annotation_database")
 local AnnotationSync=require("miuread.annotation_sync")
 local Downloader=require("miuread.downloader")
+local StreamReader=require("miuread.stream_reader")
 local DownloadProgress=require("miuread.download_progress")
 local DownloadTask=require("miuread.download_task")
 local DownloadResult=require("miuread.download_result")
@@ -98,7 +99,7 @@ local COVER_GUARD_WINDOW=6*60*60
 local HOME_LOCAL_CACHE_TTL=20*60
 local HOME_SHELF_REFRESH_TTL=10*60
 local HOME_REMOTE_AUTO_RETRY=5*60
-local HOME_SECTION_ORDER={"account","generated","local","mp"}
+local HOME_SECTION_ORDER={"account","local","mp"}
 local HOME_QUICK_ITEM_LEGACY_ORDER={"wifi","frontlight","refresh_shelf","full_refresh","settings","koreader_menu","downloads","sync","night","rotate","sleep","restart","quit"}
 local HOME_QUICK_ITEM_LEGACY_DEFAULT={wifi=true,frontlight=true,refresh_shelf=true,full_refresh=true,settings=true,koreader_menu=true,downloads=true,sync=true,night=false,rotate=false,sleep=true,restart=false,quit=false}
 
@@ -147,6 +148,11 @@ if type(HOME_SESSION)~="table" then
         foreground="native",suspended=false,reader_session_generation=0,reader_session_file=nil,reader_session_active=false,
         return_requested=false,return_session_generation=0,return_request_file=nil}
     rawset(_G,"__MIUREAD_HOME_SESSION",HOME_SESSION)
+end
+local STREAM_SESSION=rawget(_G,"__MIUREAD_STREAM_SESSION")
+if type(STREAM_SESSION)~="table" then
+    STREAM_SESSION={reader=nil,meta=nil,pending_percent=nil}
+    rawset(_G,"__MIUREAD_STREAM_SESSION",STREAM_SESSION)
 end
 -- ReaderUI and FileManager transition asynchronously and may use different
 -- plugin instances. Keep one shared close coordinator so CloseDocument,
@@ -1419,7 +1425,6 @@ function Plugin:home_menu()
     out[#out+1]={text="我的书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)}
     local trailing={
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
-        {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
         {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         account,
         {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
@@ -1438,26 +1443,13 @@ function Plugin:home_menu()
 end
 
 function Plugin:_confirm_current_book_rebuild(book,annotations)
-    local label=annotations and "划线与想法版" or "纯净版"
-    UIManager:show(ConfirmBox:new{
-        text="重新生成当前书籍的"..label.."？\n\n新文件会在生成完成后替换对应版本。",
-        ok_text="重新生成",
-        cancel_text="取消",
-        ok_callback=function() self:choose_download_mode(book,{annotations=annotations},false) end,
-    })
+    self:_open_book_stream(book)
 end
 
 function Plugin:current_book_download_menu(book)
-    local items={
-        {text="下载当前章",callback=function() self:download_current_chapters(1) end},
-        {text="当前章及后续 5 章",callback=function() self:download_current_chapters(6) end},
-        {text="当前章及后续 10 章",callback=function() self:download_current_chapters(11) end},
-        {text="选择章节范围",callback=function() self:chapters(book) end},
+    return {
+        {text="下一章",callback=function() self:_stream_go_next_chapter() end},
     }
-    if self:_has_range_variant(book.bookId) then
-        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(book) end}
-    end
-    return items
 end
 
 function Plugin:current_book_rebuild_menu(book)
@@ -1474,9 +1466,8 @@ function Plugin:current_book_menu()
     local b={bookId=r.book.book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
     return {
         {text="书籍详情",callback=function() self:book_details(b) end},
-        {text="下载章节",sub_item_table_func=function() return self:current_book_download_menu(b) end},
-        {text="重新生成与修复",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
-        {text="管理本地文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
+        {text="下一章",callback=function() self:_stream_go_next_chapter() end},
+        {text="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
     }
 end
 
@@ -1516,7 +1507,6 @@ function Plugin:reader_menu()
             {text="当前文章",sub_item_table_func=function() return self:current_mp_article_menu(mp_context) end},
         }
         if desktop then out[#out+1]={text="全部阅读功能",callback=function() self:show_reader_control_center("reading") end} end
-        out[#out+1]={text=self:_download_menu_text(),callback=function() self:show_downloads() end}
         out[#out+1]={text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end}
         if not desktop then out[#out+1]={text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end} end
         return out
@@ -1533,7 +1523,6 @@ function Plugin:reader_menu()
     end
     out[#out+1]={text="当前书籍",sub_item_table_func=function() return self:current_book_menu() end}
     out[#out+1]={text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end}
-    out[#out+1]={text=self:_download_menu_text(),callback=function() self:show_downloads() end}
     out[#out+1]={text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end}
     if not desktop then
         out[#out+1]={text="KOReader 菜单",callback=function() self:_show_koreader_reader_menu() end}
@@ -1882,18 +1871,13 @@ function Plugin:_shelf_select(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
     if Protocol.is_mp_account(id) then self:mp_account(b); return end
-    local record=self:_preferred_record(id)
-    if record and record.file and U.file_exists(record.file) then
-        self:open_file(record.file)
-    else
-        self:book_menu(b)
-    end
+    self:_open_book_stream(b)
 end
 function Plugin:_shelf_hold(b)
     local id=tostring(b and (b.bookId or b.book_id) or "")
     if id=="" then return end
     if Protocol.is_mp_account(id) then self:mp_account(b); return end
-    self:book_menu(b)
+    self:_home_hold_book(b)
 end
 
 function Plugin:show_shelf_search_dialog(mp_mode,source_rows,section)
@@ -6063,24 +6047,400 @@ function Plugin:_home_source_text(book)
 end
 
 function Plugin:_show_home_book_open_popup(book,anchor)
-    local id=tostring(book and (book.bookId or book.book_id) or "")
-    local target=U.copy(book or {})
-    local state=self:_download_state()
-    local same_failed=state.status=="failed" and tostring(state.book_id or state.bookId or "")==id
-    local partial=id~="" and self.store:book_has_partial_cache(id)==true
-    local label=(same_failed or partial) and "继续下载 / 修复" or "下载并阅读"
-    ActionSheet.show{
-        anchor=anchor,preferred_direction="above",width_ratio=.62,
-        title=tostring(target.title or "书籍"),
-        subtitle=(same_failed or partial) and "下载尚未完整" or "这本书尚未下载",
-        actions={
-            {icon="⇩",label=label,detail=(same_failed or partial) and "继续现有任务，必要时重新生成" or "加入下载任务",callback=function()
-                self:choose_download(target,nil,false)
-            end},
-            {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
-        },
-    }
+    return self:_open_book_stream(book,anchor)
+end
+
+function Plugin:_stream_enabled()
+    return Config.STREAM_READING==true
+end
+
+function Plugin:_stream_active()
+    local session=STREAM_SESSION
+    if not session or not session.reader or session.reader.active~=true then return false end
+    local path=normalized_reader_file(self:_current_document_path())
+    local epub=normalized_reader_file(session.reader.epub_path)
+    return path~="" and epub~="" and path==epub
+end
+
+function Plugin:_stream_book_id_from_path(path,book)
+    local book_id=book and tostring(book.book_id or book.bookId or "") or ""
+    if book_id~="" then return book_id end
+    local meta=path and self.store:epub_identity(path) or nil
+    return meta and tostring(meta.book_id or "") or ""
+end
+
+function Plugin:_stream_account_book(book,path)
+    if book and (book.source=="local" or book.local_file==true) then return false end
+    local book_id=self:_stream_book_id_from_path(path,book)
+    return book_id~=""
+end
+
+function Plugin:_should_open_book_stream(book,path,options)
+    options=type(options)=="table" and options or {}
+    if not self:_stream_enabled() or options.stream_result==true then return false end
+    if self._stream_open_inflight==true then return false end
+    if self:_stream_active() then return false end
+    local session=STREAM_SESSION
+    local active_epub=session and session.reader and normalized_reader_file(session.reader.epub_path) or ""
+    if active_epub~="" and normalized_reader_file(path)==active_epub then return false end
+    return self:_stream_account_book(book,path)
+end
+
+function Plugin:_redirect_open_to_stream(book,path,reason)
+    local book_id=self:_stream_book_id_from_path(path,book)
+    if book_id=="" then return false end
+    logger.warn("[MiuRead][Stream] redirect to stream",
+        "reason=",tostring(reason or ""),"book=",book_id,"path=",tostring(path or ""))
+    self._stream_open_inflight=true
+    local owner=self
+    UIManager:nextTick(function()
+        owner._stream_open_inflight=nil
+        owner:_open_book_stream({
+            bookId=book_id,
+            title=book and book.title,
+            author=book and book.author,
+        })
+    end)
     return true
+end
+
+function Plugin:_close_stream_session()
+    self._stream_hydrating_key=nil
+    if STREAM_SESSION.reader then
+        pcall(STREAM_SESSION.reader.close,STREAM_SESSION.reader)
+        STREAM_SESSION.reader=nil
+        STREAM_SESSION.meta=nil
+        STREAM_SESSION.pending_percent=nil
+    end
+end
+
+function Plugin:_handle_stream_error(err,channel)
+    local text=tostring(err or "未知错误")
+    if Http.is_auth_error(text) then
+        self:_mark_auth_problem(channel or "download",text,true)
+        local dialog
+        dialog=ButtonDialog:new{title="微信读书登录已失效\n\n无法在线加载章节，请重新扫码登录。\n\n已下载书籍和本地阅读记录不会删除。",title_align="center",
+            buttons={
+                {{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}},
+                {{text="稍后",callback=function() UIManager:close(dialog) end}},
+            }}
+        UIManager:show(dialog)
+        return true
+    end
+    self:info("无法加载：\n"..U.first_line(text,120))
+    return false
+end
+
+function Plugin:_run_stream_task(label,fn,done,timeout)
+    local loading=InfoMessage:new{text=tostring(label or "正在加载章节……")}
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+    local function finish(result)
+        pcall(function() UIManager:close(loading) end)
+        if done then done(result) end
+    end
+    -- Stream fetch/build must stay in the main plugin context. KOReader subprocess
+    -- workers cannot reuse live HTTP sessions, FFI codec handles, or StreamReader
+    -- instances, and JSON cannot round-trip the stream controller back to the UI.
+    UIManager:scheduleIn(.05,function()
+        local ok,value=pcall(fn)
+        finish(ok and {ok=true,value=value} or {ok=false,error=tostring(value)})
+    end)
+    return true
+end
+
+function Plugin:_reader_plugin_instance()
+    local reader_ui=self:_active_reader_ui()
+    return reader_ui and reader_ui.miuread or nil
+end
+
+function Plugin:_reader_miuread_plugin()
+    if self.ui and self.ui.document then return self end
+    return self:_reader_plugin_instance()
+end
+
+function Plugin:_install_thought_link_guard()
+    local ui=self.ui
+    if not ui or not ui.link or type(ui.link.onGotoLink)~="function" then
+        logger.warn("[MiuRead][ThoughtPopup] link guard skipped: reader link module unavailable")
+        return false
+    end
+    local link=ui.link
+    if link._miuread_thought_link_patched then return true end
+    local owner=self
+    link._miuread_original_onGotoLink=link.onGotoLink
+    link.onGotoLink=function(link_self,lnk,neglect_current_location,allow_footnote_popup)
+        local info=owner:_thought_info_from_link(lnk)
+        if info and owner:_show_thought_info(info) then return true end
+        return link._miuread_original_onGotoLink(link_self,lnk,neglect_current_location,allow_footnote_popup)
+    end
+    if type(link.getLinkFromGes)=="function" and not link._miuread_original_getLinkFromGes then
+        link._miuread_original_getLinkFromGes=link.getLinkFromGes
+        link.getLinkFromGes=function(link_self,ges)
+            local lnk=link._miuread_original_getLinkFromGes(link_self,ges)
+            if not lnk then return nil end
+            local info=owner:_thought_info_from_link(lnk)
+            if info then lnk.miuread_thought_href="#"..tostring(info.anchor or "") end
+            return lnk
+        end
+    end
+    if type(link.onTap)=="function" then
+        link._miuread_original_onTap=link.onTap
+        link.onTap=function(link_self,_,ges)
+            local info=owner:_resolve_thought_from_ges(ges)
+            if info then
+                if owner:_thought_edge_page_turn(ges) then return true end
+                return owner:_show_thought_info(info)
+            end
+            return link._miuread_original_onTap(link_self,_,ges)
+        end
+    end
+    link._miuread_thought_link_patched=true
+    logger.info("[MiuRead][ThoughtPopup] link guard installed")
+    return true
+end
+
+function Plugin:_setup_stream_thought_tap()
+    local plugin=self:_reader_miuread_plugin()
+    if not plugin then
+        logger.warn("[MiuRead][ThoughtPopup] stream hooks skipped: reader plugin missing")
+        return false
+    end
+    local tap_ok=plugin:_setup_thought_tap()
+    local guard_ok=plugin:_install_thought_link_guard()
+    logger.info("[MiuRead][ThoughtPopup] stream hooks",
+        "tap=",tostring(tap_ok==true),"guard=",tostring(guard_ok==true))
+    return tap_ok or guard_ok
+end
+
+function Plugin:_ensure_stream_reader_hooks(attempt)
+    attempt=tonumber(attempt) or 1
+    local stream=STREAM_SESSION.reader
+    if not stream or stream.active~=true then return false end
+    self:_setup_stream_thought_tap()
+    local plugin=self:_reader_plugin_instance()
+    if plugin and type(plugin._patch_stream_end_of_book)=="function" then
+        plugin:_patch_stream_end_of_book()
+    end
+    if self:_stream_active() then
+        if plugin and type(plugin._apply_stream_pending_position)=="function" then
+            plugin:_apply_stream_pending_position()
+        end
+        return true
+    end
+    if attempt<6 then
+        local owner=self
+        UIManager:scheduleIn(.25+attempt*.15,function() owner:_ensure_stream_reader_hooks(attempt+1) end)
+    end
+    return false
+end
+
+function Plugin:_apply_stream_chapter_result(stream,result,options)
+    options=options or {}
+    if not result or result.ok~=true or type(result.value)~="table" then
+        self:_handle_stream_error(result and result.error or "未知错误","download")
+        if options.close_on_fail then self:_close_stream_session() end
+        return false
+    end
+    local payload=result.value
+    local epub_path=tostring(payload.path or "")
+    if epub_path=="" or not U.file_exists(epub_path) then
+        self:info("章节文件未生成")
+        if options.close_on_fail then self:_close_stream_session() end
+        return false
+    end
+    STREAM_SESSION.reader=stream
+    STREAM_SESSION.meta=payload.meta
+    STREAM_SESSION.pending_percent=payload.meta and payload.meta.pending_percent or nil
+    local open_opts={stream_result=true,force_reopen=options.force_reopen==true}
+    local opened
+    if options.switch and self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
+        opened=self:_open_file_direct(epub_path,open_opts)
+    else
+        opened=self:_open_file_direct(epub_path,open_opts)
+    end
+    if opened==false then
+        self:_close_stream_session()
+        return false
+    end
+    local owner=self
+    UIManager:scheduleIn(.1,function() owner:_ensure_stream_reader_hooks(1) end)
+    UIManager:scheduleIn(.6,function() owner:_ensure_stream_reader_hooks(2) end)
+    if options.defer_annotations==true then
+        self:_stream_schedule_annotation_hydration(stream,payload.meta)
+    end
+    return true
+end
+
+function Plugin:_stream_schedule_annotation_hydration(stream,meta)
+    stream = stream or (STREAM_SESSION and STREAM_SESSION.reader)
+    if not stream or stream.active ~= true then return false end
+    meta = type(meta) == "table" and meta or {}
+    if meta.annotation_requested == true then return false end
+    local chapter_uid = tostring(meta.uid or meta.chapter_uid or stream.current_uid or "")
+    local index = tonumber(meta.index or stream.current_index) or 1
+    if chapter_uid == "" then return false end
+    local hydrate_key = tostring(stream.book and stream.book.bookId or "") .. ":" .. chapter_uid
+    if self._stream_hydrating_key == hydrate_key then return false end
+    self._stream_hydrating_key = hydrate_key
+    local owner = self
+    UIManager:scheduleIn(.25, function()
+        if owner._stream_hydrating_key ~= hydrate_key then return end
+        if not stream or stream.active ~= true then owner._stream_hydrating_key=nil; return end
+        if stream.current_uid ~= chapter_uid then owner._stream_hydrating_key=nil; return end
+        owner:_run_stream_task("正在同步划线与想法…", function()
+            local path, hydrated_meta = stream:load_chapter_with_annotations(index)
+            if not path then error(tostring(hydrated_meta or "批注同步失败")) end
+            return {path = path, meta = hydrated_meta}
+        end, function(result)
+            owner._stream_hydrating_key = nil
+            if not result or result.ok ~= true then
+                logger.warn("[MiuRead][Stream] annotation hydration failed", tostring(result and result.error or "unknown"))
+                return
+            end
+            owner:_apply_stream_chapter_result(stream,result,{switch=true,force_reopen=true})
+        end, 180)
+    end)
+    return true
+end
+
+function Plugin:_open_book_stream(book,anchor)
+    if not self:require_login() then return false end
+    local target=U.copy(book or {})
+    logger.warn("[MiuRead][Stream] open requested",
+        "book=",tostring(target.bookId or target.book_id or ""),
+        "title=",tostring(target.title or ""))
+    self:_close_stream_session()
+    self:_home_stop_background("stream open")
+    local stream=StreamReader:new(self.store,self.reader,self.api,self.annotations,self.downloader)
+    local owner=self
+    self:_run_stream_task("正在加载《"..tostring(target.title or "书籍").."》……",function()
+        local path,meta=stream:open(target,{fetch_annotations=false})
+        if not path then error(tostring(meta or "打开失败")) end
+        return {path=path,meta=meta,stream=stream}
+    end,function(result)
+        if not result or result.ok~=true then
+            owner:_handle_stream_error(result and result.error or "未知错误","download")
+            pcall(stream.close,stream)
+            return
+        end
+        local payload=result.value
+        owner:_apply_stream_chapter_result(payload.stream,{ok=true,value={path=payload.path,meta=payload.meta}},{close_on_fail=true,defer_annotations=true})
+    end,180)
+    return true
+end
+
+function Plugin:_stream_go_chapter(index)
+    local session=STREAM_SESSION
+    if not session or not session.reader or session.reader.active~=true then return false end
+    local stream=session.reader
+    local owner=self
+    local chapter=stream.chapters and stream.chapters[index]
+    local title=tostring(chapter and chapter.title or "章节")
+    self:_run_stream_task("正在加载："..title,function()
+        local path,meta=stream:load_chapter(index,{fetch_annotations=false})
+        if not path then error(tostring(meta or "加载失败")) end
+        return {path=path,meta=meta}
+    end,function(result)
+        if not owner:_apply_stream_chapter_result(stream,result,{switch=true,defer_annotations=true}) then return end
+        UIManager:nextTick(function()
+            if owner.ui and owner.ui.document then
+                owner.ui:handleEvent(Event:new("GotoPage",1))
+            end
+        end)
+    end,180)
+    return true
+end
+
+function Plugin:_stream_go_next_chapter()
+    local session=STREAM_SESSION
+    if not session or not session.reader then return false end
+    local next_index=session.reader:next_index()
+    if not next_index then
+        self:info("已经是最后一章")
+        return false
+    end
+    return self:_stream_go_chapter(next_index)
+end
+
+function Plugin:_patch_stream_end_of_book()
+    local ui=self.ui
+    if not ui or not ui.status or ui.status._miuread_stream_eob_patched then return end
+    local status=ui.status
+    status._miuread_stream_original_onEndOfBook=status.onEndOfBook
+    local owner=self
+    status.onEndOfBook=function(status_self,...)
+        if not owner:_stream_active() then
+            if status._miuread_stream_original_onEndOfBook then
+                return status._miuread_stream_original_onEndOfBook(status_self,...)
+            end
+            return false
+        end
+        owner:_show_stream_end_dialog()
+        return true
+    end
+    status._miuread_stream_eob_patched=true
+end
+
+function Plugin:_show_stream_end_dialog()
+    local session=STREAM_SESSION
+    local has_next=session and session.reader and session.reader:has_next()
+    local buttons={}
+    if has_next then
+        buttons[#buttons+1]={{text="下一章",callback=function()
+            if self._stream_end_dialog then UIManager:close(self._stream_end_dialog); self._stream_end_dialog=nil end
+            self:_stream_go_next_chapter()
+        end}}
+    else
+        buttons[#buttons+1]={{text="已是最后一章",enabled=false,callback=function() end}}
+    end
+    buttons[#buttons+1]={{text="返回书架",callback=function()
+        if self._stream_end_dialog then UIManager:close(self._stream_end_dialog); self._stream_end_dialog=nil end
+        self:return_to_miuread_home("stream end")
+    end}}
+    if self._stream_end_dialog then pcall(UIManager.close,UIManager,self._stream_end_dialog) end
+    self._stream_end_dialog=ButtonDialog:new{
+        title="本章已读完",
+        title_align="center",
+        buttons=buttons,
+    }
+    UIManager:show(self._stream_end_dialog)
+end
+
+function Plugin:_stream_toc_items()
+    local session=STREAM_SESSION
+    if not session or not session.reader or not session.reader.chapters then return nil end
+    local stream=session.reader
+    local current=tonumber(stream.current_index) or 1
+    local items={}
+    for index,chapter in ipairs(stream.chapters) do
+        local title=U.trim(tostring(chapter.title or ""))
+        if title=="" then title="第 "..tostring(index).." 节" end
+        local depth=tonumber(chapter.level or chapter.chapterLevel or chapter.chapter_level) or 1
+        items[#items+1]={
+            title=title,
+            depth=depth,
+            current=index==current,
+            callback=function()
+                if index==current then return true end
+                self:_stream_go_chapter(index)
+                return true
+            end,
+        }
+    end
+    return items,current
+end
+
+function Plugin:_apply_stream_pending_position()
+    local percent=tonumber(STREAM_SESSION.pending_percent)
+    if not percent or percent<=0 then return end
+    STREAM_SESSION.pending_percent=nil
+    if not (self.ui and self.ui.document) then return end
+    UIManager:scheduleIn(.15,function()
+        if self.ui and self.ui.document then
+            self.ui:handleEvent(Event:new("GotoPercent",percent))
+        end
+    end)
 end
 
 function Plugin:_home_open_book(book,anchor)
@@ -6101,13 +6461,11 @@ function Plugin:_home_open_book(book,anchor)
         return self:_home_leave_and_run("mp account",function() self:mp_account(book) end)
     end
     self:_home_attach_local_record(book)
-    local record=id~="" and self:_preferred_record(id) or nil
-    if record and record.file and U.file_exists(record.file) then
-        self:_home_stop_background("opening book")
-        return self:_open_file_direct(record.file)
+    if id~="" then
+        self:_home_stop_background("stream open")
+        return self:_open_book_stream(book,anchor)
     end
-    if id~="" then return self:_show_home_book_open_popup(book,anchor) end
-    self:info("本地书籍记录不存在")
+    self:info("无法打开书籍")
     return false
 end
 
@@ -6155,7 +6513,7 @@ function Plugin:_home_all_rows()
     local rows,seen={},{}
     -- Prefer the downloaded copy when the same WeRead book exists in both
     -- "微信书架" and "已下载".
-    for _,section in ipairs({"generated","account","local","mp"}) do
+    for _,section in ipairs({"account","local","mp"}) do
         local entry=self._home_sections and self._home_sections[section]
         for _,book in ipairs(entry and entry.rows or {}) do
             local key=self:_home_book_key(book)
@@ -6662,20 +7020,7 @@ function Plugin:_show_home_refresh_popup(anchor)
 end
 
 function Plugin:_show_home_download_popup(anchor)
-    ActionSheet.show{
-        cache_key="home_download",
-        anchor=anchor,
-        preferred_direction="below",
-        title="下载",
-        subtitle=self:_download_menu_text(),
-        actions={
-            {icon="⇩",label="下载任务",detail="查看进度 排队和失败重试",callback=function() self:show_downloads() end},
-            {icon="⚙",label="下载设置",detail="下载策略 目录与提醒",callback=function()
-                self:_show_standalone_menu("下载设置",self:download_settings_menu())
-            end},
-        },
-        footer_action={label="存储清理",callback=function() self:show_download_cleanup_dialog() end},
-    }
+    return
 end
 
 function Plugin:_show_home_sync_popup(anchor)
@@ -7088,21 +7433,13 @@ function Plugin:_show_home_local_book_more(book,anchor)
 end
 
 function Plugin:_show_home_remote_book_more(book,anchor)
-    local target=U.copy(book or {})
+    local target=U.copy(book)
+    self:_home_attach_local_record(target)
     local id=tostring(target.bookId or target.book_id or "")
     local actions={
-        {icon="⇩",label="生成／更新书籍",detail="重新生成或更新 EPUB",callback=function() self:choose_download(target,nil,false) end},
-        {icon="▤",label="按章节下载",detail="选择章节后生成",callback=function() self:chapters(target) end},
+        {icon="▶",label="开始阅读",detail="按云端进度在线阅读",callback=function() self:_open_book_stream(target,anchor) end},
+        {icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end},
     }
-    if id~="" and self:_has_range_variant(id) then
-        actions[#actions+1]={icon="＋",label="扩展已有章节版",detail="继续增加章节范围",callback=function()
-            self:_show_home_bubble_menu("扩展已有章节版",self:range_extend_menu(target),{anchor=anchor,preferred_direction="above",page_size=7})
-        end}
-    end
-    if id~="" and (self:_book_has_cache(id) or self.store:book_has_partial_cache(id)) then
-        actions[#actions+1]={icon="▣",label="管理本书文件",detail="查看和管理已生成文件",callback=function() self:downloaded_book_menu(id) end}
-    end
-    actions[#actions+1]={icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end}
     return ActionSheet.show{
         anchor=anchor,preferred_direction="above",width_ratio=.66,
         title=tostring(target.title or "书籍"),subtitle="更多书籍操作",
@@ -7180,27 +7517,17 @@ function Plugin:_home_hold_book(book,anchor)
 
     local target=U.copy(book)
     self:_home_attach_local_record(target)
-    local record=id~="" and self:_preferred_record(id) or nil
-    local available=record and record.file and U.file_exists(record.file)
     local primary_actions={
+        {icon="▶",label="开始阅读",detail="按云端进度在线阅读",callback=function() self:_open_book_stream(target,anchor) end},
         {icon="i",label="查看详情",detail="书籍简介和出版信息",callback=function() self:book_details(target) end},
         {icon="↻",label="更新书籍信息",detail="微信读书详情与网络补全",callback=function() self:_home_refresh_one_book_metadata(target,true) end},
     }
-    if available then
-        primary_actions[#primary_actions+1]={icon="✚",label="修复这本书",detail="检查正文、目录和生成记录",callback=function() self:_home_repair_book(target) end}
-        primary_actions[#primary_actions+1]={icon="⌫",label="删除书籍",detail="选择删除当前或全部版本",danger=true,callback=function()
-            self:_show_home_delete_book_popup(target,anchor)
-        end}
-    else
-        primary_actions[#primary_actions+1]={icon="⇩",label="下载书籍",detail="加入下载任务",callback=function() self:choose_download(target,nil,false) end}
-    end
     ActionSheet.show{
         anchor=anchor,
         preferred_direction="above",
         width_ratio=.66,
         title=tostring(target.title or "书籍"),
-        subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author)
-            or (available and "已下载" or "尚未下载"),
+        subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author) or "在线阅读",
         actions=primary_actions,wide_last=(#primary_actions%2==1),
         footer_action={label="更多书籍操作",callback=function() self:_show_home_remote_book_more(target,anchor) end},
     }
@@ -7227,7 +7554,6 @@ function Plugin:_home_action_entries()
             self:_home_manual_refresh()
         end},
         search={icon="⌕",icon_key="search",label="搜索",callback=function(anchor) self:_show_home_search_popup(anchor) end},
-        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function(anchor) self:_show_home_download_popup(anchor) end},
         sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
             self:_sync_home_pending(); self:_show_home_quick_notice(anchor,"正在同步","待处理内容已提交")
         end},
@@ -8184,6 +8510,9 @@ end
 function Plugin:_home_open_miuread(book)
     self:_home_stop_background("opening book")
     local id=tostring(book and (book.bookId or book.book_id) or "")
+    if id~="" and self:_stream_enabled() then
+        return self:_open_book_stream(book)
+    end
     local record=id~="" and self:_preferred_record(id) or nil
     if record and record.file and U.file_exists(record.file) then
         return self:_open_file_direct(record.file)
@@ -9349,6 +9678,10 @@ function Plugin:_reader_current_page()
 end
 
 function Plugin:_reader_toc_items()
+    if self:_stream_active() then
+        local stream_items,stream_current=self:_stream_toc_items()
+        if stream_items and #stream_items>0 then return stream_items,stream_current end
+    end
     local ui=self.ui
     local toc=ui and ui.toc or nil
     if not toc then return {},nil end
@@ -11973,12 +12306,11 @@ function Plugin:_home_refresh_recent_hero_cached()
     if self._home_recent_read_dirty~=true and HOME_SESSION.recent_read_dirty~=true then return false end
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
     local sections=self._home_sections or {}
-    local generated=sections.generated and sections.generated.rows or {}
     local local_rows=sections["local"] and sections["local"].rows or {}
     local account=sections.account and sections.account.rows or {}
-    if #generated==0 and #local_rows==0 and #account==0 then return false end
-    self:_home_apply_recent_read_times(generated,local_rows,account)
-    local hero=self:_home_prepare_hero_book(self:_home_recent_book(generated,local_rows,account))
+    if #local_rows==0 and #account==0 then return false end
+    self:_home_apply_recent_read_times({},local_rows,account)
+    local hero=self:_home_prepare_hero_book(self:_home_recent_book({},local_rows,account))
     self._home_recent_read_dirty=false
     HOME_SESSION.recent_read_dirty=false
     if not hero then return false end
@@ -12039,7 +12371,6 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     persist_home_session()
 
     if force_scan==true then self:_home_reset_local_metadata() end
-    local miuread_rows=self:_home_miuread_rows()
     local local_rows=self:_home_local_rows()
     local cached_books,cached_mp=self.library:cached()
     cached_books=type(cached_books)=="table" and cached_books or {}
@@ -12061,12 +12392,11 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
 
     local home,home_preferences=self:_home_preferences()
-    self:_home_apply_recent_read_times(miuread_rows,local_rows,account_rows,mp_rows)
-    local hero=self:_home_prepare_hero_book(self:_home_recent_book(miuread_rows,local_rows,account_rows))
+    self:_home_apply_recent_read_times(local_rows,account_rows,mp_rows)
+    local hero=self:_home_prepare_hero_book(self:_home_recent_book({},local_rows,account_rows))
 
     local sections={
         account={title="微信书架",rows=account_rows,empty="这里还没有微信书架内容"},
-        generated={title="已下载",rows=miuread_rows,empty="这里还没有已下载书籍"},
         ["local"]={title="本地书籍",rows=local_rows,empty=self:_home_local_empty_text()},
         mp={title="公众号",rows=mp_rows,empty="这里还没有公众号内容"},
     }
@@ -12689,6 +13019,7 @@ end
 
 function Plugin:return_to_miuread_home(reason)
     sync_home_session()
+    if self:_stream_active() then self:_close_stream_session() end
     if HOME_EXITING or UIManager._exit_code~=nil then return false end
     self:_cancel_native_menu_guard()
     HOME_SESSION_SUPPRESSED=false
@@ -13160,26 +13491,10 @@ function Plugin:book_menu(b)
     local original=type(b)=="table" and b or {}
     b=U.merge(original,normalize(original))
     if Protocol.is_mp_account(b.bookId) then self:mp_account(b); return end
-    local items={}
-    local records={{kind="clean",label="纯净版"},{kind="notes",label="划线与想法版"},
-        {kind="range_clean",label="章节版 · 纯净版"},{kind="range_notes",label="章节版 · 划线与想法版"},
-        {kind="preview_clean",label="试读版 · 纯净版"},{kind="preview_notes",label="试读版 · 划线与想法版"}}
-    for _,entry in ipairs(records) do
-        local record=self:_variant_exists(b.bookId,entry.kind)
-        if record then
-            items[#items+1]={text="打开"..entry.label,callback=function() self:open_file(record.file) end}
-        end
-    end
-    items[#items+1]={text="生成／更新书籍",callback=function() self:choose_download(b,nil,false) end}
-    items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
-    if self:_has_range_variant(b.bookId) then
-        items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
-    end
-    if self:_book_has_cache(b.bookId) or self.store:book_has_partial_cache(b.bookId) then
-        items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
-    end
-    items[#items+1]={text="书籍详情",callback=function() self:book_details(b) end}
-    self:list(b.title,items)
+    self:list(b.title,{
+        {text="开始阅读",callback=function() self:_open_book_stream(b) end},
+        {text="书籍详情",callback=function() self:book_details(b) end},
+    })
 end
 
 function Plugin:book_details(b)
@@ -13252,73 +13567,12 @@ function Plugin:_download_preflight(callback)
 end
 
 function Plugin:choose_download_mode(b,opt,open_after)
-    local dialog
-    local function launch(background,defer_until_reader_closed)
-        if defer_until_reader_closed==true then
-            if dialog then UIManager:close(dialog) end
-            self:_queue_download(b,opt,open_after,{defer_until_reader_closed=true,reason="退出阅读后下载"})
-            return
-        end
-        if self._download_launch_pending then
-            self:toast("下载操作正在准备，请勿重复点击",2)
-            return
-        end
-        self._download_launch_pending=true
-        if dialog then UIManager:close(dialog) end
-        self:status_toast("觅阅",tostring(b and b.title or "未命名")..
-            (background and "正在准备后台下载" or "正在准备下载"),2)
-        UIManager:scheduleIn(.20,function()
-            self._download_launch_pending=false
-            self:download(b,opt,open_after,nil,background)
-        end)
-    end
-    local function begin_after_preflight(background)
-        local active_reader=self:_active_reader_ui()~=nil
-        if not active_reader then launch(background); return end
-        local preferences=self.store:preferences()
-        local policy=tostring(preferences.download_reader_policy or "ask")
-        if policy=="allow" or preferences.download_reader_warning==false or not self:_notice_enabled("reader_download") then
-            launch(background)
-            return
-        end
-        if policy=="after_reading" then
-            launch(true,true)
-            return
-        end
-        if dialog then UIManager:close(dialog) end
-        dialog=ButtonDialog:new{title="阅读时下载会增加耗电，并可能导致翻页、评论或菜单响应变慢。",title_align="center",buttons={
-            {{text="继续后台下载",callback=function() UIManager:close(dialog); dialog=nil; launch(true) end}},
-            {{text="退出阅读后下载",callback=function() UIManager:close(dialog); dialog=nil; launch(true,true) end}},
-            {{text="取消",callback=function() UIManager:close(dialog) end}},
-        }}
-        UIManager:show(dialog)
-    end
-    local function start(background)
-        if dialog then UIManager:close(dialog); dialog=nil end
-        self:_download_preflight(function() begin_after_preflight(background) end)
-    end
-    dialog=ButtonDialog:new{title="下载方式",title_align="center",buttons={
-        {{text="后台下载",callback=function() start(true) end}},
-        {{text="留在当前页面下载",callback=function() start(false) end}},
-        {{text="取消",callback=function() UIManager:close(dialog) end}},
-    }}
-    UIManager:show(dialog)
+    if b and open_after then return self:_open_book_stream(b) end
+    return
 end
 function Plugin:choose_download(b,limit,open_after,uid)
-    local dialog
-    local function choose_version(annotations)
-        UIManager:close(dialog)
-        self:choose_download_mode(b,{annotations=annotations,limit=limit,chapter_uid=uid},open_after)
-    end
-    dialog=ButtonDialog:new{
-        title="下载《"..tostring(b.title or "未命名").."》",title_align="center",
-        buttons={
-            {{text="纯净版",callback=function() choose_version(false) end}},
-            {{text="划线与想法版",callback=function() choose_version(true) end}},
-            {{text="取消",callback=function() UIManager:close(dialog) end}},
-        },
-    }
-    UIManager:show(dialog)
+    if b and open_after then return self:_open_book_stream(b) end
+    return
 end
 function Plugin:_download_summary(rec,opt)
     local preview=tostring(rec and rec.access_scope or "")=="preview" and not (opt and opt.chapter_uid)
@@ -14146,71 +14400,9 @@ function Plugin:show_waiting_downloads()
 end
 
 function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
-    if not self:require_login() then return end
-    if not self:is_online() then self:info(_("Network unavailable")); return end
-    opt=U.copy(opt or {})
-    local requested_id=tostring(b and (b.bookId or b.book_id) or "")
-    if from_queue~=true and requested_id~="" then
-        for _,job in ipairs(self.store:download_queue()) do
-            local queued_id=tostring(job.book and (job.book.bookId or job.book.book_id) or "")
-            if queued_id==requested_id then
-                self:info("这本书已经在等待下载。\n\n请在下载管理中查看或移除等待任务。")
-                return false
-            end
-        end
-    end
-    if self.download_task and self.download_task:busy() then
-        if from_queue then
-            self:_queue_download(b,opt,open_after)
-            return false
-        end
-        return self:_queue_download(b,opt,open_after)
-    end
-    local stored=self.store:download_state()
-    if stored.status=="active" and self:_recover_download_state() then
-        if from_queue then
-            self:_queue_download(b,opt,open_after)
-            return false
-        end
-        return self:_queue_download(b,opt,open_after)
-    end
-    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存正在清理，完成后再开始下载。"); return end
-    if b and b.bookId and tostring(b.bookId)~="" then
-        self.store:save_book(b.bookId,{book_id=tostring(b.bookId),title=b.title,author=b.author,
-            content_type=b.content_type,updated_at=os.time()})
-    end
-    local prefs=self.store:preferences()
-    if opt.images==nil then opt.images=prefs.images end
-    opt.network_mode=tostring(prefs.download_network_mode or "auto")=="ipv4" and "ipv4" or "auto"
-    opt.active_document_path=self:_current_document_path()
-    local runtime={book=U.copy(b),options=U.copy(opt),last_state={stage="prepare",current=0,total=1,percent=0,chapter=b.title or ""},background=start_in_background==true,dialog=nil,started_at=os.time(),open_after=open_after==true,done=done,notified_milestones={}}
-    self._download_runtime=runtime
-    self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
-    self:_notify_home_data_changed("content")
-    local ok,err=self.download_task:start(b,opt,
-        function(state) self:_on_download_progress(runtime,state) end,
-        function(result) self:_finish_download_runtime(runtime,result) end)
-    if not ok then
-        self._download_runtime=nil
-        self.store:clear_download_state()
-        self:_notify_home_data_changed("content")
-        if from_queue then self:_queue_download(b,opt,open_after) end
-        self:info("无法启动下载任务：\n"..tostring(err))
-        return false
-    end
-    runtime.task=self.download_task:descriptor()
-    self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
-    if runtime.background then
-        self.download_task:set_backgrounded(true)
-        self:_update_open_shelf_download_status(b.bookId,"生成中 0%")
-        if self.store:preferences().download_notice_enabled~=false then
-            self:status_toast("觅阅",tostring(b.title or "未命名").."已转入后台下载",3)
-        end
-    else
-        self:_show_active_download_dialog()
-    end
+    if open_after and b then return self:_open_book_stream(b) end
+    return false
 end
-
 
 
 function Plugin:_range_variant(book_id,kind)
@@ -14277,28 +14469,13 @@ function Plugin:_current_catalog_index(record,rows)
     return nil
 end
 function Plugin:download_current_chapters(count)
-    local record=self:_current_book_record()
-    if not record or not record.book then self:info("当前不是觅阅生成的书籍。") return end
-    local b={bookId=record.book.book_id,title=record.book.title,author=record.book.author,cover=record.book.cover}
-    local wanted=math.max(1,tonumber(count) or 1)
-    local context=self:_interactive_network_context()
-    self:_request_catalog(b,"current-chapter-download",function(rows)
-        rows=rows or {}
-        local first=self:_current_catalog_index(record,rows)
-        if not first or not rows[first] then self:info("暂时无法确定当前章节，请使用“选择章节范围”。") return end
-        local last=math.min(#rows,first+wanted-1)
-        self:_choose_range_version(b,rows,first,last,false)
-    end,{context=context,status_text="正在后台定位当前章节…"})
+    if self:_stream_active() then return self:_stream_go_next_chapter() end
+    return
 end
 
 function Plugin:_chapter_state_text(book_id,chapter)
     local uid=tostring(chapter.chapterUid or chapter.uid or "")
-    local states={}
-    for _,entry in ipairs({{"clean","纯净版"},{"notes","划线与想法版"}}) do
-        local record=self.store:chapter_variant(book_id,uid,entry[1])
-        if record and record.file and U.file_exists(record.file) then states[#states+1]=entry[2] end
-    end
-    return #states>0 and table.concat(states," · ") or tostring(chapter.wordCount or "")
+    return tostring(chapter.wordCount or chapter.title or "")
 end
 function Plugin:_chapter_list_menu(b,rows,title,callback,start_index)
     local items={}
@@ -14354,52 +14531,26 @@ function Plugin:_range_count_menu(b,rows,first)
     self:list("从《"..tostring(start_ch and start_ch.title or "所选章节").."》开始",items)
 end
 function Plugin:chapters(b)
-    local context=self:_interactive_network_context()
-    self:_request_catalog(b,"chapters",function(rows)
-        rows=rows or {}
-        local items={
-            {text="下载单章",callback=function()
-                self:_chapter_list_menu(b,rows,"选择单章 · "..tostring(b.title or "未命名"),function(_,chapter) self:chapter_menu(b,chapter) end)
-            end},
-            {text="下载章节范围",callback=function()
-                self:_chapter_list_menu(b,rows,"选择起始章节",function(first)
-                    self:_chapter_list_menu(b,rows,"选择结束章节",function(last) self:_choose_range_version(b,rows,first,last,false) end,first)
-                end)
-            end},
-            {text="从指定章节开始",callback=function()
-                self:_chapter_list_menu(b,rows,"选择起始章节",function(first) self:_range_count_menu(b,rows,first) end)
-            end},
-        }
-        self:list("章节下载 · "..tostring(b.title or "未命名"),items,"没有可用章节")
-    end,{context=context,status_text="正在后台读取章节目录…"})
-end
-function Plugin:chapter_menu(b,ch)
-    local uid=tostring(ch.chapterUid or ch.uid or "")
-    local clean=self.store:chapter_variant(b.bookId,uid,"clean")
-    local notes=self.store:chapter_variant(b.bookId,uid,"notes")
-    if not (clean and clean.file and U.file_exists(clean.file)) then clean=nil end
-    if not (notes and notes.file and U.file_exists(notes.file)) then notes=nil end
-    local items={}
-    for _,entry in ipairs({{record=clean,label="纯净版"},{record=notes,label="划线与想法版"}}) do
-        local record=entry.record
-        if record then
-            local label=DownloadResult.variant_label(entry.label,record)
-            items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
-        end
-    end
-    items[#items+1]={text=(clean or notes) and "更新本章" or "下载本章",callback=function() self:choose_download(b,nil,true,uid) end}
-    if clean or notes then items[#items+1]={text="删除本章文件",callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or uid) end} end
-    self:list(ch.title or uid,items)
+    self:_open_book_stream(b)
 end
 
-function Plugin:_open_file_direct(path)
+function Plugin:chapter_menu(b,ch)
+    self:_open_book_stream(b)
+end
+
+function Plugin:_open_file_direct(path,options)
+    options=type(options)=="table" and options or {}
     path=normalized_reader_file(path)
     if not path or not U.file_exists(path) then self:info(_("No cached file")); return false end
+    if self:_should_open_book_stream(nil,path,options) then
+        local book=self.store:identify_file(path,false)
+        if self:_redirect_open_to_stream(book,path,"direct open") then return true end
+    end
     sync_home_session()
     local now=os.time()
     local opening=tostring(HOME_SESSION.opening_file or "")
     local opening_age=now-(tonumber(HOME_SESSION.opening_at) or 0)
-    if opening~="" and opening_age>=0 and opening_age<12 then
+    if options.force_reopen~=true and opening~="" and opening_age>=0 and opening_age<12 then
         if opening==path then
             logger.info("[MiuRead][Reader] duplicate open ignored",opening)
             self:status_toast("正在打开书籍","请稍候",2)
@@ -14462,9 +14613,14 @@ function Plugin:_open_file_direct(path)
 end
 
 function Plugin:open_file(path)
-    if not path then self:info(_("No cached file")); return end
+    if not path then return end
+    path=normalized_reader_file(path)
     local book=self.store:identify_file(path,false)
-    local book_id=book and tostring(book.book_id or book.bookId or "") or ""
+    local book_id=self:_stream_book_id_from_path(path,book)
+    if self:_stream_enabled() and book_id~="" and not (book and (book.source=="local" or book.local_file==true)) then
+        logger.warn("[MiuRead][Stream] open_file routed to stream","book=",book_id,"path=",path)
+        return self:_open_book_stream({bookId=book_id,title=book and book.title,author=book and book.author})
+    end
     local resolved=book_id~="" and self.access:resolve_path(book_id,path) or path
     if not resolved or not U.file_exists(resolved) then self:info(_("No cached file")); return end
     self:_open_file_direct(resolved)
@@ -14917,6 +15073,9 @@ function Plugin:show_download_cleanup_dialog()
 end
 
 function Plugin:show_downloads(back_callback)
+    return
+end
+function Plugin:show_downloads_legacy(back_callback)
     if type(back_callback)=="function" then
         self._downloads_return_callback=back_callback
     elseif self.ui and self.ui.document and type(self._downloads_return_callback)=="function" then
@@ -17551,6 +17710,7 @@ function Plugin:show_about()
 end
 function Plugin:onExit()
     self:_cancel_interactive_network("exit")
+    self:_close_stream_session()
     if not HOME_EXITING then self:_begin_koreader_exit("external exit") end
     return false
 end
@@ -17637,11 +17797,213 @@ local function extract_thought_href(value,seen,depth)
     if type(value)=="string" then return value:match("(#?miuthought%-[%x%.]+)") end
     if type(value)~="table" then return nil end
     seen=seen or {}; if seen[value] then return nil end; seen[value]=true
-    for _,key in ipairs({"href","url","target","link","uri","dest","destination"}) do local found=extract_thought_href(value[key],seen,depth+1); if found then return found end end
+    for _,key in ipairs({"miuread_thought_href","xpointer","marker_xpointer","a_xpointer","href","url","target","link","uri","dest","destination"}) do
+        local found=extract_thought_href(value[key],seen,depth+1); if found then return found end
+    end
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
+
+local function thought_href_from_html(html)
+    html=tostring(html or "")
+    if html=="" then return nil end
+    local href=html:match('href="(#miuthought%-[%x%.]+)"')
+        or html:match("href='(#miuthought%-[%x%.]+)'")
+        or html:match('href="(miuthought%-[%x%.]+)"')
+        or html:match("href='(miuthought%-[%x%.]+)'")
+    if href then
+        if href:sub(1,1)~="#" then href="#"..href end
+        return href
+    end
+    local anchor=html:match('id="(miuthought%-[%x%.]+)"') or html:match("id='(miuthought%-[%x%.]+)'")
+    if anchor then return "#"..anchor end
+    return nil
+end
+
+local function thought_range_from_html(html)
+    html=tostring(html or "")
+    if html=="" then return nil end
+    return html:match('data%-miu%-range="([^"]+)"') or html:match("data%-miu%-range='([^']+)'")
+end
+
+local function html_is_thought_target(html)
+    html=tostring(html or "")
+    if html=="" then return false end
+    if html:find("miu-thought-link", 1, true) then return true end
+    if html:find("miu-thought-mark", 1, true) then return true end
+    if html:find("miuthought%-", 1, true) then return true end
+    return false
+end
+
+function Plugin:_reader_thought_context()
+    local stream=STREAM_SESSION.reader
+    if stream and stream.active==true and stream.book then
+        local book_id=tostring(stream.book.bookId or stream.book.book_id or "")
+        local chapter_uid=tostring(stream.current_uid or "")
+        if chapter_uid=="" and type(stream.current_chapter)=="table" then
+            chapter_uid=tostring(stream.current_chapter.chapterUid or stream.current_chapter.uid or "")
+        end
+        if book_id~="" and chapter_uid~="" then return book_id,chapter_uid end
+    end
+    local path=self:_current_document_path()
+    if not path then return "","" end
+    local identity=self.store:epub_identity_light(path) or {}
+    local book_id=tostring(identity.book_id or "")
+    local chapter_uid=tostring(identity.chapter_uid or "")
+    if book_id~="" and chapter_uid~="" then return book_id,chapter_uid end
+    local book,record=self.store:identify_file(path,false)
+    return tostring(book and (book.book_id or book.bookId) or ""),
+        tostring(record and record.chapter_uid or "")
+end
+
+function Plugin:_thought_html_at_xpointer(xpointer)
+    local doc=self.ui and self.ui.document
+    xpointer=tostring(xpointer or "")
+    if not doc or xpointer=="" or type(doc.getHTMLFromXPointer)~="function" then return nil end
+    for _,from_parent in ipairs({true,false}) do
+        local ok,html=pcall(doc.getHTMLFromXPointer,doc,xpointer,0x1001,from_parent)
+        if ok and type(html)=="string" and html~="" then return html end
+    end
+    return nil
+end
+
+function Plugin:_thought_info_from_html(html)
+    html=tostring(html or "")
+    if html=="" or not html_is_thought_target(html) then return nil end
+    local href=thought_href_from_html(html)
+    local info=href and Thoughts.parse_href(href) or nil
+    if info then return info end
+    local range_key=thought_range_from_html(html)
+    if not range_key then return nil end
+    local book_id,chapter_uid=self:_reader_thought_context()
+    if book_id=="" or chapter_uid=="" then return nil end
+    return {book_id=book_id,chapter_uid=chapter_uid,range=range_key,
+        anchor=Thoughts.anchor(book_id,chapter_uid,range_key)}
+end
+
+function Plugin:_lookup_thought_group(info)
+    info=type(info)=="table" and info or nil
+    if not info then return nil,"无效的想法定位",nil end
+    local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
+    if group then return group,err,token end
+
+    local stream=STREAM_SESSION.reader
+    local annotation=stream and stream.active==true and stream.last_annotation or nil
+    if type(annotation)~="table" then return nil,err,token end
+    if tostring(annotation.book_id or "")~=tostring(info.book_id or "") then return nil,err,token end
+    local ann_uid=tostring(annotation.chapter_uid or "")
+    local info_uid=tostring(info.chapter_uid or "")
+    if ann_uid=="" or info_uid=="" then return nil,err,token end
+    if U.id_name(ann_uid)~=U.id_name(info_uid) then return nil,err,token end
+
+    local range_key=tostring(info.range or "")
+    if range_key=="" then return nil,err,token end
+    for _,item in ipairs(annotation.review_groups or {}) do
+        if type(item)=="table" and tostring(item.range or "")==range_key and #(item.texts or {})>0 then
+            return item,nil,{stream_cache=true,index_hit=true,cache_hit=true}
+        end
+    end
+    local texts=annotation.review_map and annotation.review_map[range_key]
+    if type(texts)=="table" and #texts>0 then
+        return {range=range_key,texts=texts},nil,{stream_cache=true,index_hit=true,cache_hit=true}
+    end
+    local rows=select(1,Thoughts.load(self.store,info.book_id,info.chapter_uid))
+    if type(rows)=="table" then
+        for _,group in ipairs(rows) do
+            if type(group)=="table" and tostring(group.range or "")==range_key and #(group.texts or {})>0 then
+                return group,nil,{chapter_cache=true,index_hit=true,cache_hit=true}
+            end
+        end
+    end
+    return nil,err,token
+end
+
+function Plugin:_thought_info_from_link(link)
+    link=type(link)=="table" and link or nil
+    if not link then return nil end
+    local href=extract_thought_href(link,{},0)
+    local info=href and Thoughts.parse_href(href) or nil
+    if info then return info end
+    for _,xp in ipairs({link.a_xpointer,link.xpointer,link.marker_xpointer,link.from_xpointer}) do
+        info=self:_thought_info_from_html(self:_thought_html_at_xpointer(xp))
+        if info then return info end
+    end
+    return nil
+end
+
+function Plugin:_resolve_thought_from_ges(ges)
+    local ui=self.ui
+    local doc=ui and ui.document
+    if not doc or not ges or not ges.pos then return nil end
+
+    if ui.link and type(ui.link.getLinkFromGes)=="function" then
+        local ok,link=pcall(ui.link.getLinkFromGes,ui.link,ges)
+        if ok and link then
+            local info=self:_thought_info_from_link(link)
+            if info then return info end
+        end
+    end
+
+    if type(doc.getLinkFromPosition)=="function" then
+        local ok,link_xpointer,a_xpointer=pcall(doc.getLinkFromPosition,doc,ges.pos)
+        if ok then
+            local info=self:_thought_info_from_link({
+                xpointer=tostring(link_xpointer or ""),
+                a_xpointer=a_xpointer,
+                marker_xpointer=tostring(link_xpointer or ""),
+            })
+            if info then return info end
+        end
+    end
+
+    local xpointers={}
+    local function remember(xpointer)
+        xpointer=tostring(xpointer or "")
+        if xpointer=="" then return end
+        for _,existing in ipairs(xpointers) do
+            if existing==xpointer then return end
+        end
+        xpointers[#xpointers+1]=xpointer
+    end
+    if type(doc.getTextFromPositions)=="function" then
+        local ok,range=pcall(doc.getTextFromPositions,doc,ges.pos.x,ges.pos.y,ges.pos.x,ges.pos.y,false,false)
+        if ok and type(range)=="table" then
+            remember(range.pos0)
+            remember(range.pos1)
+        end
+    end
+    if type(doc.getWordFromPosition)=="function" then
+        local ok,word=pcall(doc.getWordFromPosition,doc,ges.pos,true)
+        if ok and type(word)=="table" then
+            remember(word.pos0)
+            remember(word.pos1)
+        end
+    end
+    for _,xpointer in ipairs(xpointers) do
+        local info=self:_thought_info_from_html(self:_thought_html_at_xpointer(xpointer))
+        if info then return info end
+    end
+    return nil
+end
+
+function Plugin:_show_thought_info(info)
+    info=type(info)=="table" and info or nil
+    if not info then return false end
+    local anchor=tostring(info.anchor or "")
+    if anchor=="" and info.book_id and info.chapter_uid and info.range then
+        anchor=Thoughts.anchor(info.book_id,info.chapter_uid,info.range)
+    end
+    if anchor=="" then return false end
+    return self:_show_thought_href("#"..anchor)
+end
 function Plugin:_teardown_thought_tap()
-    if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
+    if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then
+        pcall(function()
+            self.ui:unRegisterTouchZones({{
+                id="miuread_thought_popup",
+                overrides={"tap_link"},
+            }})
+        end)
+    end
     self._thought_tap_setup=nil
 end
 function Plugin:_thought_font_size(level)
@@ -17790,7 +18152,7 @@ function Plugin:_open_thought_info(info,generation)
         -- abnormally. Keep intermediate stages in the log instead of rewriting
         -- the same flash file several times during one visible tap.
         local lookup_started=monotonic_wall_time()
-        local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
+        local group,err,token=self:_lookup_thought_group(info)
         local lookup_ms=math.floor((monotonic_wall_time()-lookup_started)*1000+.5)
         if not group then notice=tostring(err or "没有想法内容"); return end
         local prefs=self.store:preferences().thoughts or {}
@@ -17850,7 +18212,11 @@ function Plugin:_open_thought_info(info,generation)
 end
 
 function Plugin:_show_thought_href(href)
-    local info=Thoughts.parse_href(href); if not info then return false end
+    local info=Thoughts.parse_href(href)
+    if not info then
+        logger.warn("[MiuRead][ThoughtPopup] invalid href", U.first_line(href, 120))
+        return false
+    end
     -- A disabled comment layer still owns its internal links. Consume them
     -- silently instead of letting KOReader report #miuthought as invalid.
     if not self:_thoughts_enabled() then return true end
@@ -17913,17 +18279,33 @@ function Plugin:_thought_edge_page_turn(ges)
 end
 
 function Plugin:_on_thought_tap(ges)
-    if not self.ui or not self.ui.link or not self.ui.link.getLinkFromGes then return false end
-    local ok,link=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges); if not ok or not link then return false end
-    local href=extract_thought_href(link,{},0); if not href then return false end
+    local info=self:_resolve_thought_from_ges(ges)
+    if not info then return false end
     if self:_thought_edge_page_turn(ges) then return true end
-    return self:_show_thought_href(href)
+    logger.info("[MiuRead][ThoughtPopup] tap",
+        "book=",tostring(info.book_id or ""),"chapter=",tostring(info.chapter_uid or ""),
+        "range=",U.first_line(tostring(info.range or ""),80))
+    return self:_show_thought_info(info)
 end
 function Plugin:_setup_thought_tap()
-    if self._thought_tap_setup or not self.ui or not self.ui.registerTouchZones then return end
-    local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
-    self.ui:registerTouchZones({{id="miuread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
+    if self._thought_tap_setup then return true end
+    if not self.ui or not self.ui.registerTouchZones then
+        logger.warn("[MiuRead][ThoughtPopup] tap setup skipped",
+            "ui=",tostring(self.ui~=nil),
+            "registerTouchZones=",tostring(self.ui and self.ui.registerTouchZones~=nil))
+        return false
+    end
+    local owner=self
+    self.ui:registerTouchZones({{
+        id="miuread_thought_popup",ges="tap",
+        screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},
+        overrides={"tap_link"},
+        handler=function(ges) return owner:_on_thought_tap(ges) end,
+    }})
     self._thought_tap_setup=true
+    self:_install_thought_link_guard()
+    logger.info("[MiuRead][ThoughtPopup] tap zone registered")
+    return true
 end
 
 function Plugin:_record_recent_read(path,book,record)
@@ -17964,8 +18346,11 @@ function Plugin:on_sync_record_ready(current)
         local book_id,path=tostring(current.book.book_id),current.path
         local record=current.record or {}
         local variant=tostring(current.variant or record.variant or "")
-        if record.annotation_requested==true or variant:find("notes",1,true) then
+        local stream_session=STREAM_SESSION.reader and STREAM_SESSION.reader.active==true
+        if stream_session or self:_stream_active()
+            or record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
+            self:_install_thought_link_guard()
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
@@ -18246,6 +18631,7 @@ end
 function Plugin:onReaderReady()
     HOME_SESSION.home_restore_generation=(tonumber(HOME_SESSION.home_restore_generation) or 0)+1
     HOME_SESSION.home_restore_active=false
+    self:_teardown_thought_tap()
 
     local ready_path=normalized_reader_file(self:_current_document_path())
     -- If the same Reader unexpectedly reappears while an explicit Home return
@@ -18314,9 +18700,24 @@ function Plugin:onReaderReady()
             book,record,variant=self.store:identify_file(path,false)
             self:_record_recent_read(path,book,record)
         end
+        if self:_should_open_book_stream(book,path,{reader_ready=true}) then
+            if self:_redirect_open_to_stream(book,path,"reader ready") then return end
+        end
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
+            self:_install_thought_link_guard()
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
+        end
+        local stream_session=STREAM_SESSION.reader and STREAM_SESSION.reader.active==true
+        if self:_stream_active() or stream_session then
+            self:_setup_thought_tap()
+            self:_install_thought_link_guard()
+            self:_patch_stream_end_of_book()
+            if self:_stream_active() then
+                self:_apply_stream_pending_position()
+            elseif stream_session then
+                self:_ensure_stream_reader_hooks(1)
+            end
         end
     end)
     -- Prime only lightweight page/chapter data. No toolbar widget survives a
@@ -18325,7 +18726,6 @@ function Plugin:onReaderReady()
     self:_reset_reader_toolbar_state_cache()
     self:_schedule_reader_toolbar_state_refresh(nil,.35)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
-    self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
     self._progress_remote_retries={}

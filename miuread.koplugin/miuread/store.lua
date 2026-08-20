@@ -1827,6 +1827,7 @@ function Store:file_record_from_identity(path,meta,relink)
                 range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
                 range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
                 annotation_error_kind=meta.annotation_error_kind,core_map_hash=meta.core_map_hash,recovered=true,
+                annotation_requested=meta.annotation_requested==true or nil,
             }
             if standalone and uid~="" then
                 record.chapter_uid=uid
@@ -1851,6 +1852,7 @@ function Store:file_record_from_identity(path,meta,relink)
             range_end_index=tonumber(meta.range_end_index),range_start_title=meta.range_start_title,
             range_end_title=meta.range_end_title,annotation_pending=meta.annotation_pending==true or nil,
             annotation_error_kind=meta.annotation_error_kind,core_map_hash=meta.core_map_hash,
+            annotation_requested=meta.annotation_requested==true or nil,
         }
         if standalone and uid~="" then record.chapter_uid=uid; book.chapters[uid]={[kind]=record}
         else book.variants[kind]=record end
