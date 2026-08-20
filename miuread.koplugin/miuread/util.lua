@@ -415,4 +415,25 @@ function U.semver_compare(a,b)
     return 0
 end
 function U.semver_newer(a,b) return U.semver_compare(a,b)>0 end
+
+function U.plugin_dir()
+    if U._plugin_dir then return U._plugin_dir end
+    for level = 2, 12 do
+        local info = debug.getinfo(level, "S")
+        if not info or not info.source then break end
+        local source = tostring(info.source or "")
+        if source:sub(1, 1) == "@" then source = source:sub(2) end
+        local dir = source:match("^(.+%.koplugin)/")
+        if dir then
+            U._plugin_dir = dir
+            return dir
+        end
+    end
+    local info = debug.getinfo(1, "S")
+    local source = info and info.source or ""
+    if source:sub(1, 1) == "@" then source = source:sub(2) end
+    U._plugin_dir = source:match("^(.-)/miuread/") or "."
+    return U._plugin_dir
+end
+
 return U
