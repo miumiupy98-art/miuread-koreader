@@ -533,7 +533,6 @@ local function install_home_screensaver_patch()
                 manager.image=nil
                 manager.image_file=nil
                 manager.screensaver_background="white"
-                -- Receipt mode needs ReaderUI; on home surface fall back to fill.
                 local home_style=style
                 if home_style=="receipt" then home_style="fill" end
                 if apply_direct_cover(manager,sources,home_style,source_file) then
@@ -566,16 +565,19 @@ local function install_home_screensaver_patch()
         -- leave KOReader's already-prepared native screensaver untouched.
         if args.n==0 and use_home_target then
             if style=="receipt" then
-                -- Delegate to the built-in book receipt module. It hooks
-                -- Screensaver.show and checks screensaver_type=="book_receipt".
-                manager.screensaver_type="book_receipt"
-                -- Auto-configure receipt for full-screen cover background.
-                local GRS=_G.G_reader_settings
-                if GRS and type(GRS.saveSetting)=="function" then
-                    pcall(GRS.saveSetting,GRS,"book_receipt_screensaver_background","book_cover")
-                    pcall(GRS.saveSetting,GRS,"book_receipt_bg_image_mode","stretch")
+                if BOOK_RECEIPT_AVAILABLE then
+                    manager.screensaver_type="book_receipt"
+                    local GRS=_G.G_reader_settings
+                    if GRS and type(GRS.saveSetting)=="function" then
+                        pcall(GRS.saveSetting,GRS,"book_receipt_screensaver_background","book_cover")
+                        pcall(GRS.saveSetting,GRS,"book_receipt_bg_image_mode","stretch")
+                    end
+                    logger.info("[MiuRead][Lockscreen] receipt mode","book=",tostring(source_file or ""))
+                else
+                    if not apply_direct_cover(manager,sources,"fill",source_file) then
+                        emergency_native_fallback(manager,reader_ui or current,nil,"receipt_not_installed")
+                    end
                 end
-                logger.info("[MiuRead][Lockscreen] receipt mode","book=",tostring(source_file or ""))
             else
                 if not apply_direct_cover(manager,sources,style,source_file) then
                     logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
@@ -21458,6 +21460,10 @@ end
 function Plugin:_set_home_lockscreen_style(style)
     local allowed={frame=true,fit=true,fill=true,receipt=true}
     style=allowed[style] and style or "frame"
+    if style=="receipt" and not BOOK_RECEIPT_AVAILABLE then
+        self:_book_receipt_ensure_or_prompt()
+        return true
+    end
     local home,preferences=self:_home_preferences()
     if home.lockscreen_style==style then return true end
     home.lockscreen_style=style
@@ -21469,7 +21475,9 @@ end
 
 function Plugin:home_lockscreen_style_menu()
     local labels={frame="画框",fit="完整",fill="铺满",receipt="书籍收据"}
-    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切",receipt="阅读进度收据卡片"}
+    local receipt_note="阅读进度收据卡片"
+    if not BOOK_RECEIPT_AVAILABLE then receipt_note="未安装 · 点击查看下载说明" end
+    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切",receipt=receipt_note}
     local items={}
     for _,style in ipairs({"frame","fit","fill","receipt"}) do
         local key=style
@@ -25192,30 +25200,74 @@ function Plugin:onFlushSettings()
 end
 
 -- ============================================================
--- 内置书籍收据屏保：直接加载收据插件文件，失败不影响主插件
+-- 书籍收据屏保：外部插件引用，未安装时提示下载
 -- ============================================================
-do
-    local function _load_book_receipt()
-        local plugin_dir
-        local info=debug.getinfo(1,"S")
-        if info and info.source and info.source:sub(1,1)=="@" then
-            local src=info.source:sub(2)
-            plugin_dir=src:match("(.*/)") or ""
+local BOOK_RECEIPT_AVAILABLE=false
+local function _find_book_receipt_plugin()
+    local lfs=require("libs/libkoreader-lfs")
+    local DataStorage=require("datastorage")
+    local search_dirs={
+        DataStorage:getDataDir().."/patches",
+        DataStorage:getDataDir().."/koreader/patches",
+    }
+    local candidates={
+        "book_receipt.lua","book-receipt.lua",
+        "bookreceipt.lua","2-book-receipt-shortcut-and-lockscreen.lua",
+    }
+    for _,dir in ipairs(search_dirs) do
+        for _,name in ipairs(candidates) do
+            local path=dir.."/"..name
+            if lfs.attributes(path,"mode")=="file" then return path end
         end
-        if not plugin_dir or plugin_dir=="" then return false,"no_plugin_dir" end
-        local path=plugin_dir.."book_receipt.lua"
-        local lfs=require("libs/libkoreader-lfs")
-        if not lfs.attributes(path,"mode") then return false,"file_not_found:"..path end
-        local ok,err=pcall(dofile,path)
-        if not ok then return false,tostring(err) end
-        return true
+        -- 也搜索 .koplugin 文件夹
+        local ok,entries=pcall(lfs.dir,dir)
+        if ok and entries then
+            for entry in entries do
+                if entry:match("book.*receipt") or entry:match("bookreceipt") then
+                    local path=dir.."/"..entry
+                    local mode=lfs.attributes(path,"mode")
+                    if mode=="file" then return path end
+                    if mode=="directory" then
+                        local main=path.."/main.lua"
+                        if lfs.attributes(main,"mode")=="file" then return main end
+                    end
+                end
+            end
+        end
     end
-    local ok,err=_load_book_receipt()
+    return nil
+end
+local function _load_book_receipt()
+    local path=_find_book_receipt_plugin()
+    if not path then
+        logger.warn("[MiuRead][BookReceipt] external plugin not found")
+        return false
+    end
+    local ok,err=pcall(dofile,path)
     if ok then
-        logger.info("[MiuRead][BookReceipt] built-in receipt loaded")
+        logger.info("[MiuRead][BookReceipt] loaded from",path)
+        return true
     else
-        logger.warn("[MiuRead][BookReceipt] built-in receipt skipped:",tostring(err))
+        logger.warn("[MiuRead][BookReceipt] load failed:",tostring(err))
+        return false
     end
+end
+BOOK_RECEIPT_AVAILABLE=_load_book_receipt()
+
+function Plugin:_book_receipt_available()
+    return BOOK_RECEIPT_AVAILABLE
+end
+
+function Plugin:_book_receipt_ensure_or_prompt()
+    if BOOK_RECEIPT_AVAILABLE then return true end
+    local UIManager=require("ui/uimanager")
+    local InfoMessage=require("ui/widget/infomessage")
+    local _=require("gettext")
+    UIManager:show(InfoMessage:new{
+        text=_("书籍收据插件未安装。\n请下载 book-receipt 插件，放入 KOReader 的 patches/ 目录后重启。\n下载地址见 PR 说明或 README。"),
+        timeout=5,
+    })
+    return false
 end
 
 return Plugin
