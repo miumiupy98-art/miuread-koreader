@@ -493,7 +493,7 @@ local function install_home_screensaver_patch()
         local use_home_target=enabled and (HomeView.is_shown() or HOME_READER_ORIGIN)
         local sources=use_home_target and collect_sources(opts) or {}
         local style=tostring((opts and opts.lockscreen_style) or HOME_SESSION.lockscreen_style or "frame")
-        if style~="frame" and style~="fit" and style~="fill" then style="frame" end
+        if style~="frame" and style~="fit" and style~="fill" and style~="receipt" then style="frame" end
 
         local ReaderUI=require("apps/reader/readerui")
         local FileManager=require("apps/filemanager/filemanager")
@@ -533,7 +533,10 @@ local function install_home_screensaver_patch()
                 manager.image=nil
                 manager.image_file=nil
                 manager.screensaver_background="white"
-                if apply_direct_cover(manager,sources,style,source_file) then
+                -- Receipt mode needs ReaderUI; on home surface fall back to fill.
+                local home_style=style
+                if home_style=="receipt" then home_style="fill" end
+                if apply_direct_cover(manager,sources,home_style,source_file) then
                     logger.info("[MiuRead][Lockscreen] home takeover committed",
                         "book=",tostring(source_file or ""),"host=",host and "filemanager" or "home")
                     return
@@ -562,16 +565,24 @@ local function install_home_screensaver_patch()
         -- substitute MiuRead's current/recent-reading cover. If rendering fails,
         -- leave KOReader's already-prepared native screensaver untouched.
         if args.n==0 and use_home_target then
-            if not apply_direct_cover(manager,sources,style,source_file) then
-                logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
-                    "reason=miuread_cover_unavailable","mode=",tostring(manager.screensaver_type or ""))
-                -- With screensaver_type=disable KOReader intentionally keeps the
-                -- current framebuffer. In Reader that exposes the last text page
-                -- as the lock screen, which is never an acceptable fallback when
-                -- MiuRead lockscreen cover is enabled. Show KOReader's neutral
-                -- image instead; other native modes remain untouched.
-                if tostring(manager.screensaver_type or "")=="disable" then
-                    emergency_native_fallback(manager,reader_ui or current,nil,"reader_cover_unavailable_disable")
+            if style=="receipt" then
+                -- Delegate to the built-in book receipt module. It hooks
+                -- Screensaver.show and checks screensaver_type=="book_receipt".
+                manager.screensaver_type="book_receipt"
+                -- Auto-configure receipt for full-screen cover background.
+                local GRS=_G.G_reader_settings
+                if GRS and type(GRS.saveSetting)=="function" then
+                    pcall(GRS.saveSetting,GRS,"book_receipt_screensaver_background","book_cover")
+                    pcall(GRS.saveSetting,GRS,"book_receipt_bg_image_mode","stretch")
+                end
+                logger.info("[MiuRead][Lockscreen] receipt mode","book=",tostring(source_file or ""))
+            else
+                if not apply_direct_cover(manager,sources,style,source_file) then
+                    logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
+                        "reason=miuread_cover_unavailable","mode=",tostring(manager.screensaver_type or ""))
+                    if tostring(manager.screensaver_type or "")=="disable" then
+                        emergency_native_fallback(manager,reader_ui or current,nil,"reader_cover_unavailable_disable")
+                    end
                 end
             end
         end
@@ -1864,7 +1875,8 @@ function Plugin:reader_menu()
     local desktop=self:_home_enabled()
     local out={
         {text=desktop and "退出阅读并返回觅阅主页" or "返回书架",callback=self:safe("shelf",function()
-            return self:_reader_home_action("reader menu")
+            if desktop then self:return_to_miuread_home()
+            else self:show_shelf(false,false,"account") end
         end)},
     }
     if desktop then
@@ -3087,27 +3099,25 @@ function Plugin:_home_preferences()
         changed=true
     end
     if type(home.ui_font_face)~="string" then home.ui_font_face=""; changed=true end
-    -- beta.13 no longer maintains a recursive local-library index. The old
-    -- scan preferences remain untouched for downgrade compatibility; only one
-    -- browser entry directory is used by the new code.
-    if type(home.local_entry_root)~="string" then home.local_entry_root=""; changed=true end
-    if (tonumber(home.local_entry_version) or 0)<1 then
-        local function usable(path)
-            path=U.trim(tostring(path or ""))
-            return path~="" and lfs.attributes(path,"mode")=="directory" and path or nil
-        end
-        local entry=usable(home.local_entry_root) or usable(home.local_root)
-        if not entry then
-            for _,root in ipairs(type(home.local_roots)=="table" and home.local_roots or {}) do
-                entry=usable(type(root)=="table" and root.path or root)
-                if entry then break end
-            end
-        end
-        home.local_entry_root=entry or ""
-        home.local_entry_version=1
+    if home.local_check_on_open==nil then home.local_check_on_open=true; changed=true end
+    -- beta.16 removes the old mutually-exclusive auto/manual/folder modes.
+    -- Updating the library and browsing it by folder are independent choices:
+    -- the home grid is always a flat book shelf, while folder browsing remains
+    -- available from the local-library entry.
+    if (tonumber(home.local_browse_version) or 0)<2 then
+        home.local_browse_version=2
+        home.local_auto_update=true
+        home.local_library_mode="auto" -- compatibility for older call sites
+        home.auto_scan=true
+        home.local_inline_path=nil
+        home.local_inline_root=nil
         changed=true
     end
-    if (tonumber(home.local_browse_version) or 0)<3 then home.local_browse_version=3; changed=true end
+    if home.local_auto_update==nil then home.local_auto_update=true; changed=true end
+    if home.local_library_mode~="auto" then home.local_library_mode="auto"; changed=true end
+    if home.auto_scan~=(home.local_auto_update==true) then
+        home.auto_scan=home.local_auto_update==true; changed=true
+    end
     if type(home.visible_sections)~="table" then home.visible_sections={}; changed=true end
     for _,section in ipairs(HOME_SECTION_ORDER) do
         if home.visible_sections[section]==nil then home.visible_sections[section]=true; changed=true end
@@ -3250,17 +3260,79 @@ function Plugin:_home_preferences()
     if home.background_thought_index~=nil then home.background_thought_index=nil; changed=true end
     if home.active_section~="account" and home.active_section~="generated" and home.active_section~="local" and home.active_section~="mp" then home.active_section="account"; changed=true end
     if home.lockscreen_recent==nil then home.lockscreen_recent=true; changed=true end
-    if home.lockscreen_style~="frame" and home.lockscreen_style~="fit" and home.lockscreen_style~="fill" then
+    if home.lockscreen_style~="frame" and home.lockscreen_style~="fit" and home.lockscreen_style~="fill" and home.lockscreen_style~="receipt" then
         home.lockscreen_style="frame"; changed=true
     end
-    -- Legacy scan roots are intentionally left byte-for-byte compatible for
-    -- rollback. Only normalize the new browser entry used by beta.13.
-    local normalized_entry=LocalLibrary.normalize(home.local_entry_root or "")
-    if normalized_entry~=tostring(home.local_entry_root or "") then
-        home.local_entry_root=normalized_entry
-        changed=true
+    home.local_root=tostring(home.local_root or "")
+    local original_roots=type(home.local_roots)=="table" and home.local_roots or {}
+    local normalized_roots,root_seen={},{}
+    local function add_root(value)
+        local item=type(value)=="table" and value or {path=value}
+        local path=LocalLibrary.normalize(item.path or "")
+        if path=="" or root_seen[path] or lfs.attributes(path,"mode")~="directory" then return end
+        root_seen[path]=true
+        normalized_roots[#normalized_roots+1]={
+            path=path,
+            name=U.trim(tostring(item.name or ""))~="" and U.trim(tostring(item.name)) or LocalLibrary.basename(path),
+            enabled=item.enabled~=false,
+            readonly=item.readonly~=false,
+        }
     end
-    if (tonumber(home.local_browse_version) or 0)<3 then home.local_browse_version=3; changed=true end
+    for _,root in ipairs(original_roots) do add_root(root) end
+    if #normalized_roots==0 then
+        add_root(home.local_root)
+        if #normalized_roots==0 then
+            local legacy=self.store:get("home_local_index",{})
+            if type(legacy)=="table" then add_root(legacy.root) end
+        end
+        if #normalized_roots==0 and lfs.attributes("/mnt/us/documents/Books","mode")=="directory" then
+            add_root("/mnt/us/documents/Books")
+        end
+    end
+    local function root_signature(rows)
+        local parts={}
+        for _,root in ipairs(rows or {}) do
+            local item=type(root)=="table" and root or {path=root}
+            parts[#parts+1]=table.concat({tostring(item.path or ""),tostring(item.name or ""),tostring(item.enabled~=false),tostring(item.readonly~=false)},"|")
+        end
+        return table.concat(parts,";")
+    end
+    if root_signature(original_roots)~=root_signature(normalized_roots) then changed=true end
+    home.local_roots=normalized_roots
+    home.local_root=normalized_roots[1] and normalized_roots[1].path or ""
+
+    -- Direct browsing keeps its current folder in preferences so returning from
+    -- a book or restarting KOReader restores the same level. Empty path means
+    -- the multi-root picker; a single enabled root opens directly at its root.
+    local old_inline_path=tostring(home.local_inline_path or "")
+    local old_inline_root=tostring(home.local_inline_root or "")
+    local inline_path=LocalLibrary.normalize(old_inline_path)
+    local inline_root=LocalLibrary.normalize(old_inline_root)
+    local enabled_roots={}
+    for _,root in ipairs(normalized_roots) do if root.enabled~=false then enabled_roots[#enabled_roots+1]=root end end
+    local matched_root
+    if inline_path~="" and lfs.attributes(inline_path,"mode")=="directory" then
+        for _,root in ipairs(enabled_roots) do
+            if inline_path==root.path or inline_path:sub(1,#root.path+1)==root.path.."/" then
+                matched_root=root
+                break
+            end
+        end
+    end
+    if #enabled_roots==0 then
+        inline_path=""; inline_root=""
+    elseif matched_root then
+        inline_root=matched_root.path
+    elseif #enabled_roots==1 then
+        inline_path=enabled_roots[1].path
+        inline_root=enabled_roots[1].path
+    else
+        inline_path=""; inline_root=""
+    end
+    if old_inline_path~=inline_path or old_inline_root~=inline_root then changed=true end
+    home.local_inline_path=inline_path
+    home.local_inline_root=inline_root
+    home.local_browse_version=2
     if type(home.page_by_section)~="table" then home.page_by_section={}; changed=true end
     if changed then self.store:save_preferences(preferences) end
     UiScale.setDisplayMode(home.display_size or "standard")
@@ -4495,7 +4567,9 @@ function Plugin:_home_manual_refresh()
         return true
     end
     if active=="local" then
-        self:_home_scan_local(true,true)
+        local started=self:_home_scan_local(true,true)
+        if started then self:toast("正在更新本地书库…",2)
+        else self:toast("本地书库暂时无法开始更新",2) end
         return true
     end
     -- Generated books are already known to MiuRead. Reconcile its saved
@@ -4524,6 +4598,10 @@ function Plugin:_home_refresh_whole_page()
 end
 
 function Plugin:_home_complete_refresh(confirmed)
+    if confirmed~=true and self:_notice_enabled("library_scan") then
+        self:_confirm_library_scan(function() self:_home_complete_refresh(true) end)
+        return true
+    end
     self:_home_reset_local_metadata()
     self.store:reload()
     self.store:prune_missing_files()
@@ -4953,7 +5031,7 @@ function Plugin:_home_update_lockscreen_session(book)
     local enabled=home.lockscreen_recent~=false
     local sources=enabled and self:_home_lockscreen_sources(book) or {}
     local style=tostring(home.lockscreen_style or "frame")
-    if style~="frame" and style~="fit" and style~="fill" then style="frame" end
+    if style~="frame" and style~="fit" and style~="fill" and style~="receipt" then style="frame" end
     local book_file=normalized_reader_file(book and book.file or nil)
     HOME_SESSION.lockscreen_recent_enabled=enabled
     HOME_SESSION.lockscreen_style=style
@@ -5965,7 +6043,7 @@ end
 
 local NOTICE_LABELS={
     reader_download="阅读时下载提醒",low_battery="低电量下载提醒",low_storage="存储空间提醒",
-    full_refresh="全屏刷新说明",library_scan="批量书籍检查提醒",
+    full_refresh="全屏刷新说明",library_scan="扫描书库提醒",
     repair_while_reading="阅读中修复提醒",mode_switch="运行模式切换说明",mode_environment="进入模式说明",
 }
 
@@ -6633,149 +6711,29 @@ function Plugin:_reader_open_native_page(label,opener,return_callback)
     return true
 end
 
-function Plugin:_wifi_state_snapshot(NetworkMgr)
-    if not NetworkMgr then
-        local ok_nm,value=pcall(require,"ui/network/manager")
-        if not ok_nm then return nil,nil end
-        NetworkMgr=value
-    end
-    if type(NetworkMgr.queryNetworkState)=="function" then pcall(NetworkMgr.queryNetworkState,NetworkMgr) end
-    local wifi_on,connected=nil,nil
-    if type(NetworkMgr.isWifiOn)=="function" then
-        local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
-        if ok then wifi_on=value==true end
-    end
-    if wifi_on==false then
-        connected=false
-    elseif type(NetworkMgr.isConnected)=="function" then
-        local ok,value=pcall(NetworkMgr.isConnected,NetworkMgr)
-        if ok then connected=value==true end
-    end
-    return wifi_on,connected
-end
-
-function Plugin:_wifi_refresh_state(source)
-    HomeData.invalidate_device_state()
-    local state=HomeData.quick_device_state(true) or {}
-    ReaderToolbar.invalidate()
-    if HomeView.is_shown() and not self:_active_reader_ui() then
-        self:_home_refresh_header_now(false,false)
-    end
-    logger.info("[MiuRead][WiFi] state refreshed",
-        "source=",tostring(source or "unknown"),
-        "radio=",tostring(state.wifi_on),
-        "connected=",tostring(state.connected),
-        "online=",tostring(state.online),
-        "ssid=",tostring(state.wifi_name or ""))
-    return state
-end
-
-function Plugin:_wifi_schedule_reconcile(source,want_on)
-    self._wifi_reconcile_generation=(tonumber(self._wifi_reconcile_generation) or 0)+1
-    local generation=self._wifi_reconcile_generation
-    local function schedule(delay)
-        UIManager:scheduleIn(delay,function()
-            if generation~=self._wifi_reconcile_generation then return end
-            local state=self:_wifi_refresh_state(tostring(source or "toggle").."+"..tostring(delay))
-            local linked=state.connected==true or (state.connected==nil and state.online==true)
-            if (want_on==true and linked) or (want_on~=true and state.wifi_on==false) then
-                self._wifi_reconcile_generation=generation+1
-            end
-        end)
-    end
-    schedule(.8)
-    schedule(3)
-    schedule(6)
-end
-
-function Plugin:_wifi_start(NetworkMgr,source)
-    local completed=false
-    local function complete()
-        if completed then return end
-        completed=true
-        self:_wifi_refresh_state(tostring(source or "toggle")..":connected")
-    end
-
-    -- Kindle's native Wi-Fi service may need several seconds to reconnect a saved
-    -- profile. Avoid an immediate scan here: on KPW5 that scan can finish before
-    -- wifid has associated, causing NetworkMgr to report a false failure.
-    local is_kindle=false
-    if type(Device.isKindle)=="function" then
-        local ok,value=pcall(Device.isKindle,Device)
-        is_kindle=ok and value==true
-    end
-    local ok=false
-    if is_kindle and type(NetworkMgr.restoreWifiAsync)=="function"
-        and type(NetworkMgr.scheduleConnectivityCheck)=="function" then
-        if NetworkMgr.pending_connectivity_check==true and type(NetworkMgr.unscheduleConnectivityCheck)=="function" then
-            pcall(NetworkMgr.unscheduleConnectivityCheck,NetworkMgr)
-        end
-        if UIManager and Event then pcall(UIManager.broadcastEvent,UIManager,Event:new("NetworkConnecting")) end
-        local ok_restore,err=pcall(NetworkMgr.restoreWifiAsync,NetworkMgr)
-        if ok_restore then
-            local ok_check,check_err=pcall(NetworkMgr.scheduleConnectivityCheck,NetworkMgr,complete)
-            ok=ok_check==true
-            if not ok_check then logger.warn("[MiuRead][WiFi] Kindle connectivity check failed",tostring(check_err)) end
-        else
-            logger.warn("[MiuRead][WiFi] Kindle restore failed",tostring(err))
-        end
-        if ok then logger.info("[MiuRead][WiFi] Kindle saved-network restore requested","source=",tostring(source or "toggle")) end
-    elseif type(NetworkMgr.toggleWifiOn)=="function" then
-        -- This is a direct user action. Passing interactive=true prevents
-        -- KOReader from treating a still-connecting radio as a background failure.
-        ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,complete,false,true)
-    elseif type(NetworkMgr.turnOnWifi)=="function" then
-        ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,complete,true)
-    end
-    if ok then
-        HomeData.invalidate_device_state()
-        self:_wifi_schedule_reconcile(source,true)
-    end
-    return ok==true
-end
-
-function Plugin:_wifi_stop(NetworkMgr,source)
-    self._wifi_reconcile_generation=(tonumber(self._wifi_reconcile_generation) or 0)+1
-    local completed=false
-    local function complete()
-        if completed then return end
-        completed=true
-        self:_wifi_refresh_state(tostring(source or "toggle")..":disconnected")
-    end
-    local ok=false
-    if type(NetworkMgr.toggleWifiOff)=="function" then
-        -- interactive=true records that the user explicitly turned Wi-Fi off,
-        -- so KOReader will not immediately auto-restore it later.
-        ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr,complete,true)
-    elseif type(NetworkMgr.turnOffWifi)=="function" then
-        ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr,complete)
-    end
-    if ok then
-        HomeData.invalidate_device_state()
-        self:_wifi_schedule_reconcile(source,false)
-    end
-    return ok==true
-end
-
 function Plugin:_reader_wifi_state()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
-    if not ok_nm or not NetworkMgr then return nil end
-    local wifi_on=self:_wifi_state_snapshot(NetworkMgr)
-    return wifi_on
+    if not ok_nm or not NetworkMgr or type(NetworkMgr.isWifiOn)~="function" then return nil end
+    local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
+    if ok then return value==true end
+    return nil
 end
 
 function Plugin:_reader_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_wifi_state_snapshot(NetworkMgr)==true
-    local ok
+    local on=self:_reader_wifi_state()==true
+    local ok=false
     if on then
-        ok=self:_wifi_stop(NetworkMgr,"reader")
-        if ok then self:toast("正在关闭 Wi-Fi",1.5) end
+        if type(NetworkMgr.toggleWifiOff)=="function" then ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr)
+        elseif type(NetworkMgr.turnOffWifi)=="function" then ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr) end
+        if ok then self:toast("Wi-Fi 已关闭",1.5) end
     else
-        ok=self:_wifi_start(NetworkMgr,"reader")
-        if ok then self:toast("正在连接 Wi-Fi",1.5) end
+        if type(NetworkMgr.toggleWifiOn)=="function" then ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr)
+        elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
+        if ok then self:toast("正在开启 Wi-Fi",1.5) end
     end
+    if ok then HomeData.invalidate_device_state() end
     return ok==true
 end
 
@@ -6842,10 +6800,9 @@ function Plugin:_home_wifi_text()
     local state=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
     if state.wifi_on==false then return "已关闭" end
     if state.wifi_on==true then
-        local linked=state.connected==true or (state.connected==nil and state.online==true)
         local ssid=U.trim(tostring(state.wifi_name or ""))
-        if linked and ssid~="" then return U.utf8_truncate(ssid,13,"…") end
-        return linked and "已连接" or "未连接"
+        if ssid~="" then return U.utf8_truncate(ssid,13,"…") end
+        return state.online==true and "已连接" or "未连接"
     end
     return "Wi-Fi"
 end
@@ -6937,7 +6894,7 @@ end
 
 function Plugin:_home_root()
     local prefs=self.store:preferences().home_ui or {}
-    local explicit=U.trim(tostring(prefs.local_entry_root or ""))
+    local explicit=U.trim(tostring(prefs.local_root or ""))
     if explicit~="" and lfs.attributes(explicit,"mode")=="directory" then return explicit end
 
     local native_home=""
@@ -6948,6 +6905,8 @@ function Plugin:_home_root()
     local download_root=tostring(self.store.default_books_dir or ""):gsub("/+$","")
     local normalized_home=native_home:gsub("/+$","")
     if download_root~="" and (normalized_home==download_root or normalized_home:sub(1,#download_root+1)==download_root.."/") then
+        -- KOReader often remembers the MiuRead download folder as its current
+        -- home. That is not the user's full local library.
         native_home=""
     end
 
@@ -6973,35 +6932,24 @@ function Plugin:_home_local_cache()
 end
 
 function Plugin:_home_local_tree_cache()
-    -- beta.13 uses a new key so old recursive/tree cache data remains intact
-    -- for rollback while the new browser only caches directories it opened.
-    local cache=self.store:get("home_local_directory_cache_v2",{version=2,dirs={}})
-    cache=type(cache)=="table" and cache or {version=2,dirs={}}
-    if tonumber(cache.version)~=2 then cache={version=2,dirs={}} end
-    cache.version=2
+    local cache=self.store:get("home_local_tree_index",{version=1,dirs={}})
+    cache=type(cache)=="table" and cache or {version=1,dirs={}}
+    cache.version=1
     cache.dirs=type(cache.dirs)=="table" and cache.dirs or {}
     return cache
 end
 
-function Plugin:_home_recent_local_metadata_cache()
-    -- This is a tiny metadata cache for books that have actually been shown.
-    -- It is not a library index and never discovers files on its own.
-    local cache=self.store:get("home_local_recent_metadata_v1",{version=1,rows={}})
-    cache=type(cache)=="table" and cache or {version=1,rows={}}
-    if tonumber(cache.version)~=1 then cache={version=1,rows={}} end
-    cache.version=1
-    cache.rows=type(cache.rows)=="table" and cache.rows or {}
-    return cache
-end
-
 function Plugin:_home_local_roots(enabled_only)
-    local path=LocalLibrary.normalize(self:_home_root())
-    if path=="" or lfs.attributes(path,"mode")~="directory" then return {} end
-    return {{
-        path=path,
-        name=LocalLibrary.basename(path)~="" and LocalLibrary.basename(path) or "本地书",
-        enabled=true,readonly=true,
-    }}
+    local home=self:_home_preferences()
+    local rows={}
+    for _,root in ipairs(type(home.local_roots)=="table" and home.local_roots or {}) do
+        local path=LocalLibrary.normalize(root.path or "")
+        if path~="" and lfs.attributes(path,"mode")=="directory"
+            and (not enabled_only or root.enabled~=false) then
+            rows[#rows+1]={path=path,name=U.trim(tostring(root.name or ""))~="" and U.trim(tostring(root.name)) or LocalLibrary.basename(path),enabled=root.enabled~=false,readonly=root.readonly~=false}
+        end
+    end
+    return rows
 end
 
 function Plugin:_home_local_root_for_path(path,roots)
@@ -7073,16 +7021,29 @@ function Plugin:_home_local_inline_rows()
 end
 
 function Plugin:_home_local_inline_title()
-    local root=self:_home_root()
-    return U.utf8_truncate("最近阅读 · "..tostring(LocalLibrary.basename(root) or "本地书"),26,"…")
+    local home=self:_home_preferences()
+    if tostring(home.local_library_mode or "direct")~="direct" then return "" end
+    local context=self:_home_local_inline_context()
+    if context.picker then return "选择本地书库目录" end
+    local root_name=tostring(context.root and context.root.name or "本地书籍")
+    if context.path==LocalLibrary.normalize(context.root and context.root.path or "") then
+        return U.utf8_truncate(root_name,26,"…")
+    end
+    return U.utf8_truncate(root_name.." / "..LocalLibrary.basename(context.path),26,"…")
 end
 
 function Plugin:_home_local_empty_text()
-    local root=self:_home_root()
-    if root=="" or lfs.attributes(root,"mode")~="directory" then
-        return "本地书入口目录不可用\n请在设置中重新选择"
-    end
-    return "暂无最近阅读的本地书籍\n点击“浏览本地书”进入文件夹"
+    local home=self:_home_preferences()
+    local mode=tostring(home.local_library_mode or "direct")
+    if mode=="manual" then return "本地书库尚未扫描\n请在设置中点击扫描本地书库" end
+    if mode~="direct" then return "这里还没有本地书籍\n请先设置本地书库目录" end
+    local context=self:_home_local_inline_context()
+    if #(context.roots or {})==0 then return "这里还没有本地书籍\n请先设置本地书库目录" end
+    if context.picker then return "请选择一个本地书库目录" end
+    local snapshot=self:_home_local_tree_cache().dirs[context.path]
+    if type(snapshot)~="table" then return "正在读取这个文件夹…" end
+    if snapshot.error then return "无法读取文件夹\n"..tostring(snapshot.error) end
+    return "这个文件夹里没有可显示的书籍"
 end
 
 function Plugin:_home_local_folder_entry(path,title,root_path)
@@ -7115,98 +7076,49 @@ function Plugin:_home_local_known_paths()
     return known
 end
 
-function Plugin:_home_local_source_filename_key(path)
-    local name=tostring(LocalLibrary.basename(path) or ""):lower():gsub("%s+",""):gsub("　","")
-    return name
-end
-
-function Plugin:_home_local_source_index()
-    local index={paths={},names={}}
-    local function remember(path)
-        path=LocalLibrary.normalize(path)
-        if path=="" then return end
-        index.paths[path]=true
-        local key=self:_home_local_source_filename_key(path)
-        if key~="" then
-            local info=index.names[key] or {count=0,existing=0}
-            info.count=info.count+1
-            if U.file_exists(path) then info.existing=info.existing+1 end
-            index.names[key]=info
-        end
-    end
-    for _,book in pairs(self.store:library() or {}) do
-        for _,record in pairs(book.variants or {}) do
-            if type(record)=="table" then remember(record.file); remember(record.original_file) end
-        end
-        for _,chapter in pairs(book.chapters or {}) do
-            for _,record in pairs(chapter or {}) do
-                if type(record)=="table" then remember(record.file); remember(record.original_file) end
-            end
-        end
-    end
-    return index
-end
-
-function Plugin:_home_local_is_miuread_file(path,index,deep)
-    path=LocalLibrary.normalize(path)
-    if path=="" then return false end
-    index=index or self:_home_local_source_index()
-    if index.paths[path] then return true end
-    local key=self:_home_local_source_filename_key(path)
-    local info=key~="" and index.names[key] or nil
-    -- Filename fallback is used only when the one saved source path has gone
-    -- missing. If the original still exists, a user's different same-named
-    -- file must not be hidden as a MiuRead download.
-    if type(info)=="table" and tonumber(info.count or 0)==1 and tonumber(info.existing or 0)==0 then return true end
-    if deep==true and path:lower():match("%.epub$") and self.store and type(self.store.epub_identity_light)=="function" then
-        local ok,identity=pcall(self.store.epub_identity_light,self.store,path)
-        if ok and type(identity)=="table" and tostring(identity.book_id or "")~="" then return true end
-    end
-    return false
-end
-
-function Plugin:_home_recent_local_rows(limit)
-    limit=math.max(1,tonumber(limit) or 16)
-    local rows={}
-    local ok_history,history=pcall(require,"readhistory")
-    if not ok_history or type(history)~="table" then return rows end
-    if type(history.reload)=="function" then pcall(history.reload,history) end
-    local source_index=self:_home_local_source_index()
-    local metadata_cache=self:_home_recent_local_metadata_cache()
-    local hidden=type(self:_home_preferences().hidden_local_files)=="table" and self:_home_preferences().hidden_local_files or {}
-    for _,item in ipairs(type(history.hist)=="table" and history.hist or {}) do
-        local path=LocalLibrary.normalize(item and item.file or "")
-        if path~="" and U.file_exists(path) and hidden[path]~=true
-            and not self:_home_local_is_miuread_file(path,source_index,false) then
-            local book=LocalLibrary.book_from_path(path,{last_read_at=tonumber(item.time) or 0})
-            if book then
-                local cached=metadata_cache.rows[path]
-                if type(cached)=="table"
-                    and tonumber(cached.metadata_mtime or -1)==tonumber(book.modified_at or -2) then
-                    LocalMetadata.merge(book,cached)
-                end
-                book.last_read_at=tonumber(item.time) or tonumber(book.modified_at) or 0
-                book.status_text=self:_home_status_text(book,true)
-                rows[#rows+1]=book
-                if #rows>=limit then break end
-            end
-        end
-    end
-    return rows
-end
-
 function Plugin:_home_local_rows()
+    local index_cache=self:_home_local_cache()
+    local tree=self:_home_local_tree_cache()
+    local roots=self:_home_local_roots(true)
     local rows={}
-    local root=LocalLibrary.normalize(self:_home_root())
-    if root~="" and lfs.attributes(root,"mode")=="directory" then
-        rows[#rows+1]={
-            kind="folder",local_folder=true,local_root_entry=true,source="local",
-            title="浏览本地书",status_text=tostring(root),
-            folder_path=root,path=root,root_path=root,
-        }
+    local known_paths=self:_home_local_known_paths()
+    local home=self:_home_preferences()
+    local mode=tostring(home.local_library_mode or "direct")
+    local hidden=type(home.hidden_local_files)=="table" and home.hidden_local_files or {}
+    local indexed_by_file={}
+    for _,book in ipairs(index_cache.books or {}) do indexed_by_file[LocalLibrary.normalize(book.file)]=book end
+
+    local function add_book(row)
+        local path=LocalLibrary.normalize(row and row.file or "")
+        if path=="" or not U.file_exists(path) or known_paths[path] or hidden[path]==true
+            or LocalLibrary.is_likely_dictionary(path,row.title) then return end
+        local copy=U.copy(row)
+        local old=indexed_by_file[path]
+        if old and tonumber(old.modified_at or 0)==tonumber(copy.modified_at or 0) then LocalMetadata.merge(copy,old) end
+        copy.file=path; copy.local_file=true; copy.source="local"
+        copy.status_text=self:_home_status_text(copy,true)
+        rows[#rows+1]=copy
     end
-    for _,book in ipairs(self:_home_recent_local_rows(16)) do rows[#rows+1]=book end
-    return rows,{root=root,scanned_at=0,books={}}
+
+    if mode=="direct" then
+        -- The home grid itself is the folder browser. Only the selected level
+        -- is exposed; recursive indexes remain completely separate.
+        local inline_rows=self:_home_local_inline_rows()
+        for _,row in ipairs(inline_rows or {}) do rows[#rows+1]=row end
+    else
+        local enabled={}
+        for _,root in ipairs(roots) do enabled[LocalLibrary.normalize(root.path)]=true end
+        for _,book in ipairs(index_cache.books or {}) do
+            local root=LocalLibrary.normalize(book.library_root or index_cache.root or "")
+            if root=="" or enabled[root] then add_book(book) end
+        end
+        table.sort(rows,function(a,b)
+            local am,bm=tonumber(a.last_read_at or a.modified_at) or 0,tonumber(b.last_read_at or b.modified_at) or 0
+            if am~=bm then return am>bm end
+            return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+        end)
+    end
+    return rows,index_cache
 end
 
 function Plugin:_home_apply_local_inline_section(refresh_metadata)
@@ -7262,14 +7174,33 @@ function Plugin:_home_local_inline_navigate(path,root_path)
 end
 
 function Plugin:_home_ensure_local_inline_loaded()
-    return true
+    local home=self:_home_preferences()
+    if tostring(home.local_library_mode or "direct")~="direct" then return false end
+    local context=self:_home_local_inline_context()
+    if context.picker or context.path=="" then return false end
+    local existing=self:_home_local_tree_cache().dirs[context.path]
+    if type(existing)=="table" and not existing.error then return true end
+    local generation=(tonumber(self._home_inline_navigation_generation) or 0)+1
+    self._home_inline_navigation_generation=generation
+    self:toast("正在读取本地文件夹…",2)
+    return self:_home_refresh_local_directory(context.path,function()
+        if generation~=self._home_inline_navigation_generation then return end
+        local current=self:_home_local_inline_context()
+        if current.picker or LocalLibrary.normalize(current.path)~=LocalLibrary.normalize(context.path) then return end
+        self:_home_apply_local_inline_section(true)
+    end,true)
 end
 
 function Plugin:_home_handle_back()
-    -- beta.13 no longer embeds folder navigation inside the home section.
-    -- Keep the hook for compatibility, but old local_library_mode values must
-    -- never change Back behavior in the new current-directory browser model.
-    return false
+    if self._home_active_section~="local" then return false end
+    local home=self:_home_preferences()
+    if tostring(home.local_library_mode or "direct")~="direct" then return false end
+    local context=self:_home_local_inline_context()
+    if context.picker or not context.root then return false end
+    local parent=self:_home_local_inline_parent_entry(context)
+    if not parent then return false end
+    self:_home_local_inline_navigate(parent.folder_path,parent.root_path)
+    return true
 end
 
 function Plugin:_home_attach_local_record(row)
@@ -7278,7 +7209,7 @@ function Plugin:_home_attach_local_record(row)
     if id=="" then return row end
     local stored=type(row.local_record)=="table" and row.local_record or self.store:book(id)
     if type(stored)=="table" then
-        for _,key in ipairs({"description","intro","summary","category","publisher","series","translator","language","pages","wordCount","word_count","format","variant","annotation_requested","metadata_source","metadata_mtime","metadata_checked_at","metadata_complete","metadata_extractor_version","metadata_state","metadata_retry_after","metadata_error"}) do
+        for _,key in ipairs({"description","intro","summary","category","publisher","series","translator","language","pages","wordCount","word_count","format","variant","annotation_requested","metadata_source","metadata_mtime","metadata_checked_at","metadata_complete"}) do
             if (row[key]==nil or row[key]=="") and stored[key]~=nil and stored[key]~="" then row[key]=stored[key] end
         end
         if not row.cover_path and stored.cover_path then row.cover_path=stored.cover_path end
@@ -7286,7 +7217,7 @@ function Plugin:_home_attach_local_record(row)
     local record=self:_preferred_record(id)
     if record and record.file and U.file_exists(record.file) then
         row.file=record.file
-        for _,key in ipairs({"description","author","title","category","publisher","series","translator","language","pages","wordCount","word_count","format","variant","annotation_requested","metadata_source","metadata_mtime","metadata_checked_at","metadata_complete","metadata_extractor_version","metadata_state","metadata_retry_after","metadata_error"}) do
+        for _,key in ipairs({"description","author","title","category","publisher","series","translator","language","pages","wordCount","word_count","format","variant","annotation_requested","metadata_source","metadata_mtime","metadata_checked_at","metadata_complete"}) do
             if (row[key]==nil or row[key]=="") and record[key]~=nil and record[key]~="" then row[key]=record[key] end
         end
         if not row.cover_path and record.cover_path then row.cover_path=record.cover_path end
@@ -7754,6 +7685,11 @@ function Plugin:_home_open_book(book,anchor,ges,direct_read)
     if book and (book.local_folder==true or book.kind=="folder") then
         local folder_path=LocalLibrary.normalize(book.folder_path or book.path)
         local root_path=LocalLibrary.normalize(book.root_path or folder_path)
+        local home=self:_home_preferences()
+        if tostring(home.local_library_mode or "direct")=="direct"
+            and HomeView.is_shown() and self._home_active_section=="local" then
+            return self:_home_local_inline_navigate(folder_path,root_path)
+        end
         local root=self:_home_local_root_for_path(folder_path,self:_home_local_roots(true))
         return self:show_local_browser(folder_path,root or {path=root_path,name=book.title},{},false)
     end
@@ -8024,7 +7960,7 @@ end
 function Plugin:show_home_search_dialog(scope)
     scope=tostring(scope or "all")
     local title=scope=="weread_shelf" and "搜索微信书架"
-        or (scope=="local" and "搜索最近本地书" or "搜索全部书籍")
+        or (scope=="local" and "搜索本地书库" or "搜索全部书籍")
     local function rows_for_scope()
         if scope=="weread_shelf" then
             local section=self._home_sections and self._home_sections.account
@@ -8547,21 +8483,11 @@ function Plugin:_home_delete_local_book(book,anchor,confirmed)
     local function delete_now()
         local ok,err=os.remove(path)
         if not ok then self:info("删除失败：\n"..tostring(err or "无法删除文件")); return end
-        local tree=self:_home_local_tree_cache()
-        local changed=false
-        for _,snapshot in pairs(tree.dirs or {}) do
-            local kept={}
-            for _,row in ipairs(type(snapshot)=="table" and snapshot.books or {}) do
-                if LocalLibrary.normalize(row.file)~=LocalLibrary.normalize(path) then kept[#kept+1]=row else changed=true end
-            end
-            if type(snapshot)=="table" then snapshot.books=kept end
-        end
-        if changed then tree.updated_at=os.time(); self.store:set("home_local_directory_cache_v2",tree) end
-        local recent=self:_home_recent_local_metadata_cache()
-        recent.rows[LocalLibrary.normalize(path)]=nil
-        recent.updated_at=os.time()
-        self.store:set("home_local_recent_metadata_v1",recent)
-        self:_home_scan_local(true,false)
+        local cache=self:_home_local_cache()
+        local kept={}
+        for _,row in ipairs(cache.books or {}) do if tostring(row.file or "")~=path then kept[#kept+1]=row end end
+        cache.books=kept
+        self.store:set("home_local_index",cache)
         self:_show_miuread_home_now(false,true,true,"content")
         self:toast("本地文件已删除")
     end
@@ -8597,7 +8523,10 @@ function Plugin:_show_home_refresh_popup(anchor)
             {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
             {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
             {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-            {icon="⌕",label="刷新本地书",detail="更新最近阅读；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
+            {icon="⌕",label="更新本地书库",detail="检查新增、删除和移动的书籍",callback=function()
+                local started=self:_home_scan_local(true,true)
+                if started then self:toast("正在更新本地书库…",2) end
+            end},
             {icon="i",label="更新最近阅读信息",detail="更新顶部这本书的资料和封面",callback=function()
                 local hero=self._home_hero
                 if hero then self:_home_refresh_current_network_metadata(hero)
@@ -8760,7 +8689,7 @@ function Plugin:_show_home_file_manager_popup(anchor)
         title="文件管理",subtitle="本地文件入口",
         actions={
             {icon="▤",label="打开 KOReader 文件管理",detail="进入原生文件浏览器",callback=function() self:_home_close_to_native(true) end},
-            {icon="▦",label="本地书",detail="按文件夹浏览本地书籍",callback=function() self:show_home_local_library() end},
+            {icon="▦",label="本地书库",detail="查看觅阅本地书籍",callback=function() self:show_home_local_library() end},
         },
     }
 end
@@ -8864,14 +8793,17 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
         {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-        {icon="⌕",label="刷新本地书",detail="更新最近阅读；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
+        {icon="⌕",label="更新本地书库",detail="检查新增、删除和移动的书籍",callback=function()
+            local started=self:_home_scan_local(true,true)
+            if started then self:toast("正在更新本地书库…",2) end
+        end},
     } end
     if key=="search" then return {
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
         {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
         {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
-        {icon="▤",label="本地书",detail="按文件夹浏览本地书籍",callback=function() self:show_home_local_library() end},
+        {icon="▤",label="本地书库",detail="浏览本地书籍",callback=function() self:show_home_local_library() end},
         {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
     } end
     if key=="downloads" then return {
@@ -8914,7 +8846,7 @@ function Plugin:_home_action_function_actions(key,anchor)
     } end
     if key=="file_manager" then return {
         {icon="▤",label="KOReader 文件管理",detail="打开原生文件浏览器",callback=function() self:_home_close_to_native(true) end},
-        {icon="▦",label="本地书",detail="按文件夹浏览本地书籍",callback=function() self:show_home_local_library() end},
+        {icon="▦",label="本地书库",detail="查看觅阅本地书籍",callback=function() self:show_home_local_library() end},
     } end
     if key=="screenshot" then return {
         {icon="▣",label="开始截图",detail="进入截图模式",callback=function() ScreenshotMode.start(self,anchor) end},
@@ -9063,13 +8995,16 @@ function Plugin:_home_hold_book(book,anchor)
             actions[#actions+1]={icon="refresh",label="刷新这一层",detail="只更新当前文件夹",callback=function()
                 local path=LocalLibrary.normalize(book.folder_path or book.path)
                 self:_home_refresh_local_directory(path,function()
-                    if HomeView.is_shown() then self:_home_scan_local(true,false) end
+                    local context=self:_home_local_inline_context()
+                    if HomeView.is_shown() and not context.picker and LocalLibrary.normalize(context.path)==path then
+                        self:_home_apply_local_inline_section(true)
+                    end
                 end,true)
             end}
         end
         ActionSheet.show{
             anchor=anchor,preferred_direction="above",width_ratio=.62,
-            title=tostring(book.title or "文件夹"),subtitle=book.local_parent and "本地书导航" or "本地书文件夹",
+            title=tostring(book.title or "文件夹"),subtitle=book.local_parent and "本地书库导航" or "本地书库文件夹",
             actions=actions,wide_last=(#actions%2==1),
         }
         return
@@ -9313,6 +9248,11 @@ function Plugin:_home_merge_directory_snapshot(snapshot,old_snapshot)
     old_snapshot=type(old_snapshot)=="table" and old_snapshot or {}
     local old_by_file={}
     for _,row in ipairs(old_snapshot.books or {}) do old_by_file[LocalLibrary.normalize(row.file)]=row end
+    local legacy=self:_home_local_cache()
+    for _,row in ipairs(legacy.books or {}) do
+        local path=LocalLibrary.normalize(row.file)
+        if old_by_file[path]==nil then old_by_file[path]=row end
+    end
     for _,row in ipairs(snapshot.books or {}) do
         local old=old_by_file[LocalLibrary.normalize(row.file)]
         if old and tonumber(old.modified_at or 0)==tonumber(row.modified_at or 0) then LocalMetadata.merge(row,old) end
@@ -9327,20 +9267,122 @@ function Plugin:_home_store_directory_snapshot(path,snapshot)
     snapshot=self:_home_merge_directory_snapshot(snapshot,cache.dirs[path])
     cache.dirs[path]=snapshot
     cache.updated_at=os.time()
-    self.store:set("home_local_directory_cache_v2",cache)
+    self.store:set("home_local_tree_index",cache)
     return snapshot
 end
 
 function Plugin:_home_scan_local(force,user_requested)
-    -- Compatibility shim for old call sites. beta.13 deliberately performs no
-    -- recursive scan: refresh KOReader history for Home and, if needed, let the
-    -- opened browser reread only its current directory.
-    local ok_history,history=pcall(require,"readhistory")
-    if ok_history and history and type(history.reload)=="function" then pcall(history.reload,history,true) end
-    self._home_refreshing=false
-    if self._home_sections then self:_home_apply_local_inline_section(true) end
-    if user_requested==true then self:toast("本地书已刷新",1.5) end
-    logger.info("[MiuRead][Home] local refresh","mode=current-directory","recursive=false")
+    user_requested=user_requested==true
+    local home=self:_home_preferences()
+    local mode="auto" -- compatibility label for existing logging
+    if force~=true and home.local_auto_update~=true then return false end
+    if force~=true then
+        local cached=self:_home_local_cache()
+        local scanned_at=tonumber(cached and cached.scanned_at or 0) or 0
+        local local_ttl=self:_lightweight_enabled()
+            and (tonumber(Config.LIGHTWEIGHT_HOME_LOCAL_TTL) or 60*60)
+            or HOME_LOCAL_CACHE_TTL
+        if scanned_at>0 and os.time()-scanned_at<local_ttl then return false end
+    end
+    if self:_home_background_blocked() or self:_active_reader_ui() then return false end
+    local roots=self:_home_local_roots(true)
+    if #roots==0 or not self.home_async or not self.home_async:available() then return false end
+    local retry=function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_scan_local(force,user_requested) end
+    end
+    local scan_priority=user_requested and 85 or (force==true and 60 or 35)
+    local token,block_reason,deferred=self:_background_claim("home_scan",{
+        user_requested=user_requested,priority=scan_priority,
+        retry_delay=user_requested and .45 or 1.3,
+    },retry)
+    if not token then return deferred==true end
+    if self.home_async:busy() then
+        self:_background_release("home_scan",token,"worker busy")
+        if not deferred then self.background_scheduler:defer("home_scan",retry,{delay=.8,priority=scan_priority,reason="worker busy"}) end
+        return true
+    end
+    self._home_scan_generation=(tonumber(self._home_scan_generation) or 0)+1
+    local generation=self._home_scan_generation
+    self._home_refreshing=true
+    local root_payload=U.copy(roots)
+    local recursive=true
+    if not recursive then
+        local context=self:_home_local_inline_context()
+        local seen={}
+        for _,item in ipairs(root_payload) do seen[LocalLibrary.normalize(item.path)]=true end
+        if not context.picker and context.path~="" and not seen[LocalLibrary.normalize(context.path)] then
+            root_payload[#root_payload+1]={path=context.path,name=LocalLibrary.basename(context.path),enabled=true,readonly=true}
+        end
+    end
+    local started,err=self.home_async:run(recursive and "home-local-library" or "home-local-roots",function()
+        local ok_ffi,ffi=pcall(require,"ffi")
+        if ok_ffi and ffi then
+            pcall(ffi.cdef,"int setpriority(int which, int who, int prio);")
+            pcall(function() ffi.C.setpriority(0,0,recursive and 14 or 12) end)
+        end
+        local Library=require("miuread.local_library")
+        if recursive then
+            local merged={books={},roots={},scanned_at=os.time(),truncated=false}
+            for _,root in ipairs(root_payload) do
+                local result=Library.scan(root.path,{limit=1000,max_depth=5,include_dictionaries=false})
+                merged.roots[#merged.roots+1]={path=root.path,name=root.name,truncated=result.truncated==true}
+                for _,book in ipairs(result.books or {}) do
+                    book.library_root=root.path
+                    merged.books[#merged.books+1]=book
+                    if #merged.books>=1000 then merged.truncated=true; break end
+                end
+                if #merged.books>=1000 then break end
+            end
+            table.sort(merged.books,function(a,b)
+                local am,bm=tonumber(a.modified_at) or 0,tonumber(b.modified_at) or 0
+                if am~=bm then return am>bm end
+                return tostring(a.title or ""):lower()<tostring(b.title or ""):lower()
+            end)
+            return merged
+        end
+        local result={}
+        for _,root in ipairs(root_payload) do
+            result[root.path]=Library.list_directory(root.path,{limit=1600,include_cover=false,include_dictionaries=false})
+        end
+        return result
+    end,function(result)
+        self:_background_release("home_scan",token,result and result.ok==true and "completed" or "failed")
+        if generation~=self._home_scan_generation then return end
+        self._home_refreshing=false
+        if not result or result.ok~=true or type(result.value)~="table" then
+            logger.warn("[MiuRead][Home] local scan failed",tostring(result and result.error or "unknown"))
+            return
+        end
+        if recursive then
+            local previous=self:_home_local_cache()
+            local previous_by_file={}
+            for _,book in ipairs(previous.books or {}) do previous_by_file[LocalLibrary.normalize(book.file)]=book end
+            for _,book in ipairs(result.value.books or {}) do
+                local old=previous_by_file[LocalLibrary.normalize(book.file)]
+                if old and tonumber(old.modified_at or 0)==tonumber(book.modified_at or 0) then LocalMetadata.merge(book,old) end
+                book.local_file=true; book.source="local"; book.status_text=self:_home_status_text(book,true)
+            end
+            self.store:set("home_local_index",result.value)
+            logger.info("[MiuRead][Home] local library indexed",
+                "mode=",mode,"books=",tostring(#(result.value.books or {})),
+                "truncated=",tostring(result.value.truncated==true))
+        else
+            for path,snapshot in pairs(result.value) do self:_home_store_directory_snapshot(path,snapshot) end
+            logger.info("[MiuRead][Home] local folders refreshed","count=",tostring(#root_payload),"recursive=false")
+        end
+        if HomeView.is_shown() then self:_notify_home_data_changed("content") end
+    end,recursive and 240 or 120)
+    if not started then
+        self._home_refreshing=false
+        self:_background_release("home_scan",token,"not started")
+        RuntimePressure.note_worker_failure("home-local-library",err)
+        logger.warn("[MiuRead][Home] local scan not started",tostring(err))
+        if self.background_scheduler then
+            self.background_scheduler:defer("home_scan",retry,{delay=RuntimePressure.active() and 3.0 or 1.2,priority=scan_priority,reason=tostring(err or "not started")})
+            return true
+        end
+        return false
+    end
     return true
 end
 
@@ -9399,7 +9441,9 @@ function Plugin:_home_refresh_local_directory(path,callback,force,owner)
 
     local function start_incremental(reason)
         logger.info("[MiuRead][LocalBrowser] using incremental reader",path,tostring(reason or "worker unavailable"))
-        local scanner=LocalLibrary.new_directory_scan(path,{include_cover=false})
+        local scanner=LocalLibrary.new_directory_scan(path,{
+            limit=1600,include_cover=false,include_dictionaries=false,
+        })
         self._local_browser_fallback_scanner=scanner
         local task
         task=function()
@@ -9445,7 +9489,7 @@ function Plugin:_home_refresh_local_directory(path,callback,force,owner)
             pcall(function() ffi.C.setpriority(0,0,10) end)
         end
         local Library=require("miuread.local_library")
-        return Library.list_directory(path,{include_cover=false})
+        return Library.list_directory(path,{limit=1600,include_cover=false,include_dictionaries=false})
     end,function(result)
         if generation~=self._home_directory_generation then return end
         if result and result.ok==true and type(result.value)=="table" then
@@ -9474,25 +9518,41 @@ function Plugin:_home_reset_local_metadata()
         local changed=false
         local cover=tostring(book.cover_path or ""):gsub("\\","/"):gsub("/+","/")
         if cover:sub(1,#prefix)==prefix then book.cover_path=nil; changed=true end
-        for _,key in ipairs({"metadata_source","metadata_mtime","metadata_checked_at","metadata_complete","metadata_state","metadata_retry_after","metadata_error","metadata_extractor_version"}) do
+        for _,key in ipairs({"metadata_source","metadata_mtime","metadata_checked_at","metadata_complete"}) do
             if book[key]~=nil then book[key]=nil; changed=true end
         end
         return changed
     end
-    local tree=self:_home_local_tree_cache()
+    local cache=self:_home_local_cache()
     local changed=false
+    for _,book in ipairs(cache.books or {}) do if clear_book(book) then changed=true end end
+    if changed then self.store:set("home_local_index",cache) end
+
+    local tree=self:_home_local_tree_cache()
+    local tree_changed=false
     for _,snapshot in pairs(tree.dirs or {}) do
-        for _,book in ipairs(type(snapshot)=="table" and snapshot.books or {}) do if clear_book(book) then changed=true end end
+        for _,book in ipairs(type(snapshot)=="table" and snapshot.books or {}) do
+            if clear_book(book) then tree_changed=true end
+        end
     end
-    if changed then tree.updated_at=os.time(); self.store:set("home_local_directory_cache_v2",tree) end
-    self.store:set("home_local_recent_metadata_v1",{version=1,rows={}})
+    if tree_changed then tree.updated_at=os.time(); self.store:set("home_local_tree_index",tree) end
 end
 
 function Plugin:_home_update_local_cache(filepath,metadata)
     filepath=LocalLibrary.normalize(filepath)
-    if filepath=="" or type(metadata)~="table" then return false end
+    local cache=self:_home_local_cache()
     local changed=false
-
+    for _,row in ipairs(cache.books or {}) do
+        if LocalLibrary.normalize(row.file)==filepath then
+            if LocalMetadata.merge(row,metadata) then changed=true end
+            row.status_text=self:_home_status_text(row,true)
+            break
+        end
+    end
+    if changed then
+        cache.scanned_at=tonumber(cache.scanned_at) or os.time()
+        self.store:set("home_local_index",cache)
+    end
     local tree=self:_home_local_tree_cache()
     local tree_changed=false
     for _,snapshot in pairs(tree.dirs or {}) do
@@ -9503,37 +9563,8 @@ function Plugin:_home_update_local_cache(filepath,metadata)
             end
         end
     end
-    if tree_changed then
-        tree.updated_at=os.time()
-        self.store:set("home_local_directory_cache_v2",tree)
-        changed=true
-    end
-
-    -- Persist metadata only for files that were actually processed. This lets
-    -- KOReader history rows keep their covers across Home rebuilds without
-    -- reviving a whole-library index. Cap it so the cache stays lightweight.
-    local recent=self:_home_recent_local_metadata_cache()
-    local row=type(recent.rows[filepath])=="table" and recent.rows[filepath] or {file=filepath}
-    local recent_changed=LocalMetadata.merge(row,metadata)
-    row.file=filepath
-    row.cached_at=os.time()
-    if recent.rows[filepath]~=row then recent_changed=true end
-    recent.rows[filepath]=row
-
-    local keys={}
-    for key,value in pairs(recent.rows) do
-        keys[#keys+1]={key=key,at=tonumber(type(value)=="table" and value.cached_at or 0) or 0}
-    end
-    if #keys>64 then
-        table.sort(keys,function(a,b) return a.at>b.at end)
-        for index=65,#keys do recent.rows[keys[index].key]=nil; recent_changed=true end
-    end
-    if recent_changed then
-        recent.updated_at=os.time()
-        self.store:set("home_local_recent_metadata_v1",recent)
-        changed=true
-    end
-    return changed
+    if tree_changed then tree.updated_at=os.time(); self.store:set("home_local_tree_index",tree) end
+    return changed or tree_changed
 end
 
 function Plugin:_home_update_miuread_metadata(filepath,metadata)
@@ -10210,14 +10241,6 @@ end
 function Plugin:_home_open_local(book)
     local path=tostring(book and book.file or "")
     if path=="" or not U.file_exists(path) then self:info("本地文件不存在"); return end
-    -- Exact-path/filename filtering happens before display. Do one deeper EPUB
-    -- identity check at open time so a moved/renamed MiuRead book is still
-    -- classified correctly without making every folder listing expensive.
-    if self:_home_local_is_miuread_file(path,nil,true) then
-        local linked,record=self.store:identify_file(path,true)
-        local id=tostring(linked and (linked.book_id or linked.bookId) or "")
-        return self:_open_file_direct(path,"weread",id)
-    end
     return self:_open_file_direct(path,"local","")
 end
 
@@ -10300,13 +10323,13 @@ function Plugin:_local_browser_decorate(snapshot,root_path)
         }
     end
     local books={}
-    local source_index=self:_home_local_source_index()
+    local known=self:_home_local_known_paths()
     local home=self:_home_preferences()
     local hidden=type(home.hidden_local_files)=="table" and home.hidden_local_files or {}
     for _,book in ipairs(snapshot.books or {}) do
         local path=LocalLibrary.normalize(book.file)
-        if path~="" and U.file_exists(path) and hidden[path]~=true
-            and not self:_home_local_is_miuread_file(path,source_index,false) then
+        if path~="" and U.file_exists(path) and not known[path] and hidden[path]~=true
+            and not LocalLibrary.is_likely_dictionary(path,book.title) then
             book.file=path; book.local_file=true; book.source="local"; book.status_text=self:_home_status_text(book,true)
             books[#books+1]=book
         end
@@ -10323,18 +10346,18 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
         and tostring(root.name or LocalLibrary.basename(path))
         or tostring(LocalLibrary.basename(path))
     local view
-    local function schedule_visible()
-        if not view or view._miu_closed then return end
-        local visible=type(view.visibleBooks)=="function" and view:visibleBooks() or {}
-        self:_home_schedule_local_shelf_metadata(visible,view)
-    end
     local function open_folder(folder)
+        -- Keep the current level alive underneath. This preserves its page
+        -- position and avoids a home-screen flash while the child directory is
+        -- read in the background.
         local next_stack=U.copy(stack)
         next_stack[#next_stack+1]={path=path,title=title}
         self:show_local_browser(folder.folder_path or folder.path,root,next_stack,false,view)
     end
     local function go_back()
         if view and not view._miu_closed then UIManager:close(view) end
+        -- The previous directory (or the MiuRead home at the configured root)
+        -- is already present underneath.
     end
     view=LocalBrowserView.show{
         title=title,folders=folders,books=books,
@@ -10343,7 +10366,6 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
         on_open_book=function(book) self:_home_open_local(book) end,
         on_hold_book=function(book) self:_home_hold_book(book) end,
         on_back=go_back,
-        on_page_changed=function() schedule_visible() end,
         on_close=function(closed_view)
             if self._home_directory_request_owner==closed_view then
                 self:_cancel_home_directory_request("local browser closed")
@@ -10352,62 +10374,86 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
         on_refresh=function()
             self:_home_refresh_local_directory(path,function(fresh)
                 local next_folders,next_books=self:_local_browser_decorate(fresh,root.path)
-                if view and not view._miu_closed then
-                    view:updateData{folders=next_folders,books=next_books,error=fresh.error}
-                    schedule_visible()
-                end
-                if HomeView.is_shown() then self:_home_scan_local(true,false) end
+                if view and not view._miu_closed then view:updateData{folders=next_folders,books=next_books,error=fresh.error} end
+                if HomeView.is_shown() then self:_notify_home_data_changed("content") end
             end,true,view)
         end,
     }
-    schedule_visible()
+    self:_home_schedule_local_shelf_metadata(books,view)
     return view
 end
 
 function Plugin:show_local_browser(path,root,stack,force,request_owner)
     path=LocalLibrary.normalize(path)
-    if path=="" or lfs.attributes(path,"mode")~="directory" then
-        self:info("本地书入口目录不存在，已回退到默认目录。")
-        path=LocalLibrary.normalize(self:_home_root())
-        if path=="" or lfs.attributes(path,"mode")~="directory" then return false end
-        root={path=path,name=LocalLibrary.basename(path)}
-    end
+    if path=="" or lfs.attributes(path,"mode")~="directory" then self:info("本地书库目录不存在"); return false end
     local cache=self:_home_local_tree_cache()
     local cached=cache.dirs[path]
-    local view
     if type(cached)=="table" and force~=true then
-        view=self:_show_local_browser_snapshot(path,root,stack,cached)
-        -- Cache is only a first frame. Always reread this exact directory so a
-        -- USB copy/delete appears without any old auto-scan preference.
-        self:_home_refresh_local_directory(path,function(fresh,scanned)
-            if not scanned or not view or view._miu_closed then return end
-            local folders,books=self:_local_browser_decorate(fresh,root and root.path or path)
-            view:updateData{folders=folders,books=books,error=fresh.error}
-            local visible=type(view.visibleBooks)=="function" and view:visibleBooks() or {}
-            self:_home_schedule_local_shelf_metadata(visible,view)
-        end,true,view)
+        local view=self:_show_local_browser_snapshot(path,root,stack,cached)
+        local home=self:_home_preferences()
+        if home.local_check_on_open~=false then
+            self:_home_refresh_local_directory(path,function(fresh,scanned)
+                if not scanned or not view or view._miu_closed then return end
+                local folders,books=self:_local_browser_decorate(fresh,root and root.path or path)
+                view:updateData{folders=folders,books=books,error=fresh.error}
+                self:_home_schedule_local_shelf_metadata(books,view)
+            end,true,view)
+        end
         return view
     end
-    self:toast("正在打开文件夹…",1.5)
+    self:toast("正在打开文件夹…",2)
     self:_home_refresh_local_directory(path,function(snapshot)
         self:_show_local_browser_snapshot(path,root,stack,snapshot)
-        if HomeView.is_shown() then self:_home_scan_local(true,false) end
+        if HomeView.is_shown() then self:_notify_home_data_changed("content") end
     end,true,request_owner)
     return true
 end
 
 function Plugin:_open_local_library_folders()
-    local path=LocalLibrary.normalize(self:_home_root())
-    if path=="" or lfs.attributes(path,"mode")~="directory" then
-        self:info("暂时找不到可用的本地书入口目录。\n\n请在 本地书 → 入口目录 中重新选择。")
+    local roots=self:_home_local_roots(true)
+    if #roots==0 then
+        self:info("还没有设置本地书库目录。\n\n可在 首页与书架 → 本地书籍 中添加。")
         return false
     end
-    local root={path=path,name=LocalLibrary.basename(path)~="" and LocalLibrary.basename(path) or "本地书"}
-    return self:show_local_browser(path,root,{},false)
+    if #roots==1 then return self:show_local_browser(roots[1].path,roots[1],{},false) end
+    local folders={}
+    for _,root in ipairs(roots) do folders[#folders+1]=self:_home_local_folder_entry(root.path,root.name,root.path) end
+    local picker
+    picker=LocalBrowserView.show{
+        title="本地文件夹",folders=folders,books={},
+        on_open_folder=function(folder)
+            local selected
+            for _,root in ipairs(roots) do if root.path==folder.folder_path then selected=root; break end end
+            self:show_local_browser(folder.folder_path,selected or {path=folder.folder_path,name=folder.title},{},false,picker)
+        end,
+        on_back=function(view) if view and not view._miu_closed then UIManager:close(view) end end,
+        on_close=function(closed_view)
+            if self._home_directory_request_owner==closed_view then self:_cancel_home_directory_request("local root picker closed") end
+        end,
+        on_refresh=function() self:_home_scan_local(true,true) end,
+    }
+    return picker
 end
 
 function Plugin:show_home_local_library(rows)
-    return self:_open_local_library_folders()
+    local roots=self:_home_local_roots(true)
+    if #roots==0 then
+        self:info("还没有设置本地书库目录。\n\n可在 首页与书架 → 本地书籍 中添加。")
+        return false
+    end
+    rows=type(rows)=="table" and rows or select(1,self:_home_local_rows())
+    if #rows==0 then
+        if self:_home_preferences().local_auto_update==true then self:_home_scan_local(false) end
+        self:info("本地书库暂时没有可显示的书籍。")
+        return false
+    end
+    return self:_home_show_full_shelf("本地书籍",rows,{
+        show_actions=true,
+        left_action_label="搜索",
+        right_action_label="文件夹",
+        on_left_action=function() self:show_home_search_dialog("local") end,
+        on_right_action=function() self:_open_local_library_folders() end,
+    })
 end
 
 function Plugin:_home_account_name()
@@ -10640,15 +10686,21 @@ end
 function Plugin:_home_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_wifi_state_snapshot(NetworkMgr)==true
+    local on=false
+    local ok_state,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)
+    if ok_state then on=value==true end
     local ok
     if on then
-        ok=self:_wifi_stop(NetworkMgr,"home")
-        if ok then self:toast("正在关闭 Wi-Fi",1.5) end
+        if type(NetworkMgr.toggleWifiOff)=="function" then ok=pcall(NetworkMgr.toggleWifiOff,NetworkMgr)
+        elseif type(NetworkMgr.turnOffWifi)=="function" then ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr) end
+        if ok then self:toast("Wi-Fi 已关闭",1.5) end
     else
-        ok=self:_wifi_start(NetworkMgr,"home")
-        if ok then self:toast("正在连接 Wi-Fi",1.5) end
+        if type(NetworkMgr.toggleWifiOn)=="function" then ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr)
+        elseif type(NetworkMgr.turnOnWifi)=="function" then ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr) end
+        if ok then self:toast("正在开启 Wi-Fi",1.5) end
     end
+    if ok then HomeData.invalidate_device_state() end
+    UIManager:scheduleIn(1,function() self:_refresh_home_view(nil,"header") end)
     return ok==true
 end
 
@@ -10964,9 +11016,12 @@ end
 
 function Plugin:maintenance_menu()
     return {
-        {text="书库维护",post_text="目录 资料 封面与书架",sub_item_table_func=function()
+        {text="书库维护",post_text="扫描 资料 封面与书架",sub_item_table_func=function()
             return {
-                {text="刷新本地书入口",post_text="不递归扫描",callback=function() self:_home_scan_local(true,true) end},
+                {text="重新扫描全部本地书库",callback=function()
+                    local started=self:_home_scan_local(true,true)
+                    if started then self:toast("正在重新扫描本地书库…",2) end
+                end},
                 {text="更新缺失书籍资料",callback=function()
                     self:_home_reset_local_metadata(); self:_home_complete_refresh(true)
                 end},
@@ -11027,13 +11082,12 @@ function Plugin:show_home_quick_panel(more_expanded)
     -- storage. The home surface already has a recent device snapshot.
     local state=HomeData.cached_device_state() or {}
     local wifi_on=state.wifi_on
-    local wifi_linked=state.connected==true or (state.connected==nil and state.online==true)
     local wifi_name=U.trim(tostring(state.wifi_name or ""))
     local wifi_detail
     if wifi_on==nil then wifi_detail="状态未知"
     elseif wifi_on~=true then wifi_detail="已关闭"
-    elseif wifi_linked and wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
-    elseif wifi_linked then wifi_detail="已连接"
+    elseif wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
+    elseif state.online==true then wifi_detail="已连接"
     else wifi_detail="未连接" end
     local download_detail=tostring(self._home_panel_download_detail or "")
     local sync_label=self:_home_sync_status_label()
@@ -11041,7 +11095,7 @@ function Plugin:show_home_quick_panel(more_expanded)
     local definitions={
         wifi={
             icon="Wi-Fi",
-            icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (wifi_linked and "wifi-connected.svg" or "wifi-disconnected.svg")),
+            icon_path=ROOT.."/resources/"..(wifi_on==false and "wifi-off.svg" or (state.online==true and "wifi-connected.svg" or "wifi-disconnected.svg")),
             label="Wi-Fi",detail=wifi_detail,
             callback=function() self:_home_wifi_toggle() end,
             hold_callback=function() self:_home_wifi_settings() end
@@ -11714,7 +11768,7 @@ function Plugin:_show_reader_progress_control(back_callback)
         on_prev_chapter=function() self:_reader_previous_chapter() end,
         on_next_chapter=function() self:_reader_next_chapter() end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
     }
     return true
 end
@@ -11814,7 +11868,7 @@ function Plugin:_show_reader_toc(back_callback)
             items=items,
             auto_follow=true,
             on_back=back_callback or function() self:show_reader_quick_panel() end,
-            on_home=function() return self:_reader_home_action("reader surface") end,
+            on_home=function() return self:return_to_miuread_home("reader surface") end,
         }
         if dialog then return true end
         logger.warn("[MiuRead][ReaderToc] custom dialog unavailable",tostring(err or "unknown"))
@@ -11914,7 +11968,7 @@ function Plugin:_show_reader_spacing_panel(back_callback)
             }
         end,
         on_back=back_callback,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local current=math.floor(self:_reader_line_spacing_value()+.5)
             return {
@@ -11941,7 +11995,7 @@ function Plugin:_show_reader_weight_panel(back_callback)
             }
         end,
         on_back=back_callback,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local current=self:_reader_font_weight_value()
             return {
@@ -12050,7 +12104,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         controls=function()
             local prefs=self.store:preferences().thoughts or {}
             local follow=prefs.follow_body_font==true
@@ -12147,10 +12201,9 @@ function Plugin:_reader_wifi_summary()
     local state=HomeData.cached_device_state() or {}
     if state.wifi_on==false then return "Wi-Fi关",false end
     if state.wifi_on==nil then return "Wi-Fi",true end
-    local linked=state.connected==true or (state.connected==nil and state.online==true)
     local ssid=U.trim(tostring(state.wifi_name or ""))
-    if linked and ssid~="" then return ssid,false end
-    if linked then return "已连接",false end
+    if ssid~="" then return ssid,false end
+    if state.online==true then return "已连接",false end
     return "Wi-Fi!",true
 end
 
@@ -12213,8 +12266,8 @@ function Plugin:_reader_toolbar_header(title)
     }
     return {
         title=tostring(title or "正在阅读"),
-        home_label=self:_home_enabled() and "首页" or "书架",
-        home_callback=function() return self:_reader_home_action("reader surface") end,
+        home_label="首页",
+        home_callback=function() return self:return_to_miuread_home("reader surface") end,
         book_callback=function() return self:_show_reader_current_book_panel(function() self:show_reader_quick_panel() end) end,
         wifi_label=wifi_text,wifi_alert=wifi_alert,
         wifi_callback=function() return self:_show_reader_wifi_quick_panel(function() self:show_reader_quick_panel() end) end,
@@ -12228,7 +12281,7 @@ function Plugin:_reader_toolbar_header(title)
         battery_label=battery,
         more_label="更多",
         more_callback=function() return self:show_reader_control_center("reading") end,
-        chapter_label="目录",
+        chapter_label=chapter,
         chapter_callback=function() return self:_show_reader_toc(function() self:show_reader_quick_panel() end) end,
         progress_label=progress_text,
         progress_callback=function() return self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end,
@@ -12366,7 +12419,7 @@ function Plugin:_show_reader_menu_table(title,source,back_callback)
         items=function() return self:_reader_menu_rows_from_table(source,title,back_callback) end,
         page_size=tonumber(type(source)=="table" and source.max_per_page) or 6,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
     }
     return true
 end
@@ -12950,7 +13003,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
         title="批注",
         subtitle=U.utf8_truncate(title,42,"…").." · 书签 划线 想法统一管理",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local sections={{
                 title="本书批注",rows={
@@ -13055,7 +13108,7 @@ function Plugin:_reader_search_results(query,results,back_callback)
         items=rows,page_size=5,
         empty_text="没有找到匹配内容",
         on_back=function() self:_reader_show_search(back_callback) end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
     }
     return true
 end
@@ -13161,7 +13214,7 @@ function Plugin:_show_reader_font_panel(back_callback)
         title="字体与排版",
         subtitle=function() return self:_reader_font_label().." · 字号 "..self:_reader_font_size_label() end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         controls=function()
             return {
                 {kind="select",label="字体",value=self:_reader_font_label(),close=true,callback=function() self:_show_reader_font_face_menu(return_to_font) end},
@@ -13209,7 +13262,7 @@ function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
         title="同步诊断",
         subtitle="进度与批注分开显示，失败不会互相覆盖",
         on_back=back_callback or function() self:_show_reader_sync_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local state=tostring(self:progress_sync_label() or "")
             local annotation_action=tonumber(annotation_summary.action_required or 0) or 0
@@ -13244,7 +13297,7 @@ function Plugin:_show_reader_sync_panel(back_callback)
         title="阅读同步",
         subtitle=function() return "时间、进度和批注可以分别设置" end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local sync=self.store:preferences().sync or {}
             return {
@@ -13677,7 +13730,7 @@ function Plugin:_show_reader_refresh_settings(back_callback)
             return "普通 "..label(day).." · 夜间 "..label(night)
         end,
         on_back=back_callback or function() self:_show_reader_page_display_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local day,night=self:_reader_refresh_rates()
             local rows={
@@ -13721,7 +13774,7 @@ function Plugin:_show_reader_page_display_panel(back_callback)
         title="页面显示",
         subtitle="阅读中的常用显示项目",
         on_back=back_callback or function() self:show_reader_quick_panel(true) end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local info_rows={
                 {label="状态栏",value=self:_reader_status_bar_label(),value_bold=true,keep_open=true,callback=function() self:_reader_toggle_status_bar() end},
@@ -13760,7 +13813,7 @@ function Plugin:_show_reader_page_panel(back_callback)
         title="页面",
         subtitle="版面, 显示和刷新集中在这里",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             local rows={}
             if self:_reader_is_reflowable() then
@@ -13964,7 +14017,7 @@ function Plugin:_show_reader_margin_panel(back_callback)
         title="页边距",
         subtitle=function() return self:_reader_margin_label() end,
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             return {
                 {title="常用预设",rows={
@@ -14019,7 +14072,7 @@ function Plugin:_show_reader_word_spacing_panel(back_callback)
         title="字符间距（高级）",
         subtitle=function() return "空格缩放/压缩 "..self:_reader_word_spacing_label() end,
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local cjk=tonumber(self:_reader_config_value("cjk_width_scaling")) or 100
             return {
@@ -14044,7 +14097,7 @@ function Plugin:_show_reader_refresh_panel(back_callback)
         title="刷新与显示",
         subtitle="只保留阅读过程中真正需要的显示控制",
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             return {
                 {label="刷新频率",value=self:_reader_refresh_rate_label(),value_bold=true,callback=function() self:_show_reader_refresh_settings(function() self:_show_reader_refresh_panel(back_callback) end) end},
@@ -14063,7 +14116,7 @@ function Plugin:_show_reader_advanced_typeset_panel(back_callback)
         title="高级排版",
         subtitle="界面由觅阅整理，设置直接写入 KOReader 当前书籍",
         on_back=back_callback or function() self:show_reader_control_center("typeset") end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             local mode=tonumber(self:_reader_config_value("block_rendering_mode")) or 2
             local mode_labels={[0]="兼容",[1]="平面",[2]="书籍",[3]="网页"}
@@ -14088,7 +14141,7 @@ function Plugin:_show_reader_wifi_quick_panel(back_callback)
             return tostring(label)
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             local on=self:_reader_wifi_state()==true
             return {
@@ -14105,7 +14158,7 @@ function Plugin:_show_reader_sync_quick_panel(back_callback)
         title="阅读同步",
         subtitle=function() return "当前状态: "..tostring(self:progress_sync_label()) end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             return {
                 {label="立即同步",value="上传当前进度",value_bold=true,keep_open=true,callback=function() self:upload_local_progress(true) end},
@@ -14121,7 +14174,7 @@ function Plugin:_show_reader_gesture_panel(back_callback)
         title="手势与按键",
         subtitle="桌面模式只接管顶部下滑阅读面板, 正文阅读手势继续交给阅读器",
         on_back=back_callback or function() self:show_reader_control_center("device") end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             local rows={
                 {label="顶部下滑",value="觅阅阅读快捷面板",arrow=false},
@@ -14142,7 +14195,7 @@ function Plugin:_show_reader_device_compat_panel(back_callback)
         title="系统与兼容",
         subtitle="日常阅读不需要进入 KOReader 原菜单",
         on_back=back_callback or function() self:show_reader_control_center("device") end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         rows=function()
             return {
                 {label="KOReader 原生菜单",value="仅用于未覆盖功能与故障排查",callback=function()
@@ -14175,10 +14228,10 @@ function Plugin:_reader_control_categories()
     end
 
     local reading_items={
-        {icon="toc",label="目录",value="",callback=function() self:_show_reader_toc(back_to("reading")) end},
+        {icon="toc",label="目录",value="当前章节",callback=function() self:_show_reader_toc(back_to("reading")) end},
         {icon="progress",label="阅读进度",value=(self:_reader_progress_percent() and (tostring(math.floor(self:_reader_progress_percent()+.5)).."%") or ""),callback=function() self:_show_reader_progress_control(back_to("reading")) end},
         {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
-        {icon="home",label=self:_home_enabled() and "返回主页" or "返回书架",value=self:_home_enabled() and (self:_reader_session_is_weread() and "保存并结束本次阅读" or "直接返回觅阅主页") or "保留当前阅读会话",callback=function() self:_reader_home_action("reader control") end},
+        {icon="home",label="返回主页",value=self:_reader_session_is_weread() and "保存并结束本次阅读" or "直接返回觅阅主页",callback=function() self:return_to_miuread_home("reader control") end},
         {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
     }
     if self:_reader_session_is_weread() then
@@ -14228,7 +14281,7 @@ function Plugin:show_reader_control_center(initial_category)
         categories=self:_reader_control_categories(),
         initial_category=tostring(initial_category or "reading"),
         on_back=function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
     }
     if not panel then
         logger.warn("[MiuRead][ReaderControlCenter] unavailable",tostring(err or "unknown"))
@@ -14242,7 +14295,7 @@ function Plugin:_show_reader_edge_guard_panel(back_callback)
         title="边缘翻页防误触",
         subtitle="左右边缘点击优先翻页，避免划线评论抢占翻页操作",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
-        on_home=function() return self:_reader_home_action("reader surface") end,
+        on_home=function() return self:return_to_miuread_home("reader surface") end,
         sections=function()
             local enabled,percent=self:_reader_edge_guard_state()
             local rows={
@@ -14280,7 +14333,7 @@ function Plugin:_reader_quick_definitions()
         search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
         -- Keep the legacy key so existing customized quick-panel layouts do not
         -- lose this slot after OTA; its action is now the requested Home action.
-        back={key="back",icon="home",label=self:_home_enabled() and "主页" or "书架",icon_scale=.98,callback=function() self:_reader_home_action("reader quick panel") end},
+        back={key="back",icon="home",label="主页",icon_scale=.98,callback=function() self:return_to_miuread_home("reader quick panel") end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
@@ -16015,13 +16068,6 @@ function Plugin:_request_reader_close(generation,source)
     end
     self:_schedule_reader_return_finish(generation,.10,"close requested")
     return true
-end
-
-function Plugin:_reader_home_action(reason)
-    if self:_home_enabled() then
-        return self:return_to_miuread_home(reason)
-    end
-    return self:show_shelf(false,false,"account")
 end
 
 function Plugin:return_to_miuread_home(reason)
@@ -21100,8 +21146,8 @@ end
 function Plugin:_confirm_library_scan(callback)
     if not self:_notice_enabled("library_scan") then callback(); return true end
     local dialog
-    dialog=ButtonDialog:new{title="批量检查已下载书籍可能暂时增加耗电，并使主页响应变慢。",title_align="center",buttons={
-        {{text="开始检查",callback=function() UIManager:close(dialog); callback() end}},
+    dialog=ButtonDialog:new{title="扫描大量本地书籍可能暂时增加耗电，并使主页响应变慢。",title_align="center",buttons={
+        {{text="开始扫描",callback=function() UIManager:close(dialog); callback() end}},
         {{text="开始并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("library_scan",false); callback() end}},
         {{text="取消",callback=function() UIManager:close(dialog) end}},
     }}
@@ -21120,9 +21166,7 @@ function Plugin:book_repair_settings_menu()
         end},
         {text="迁移当前书籍评论",callback=function() self:migrate_current_book_comments() end},
         {text="扫描所有待迁移书籍",callback=function() self:scan_downloaded_books_for_repair() end},
-        {text="重置本地书封面缓存",callback=function()
-            self:_home_reset_local_metadata(); self:_home_scan_local(true,false); self:toast("本地书封面缓存已重置",2)
-        end},
+        {text="重新扫描本地书籍与封面",callback=function() self:show_miuread_home(true) end},
         {text="清理已验证的旧 JSON 备份",callback=function() self:clear_invalid_comment_indexes() end},
         {text="迁移记录",callback=function() self:show_repair_history() end},
         {text="重置迁移提示状态",callback=function()
@@ -21286,7 +21330,7 @@ function Plugin:remove_local_root(path)
                 local normalized=LocalLibrary.normalize(key)
                 if normalized==LocalLibrary.normalize(path) or normalized:sub(1,#prefix)==prefix then tree.dirs[key]=nil end
             end
-            self.store:set("home_local_directory_cache_v2",tree)
+            self.store:set("home_local_tree_index",tree)
             local index_cache=self:_home_local_cache()
             local kept={}
             local normalized_root=LocalLibrary.normalize(path)
@@ -21380,74 +21424,39 @@ function Plugin:_toggle_local_library_auto_update()
     return home.local_auto_update
 end
 
-function Plugin:_set_local_entry_root(path)
-    path=LocalLibrary.normalize(path or "")
-    if path=="" or lfs.attributes(path,"mode")~="directory" then
-        self:info("所选目录不存在或当前设备无法访问。")
-        return false
-    end
-    local home,preferences=self:_home_preferences()
-    home.local_entry_root=path
-    home.local_entry_version=1
-    home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
-    home.page_by_section["local"]=1
-    self:_save_home_preferences(home,preferences)
-    self:_home_scan_local(true,false)
-    self:toast("本地书入口已改为\n"..path,2)
-    return true
-end
-
-function Plugin:choose_local_entry_root_dialog()
-    if not self:_ensure_path_chooser_base() then
-        self:info("暂时无法打开文件夹选择器，请稍后重试")
-        return false
-    end
-    local current=self:_home_root()
-    if current=="" or lfs.attributes(current,"mode")~="directory" then
-        current=lfs.attributes("/mnt/us/documents","mode")=="directory" and "/mnt/us/documents"
-            or (lfs.attributes("/mnt/onboard","mode")=="directory" and "/mnt/onboard" or "/")
-    end
-    local chooser=PathChooser:new{
-        title="选择本地书入口目录",select_directory=true,select_file=false,show_files=false,path=current,
-        onConfirm=function(path) self:_set_local_entry_root(path) end,
-    }
-    UIManager:show(chooser)
-    return true
-end
-
-function Plugin:_reset_local_entry_root()
-    local home,preferences=self:_home_preferences()
-    home.local_entry_root=""
-    home.local_entry_version=1
-    self:_save_home_preferences(home,preferences)
-    self:_home_scan_local(true,false)
-    self:toast("已恢复设备默认本地书入口",2)
-    return true
-end
-
 function Plugin:local_library_settings_menu()
     local home=self:_home_preferences()
-    local entry=self:_home_root()
-    local explicit=U.trim(tostring(home.local_entry_root or ""))
     local items={
-        {text="入口目录",post_text=tostring(entry),callback=function() self:choose_local_entry_root_dialog() end},
-        {text="打开本地书",post_text="只读取当前文件夹",callback=function() self:_open_local_library_folders() end},
+        {text="自动更新本地书库",post_text=home.local_auto_update==true and "已开启" or "已关闭",
+            checked_func=function() return self:_home_preferences().local_auto_update==true end,keep_menu_open=true,
+            callback=function() self:_toggle_local_library_auto_update() end},
+        {text="按文件夹浏览",post_text="书籍与文件夹分开查看",callback=function() self:_open_local_library_folders() end},
     }
-    if explicit~="" then
-        items[#items+1]={text="恢复默认入口",post_text="由设备/KOReader选择",callback=function() self:_reset_local_entry_root() end}
+    for _,root in ipairs(self:_home_local_roots(false)) do
+        local path=root.path
+        items[#items+1]={
+            text=tostring(root.name or LocalLibrary.basename(path)),post_text=root.enabled~=false and "已启用" or "已停用",
+            sub_item_table_func=function() return self:local_root_settings_menu(path) end,
+        }
     end
-    items[#items+1]={text="说明",post_text="不全盘扫描 · 格式跟随 KOReader",enabled=false}
+    if #self:_home_local_roots(false)==0 then items[#items+1]={text="尚未添加本地书库目录",enabled=false} end
+    items[#items+1]={text="添加本地书库目录",post_text="选择实际存放书籍的文件夹",callback=function() self:add_local_root_dialog() end}
+    local cache=self:_home_local_cache()
+    local scanned=tonumber(cache.scanned_at or 0) or 0
+    items[#items+1]={text="上次更新",post_text=scanned>0 and self:_display_time("%m-%d %H:%M",scanned) or "尚未更新",enabled=false}
+    items[#items+1]={text="说明",post_text="主页只显示书籍 文件夹浏览不会混进书架",enabled=false}
     return items
 end
 
+
 function Plugin:_home_lockscreen_style_label(home)
     home=home or self:_home_preferences()
-    local labels={frame="画框",fit="完整",fill="铺满"}
+    local labels={frame="画框",fit="完整",fill="铺满",receipt="书籍收据"}
     return labels[tostring(home.lockscreen_style or "frame")] or "画框"
 end
 
 function Plugin:_set_home_lockscreen_style(style)
-    local allowed={frame=true,fit=true,fill=true}
+    local allowed={frame=true,fit=true,fill=true,receipt=true}
     style=allowed[style] and style or "frame"
     local home,preferences=self:_home_preferences()
     if home.lockscreen_style==style then return true end
@@ -21459,10 +21468,10 @@ function Plugin:_set_home_lockscreen_style(style)
 end
 
 function Plugin:home_lockscreen_style_menu()
-    local labels={frame="画框",fit="完整",fill="铺满"}
-    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切"}
+    local labels={frame="画框",fit="完整",fill="铺满",receipt="书籍收据"}
+    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切",receipt="阅读进度收据卡片"}
     local items={}
-    for _,style in ipairs({"frame","fit","fill"}) do
+    for _,style in ipairs({"frame","fit","fill","receipt"}) do
         local key=style
         items[#items+1]={
             text=labels[key],post_text=notes[key],radio=true,
@@ -21581,7 +21590,7 @@ function Plugin:display_settings_menu()
         {text="觅阅界面字体",post_text=self:_home_ui_font_label(home),sub_item_table_func=function() return self:home_ui_font_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
-        {text="本地书籍",post_text="按文件夹读取",sub_item_table_func=function() return self:local_library_settings_menu() end},
+        {text="本地书籍",post_text=home.local_auto_update==true and "自动更新" or "手动更新",sub_item_table_func=function() return self:local_library_settings_menu() end},
         {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
         {text="下滑工具栏",post_text="设备与 KOReader",sub_item_table_func=function() return self:home_panel_settings_menu() end},
@@ -21826,7 +21835,7 @@ function Plugin:settings_menu()
         rows[#rows+1]={text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end}
     end
     rows[#rows+1]={text="评论 划线与想法",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
-    rows[#rows+1]={text="本地书",post_text=LocalLibrary.basename(self:_home_root()),sub_item_table_func=function() return self:local_library_settings_menu() end}
+    rows[#rows+1]={text="本地书库",post_text=(self:_home_preferences().local_auto_update==true and "自动更新" or "手动更新"),sub_item_table_func=function() return self:local_library_settings_menu() end}
     rows[#rows+1]={text="账户",post_text=self:logged_in() and "已登录" or "未登录",callback=function() self:show_account_status() end}
     rows[#rows+1]={text="阅读同步",post_text=self:_home_sync_status_label(),sub_item_table_func=function() return self:sync_settings_menu() end}
     rows[#rows+1]={text="下载管理",post_text=self:_download_menu_text(),callback=function() self:show_downloads() end}
@@ -25181,4 +25190,32 @@ function Plugin:onFlushSettings()
     self:_flush_cover_index()
     self.store:flush()
 end
+
+-- ============================================================
+-- 内置书籍收据屏保：直接加载收据插件文件，失败不影响主插件
+-- ============================================================
+do
+    local function _load_book_receipt()
+        local plugin_dir
+        local info=debug.getinfo(1,"S")
+        if info and info.source and info.source:sub(1,1)=="@" then
+            local src=info.source:sub(2)
+            plugin_dir=src:match("(.*/)") or ""
+        end
+        if not plugin_dir or plugin_dir=="" then return false,"no_plugin_dir" end
+        local path=plugin_dir.."book_receipt.lua"
+        local lfs=require("libs/libkoreader-lfs")
+        if not lfs.attributes(path,"mode") then return false,"file_not_found:"..path end
+        local ok,err=pcall(dofile,path)
+        if not ok then return false,tostring(err) end
+        return true
+    end
+    local ok,err=_load_book_receipt()
+    if ok then
+        logger.info("[MiuRead][BookReceipt] built-in receipt loaded")
+    else
+        logger.warn("[MiuRead][BookReceipt] built-in receipt skipped:",tostring(err))
+    end
+end
+
 return Plugin
