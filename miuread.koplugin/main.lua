@@ -511,7 +511,7 @@ local function install_home_screensaver_patch()
         local use_home_target=enabled and (HomeView.is_shown() or HOME_READER_ORIGIN)
         local sources=use_home_target and collect_sources(opts) or {}
         local style=tostring((opts and opts.lockscreen_style) or HOME_SESSION.lockscreen_style or "frame")
-        if style~="frame" and style~="fit" and style~="fill" then style="frame" end
+        if style~="frame" and style~="fit" and style~="fill" and style~="receipt" then style="frame" end
 
         local ReaderUI=require("apps/reader/readerui")
         local FileManager=require("apps/filemanager/filemanager")
@@ -543,18 +543,24 @@ local function install_home_screensaver_patch()
             -- freeze background producers here; Plugin:onSuspend owns the
             -- lifecycle transition exactly once after KOReader commits suspend.
             if args.n==0 and use_home_target then
-                manager.ui=host or current
-                manager.show_message=false
-                manager.prefix=""
-                manager.event_message=nil
-                manager.overlay_message=nil
-                manager.image=nil
-                manager.image_file=nil
-                manager.screensaver_background="white"
-                if apply_direct_cover(manager,sources,style,source_file) then
-                    logger.info("[MiuRead][Lockscreen] home takeover committed",
-                        "book=",tostring(source_file or ""),"host=",host and "filemanager" or "home")
-                    return
+                if style=="receipt" then
+                    -- 墨痕壁纸：交给 InkStain 插件自行管理屏保设置，
+                    -- miuread 不干预，让原版 Screensaver.setup 正常执行。
+                    logger.info("[MiuRead][Lockscreen] receipt mode delegated to InkStain")
+                else
+                    manager.ui=host or current
+                    manager.show_message=false
+                    manager.prefix=""
+                    manager.event_message=nil
+                    manager.overlay_message=nil
+                    manager.image=nil
+                    manager.image_file=nil
+                    manager.screensaver_background="white"
+                    if apply_direct_cover(manager,sources,style,source_file) then
+                        logger.info("[MiuRead][Lockscreen] home takeover committed",
+                            "book=",tostring(source_file or ""),"host=",host and "filemanager" or "home")
+                        return
+                    end
                 end
             end
 
@@ -576,20 +582,19 @@ local function install_home_screensaver_patch()
 
         local native_ok,native_result=call_original(manager,args,nil)
         if not native_ok then error(native_result) end
-        -- Poweroff/reboot keep KOReader's own screen. Only normal suspend may
-        -- substitute MiuRead's current/recent-reading cover. If rendering fails,
-        -- leave KOReader's already-prepared native screensaver untouched.
         if args.n==0 and use_home_target then
-            if not apply_direct_cover(manager,sources,style,source_file) then
-                logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
-                    "reason=miuread_cover_unavailable","mode=",tostring(manager.screensaver_type or ""))
-                -- With screensaver_type=disable KOReader intentionally keeps the
-                -- current framebuffer. In Reader that exposes the last text page
-                -- as the lock screen, which is never an acceptable fallback when
-                -- MiuRead lockscreen cover is enabled. Show KOReader's neutral
-                -- image instead; other native modes remain untouched.
-                if tostring(manager.screensaver_type or "")=="disable" then
-                    emergency_native_fallback(manager,reader_ui or current,nil,"reader_cover_unavailable_disable")
+            if style=="receipt" then
+                -- 墨痕壁纸：不设置无效的 screensaver_type，
+                -- InkStain 插件的 onSuspend 会自行设置 document_cover + PNG 路径，
+                -- 原版 Screensaver.setup 已根据这些设置正常执行。
+                logger.info("[MiuRead][Lockscreen] receipt mode delegated to InkStain","book=",tostring(source_file or ""))
+            else
+                if not apply_direct_cover(manager,sources,style,source_file) then
+                    logger.info("[MiuRead][Lockscreen] takeover=false fallback=koreader",
+                        "reason=miuread_cover_unavailable","mode=",tostring(manager.screensaver_type or ""))
+                    if tostring(manager.screensaver_type or "")=="disable" then
+                        emergency_native_fallback(manager,reader_ui or current,nil,"reader_cover_unavailable_disable")
+                    end
                 end
             end
         end
@@ -3335,7 +3340,7 @@ function Plugin:_home_preferences()
     if home.background_thought_index~=nil then home.background_thought_index=nil; changed=true end
     if home.active_section~="account" and home.active_section~="generated" and home.active_section~="local" and home.active_section~="mp" then home.active_section="account"; changed=true end
     if home.lockscreen_recent==nil then home.lockscreen_recent=true; changed=true end
-    if home.lockscreen_style~="frame" and home.lockscreen_style~="fit" and home.lockscreen_style~="fill" then
+    if home.lockscreen_style~="frame" and home.lockscreen_style~="fit" and home.lockscreen_style~="fill" and home.lockscreen_style~="receipt" then
         home.lockscreen_style="frame"; changed=true
     end
     -- Legacy scan roots are intentionally left byte-for-byte compatible for
@@ -5148,7 +5153,7 @@ function Plugin:_home_update_lockscreen_session(book)
     local enabled=home.lockscreen_recent~=false
     local sources=enabled and self:_home_lockscreen_sources(book) or {}
     local style=tostring(home.lockscreen_style or "frame")
-    if style~="frame" and style~="fit" and style~="fill" then style="frame" end
+    if style~="frame" and style~="fit" and style~="fill" and style~="receipt" then style="frame" end
     local book_file=normalized_reader_file(book and book.file or nil)
     HOME_SESSION.lockscreen_recent_enabled=enabled
     HOME_SESSION.lockscreen_style=style
@@ -23257,13 +23262,17 @@ end
 
 function Plugin:_home_lockscreen_style_label(home)
     home=home or self:_home_preferences()
-    local labels={frame="画框",fit="完整",fill="铺满"}
+    local labels={frame="画框",fit="完整",fill="铺满",receipt="墨痕壁纸"}
     return labels[tostring(home.lockscreen_style or "frame")] or "画框"
 end
 
 function Plugin:_set_home_lockscreen_style(style)
-    local allowed={frame=true,fit=true,fill=true}
+    local allowed={frame=true,fit=true,fill=true,receipt=true}
     style=allowed[style] and style or "frame"
+    if style=="receipt" and not self:_inkstain_available() then
+        self:_inkstain_ensure_or_prompt()
+        return true
+    end
     local home,preferences=self:_home_preferences()
     if home.lockscreen_style==style then return true end
     home.lockscreen_style=style
@@ -23274,10 +23283,12 @@ function Plugin:_set_home_lockscreen_style(style)
 end
 
 function Plugin:home_lockscreen_style_menu()
-    local labels={frame="画框",fit="完整",fill="铺满"}
-    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切"}
+    local labels={frame="画框",fit="完整",fill="铺满",receipt="墨痕壁纸"}
+    local receipt_note="阅读统计墨痕账单"
+    if not self:_inkstain_available() then receipt_note="未安装 · 点击查看下载说明" end
+    local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切",receipt=receipt_note}
     local items={}
-    for _,style in ipairs({"frame","fit","fill"}) do
+    for _,style in ipairs({"frame","fit","fill","receipt"}) do
         local key=style
         items[#items+1]={
             text=labels[key],post_text=notes[key],radio=true,
@@ -27095,4 +27106,72 @@ function Plugin:onFlushSettings()
     self:_flush_cover_index()
     self.store:flush()
 end
+
+-- ============================================================
+-- 墨痕壁纸屏保：检测 plugins/ 目录下是否有 inkstain 插件
+-- 墨痕是独立 KOReader 插件，自行管理屏保设置，miuread 不干预
+-- ============================================================
+function Plugin:_find_inkstain_plugin()
+    -- 优先检查全局实例（插件已加载）
+    if _G.InkStainWallpaper then return "loaded" end
+    local lfs=require("libs/libkoreader-lfs")
+    local search_dirs={}
+    local ok_ds,DataStorage=pcall(require,"datastorage")
+    if ok_ds and DataStorage then
+        local base=DataStorage:getDataDir()
+        if base then
+            table.insert(search_dirs,base.."/plugins")
+            table.insert(search_dirs,base.."/koreader/plugins")
+        end
+    end
+    if #search_dirs==0 then
+        table.insert(search_dirs,"./plugins")
+        table.insert(search_dirs,"./koreader/plugins")
+    end
+    for _,dir in ipairs(search_dirs) do
+        local main=dir.."/inkstain.koplugin/main.lua"
+        if lfs.attributes(main,"mode")=="file" then return main end
+        local ok,entries=pcall(lfs.dir,dir)
+        if ok and entries then
+            for entry in entries do
+                if entry:match("inkstain") then
+                    local path=dir.."/"..entry
+                    local mode=lfs.attributes(path,"mode")
+                    if mode=="directory" then
+                        local m=path.."/main.lua"
+                        if lfs.attributes(m,"mode")=="file" then return m end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Plugin:_inkstain_available()
+    if Plugin._inkstain_ok==nil then
+        Plugin._inkstain_ok=false
+        local ok,path=pcall(Plugin._find_inkstain_plugin,Plugin)
+        if ok and path then
+            logger.info("[MiuRead][InkStain] found at",path)
+            Plugin._inkstain_ok=true
+        else
+            logger.warn("[MiuRead][InkStain] not found")
+        end
+    end
+    return Plugin._inkstain_ok
+end
+
+function Plugin:_inkstain_ensure_or_prompt()
+    if self:_inkstain_available() then return true end
+    local UIManager=require("ui/uimanager")
+    local InfoMessage=require("ui/widget/infomessage")
+    local _=require("gettext")
+    UIManager:show(InfoMessage:new{
+        text=_("墨痕壁纸插件未安装。\n请下载 inkstain 插件，放入 KOReader 的 plugins/ 目录后重启。\n下载地址见 PR 说明或 README。"),
+        timeout=5,
+    })
+    return false
+end
+
 return Plugin
