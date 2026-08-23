@@ -1,5 +1,10 @@
 # Changelog
 
+## 5.0.0-beta.2 - 2026-08-23
+
+- Delete miuread.koplugin/main.lua
+- Add files via upload
+
 ## 5.0.0-beta.1 - 2026-08-23
 
 - Delete miuread.koplugin/main.lua
