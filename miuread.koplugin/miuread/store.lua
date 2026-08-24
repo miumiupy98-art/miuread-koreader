@@ -54,11 +54,33 @@ local function invalidate_report_contexts_table(sessions)
     end
     return sessions,changed
 end
+local function invalidate_same_account_contexts_table(sessions)
+    sessions=type(sessions)=="table" and sessions or {}
+    local changed=0
+    local clear_keys={
+        "legacy_report_context","report_context","psvts","pclts","token","reader_url",
+        "context_updated_at","report_login_session_id","verification_login_session_id",
+        "remote","remote_sources","remote_checked_at","remote_web_error","remote_agent_error",
+        "remote_verified","verified_at","verified_reason","verified_local_percent","verified_remote_percent",
+        "last_response_summary","last_http_code","last_http_length","last_payload_public","last_path",
+        "last_stage","last_error","last_attempts",
+    }
+    for _,session in pairs(sessions) do
+        if type(session)=="table" then
+            for _,key in ipairs(clear_keys) do
+                if session[key]~=nil then session[key]=nil; changed=changed+1 end
+            end
+            if tonumber(session.consecutive_failures or 0)~=0 then session.consecutive_failures=0; changed=changed+1 end
+        end
+    end
+    return sessions,changed
+end
 local function invalidate_upload_health_table(auth)
     auth=U.merge(defaults.auth,auth or {})
     auth.health.notice_pending=false
     auth.health.last_error_channel=""
-    if tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+    local cookies=type(auth.cookies)=="table" and auth.cookies or {}
+    if tostring(auth.api_key or "")~="" or next(cookies)~=nil then
         auth.health.state="unknown"
         for _,channel in ipairs({"progress","read_report"}) do
             local row=auth.health.channels[channel] or {}
@@ -1599,8 +1621,11 @@ function Store:generate_login_session_id() return generate_login_session_id() en
 function Store:ensure_login_session_id()
     local auth=self:auth()
     local account=type(auth.account)=="table" and auth.account or {}
+    local cookies=type(auth.cookies)=="table" and auth.cookies or {}
+    local has_web=tostring(cookies.wr_skey or "")~=""
+    local has_agent=tostring(auth.api_key or "")~=""
     if tostring(auth.login_session_id or "")=="" and tostring(account.vid or "")~=""
-        and tostring(auth.api_key or "")~="" and next(auth.cookies or {})~=nil then
+        and (has_agent or has_web) then
         auth.login_session_id=generate_login_session_id()
         local saved,err=self:save_auth(auth)
         if saved~=true then return "",err end
@@ -2331,6 +2356,15 @@ function Store:clear_login_bound_sessions(reason)
     self:save_auth(invalidate_upload_health_table(self:get("auth",{})))
     logger.info("[MiuRead][Store] login-bound sessions cleared",
         "reason=",tostring(reason or "unknown"),"fields=",tostring(changed))
+    return changed,reason
+end
+function Store:refresh_same_account_login_contexts(reason)
+    local sessions=self:get("sessions",{})
+    local cleaned,changed=invalidate_same_account_contexts_table(sessions)
+    if changed>0 then self:set("sessions",cleaned) end
+    self:save_auth(invalidate_upload_health_table(self:get("auth",{})))
+    logger.info("[MiuRead][Store] same-account login contexts refreshed",
+        "reason=",tostring(reason or "login_refreshed"),"fields=",tostring(changed))
     return changed,reason
 end
 function Store:invalidate_report_contexts(reason)

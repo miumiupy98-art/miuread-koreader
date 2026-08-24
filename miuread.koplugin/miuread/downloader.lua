@@ -1511,7 +1511,7 @@ function Downloader:book(input, opt, progress)
 
         if current.auth_required==true then
             error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
-                or "登录状态已失效 [MiuReadAuth]")
+                or "登录凭证仍不可用 [MiuReadAuth]")
         end
         if current.rate_limited==true then
             annotation_suspended=true

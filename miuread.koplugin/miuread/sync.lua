@@ -2138,7 +2138,7 @@ function Sync:upload(elapsed, callback, options)
     local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local vid_snapshot=tostring(account.vid or "")
     if login_snapshot=="" or vid_snapshot=="" then
-        if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
+        if callback then callback(false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码") end
         return false
     end
     local ratio = type(options.position_override)=="table" and tonumber(options.position_override.progress)
@@ -2498,7 +2498,7 @@ function Sync:test_upload(callback)
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     if tostring(auth.login_session_id or "")=="" or tostring(account.vid or "")=="" then
-        if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
+        if callback then callback(false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码") end
         return false
     end
     local book_id=tostring(record.book.book_id or "")
@@ -3278,7 +3278,7 @@ function Sync:_start_daemon(reason)
     local account_vid=tostring(current_account.vid or "")
     if login_session_id=="" or account_vid=="" then
         self.state="stopped"
-        return false,"当前账号登录会话无效，请重新扫码登录"
+        return false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码"
     end
     self.pending_report_elapsed=0
     self.pending_report_status_at=os.time()

@@ -740,7 +740,7 @@ local RATE_LIMIT_MARKER = "[MiuReadRateLimit]"
 
 local function auth_error_message(code, message)
     local suffix = tostring(message or ""):gsub("[%c]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    local out = "登录状态已失效 " .. AUTH_ERROR_MARKER .. " error_code=" .. tostring(code or "unknown")
+    local out = "登录凭证需要更新 " .. AUTH_ERROR_MARKER .. " error_code=" .. tostring(code or "unknown")
     if suffix ~= "" then out = out .. ": " .. suffix end
     return out
 end

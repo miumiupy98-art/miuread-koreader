@@ -1381,7 +1381,13 @@ function Plugin:list(title,items,empty)
 end
 function Plugin:logged_in()
     local a=self.store:auth()
-    return tostring(a.api_key or "")~="" and next(a.cookies or {})~=nil
+    local cookies=type(a.cookies)=="table" and a.cookies or {}
+    local account=type(a.account)=="table" and a.account or {}
+    local vid=tostring(account.vid or "")
+    if vid=="" then vid=tostring(cookies.wr_vid or "") end
+    local has_web=vid~="" and tostring(cookies.wr_skey or "")~=""
+    local has_agent=tostring(a.api_key or "")~=""
+    return has_web or has_agent
 end
 function Plugin:require_login()
     if not self:logged_in() then
@@ -1426,7 +1432,7 @@ function Plugin:_recompute_auth_health(health)
     local partial,unknown=false,false
     for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
         local state=tostring(auth_row(health.channels[channel]).state)
-        if state=="expired" or state=="error" then partial=true
+        if state=="expired" or state=="error" or state=="recovering" then partial=true
         elseif state~="ok" then unknown=true end
     end
     health.state=partial and "partial" or (unknown and "unknown" or "ok")
@@ -1472,10 +1478,8 @@ function Plugin:_mark_auth_access_denied(channel,err,notify)
     health.channels=health.channels or {}
     local previous=auth_row(health.channels[channel])
     local failures=(tonumber(previous.failures) or 0)+1
-    local threshold=math.max(1,tonumber(Config.AUTH_NOTICE_FAILURE_THRESHOLD) or 2)
-    local confirmed=failures>=threshold
     local message=U.first_line(err or "HTTP 403",220)
-    health.channels[channel]={state=confirmed and "expired" or "error",checked_at=now,
+    health.channels[channel]={state="error",checked_at=now,
         error=U.first_line(message,180),code="403",failures=failures,retry_at=0,
         last_ok_at=previous.last_ok_at or 0}
     health.last_checked_at=now
@@ -1483,43 +1487,37 @@ function Plugin:_mark_auth_access_denied(channel,err,notify)
     health.last_error_code="403"
     health.last_error_message=message
     health.last_error_channel=channel
-    if notify~=false and confirmed then health.notice_pending=true end
     self:_recompute_auth_health(health)
     self:_save_auth_health(health)
     logger.warn("[MiuRead][Auth] feature access denied",
-        "channel=",tostring(channel),"failures=",tostring(failures),"confirmed=",tostring(confirmed),
+        "channel=",tostring(channel),"failures=",tostring(failures),"confirmed=false",
         "error=",U.first_line(message,160))
-    if health.notice_pending then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
     return true
 end
-function Plugin:_mark_auth_problem(channel,err,notify)
+function Plugin:_mark_auth_problem(channel,err,notify,confirmed_expired)
     local text=tostring(err or "登录状态暂时不可用")
     if not Http.is_auth_error(text) then return false end
     local now=os.time()
     local health=self:_auth_health()
     health.channels=health.channels or {}
     local previous=auth_row(health.channels[channel])
-    local threshold=math.max(1,tonumber(Config.AUTH_NOTICE_FAILURE_THRESHOLD) or 2)
     local failures=(tonumber(previous.failures) or 0)+1
-    local confirmed=text:find("自动续期失败",1,true)~=nil
-        or text:find("renewal=",1,true)~=nil
-        or text:find("refreshed=",1,true)~=nil
-    if confirmed then failures=math.max(failures,threshold) end
-    local expired=failures>=threshold
+    local confirmed=confirmed_expired==true or text:find("[MiuReadAuthConfirmedExpired]",1,true)~=nil
     local code=auth_error_code(text)
-    health.channels[channel]={state=expired and "expired" or "error",checked_at=now,
+    health.channels[channel]={state=confirmed and "expired" or "recovering",checked_at=now,
         error=U.first_line(text,180),code=code,failures=failures,retry_at=0,last_ok_at=previous.last_ok_at or 0}
     health.last_checked_at=now
     health.last_error_at=now
     health.last_error_code=code
     health.last_error_message=U.first_line(text,220)
     health.last_error_channel=channel
-    if notify~=false and expired then health.notice_pending=true end
+    if notify~=false and confirmed then health.notice_pending=true end
     self:_recompute_auth_health(health)
     self:_save_auth_health(health)
     logger.warn("[MiuRead][Auth] feature request authentication failed",
         "channel=",tostring(channel),"code=",tostring(code),"failures=",tostring(failures),
-        "confirmed=",tostring(confirmed),"error=",U.first_line(text,160))
+        "confirmed=",tostring(confirmed),"state=",confirmed and "expired" or "recovering",
+        "error=",U.first_line(text,160))
     if health.notice_pending then UIManager:scheduleIn(.05,function() self:_show_auth_notice() end) end
     return true
 end
@@ -1538,8 +1536,8 @@ function Plugin:_show_auth_notice()
     local channel=AUTH_CHANNEL_LABELS[channel_key] or "在线功能"
     local annotation_forbidden=channel_key=="annotations" and tostring(health.last_error_code or "")=="403"
     local notice_text=annotation_forbidden
-        and "正文下载仍可使用，但划线与想法接口连续拒绝访问。插件已保留正文、已有批注和下载断点。请重新扫码后再次生成书籍。"
-        or "只有此功能受到影响，其他功能会继续运行。插件会保留下载断点和待上传阅读时间，并在后续真实请求中自动重试。多次失败后可重新扫码。"
+        and "正文下载仍可使用，但划线与想法接口拒绝访问。插件已保留正文、已有批注和下载断点；基础登录不会因此判定失效。"
+        or "自动续期、原请求重试和备用登录通道均未恢复此功能。其他本地功能和已缓存内容仍会保留；此时才建议重新扫码。"
     local dialog
     local function close()
         if self._auth_notice_dialog==dialog then self._auth_notice_dialog=nil end
@@ -1581,7 +1579,8 @@ local function account_channel_text(row)
     row=auth_row(row)
     local state=tostring(row.state or "unknown")
     if state=="ok" then return "正常" end
-    if state=="expired" then return "多次验证失败，可重新扫码" end
+    if state=="expired" then return "自动恢复失败，需要重新扫码" end
+    if state=="recovering" then return "凭证暂时异常，正在自动恢复" end
     if state=="error" then
         local retry_at=tonumber(row.retry_at or 0) or 0
         return retry_at>os.time() and "暂时失败，等待自动重试" or "暂时失败"
@@ -1645,8 +1644,11 @@ function Plugin:check_account_status()
     self:_run_interactive_network("account-status","account-status-check",function()
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
+        local ReaderChild=require("miuread.reader")
         local child_store=interactive_child_store(auth,data_dir,temp_dir)
-        local child_api=ApiChild:new(HttpChild:new(child_store),child_store)
+        local child_http=HttpChild:new(child_store)
+        local child_reader=ReaderChild:new(child_http,child_store)
+        local child_api=ApiChild:new(child_http,child_store,child_reader)
         local ok,value=pcall(child_api.shelf,child_api,{retries=0,timeout={7,12}})
         local child_auth,auth_changed=child_store:snapshot()
         return {request_ok=ok,value=ok and value or nil,error=ok and nil or tostring(value),
@@ -1662,7 +1664,9 @@ function Plugin:check_account_status()
         if payload.request_ok==true then
             self:_mark_auth_channel_ok("shelf")
         elseif Http.is_auth_error(payload.error) then
-            self:_mark_auth_problem("shelf",payload.error,false)
+            -- This check already exhausted Skills refresh, Web renewal and an
+            -- Agent retry inside the isolated child. Only now is re-scan justified.
+            self:_mark_auth_problem("shelf",payload.error,true,true)
         else
             self:_mark_auth_channel_error("shelf",payload.error or "账号检查失败")
         end
@@ -1701,8 +1705,10 @@ function Plugin:on_auth_replaced(old_auth,new_auth)
     if self.sync and self.sync.invalidate_login_session then
         self.sync:invalidate_login_session(same_account and "login_refreshed" or "account_changed")
     end
-    if self.store.clear_login_bound_sessions then
-        self.store:clear_login_bound_sessions(same_account and "login_refreshed" or "account_changed")
+    if same_account and self.store.refresh_same_account_login_contexts then
+        self.store:refresh_same_account_login_contexts("login_refreshed")
+    elseif self.store.clear_login_bound_sessions then
+        self.store:clear_login_bound_sessions("account_changed")
     end
     -- A same-account QR refresh is only a new credential set for this device.
     -- Keep its shelf/cache/history. A real account switch still clears account data.
@@ -1989,7 +1995,7 @@ function Plugin:_friendly_remote_error(err, context)
     end
     if Http.is_auth_error(text) or lower:find("api key",1,true)
         or lower:find("authorization",1,true) then
-        return "登录凭证已失效或被拒绝，请在账户设置中重新扫码登录。"
+        return "登录凭证暂时不可用，觅阅会自动尝试续期或切换备用通道；无需立即重新扫码。"
     end
     if lower:find("timeout",1,true) then return "网络请求超时，请检查 Wi-Fi 后重试。" end
     if lower:find("network request failed",1,true) then return "网络连接失败，请检查 Wi-Fi 后重试。" end
@@ -2075,24 +2081,32 @@ function Plugin:_refresh_shelf_async(on_ready,silent,request_options)
     end
 
     local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     logger.info("[MiuRead][Shelf] refresh started","mode=subprocess")
     local started,err=self.shelf_async:run("shelf_refresh",function()
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
-        local UtilChild=require("miuread.util")
-        local child_store={
-            auth=function() return UtilChild.copy(auth) end,
-            save_auth=function() end,
-        }
-        local api=ApiChild:new(HttpChild:new(child_store),child_store)
+        local ReaderChild=require("miuread.reader")
+        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_http=HttpChild:new(child_store)
+        local child_reader=ReaderChild:new(child_http,child_store)
+        local api=ApiChild:new(child_http,child_store,child_reader)
+        local data
         if use_stream then
-            return api:shelf_stream({retries=1,timeout={10,18},stream=true,count=16,allow_full_fallback=allow_full_fallback})
+            data=api:shelf_stream({retries=1,timeout={10,18},stream=true,count=16,allow_full_fallback=allow_full_fallback})
+        else
+            data=api:shelf({retries=1,timeout={10,18}})
         end
-        return api:shelf({retries=1,timeout={10,18}})
+        local child_auth,auth_changed=child_store:snapshot()
+        return {data=data,auth=child_auth,auth_changed=auth_changed}
     end,function(result)
         if generation~=self._shelf_refresh_generation then return end
         if result and result.ok==true then
-            succeed(result.value or {},"subprocess")
+            local payload=type(result.value)=="table" and result.value or {}
+            if payload.auth_changed==true then
+                self:_apply_interactive_auth{auth=payload.auth,changed=true}
+            end
+            succeed(type(payload.data)=="table" and payload.data or {},"subprocess")
             return
         end
         fail(result and result.error or "未知错误")
@@ -17855,13 +17869,13 @@ function Plugin:_finish_download_runtime(runtime,result)
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
         self:_update_open_shelf_download_status(b.bookId,
-            auth_required and "等待重新登录" or (rate_limited and "请求受限 · 稍后继续"
+            auth_required and "等待登录恢复" or (rate_limited and "请求受限 · 稍后继续"
                 or (network_failed and "等待网络 · 可继续"
                 or (image_missing and "正文图片待修复 · 断点已保留" or "生成未完成"))))
         self:_notify_home_data_changed("content")
         local first
         if auth_required then
-            first="微信读书登录已失效。下载断点已经保留，请重新扫码登录后继续。"
+            first="微信读书登录凭证暂时未能自动恢复。下载断点已经保留，可稍后继续；若账号状态检查也失败，再重新扫码。"
         elseif rate_limited then
             first="微信读书暂时限制了请求频率。插件已停止继续请求，正文和断点均已保留，请稍后继续下载。"
         elseif network_failed then
@@ -17878,7 +17892,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         if was_background then
             local toast_title=auth_required and "下载登录验证失败" or (rate_limited and "请求受限"
                 or (network_failed and "等待网络" or (image_missing and "书籍图片待修复" or "觅阅")))
-            local toast_text=auth_required and "后台下载已暂停，重新扫码后自动继续"
+            local toast_text=auth_required and "后台下载已暂停，登录恢复后可从断点继续"
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
                 or (image_missing and "已完成内容和断点已保留，可用修复书籍继续"
@@ -18100,7 +18114,7 @@ function Plugin:_download_status_label()
     end
     if state.status=="annotation_pending" then return "后台下载 · 正文已完成，批注待修复" end
     if state.status=="completed" then return "后台下载 · 已完成" end
-    if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待重新登录" end
+    if state.status=="failed" and state.auth_required==true then return "后台下载 · 等待登录恢复" end
     if state.status=="failed" and state.error_kind=="network" then return "后台下载 · 等待网络，可继续" end
     if state.status=="failed" and state.error_kind=="image_missing" then return "后台下载 · 正文图片待修复" end
     if state.status=="failed" then return "后台下载 · 未完成" end
@@ -18348,7 +18362,7 @@ function Plugin:show_download_status()
         if state.annotation_pending==true then lines[#lines+1]="新版本已下载完成"
         elseif state.annotation_fallback==true then lines[#lines+1]="新版本已下载完成"
         else lines[#lines+1]="新版本已下载完成" end
-    elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待重新登录"
+    elseif state.status=="failed" and state.auth_required==true then lines[#lines+1]="等待登录恢复"
     elseif state.status=="failed" and state.error_kind=="rate_limit" then lines[#lines+1]="请求频率受限，稍后可继续"
     elseif state.status=="failed" and state.error_kind=="network" then lines[#lines+1]="网络中断，断点已保留"
     elseif state.status=="failed" and state.error_kind=="image_missing" then lines[#lines+1]="正文图片未完整，断点可修复"
@@ -22208,7 +22222,8 @@ function Plugin:repair_current_sync()
             local kind=tostring(session.sync_repair_kind or self.sync.last_error_kind or "")
             if kind=="authentication" or Http.is_auth_error(err) then
                 local dialog
-                dialog=ButtonDialog:new{title="微信读书登录已失效",buttons={
+                dialog=ButtonDialog:new{title="微信读书登录验证暂时未恢复",buttons={
+                    {{text="检查账号状态",callback=function() UIManager:close(dialog); self:check_account_status() end}},
                     {{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}},
                     {{text="稍后",callback=function() UIManager:close(dialog) end}},
                 }}
