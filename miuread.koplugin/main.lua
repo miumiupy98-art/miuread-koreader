@@ -22141,6 +22141,39 @@ function Plugin:_inkstain_settings_items()
     return {{text="当前墨痕版本无法从觅阅打开完整设置",post_text="请从 KOReader 插件菜单进入",enabled=false}}
 end
 
+function Plugin:_inkstain_open_settings()
+    local instance=self:_inkstain_instance()
+    if not instance then
+        self:_inkstain_ensure_or_prompt(true)
+        return false
+    end
+    if type(instance.openSettings)~="function" then
+        self:info("当前墨痕版本不支持从觅阅直接打开完整设置。\n\n请更新到 InkStain 3.5.7 或更高版本。")
+        return false
+    end
+
+    -- Close MiuRead's transient menu first, then let InkStain own the entire
+    -- settings UI and every callback below it (including OTA/update dialogs).
+    if TransientGuard and type(TransientGuard.close_all)=="function" then
+        pcall(TransientGuard.close_all)
+    end
+    UIManager:scheduleIn(.08,function()
+        local ok,result,err=xpcall(function()
+            return instance:openSettings({source="miuread"})
+        end,debug.traceback)
+        if not ok then
+            logger.warn("[MiuRead][InkStain] openSettings crashed",tostring(result))
+            self:info("无法打开墨痕设置。\n\n"..tostring(result))
+            return
+        end
+        if result==false then
+            logger.warn("[MiuRead][InkStain] openSettings failed",tostring(err or "unknown"))
+            self:info("无法打开墨痕设置。"..(err and ("\n\n"..tostring(err)) or ""))
+        end
+    end)
+    return true
+end
+
 function Plugin:home_lockscreen_style_menu()
     local labels={frame="画框",fit="完整",fill="铺满",receipt="墨痕壁纸"}
     local status=self:_inkstain_status()
@@ -22173,8 +22206,10 @@ function Plugin:home_lockscreen_style_menu()
         separator=true,
     }
     items[#items+1]={
-        text="墨痕设置",post_text=status.loaded and "打开墨痕自己的完整设置" or (status.installed and "当前未加载" or "未安装"),
-        sub_item_table_func=function() return self:_inkstain_settings_items() end,
+        text="墨痕设置",post_text=status.loaded and "进入 InkStain 原生设置" or (status.installed and "当前未加载" or "未安装"),
+        enabled_func=function() return self:_inkstain_instance()~=nil end,
+        arrow=true,
+        callback=function() self:_inkstain_open_settings() end,
     }
     return items
 end

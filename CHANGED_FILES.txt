@@ -1,11 +1,10 @@
-5.0.0-beta.6
+5.0.0-beta.7
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/store.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: make MiuRead's InkStain entry a real bidirectional lockscreen control surface while keeping InkStain independent and reusing InkStain's own complete settings menu.
+Focus: open InkStain 3.5.7 settings as an InkStain-owned native KOReader menu so complex actions such as OTA updates are no longer proxied by MiuRead.
