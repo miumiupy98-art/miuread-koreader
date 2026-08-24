@@ -54,7 +54,7 @@ local MAP = {
     ["full-refresh"] = "full-refresh",
     ["return"] = "return",
     ["ko-reader"] = "ko-reader", koreader = "ko-reader",
-    display = "display", tools = "tools", device = "device", book = "book", folder = "folder", ["📁"] = "folder", wifi = "wifi", ["⌁"] = "wifi",
+    display = "display", tools = "repair", device = "device", book = "book", folder = "folder", ["📁"] = "folder", wifi = "wifi", ["⌁"] = "wifi",
     bluetooth = "bluetooth", bt = "bluetooth",
 }
 

@@ -2047,10 +2047,6 @@ function Store:epub_identity(path)
     return nil
 end
 
-local function access_from_epub_meta(_meta)
-    return nil
-end
-
 local function metadata_key(value)
     local text=tostring(value or ""):lower()
     text=text:gsub("%.epub$","")

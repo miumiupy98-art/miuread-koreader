@@ -22,22 +22,9 @@ local READ_REPORT_SERVICE_VERSION = 21
 local FIRST_REPORT_DELAY = 60
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
-local READER_BUSY_PATH = "/tmp/miuread-reader-busy.until"
 
 -- beta.45: source-anchor reports may carry the Web Reader's native raw-XHTML
 -- UTF-16 `co`. Whole-book inverse mapping remains only as a `pr`/fallback aid.
-
-local function reader_interaction_busy(host)
-    if type(host) == "table" then
-        if type(host._reader_background_idle) == "function" then
-            local ok, idle = pcall(host._reader_background_idle, host)
-            if ok then return idle ~= true end
-        end
-        if (tonumber(host._reader_busy_until or 0) or 0) > os.time() then return true end
-    end
-    local raw = U.read_file(READER_BUSY_PATH, true)
-    return (tonumber(raw or 0) or 0) > os.time()
-end
 
 local function report_ratio_from_position(position)
     position = type(position) == "table" and position or {}
@@ -3589,18 +3576,6 @@ function Sync:_final_elapsed(skip_status_import)
     elapsed = math.min(elapsed, maximum)
     if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
     return elapsed
-end
-
--- Kept for compatibility with older callers. Automatic reporting now uses one
--- long-lived subprocess instead of forking a fresh worker every 60 seconds.
-function Sync:_schedule(_delay)
-    if self.store:preferences().sync.time_enabled and not self.suspended then
-        self:_start_daemon("schedule_compat")
-    end
-end
-
-function Sync:_tick()
-    self:_write_daemon_control(true)
 end
 
 function Sync:start(reason)

@@ -1,10 +1,19 @@
-5.0.0-beta.4
+5.0.0-beta.5
 
 Changed files:
 - miuread.koplugin/main.lua
+- miuread.koplugin/miuread/local_library.lua
+- miuread.koplugin/miuread/local_browser_view.lua (removed)
+- miuread.koplugin/miuread/store.lua
+- miuread.koplugin/miuread/bluetooth.lua
+- miuread.koplugin/miuread/sync.lua
+- miuread.koplugin/miuread/downloader.lua
+- miuread.koplugin/miuread/icon_registry.lua
+- miuread.koplugin/resources/icons/miuread/tools.svg (removed; duplicate of repair.svg)
+- miuread.koplugin/miuread/legacy/read_report_worker.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: hand local-file browsing and classification back to KOReader, retire MiuRead local-folder selection from the active UI, keep KOReader folders/Home Folder/Collections intact, and exclude MiuRead-generated WeRead EPUBs from local recent reading without blacklisting an entire download directory. No download, sync, suspend/resume, lockscreen, progress, or reader-layout logic is changed.
+Focus: remove retired MiuRead-owned local-folder browsing/indexing and confirmed unreachable compatibility code while keeping KOReader local-book ownership, recent-reading classification, downloads, sync, reading statistics, progress, suspend/resume, lockscreen, and reader behavior unchanged.
