@@ -1,19 +1,11 @@
-5.0.0-beta.5
+5.0.0-beta.6
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/local_library.lua
-- miuread.koplugin/miuread/local_browser_view.lua (removed)
 - miuread.koplugin/miuread/store.lua
-- miuread.koplugin/miuread/bluetooth.lua
-- miuread.koplugin/miuread/sync.lua
-- miuread.koplugin/miuread/downloader.lua
-- miuread.koplugin/miuread/icon_registry.lua
-- miuread.koplugin/resources/icons/miuread/tools.svg (removed; duplicate of repair.svg)
-- miuread.koplugin/miuread/legacy/read_report_worker.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: remove retired MiuRead-owned local-folder browsing/indexing and confirmed unreachable compatibility code while keeping KOReader local-book ownership, recent-reading classification, downloads, sync, reading statistics, progress, suspend/resume, lockscreen, and reader behavior unchanged.
+Focus: make MiuRead's InkStain entry a real bidirectional lockscreen control surface while keeping InkStain independent and reusing InkStain's own complete settings menu.

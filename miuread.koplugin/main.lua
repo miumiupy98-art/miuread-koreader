@@ -511,6 +511,19 @@ local function install_home_screensaver_patch()
         local sources=use_home_target and collect_sources(opts) or {}
         local style=tostring((opts and opts.lockscreen_style) or HOME_SESSION.lockscreen_style or "frame")
         if style~="frame" and style~="fit" and style~="fill" and style~="receipt" then style="frame" end
+        -- beta.6: receipt is not just a MiuRead preference anymore. InkStain's
+        -- real enabled state wins, so enabling/disabling it from either plugin
+        -- cannot leave MiuRead and the actual KOReader screensaver out of sync.
+        local owner=home_owner()
+        if owner and type(owner._inkstain_enabled)=="function" then
+            local ok_ink,ink_enabled=pcall(owner._inkstain_enabled,owner)
+            if ok_ink and ink_enabled==true then
+                style="receipt"
+            elseif style=="receipt" and type(owner._home_native_lockscreen_style)=="function" then
+                local ok_native,native_style=pcall(owner._home_native_lockscreen_style,owner)
+                if ok_native then style=tostring(native_style or "frame") end
+            end
+        end
 
         local ReaderUI=require("apps/reader/readerui")
         local FileManager=require("apps/filemanager/filemanager")
@@ -3329,6 +3342,10 @@ function Plugin:_home_preferences()
     if home.lockscreen_style~="frame" and home.lockscreen_style~="fit" and home.lockscreen_style~="fill" and home.lockscreen_style~="receipt" then
         home.lockscreen_style="frame"; changed=true
     end
+    if home.lockscreen_last_native_style~="frame" and home.lockscreen_last_native_style~="fit" and home.lockscreen_last_native_style~="fill" then
+        home.lockscreen_last_native_style=(home.lockscreen_style=="fit" or home.lockscreen_style=="fill") and home.lockscreen_style or "frame"
+        changed=true
+    end
     -- Legacy scan roots are intentionally left byte-for-byte compatible for
     -- rollback. Only normalize the new browser entry used by beta.13.
     local normalized_entry=LocalLibrary.normalize(home.local_entry_root or "")
@@ -5110,8 +5127,7 @@ function Plugin:_home_update_lockscreen_session(book)
     local home=self:_home_preferences()
     local enabled=home.lockscreen_recent~=false
     local sources=enabled and self:_home_lockscreen_sources(book) or {}
-    local style=tostring(home.lockscreen_style or "frame")
-    if style~="frame" and style~="fit" and style~="fill" and style~="receipt" then style="frame" end
+    local style=self:_home_effective_lockscreen_style(home)
     local book_file=normalized_reader_file(book and book.file or nil)
     HOME_SESSION.lockscreen_recent_enabled=enabled
     HOME_SESSION.lockscreen_style=style
@@ -22049,42 +22065,117 @@ function Plugin:local_library_settings_menu()
     }
 end
 
-function Plugin:_home_lockscreen_style_label(home)
+function Plugin:_home_native_lockscreen_style(home)
     home=home or self:_home_preferences()
+    local style=tostring(home.lockscreen_style or "frame")
+    if style=="frame" or style=="fit" or style=="fill" then return style end
+    local previous=tostring(home.lockscreen_last_native_style or "frame")
+    if previous~="frame" and previous~="fit" and previous~="fill" then previous="frame" end
+    return previous
+end
+
+function Plugin:_home_effective_lockscreen_style(home)
+    home=home or self:_home_preferences()
+    if self:_inkstain_enabled() then return "receipt" end
+    return self:_home_native_lockscreen_style(home)
+end
+
+function Plugin:_home_lockscreen_style_label(home)
     local labels={frame="画框",fit="完整",fill="铺满",receipt="墨痕壁纸"}
-    return labels[tostring(home.lockscreen_style or "frame")] or "画框"
+    return labels[self:_home_effective_lockscreen_style(home)] or "画框"
 end
 
 function Plugin:_set_home_lockscreen_style(style)
     local allowed={frame=true,fit=true,fill=true,receipt=true}
     style=allowed[style] and style or "frame"
-    if style=="receipt" and not self:_inkstain_available() then
-        self:_inkstain_ensure_or_prompt()
-        return true
-    end
     local home,preferences=self:_home_preferences()
-    if home.lockscreen_style==style then return true end
-    home.lockscreen_style=style
+
+    if style=="receipt" then
+        if not self:_inkstain_ensure_or_prompt(true) then return false end
+        local native=self:_home_native_lockscreen_style(home)
+        if not self:_inkstain_enable() then return false end
+        home.lockscreen_last_native_style=native
+        -- Keep receipt for rollback compatibility, but the real source of truth
+        -- is InkStain's own enabled state (see _home_effective_lockscreen_style).
+        home.lockscreen_style="receipt"
+    else
+        -- Disable InkStain first. Its restore operation may rewrite KOReader's
+        -- screensaver settings, so MiuRead must apply the requested native style
+        -- only after that restore has completed.
+        if self:_inkstain_enabled() or self:_inkstain_active() then
+            if not self:_inkstain_disable() then return false end
+        end
+        home.lockscreen_style=style
+        home.lockscreen_last_native_style=style
+    end
+
     self:_save_home_preferences(home,preferences)
     self:_home_update_lockscreen_session(self._home_hero)
     self:toast("锁屏封面："..self:_home_lockscreen_style_label(home),1.5)
     return true
 end
 
+function Plugin:_inkstain_settings_items()
+    local instance=self:_inkstain_instance()
+    if not instance then
+        return {{text=self:_inkstain_available() and "墨痕已安装，但当前未加载" or "墨痕壁纸插件未安装",enabled=false}}
+    end
+    -- InkStain 3.5.5 already builds its complete settings tree in addToMainMenu.
+    -- Ask the plugin for that tree instead of copying any of its options here.
+    if type(instance.getSettingsMenu)=="function" then
+        local ok,items=pcall(instance.getSettingsMenu,instance)
+        if ok and type(items)=="table" then return items end
+    end
+    if type(instance.addToMainMenu)=="function" then
+        local holder={}
+        local ok=pcall(instance.addToMainMenu,instance,holder)
+        local entry=ok and holder.inkstain_wallpaper or nil
+        if type(entry)=="table" then
+            if type(entry.sub_item_table_func)=="function" then
+                local ok_items,items=pcall(entry.sub_item_table_func)
+                if ok_items and type(items)=="table" then return items end
+            end
+            if type(entry.sub_item_table)=="table" then return entry.sub_item_table end
+        end
+    end
+    return {{text="当前墨痕版本无法从觅阅打开完整设置",post_text="请从 KOReader 插件菜单进入",enabled=false}}
+end
+
 function Plugin:home_lockscreen_style_menu()
     local labels={frame="画框",fit="完整",fill="铺满",receipt="墨痕壁纸"}
-    local receipt_note="阅读统计墨痕账单"
-    if not self:_inkstain_available() then receipt_note="未安装 · 点击查看下载说明" end
+    local status=self:_inkstain_status()
+    local receipt_note
+    if status.enabled then
+        receipt_note=status.active and "已开启 · 正在接管锁屏" or "已开启"
+    elseif status.loaded then
+        receipt_note="已加载 · 当前关闭"
+    elseif status.installed then
+        receipt_note="已安装 · 当前未加载"
+    else
+        receipt_note="未安装 · 点击查看说明"
+    end
     local notes={frame="76% · 正中 · 完整封面",fit="尽量放大 · 不裁切",fill="铺满屏幕 · 居中裁切",receipt=receipt_note}
     local items={}
     for _,style in ipairs({"frame","fit","fill","receipt"}) do
         local key=style
         items[#items+1]={
             text=labels[key],post_text=notes[key],radio=true,
-            checked_func=function() return tostring(self:_home_preferences().lockscreen_style or "frame")==key end,
+            checked_func=function() return self:_home_effective_lockscreen_style()==key end,
             callback=function() self:_set_home_lockscreen_style(key) end,
         }
     end
+    items[#items+1]={
+        text="立即刷新墨痕",post_text=status.loaded and "重新生成当前墨痕壁纸" or "需先加载墨痕插件",
+        enabled_func=function() return self:_inkstain_instance()~=nil end,
+        callback=function()
+            if self:_inkstain_refresh() then self:toast("墨痕壁纸已刷新",2) end
+        end,
+        separator=true,
+    }
+    items[#items+1]={
+        text="墨痕设置",post_text=status.loaded and "打开墨痕自己的完整设置" or (status.installed and "当前未加载" or "未安装"),
+        sub_item_table_func=function() return self:_inkstain_settings_items() end,
+    }
     return items
 end
 
@@ -25897,12 +25988,31 @@ function Plugin:onFlushSettings()
 end
 
 -- ============================================================
--- 墨痕壁纸屏保：检测 plugins/ 目录下是否有 inkstain 插件
--- 墨痕是独立 KOReader 插件，自行管理屏保设置，miuread 不干预
+-- InkStain compatibility bridge (beta.6)
+--
+-- InkStain remains an independent KOReader plugin. MiuRead only owns the
+-- integration surface: discover, query, enable/disable, refresh and expose the
+-- plugin's own settings menu. InkStain 3.5.5 is supported directly; a future
+-- public API can replace the compatibility path without changing MiuRead UI.
 -- ============================================================
+local INKSTAIN_SCREENSAVER_KEYS={
+    "screensaver_type","screensaver_dir","screensaver_document_cover",
+    "screensaver_img_background","screensaver_msg_background","screensaver_stretch_images",
+    "screensaver_stretch_limit_percentage","screensaver_rotate_auto_for_best_fit",
+    "screensaver_show_message","screensaver_message","screensaver_message_container",
+    "screensaver_message_vertical_position","screensaver_message_alpha","screensaver_delay",
+    "screensaver_show_exit_message","screensaver_hide_cover_in_filemanager",
+    "screensaver_exclude_finished_books","screensaver_exclude_on_hold_books",
+    "screensaver_cycle_images_alphabetically",
+}
+
+function Plugin:_inkstain_instance()
+    local instance=rawget(_G,"InkStainWallpaper")
+    return type(instance)=="table" and instance or nil
+end
+
 function Plugin:_find_inkstain_plugin()
-    -- 优先检查全局实例（插件已加载）
-    if _G.InkStainWallpaper then return "loaded" end
+    if self:_inkstain_instance() then return "loaded" end
     local lfs=require("libs/libkoreader-lfs")
     local search_dirs={}
     local ok_ds,DataStorage=pcall(require,"datastorage")
@@ -25923,7 +26033,7 @@ function Plugin:_find_inkstain_plugin()
         local ok,entries=pcall(lfs.dir,dir)
         if ok and entries then
             for entry in entries do
-                if entry:match("inkstain") then
+                if entry:lower():match("inkstain") then
                     local path=dir.."/"..entry
                     local mode=lfs.attributes(path,"mode")
                     if mode=="directory" then
@@ -25938,28 +26048,193 @@ function Plugin:_find_inkstain_plugin()
 end
 
 function Plugin:_inkstain_available()
-    if Plugin._inkstain_ok==nil then
-        Plugin._inkstain_ok=false
-        local ok,path=pcall(Plugin._find_inkstain_plugin,Plugin)
-        if ok and path then
-            logger.info("[MiuRead][InkStain] found at",path)
-            Plugin._inkstain_ok=true
-        else
-            logger.warn("[MiuRead][InkStain] not found")
-        end
+    -- A cached positive result is safe. A negative result is retried because
+    -- plugins may finish loading after MiuRead's own init order.
+    if self:_inkstain_instance() then Plugin._inkstain_ok=true; return true end
+    if Plugin._inkstain_ok==true then return true end
+    local ok,path=pcall(Plugin._find_inkstain_plugin,Plugin)
+    if ok and path then
+        logger.info("[MiuRead][InkStain] found at",path)
+        Plugin._inkstain_ok=true
+        return true
     end
-    return Plugin._inkstain_ok
+    Plugin._inkstain_ok=false
+    return false
 end
 
-function Plugin:_inkstain_ensure_or_prompt()
-    if self:_inkstain_available() then return true end
-    local UIManager=require("ui/uimanager")
-    local InfoMessage=require("ui/widget/infomessage")
-    local _=require("gettext")
-    UIManager:show(InfoMessage:new{
-        text=_("墨痕壁纸插件未安装。\n请下载 inkstain 插件，放入 KOReader 的 plugins/ 目录后重启。\n下载地址见 PR 说明或 README。"),
-        timeout=5,
-    })
+function Plugin:_inkstain_status()
+    local instance=self:_inkstain_instance()
+    local installed=self:_inkstain_available()
+    local enabled=false
+    local active=false
+    if instance then
+        if type(instance.isEnabled)=="function" then
+            local ok,value=pcall(instance.isEnabled,instance)
+            if ok then enabled=value==true end
+        elseif type(instance.settings)=="table" then
+            enabled=instance.settings.auto_set_screensaver==true
+        end
+        if type(instance.isActive)=="function" then
+            local ok,value=pcall(instance.isActive,instance)
+            if ok then active=value==true end
+        elseif type(instance.isUsingInkStainScreensaver)=="function" then
+            local ok,value=pcall(instance.isUsingInkStainScreensaver,instance)
+            if ok then active=value==true end
+        end
+    else
+        local raw=G_reader_settings:readSetting("inkstain_wallpaper",{})
+        if type(raw)=="table" then enabled=raw.auto_set_screensaver==true end
+        local cover=tostring(G_reader_settings:readSetting("screensaver_document_cover") or "")
+        local dir=tostring(G_reader_settings:readSetting("screensaver_dir") or "")
+        active=cover:find("/inkstain",1,true)~=nil or dir:find("/inkstain",1,true)~=nil
+    end
+    return {installed=installed,loaded=instance~=nil,enabled=enabled,active=active}
+end
+
+function Plugin:_inkstain_enabled()
+    return self:_inkstain_status().enabled==true
+end
+
+function Plugin:_inkstain_active()
+    return self:_inkstain_status().active==true
+end
+
+function Plugin:_inkstain_ensure_or_prompt(require_loaded)
+    if not self:_inkstain_available() then
+        self:info("墨痕壁纸插件未安装。\n\n请将 inkstain.koplugin 放入 KOReader 的 plugins/ 目录并重启。")
+        return false
+    end
+    if require_loaded and not self:_inkstain_instance() then
+        self:info("已检测到墨痕壁纸插件，但当前没有加载。\n\n请在 KOReader 插件管理中启用墨痕后重新启动 KOReader。")
+        return false
+    end
+    return true
+end
+
+function Plugin:_inkstain_enable()
+    local instance=self:_inkstain_instance()
+    if not instance then return self:_inkstain_ensure_or_prompt(true) and false end
+
+    -- Prefer the future stable public API when present.
+    if type(instance.enable)=="function" then
+        local ok,result=pcall(instance.enable,instance,{quiet=true,source="miuread"})
+        if ok and result~=false then return true end
+        logger.warn("[MiuRead][InkStain] public enable failed",tostring(result))
+    end
+
+    -- InkStain 3.5.5 compatibility: perform the exact native enable operation
+    -- quietly so the user sees a single MiuRead confirmation instead of two.
+    if type(instance.settings)=="table" and type(instance.saveSettings)=="function"
+        and type(instance.generate)=="function" then
+        instance.settings.auto_set_screensaver=true
+        instance.settings.auto_refresh_on_suspend=true
+        local ok_save,save_err=pcall(instance.saveSettings,instance)
+        if not ok_save then
+            logger.warn("[MiuRead][InkStain] save enable state failed",tostring(save_err))
+            self:info("无法开启墨痕壁纸：设置保存失败。")
+            return false
+        end
+        local ok_generate,result=pcall(instance.generate,instance,true)
+        if ok_generate and result~=false then
+            if type(instance._schedulePeriodicRefresh)=="function" then pcall(instance._schedulePeriodicRefresh,instance) end
+            return true
+        end
+        logger.warn("[MiuRead][InkStain] generate on enable failed",tostring(result))
+        self:info("无法开启墨痕壁纸：壁纸生成失败。")
+        return false
+    end
+
+    if type(instance.enableFromNativeScreensaverMenu)=="function" then
+        local ok,result=pcall(instance.enableFromNativeScreensaverMenu,instance)
+        if ok and result~=false then return true end
+    end
+    self:info("当前墨痕版本无法由觅阅开启，请从墨痕插件菜单开启。")
+    return false
+end
+
+function Plugin:_inkstain_restore_saved_screensaver(settings)
+    local prev=type(settings)=="table" and settings.previous_screensaver or nil
+    if type(prev)=="table" and prev.version==2 and type(prev.values)=="table" then
+        for _,key in ipairs(INKSTAIN_SCREENSAVER_KEYS) do
+            local item=prev.values[key]
+            if type(item)=="table" and item.has then
+                G_reader_settings:saveSetting(key,item.value)
+            elseif G_reader_settings.delSetting then
+                G_reader_settings:delSetting(key)
+            end
+        end
+        settings.previous_screensaver=nil
+        return true
+    end
+    return false
+end
+
+function Plugin:_inkstain_disable()
+    local instance=self:_inkstain_instance()
+    if instance and type(instance.disable)=="function" then
+        local ok,result=pcall(instance.disable,instance,{quiet=true,source="miuread"})
+        if ok and result~=false then return true end
+        logger.warn("[MiuRead][InkStain] public disable failed",tostring(result))
+    end
+
+    if instance and type(instance.settings)=="table" and type(instance.saveSettings)=="function" then
+        instance.settings.auto_refresh_on_suspend=false
+        instance.settings.auto_set_screensaver=false
+        local active=false
+        if type(instance.isUsingInkStainScreensaver)=="function" then
+            local ok,value=pcall(instance.isUsingInkStainScreensaver,instance)
+            active=ok and value==true
+        end
+        if active and type(instance.restorePreviousScreensaverSettings)=="function" then
+            local ok_restore,restore_err=pcall(instance.restorePreviousScreensaverSettings,instance)
+            if not ok_restore then logger.warn("[MiuRead][InkStain] restore failed",tostring(restore_err)) end
+        end
+        local ok_save,save_err=pcall(instance.saveSettings,instance)
+        if ok_save then return true end
+        logger.warn("[MiuRead][InkStain] save disable state failed",tostring(save_err))
+    end
+
+    -- Hard fallback for an installed-but-not-loaded InkStain. This is important
+    -- when users switch MiuRead back to a native cover after disabling the plugin:
+    -- persist InkStain's own switches as off and restore its saved KOReader
+    -- screensaver snapshot if one exists.
+    local settings=G_reader_settings:readSetting("inkstain_wallpaper",{})
+    if type(settings)~="table" then settings={} end
+    settings.auto_refresh_on_suspend=false
+    settings.auto_set_screensaver=false
+    local restored=self:_inkstain_restore_saved_screensaver(settings)
+    if not restored then
+        local cover=tostring(G_reader_settings:readSetting("screensaver_document_cover") or "")
+        local dir=tostring(G_reader_settings:readSetting("screensaver_dir") or "")
+        if cover:find("/inkstain",1,true)~=nil or dir:find("/inkstain",1,true)~=nil then
+            G_reader_settings:saveSetting("screensaver_type","disable")
+            G_reader_settings:makeTrue("screensaver_show_message")
+            if G_reader_settings.delSetting then
+                G_reader_settings:delSetting("screensaver_document_cover")
+                G_reader_settings:delSetting("screensaver_dir")
+            end
+        end
+    end
+    G_reader_settings:saveSetting("inkstain_wallpaper",settings)
+    if G_reader_settings.flush then G_reader_settings:flush() end
+    return true
+end
+
+function Plugin:_inkstain_refresh()
+    local instance=self:_inkstain_instance()
+    if not instance then
+        self:_inkstain_ensure_or_prompt(true)
+        return false
+    end
+    if type(instance.refresh)=="function" then
+        local ok,result=pcall(instance.refresh,instance,{quiet=true,source="miuread"})
+        if ok and result~=false then return true end
+    end
+    if type(instance.generate)=="function" then
+        local ok,result=pcall(instance.generate,instance,true)
+        if ok and result~=false then return true end
+    end
+    self:info("墨痕壁纸刷新失败，请从墨痕插件菜单重试。")
     return false
 end
 
