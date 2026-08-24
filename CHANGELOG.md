@@ -1,5 +1,13 @@
 # Changelog
 
+## 5.0.0-beta.9 - 2026-08-25
+
+- 修复 Issue #55：后台阅读时间服务 fork 后立即关闭从 KOReader 继承的 socket，避免 HTTP Inspector 8080 等监听端口被子进程长期占用。
+- 阅读结束 finalizer 与章节下载的休眠状态分离；仅由阅读时间收尾产生的 `SCREEN_SAVER_HOLD` 不再传给 DownloadTask。
+- DownloadTask 增加任务资格双重检查：没有真实共享下载任务时，不进入锁屏下载、不申请网络保活，也不调用 KOReader 的 Wi-Fi 恢复接口。
+- 所有现有 `runInSubProcess()` worker 统一执行 socket 清理，避免同类 fd 继承问题扩散到下载、异步任务和缓存清理。
+- 保留真实 Kindle/Kobo 熄屏下载与阅读时间 finalizer；不修改进度、本地书、前光等其它功能，`SCHEMA` 保持 119。
+
 ## 5.0.0-beta.8 - 2026-08-25
 
 - 修复“前光与色温”入口：补回 beta.7 中缺失的前光面板连接，阅读设置中的入口可以正常打开。

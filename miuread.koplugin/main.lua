@@ -25296,7 +25296,11 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     -- is still active it simply keeps its own lease; no pause/resume handoff is
     -- needed when final progress/time work ends.
     if self.download_task then
-        local download_target=self:_passive_prefetch_active() and "REAL_SUSPEND" or target
+        -- Reader finalization may still own the device-level screen-saver hold,
+        -- but the download lane only receives a locked state for a real task.
+        local download_target=(not self:_passive_prefetch_active() and download_continue)
+            and (hold_active and hold_state or "DOWNLOAD_LOCKED")
+            or "REAL_SUSPEND"
         self.download_task:on_suspend(download_target,power.generation)
     end
     self._reading_end_standby_held=false
@@ -25621,7 +25625,12 @@ function Plugin:onSuspend()
     -- download remains in PSEUDO_LOCKED/DOWNLOAD_LOCKED while reader_finalizer
     -- holds a separate lease; no reader_finalizer pause reason is injected.
     if self.download_task then
-        local download_power_target=self:_passive_prefetch_active() and "REAL_SUSPEND" or power_target
+        -- Keep reader_finalizer's device hold separate from DownloadTask. A
+        -- SCREEN_SAVER_HOLD caused only by sync must look like REAL_SUSPEND to
+        -- the download subsystem, otherwise it may restore Wi-Fi with no task.
+        local download_power_target=(not self:_passive_prefetch_active() and download_continue)
+            and (backend_active and backend_hold_state or "DOWNLOAD_LOCKED")
+            or "REAL_SUSPEND"
         self.download_task:on_suspend(download_power_target,power.generation)
     end
     self._suspended_at=os.time()

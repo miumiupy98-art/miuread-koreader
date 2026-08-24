@@ -12,6 +12,7 @@ local BookIntegrity = require("miuread.book_integrity")
 local PrecisePosition = require("miuread.precise_position")
 local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
+local SubprocessHygiene = require("miuread.subprocess_hygiene")
 
 local Sync = {}
 Sync.__index = Sync
@@ -2743,7 +2744,12 @@ function Sync:_ensure_daemon()
         lock_path = paths.lock,
         reader_busy_path = "/tmp/miuread-reader-busy.until",
     }
-    local child = function() return ReadReportService.run(service_job) end
+    local child = function()
+        -- A forked long-lived worker must not retain KOReader listeners such as
+        -- HTTP Inspector :8080. Open its own sockets only after this boundary.
+        SubprocessHygiene.close_inherited_sockets()
+        return ReadReportService.run(service_job)
+    end
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
     if not ok or not pid then
         os.remove(paths.owner)

@@ -1,11 +1,15 @@
-5.0.0-beta.8
+5.0.0-beta.9
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/frontlight_controller.lua
+- miuread.koplugin/miuread/subprocess_hygiene.lua
+- miuread.koplugin/miuread/sync.lua
+- miuread.koplugin/miuread/download_task.lua
+- miuread.koplugin/miuread/async.lua
+- miuread.koplugin/miuread/cache_cleanup_task.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: restore the missing frontlight panel entry and make warmth changes follow KOReader's native FrontLightWidget path with readback.
+Focus: fix Issue #55 by preventing inherited KOReader sockets in forked workers and separating reader-finalizer power holds from real download network policy.
