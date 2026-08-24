@@ -296,25 +296,6 @@ local function preview_information_chapter(book, mode, catalog_count, readable_c
     return table.concat(lines, "\n"), title
 end
 
-local function localize(http, html, assets, enabled)
-    if not enabled then return html end
-    local cache = {}
-    local function replace(prefix, quote, url)
-        local clean = tostring(url):gsub("&amp;", "&")
-        if cache[clean] then return prefix .. quote .. cache[clean] .. quote end
-        local ok, data = pcall(http.download, http, clean, {auth=false, retries=3})
-        if not ok or not data or #data == 0 then return prefix .. quote .. url .. quote end
-        local ext, mime = Codec.media(data)
-        local href = "images/remote-" .. tostring(#assets + 1) .. ext
-        assets[#assets + 1] = {href=href, data=data, mime=mime}
-        cache[clean] = "../" .. href
-        return prefix .. quote .. cache[clean] .. quote
-    end
-    html = html:gsub("(data%-src=)([\"'])(https?://[^\"']+)%2", replace)
-    html = html:gsub("(src=)([\"'])(https?://[^\"']+)%2", replace)
-    return html
-end
-
 local function failure_message(failures, expected, actual, checkpointed)
     local lines = {
         "下载不完整，未生成新的 EPUB",
@@ -1511,7 +1492,7 @@ function Downloader:book(input, opt, progress)
 
         if current.auth_required==true then
             error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
-                or "登录状态已失效 [MiuReadAuth]")
+                or "登录凭证仍不可用 [MiuReadAuth]")
         end
         if current.rate_limited==true then
             annotation_suspended=true

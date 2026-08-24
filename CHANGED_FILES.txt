@@ -1,11 +1,15 @@
-4.9.0-beta.30
+5.0.0-beta.9
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/plugin_settings.lua
+- miuread.koplugin/miuread/subprocess_hygiene.lua
+- miuread.koplugin/miuread/sync.lua
+- miuread.koplugin/miuread/download_task.lua
+- miuread.koplugin/miuread/async.lua
+- miuread.koplugin/miuread/cache_cleanup_task.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: fully separate the MiuRead reader-toolbar preference and hook lifecycle between desktop mode and plugin mode. Plugin mode now has its own visible switch, defaults to disabled, restores KOReader-native reader menu behavior when disabled, and cannot inherit the desktop-mode toolbar state. No frontlight, authentication, download, suspend/resume, progress, or home-layout logic is changed.
+Focus: fix Issue #55 by preventing inherited KOReader sockets in forked workers and separating reader-finalizer power holds from real download network policy.

@@ -2,6 +2,7 @@ local FFIUtil=require("ffi/util")
 local Json=require("miuread.json")
 local U=require("miuread.util")
 local RuntimePressure=require("miuread.runtime_pressure")
+local SubprocessHygiene=require("miuread.subprocess_hygiene")
 local UIManager=require("ui/uimanager")
 local Async={}; Async.__index=Async
 function Async:new(store, options)
@@ -68,7 +69,14 @@ function Async:run(label,fn,callback,timeout)
         UIManager:scheduleIn(self.fallback_delay,task)
         return true
     end
-    local path=self.store.temp_dir.."/worker-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))..".json"; local child=function() local ok,x=pcall(fn); local res=ok and {ok=true,value=x} or {ok=false,error=tostring(x)}; local encoded=Json.encode(res); U.atomic_write(path,encoded,true) end
+    local path=self.store.temp_dir.."/worker-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))..".json"
+    local child=function()
+        SubprocessHygiene.close_inherited_sockets()
+        local ok,x=pcall(fn)
+        local res=ok and {ok=true,value=x} or {ok=false,error=tostring(x)}
+        local encoded=Json.encode(res)
+        U.atomic_write(path,encoded,true)
+    end
     local ok,pid,err=pcall(FFIUtil.runInSubProcess,child,false,false)
     if not ok or not pid then
         local failure=tostring(err or pid)

@@ -193,13 +193,6 @@ local function confirmation(result)
     }
 end
 
-local function book_record(books, book_id)
-    if type(books) ~= "table" then
-        return nil
-    end
-    return books[tostring(book_id)] or books[book_id]
-end
-
 local function select_context_chapter(book)
     local chapters = type(book.chapters) == "table" and book.chapters or {}
 

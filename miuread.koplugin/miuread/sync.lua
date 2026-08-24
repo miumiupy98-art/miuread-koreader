@@ -12,6 +12,7 @@ local BookIntegrity = require("miuread.book_integrity")
 local PrecisePosition = require("miuread.precise_position")
 local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
+local SubprocessHygiene = require("miuread.subprocess_hygiene")
 
 local Sync = {}
 Sync.__index = Sync
@@ -22,22 +23,9 @@ local READ_REPORT_SERVICE_VERSION = 21
 local FIRST_REPORT_DELAY = 60
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
-local READER_BUSY_PATH = "/tmp/miuread-reader-busy.until"
 
 -- beta.45: source-anchor reports may carry the Web Reader's native raw-XHTML
 -- UTF-16 `co`. Whole-book inverse mapping remains only as a `pr`/fallback aid.
-
-local function reader_interaction_busy(host)
-    if type(host) == "table" then
-        if type(host._reader_background_idle) == "function" then
-            local ok, idle = pcall(host._reader_background_idle, host)
-            if ok then return idle ~= true end
-        end
-        if (tonumber(host._reader_busy_until or 0) or 0) > os.time() then return true end
-    end
-    local raw = U.read_file(READER_BUSY_PATH, true)
-    return (tonumber(raw or 0) or 0) > os.time()
-end
 
 local function report_ratio_from_position(position)
     position = type(position) == "table" and position or {}
@@ -2138,7 +2126,7 @@ function Sync:upload(elapsed, callback, options)
     local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local vid_snapshot=tostring(account.vid or "")
     if login_snapshot=="" or vid_snapshot=="" then
-        if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
+        if callback then callback(false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码") end
         return false
     end
     local ratio = type(options.position_override)=="table" and tonumber(options.position_override.progress)
@@ -2498,7 +2486,7 @@ function Sync:test_upload(callback)
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     if tostring(auth.login_session_id or "")=="" or tostring(account.vid or "")=="" then
-        if callback then callback(false,"当前账号登录会话无效，请重新扫码登录") end
+        if callback then callback(false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码") end
         return false
     end
     local book_id=tostring(record.book.book_id or "")
@@ -2756,7 +2744,12 @@ function Sync:_ensure_daemon()
         lock_path = paths.lock,
         reader_busy_path = "/tmp/miuread-reader-busy.until",
     }
-    local child = function() return ReadReportService.run(service_job) end
+    local child = function()
+        -- A forked long-lived worker must not retain KOReader listeners such as
+        -- HTTP Inspector :8080. Open its own sockets only after this boundary.
+        SubprocessHygiene.close_inherited_sockets()
+        return ReadReportService.run(service_job)
+    end
     local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
     if not ok or not pid then
         os.remove(paths.owner)
@@ -3278,7 +3271,7 @@ function Sync:_start_daemon(reason)
     local account_vid=tostring(current_account.vid or "")
     if login_session_id=="" or account_vid=="" then
         self.state="stopped"
-        return false,"当前账号登录会话无效，请重新扫码登录"
+        return false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码"
     end
     self.pending_report_elapsed=0
     self.pending_report_status_at=os.time()
@@ -3589,18 +3582,6 @@ function Sync:_final_elapsed(skip_status_import)
     elapsed = math.min(elapsed, maximum)
     if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
     return elapsed
-end
-
--- Kept for compatibility with older callers. Automatic reporting now uses one
--- long-lived subprocess instead of forking a fresh worker every 60 seconds.
-function Sync:_schedule(_delay)
-    if self.store:preferences().sync.time_enabled and not self.suspended then
-        self:_start_daemon("schedule_compat")
-    end
-end
-
-function Sync:_tick()
-    self:_write_daemon_control(true)
 end
 
 function Sync:start(reason)

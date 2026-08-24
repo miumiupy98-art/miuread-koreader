@@ -9,6 +9,7 @@ local RuntimePressure = require("miuread.runtime_pressure")
 local SuspendWorkLease = require("miuread.suspend_work_lease")
 local PseudoLockscreen = require("miuread.pseudo_lockscreen")
 local lfs = require("libs/libkoreader-lfs")
+local SubprocessHygiene = require("miuread.subprocess_hygiene")
 
 local DownloadTask = {}
 DownloadTask.__index = DownloadTask
@@ -369,6 +370,22 @@ function DownloadTask:on_suspend(mode, generation)
         self.power_mode = "REAL_SUSPEND"
     end
     if background_lock_mode(self.power_mode) then
+        -- Power-state ownership is not proof that a download exists. Reader
+        -- finalization may hold the same Kindle screen-saver session, so gate
+        -- the download lane with the persisted/shared task descriptor first.
+        local can_continue,continue_reason=self:can_continue_locked()
+        if can_continue~=true then
+            local requested=self.power_mode
+            self.power_mode="REAL_SUSPEND"
+            self:_clear_lockscreen_network("no_download:"..tostring(continue_reason or "unknown"))
+            self:_release_awake()
+            self:_replace_transient_pause_reasons(true)
+            logger.info("[MiuRead][DownloadTask] background suspend denied",
+                "requested=",requested,"generation=",tostring(self.power_generation),
+                "reason=",tostring(continue_reason or "unknown"))
+            return false
+        end
+
         -- The lease may already have been armed at the beginning of onSuspend.
         -- Keep it across the lock-screen transition and immediately assert the
         -- platform network policy before the transfer continues.
@@ -376,7 +393,7 @@ function DownloadTask:on_suspend(mode, generation)
         if resumed then
             self:_hold_awake()
             self:_capture_lockscreen_network("download_locked")
-            self:_guard_lockscreen_network(self.job,os.time(),
+            self:_guard_lockscreen_network(self:_control_descriptor(),os.time(),
                 (tonumber(self.last_connection_assert_at) or 0)<=0)
         end
         logger.info("[MiuRead][DownloadTask] power suspend mode",
@@ -671,6 +688,20 @@ function DownloadTask:_guard_lockscreen_network(job,now,force)
     if not background_lock_mode(self.power_mode) then
         return false,"not_locked"
     end
+    -- Final hard boundary before touching KOReader's network manager. A stale
+    -- SCREEN_SAVER_HOLD must never be able to restore Wi-Fi by itself.
+    local can_continue,continue_reason=self:can_continue_locked()
+    if can_continue~=true then
+        self.power_mode="REAL_SUSPEND"
+        self:_clear_lockscreen_network("guard_no_download:"..tostring(continue_reason or "unknown"))
+        self:_release_awake()
+        return false,"no_download:"..tostring(continue_reason or "unknown")
+    end
+    job=job or self:_control_descriptor()
+    if type(job)~="table" then
+        self:_clear_lockscreen_network("guard_no_descriptor")
+        return false,"no_download:descriptor"
+    end
     now=tonumber(now) or os.time()
     local gap=math.max(3,tonumber(Config.DOWNLOAD_LOCKSCREEN_LINK_GUARD_SECONDS) or 5)
     if force~=true and now-(tonumber(self.last_link_guard_at) or 0)<gap then
@@ -734,6 +765,13 @@ function DownloadTask:prepare_suspend_lock()
         return false, "unsupported_suspend_platform"
     end
     if not self.keep_awake_enabled then return false,"disabled" end
+    local can_continue,continue_reason=self:can_continue_locked()
+    if can_continue~=true then
+        self.power_mode="REAL_SUSPEND"
+        self:_clear_lockscreen_network("prepare_no_download:"..tostring(continue_reason or "unknown"))
+        self:_release_awake()
+        return false,tostring(continue_reason or "no_download")
+    end
     self.power_mode="SUSPEND_PENDING"
 
     local pseudo_owned=PseudoLockscreen.active()==true
@@ -1828,6 +1866,9 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     clean_options.cancelled = nil
 
     local child = function()
+        -- Close parent-owned KOReader sockets before the download worker opens
+        -- any connection of its own.
+        SubprocessHygiene.close_inherited_sockets()
         lower_worker_priority()
         local Store = require("miuread.store")
         local Http = require("miuread.http")
