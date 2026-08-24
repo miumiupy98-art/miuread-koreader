@@ -1,11 +1,10 @@
-4.9.0-beta.30
+5.0.0-beta.4
 
 Changed files:
 - miuread.koplugin/main.lua
-- miuread.koplugin/miuread/plugin_settings.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: fully separate the MiuRead reader-toolbar preference and hook lifecycle between desktop mode and plugin mode. Plugin mode now has its own visible switch, defaults to disabled, restores KOReader-native reader menu behavior when disabled, and cannot inherit the desktop-mode toolbar state. No frontlight, authentication, download, suspend/resume, progress, or home-layout logic is changed.
+Focus: hand local-file browsing and classification back to KOReader, retire MiuRead local-folder selection from the active UI, keep KOReader folders/Home Folder/Collections intact, and exclude MiuRead-generated WeRead EPUBs from local recent reading without blacklisting an entire download directory. No download, sync, suspend/resume, lockscreen, progress, or reader-layout logic is changed.

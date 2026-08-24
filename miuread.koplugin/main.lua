@@ -6335,7 +6335,7 @@ function Plugin:show_home_layout_dialog()
     })
 end
 
-function Plugin:_home_close_to_native_now(show_notice)
+function Plugin:_home_close_to_native_now(show_notice,after_open)
     self._native_heavy_transition_pending=false
     -- This is the only temporary path that intentionally reveals FileManager.
     Orientation.release_session("return to KOReader")
@@ -6358,10 +6358,16 @@ function Plugin:_home_close_to_native_now(show_notice)
     if show_notice~=false then
         self:toast("已进入 KOReader；可从“返回觅阅主页”回到觅阅",3)
     end
+    if type(after_open)=="function" then
+        UIManager:nextTick(function()
+            local ok,err=xpcall(after_open,debug.traceback)
+            if not ok then logger.warn("[MiuRead][Home] native follow-up failed",tostring(err)) end
+        end)
+    end
     return true
 end
 
-function Plugin:_home_close_to_native(show_notice)
+function Plugin:_home_close_to_native(show_notice,after_open)
     if self._native_heavy_transition_pending==true then
         self:status_toast("正在准备文件管理","后台下载正在安全让路，请稍候",2)
         return true
@@ -6369,7 +6375,7 @@ function Plugin:_home_close_to_native(show_notice)
     self:_home_stop_background("preparing native visit")
     local task=self.download_task
     if not task or not task:busy() or task:is_hibernated() then
-        return self:_home_close_to_native_now(show_notice)
+        return self:_home_close_to_native_now(show_notice,after_open)
     end
 
     self._native_heavy_transition_pending=true
@@ -6402,14 +6408,14 @@ function Plugin:_home_close_to_native(show_notice)
             logger.info("[MiuRead][HeavyGuard] native transition released",
                 "mode=hibernated","wait_ms=",tostring(math.floor(elapsed*1000+.5)),
                 "memory_kb=",tostring(available or "unknown"))
-            self:_home_close_to_native_now(show_notice)
+            self:_home_close_to_native_now(show_notice,after_open)
             return
         end
         if not should_hibernate and task:worker_pause_acknowledged() then
             logger.info("[MiuRead][HeavyGuard] native transition released",
                 "mode=paused","wait_ms=",tostring(math.floor(elapsed*1000+.5)),
                 "memory_kb=",tostring(available or "unknown"))
-            self:_home_close_to_native_now(show_notice)
+            self:_home_close_to_native_now(show_notice,after_open)
             return
         end
         if elapsed>=wait_limit then
@@ -6428,13 +6434,43 @@ function Plugin:_home_close_to_native(show_notice)
                 "hibernated=",tostring(task:is_hibernated()),
                 "pause_ack=",tostring(task:worker_pause_acknowledged()),
                 "memory_kb=",tostring(current_kb or "unknown"))
-            self:_home_close_to_native_now(show_notice)
+            self:_home_close_to_native_now(show_notice,after_open)
             return
         end
         UIManager:scheduleIn(.25,waiter)
     end
     UIManager:scheduleIn(.05,waiter)
     return true
+end
+
+function Plugin:_home_open_koreader_filemanager(path,show_notice)
+    local target=LocalLibrary.normalize(path or "")
+    return self:_home_close_to_native(show_notice,function()
+        if target=="" then return end
+        local ok,FileManager=pcall(require,"apps/filemanager/filemanager")
+        local fm=ok and FileManager and FileManager.instance or nil
+        local chooser=fm and fm.file_chooser or nil
+        if not chooser or type(chooser.changeToPath)~="function" then return end
+        local mode=lfs.attributes(target,"mode")
+        local dir=mode=="directory" and target or LocalLibrary.dirname(target)
+        if dir=="" or lfs.attributes(dir,"mode")~="directory" then return end
+        local focused=mode=="file" and target or nil
+        pcall(chooser.changeToPath,chooser,dir,focused)
+    end)
+end
+
+function Plugin:_home_open_koreader_collections()
+    return self:_home_close_to_native(false,function()
+        local ok,FileManager=pcall(require,"apps/filemanager/filemanager")
+        local fm=ok and FileManager and FileManager.instance or nil
+        local collections=fm and fm.collections or nil
+        if collections and type(collections.onShowCollList)=="function" then
+            local shown,err=pcall(collections.onShowCollList,collections)
+            if not shown then logger.warn("[MiuRead][Local] KOReader collections failed",tostring(err)) end
+            return
+        end
+        self:toast("当前 KOReader 暂时无法打开 Collections",3)
+    end)
 end
 
 function Plugin:_home_leave_and_run(reason,callback)
@@ -7184,25 +7220,18 @@ function Plugin:_home_status_text(book,is_local)
 end
 
 function Plugin:_home_root()
-    local prefs=self.store:preferences().home_ui or {}
-    local explicit=U.trim(tostring(prefs.local_entry_root or ""))
-    if explicit~="" and lfs.attributes(explicit,"mode")=="directory" then return explicit end
-
+    -- 5.0.0-beta.4: local files belong to KOReader.  Keep legacy MiuRead
+    -- local_root/local_roots/local_entry_root values untouched for rollback,
+    -- but never let them decide what the user can browse.
     local native_home=""
     if _G.G_reader_settings and type(_G.G_reader_settings.readSetting)=="function" then
         local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"home_dir")
         if ok then native_home=U.trim(tostring(value or "")) end
     end
-    local download_root=tostring(self.store.default_books_dir or ""):gsub("/+$","")
-    local normalized_home=native_home:gsub("/+$","")
-    if download_root~="" and (normalized_home==download_root or normalized_home:sub(1,#download_root+1)==download_root.."/") then
-        native_home=""
-    end
-
     for _,candidate in ipairs({
+        native_home,
         "/mnt/us/documents",
         "/mnt/onboard",
-        native_home,
         "/mnt/us/books",
         self.store.default_books_dir,
     }) do
@@ -7321,16 +7350,11 @@ function Plugin:_home_local_inline_rows()
 end
 
 function Plugin:_home_local_inline_title()
-    local root=self:_home_root()
-    return U.utf8_truncate("最近阅读 · "..tostring(LocalLibrary.basename(root) or "本地书"),26,"…")
+    return "最近阅读 · 本地书"
 end
 
 function Plugin:_home_local_empty_text()
-    local root=self:_home_root()
-    if root=="" or lfs.attributes(root,"mode")~="directory" then
-        return "本地书入口目录不可用\n请在设置中重新选择"
-    end
-    return "暂无最近阅读的本地书籍\n点击“浏览本地书”进入文件夹"
+    return "暂无最近阅读的本地书籍\n点击“浏览本地书”进入 KOReader 文件管理"
 end
 
 function Plugin:_home_local_folder_entry(path,title,root_path)
@@ -7400,12 +7424,9 @@ function Plugin:_home_local_is_miuread_file(path,index,deep)
     if path=="" then return false end
     index=index or self:_home_local_source_index()
     if index.paths[path] then return true end
-    local key=self:_home_local_source_filename_key(path)
-    local info=key~="" and index.names[key] or nil
-    -- Filename fallback is used only when the one saved source path has gone
-    -- missing. If the original still exists, a user's different same-named
-    -- file must not be hidden as a MiuRead download.
-    if type(info)=="table" and tonumber(info.count or 0)==1 and tonumber(info.existing or 0)==0 then return true end
+    -- Never classify by filename alone. A user-owned book may legitimately
+    -- have the same filename as an old MiuRead download. Moved/renamed MiuRead
+    -- EPUBs are identified from their embedded source marker below.
     if deep==true and path:lower():match("%.epub$") and self.store and type(self.store.epub_identity_light)=="function" then
         local ok,identity=pcall(self.store.epub_identity_light,self.store,path)
         if ok and type(identity)=="table" and tostring(identity.book_id or "")~="" then return true end
@@ -7421,13 +7442,36 @@ function Plugin:_home_recent_local_rows(limit)
     if type(history.reload)=="function" then pcall(history.reload,history) end
     local source_index=self:_home_local_source_index()
     local metadata_cache=self:_home_recent_local_metadata_cache()
-    local hidden=type(self:_home_preferences().hidden_local_files)=="table" and self:_home_preferences().hidden_local_files or {}
+    local identity_cache_changed=false
+
+    local function is_miuread_download(path,modified_at)
+        -- Exact current/old download records are the fast path.  If a generated
+        -- EPUB was manually moved or renamed, inspect its embedded MiuRead
+        -- identity once and cache the result by file mtime.
+        if self:_home_local_is_miuread_file(path,source_index,false) then return true end
+        if not tostring(path):lower():match("%.epub$") then return false end
+        local cached=metadata_cache.rows[path]
+        if type(cached)=="table"
+            and tonumber(cached.miuread_identity_mtime or -1)==tonumber(modified_at or -2)
+            and cached.miuread_generated~=nil then
+            return cached.miuread_generated==true
+        end
+        local generated=self:_home_local_is_miuread_file(path,source_index,true)==true
+        cached=type(cached)=="table" and cached or {file=path}
+        cached.file=path
+        cached.miuread_identity_mtime=tonumber(modified_at) or 0
+        cached.miuread_generated=generated
+        cached.cached_at=os.time()
+        metadata_cache.rows[path]=cached
+        identity_cache_changed=true
+        return generated
+    end
+
     for _,item in ipairs(type(history.hist)=="table" and history.hist or {}) do
         local path=LocalLibrary.normalize(item and item.file or "")
-        if path~="" and U.file_exists(path) and hidden[path]~=true
-            and not self:_home_local_is_miuread_file(path,source_index,false) then
+        if path~="" and U.file_exists(path) then
             local book=LocalLibrary.book_from_path(path,{last_read_at=tonumber(item.time) or 0})
-            if book then
+            if book and not is_miuread_download(path,book.modified_at) then
                 local cached=metadata_cache.rows[path]
                 if type(cached)=="table"
                     and tonumber(cached.metadata_mtime or -1)==tonumber(book.modified_at or -2) then
@@ -7440,21 +7484,16 @@ function Plugin:_home_recent_local_rows(limit)
             end
         end
     end
+    if identity_cache_changed then
+        metadata_cache.updated_at=os.time()
+        self.store:set("home_local_recent_metadata_v1",metadata_cache)
+    end
     return rows
 end
 
 function Plugin:_home_local_rows()
-    local rows={}
-    local root=LocalLibrary.normalize(self:_home_root())
-    if root~="" and lfs.attributes(root,"mode")=="directory" then
-        rows[#rows+1]={
-            kind="folder",local_folder=true,local_root_entry=true,source="local",
-            title="浏览本地书",status_text=tostring(root),
-            folder_path=root,path=root,root_path=root,
-        }
-    end
-    for _,book in ipairs(self:_home_recent_local_rows(16)) do rows[#rows+1]=book end
-    return rows,{root=root,scanned_at=0,books={}}
+    local rows=self:_home_recent_local_rows(16)
+    return rows,{root="",scanned_at=0,books={}}
 end
 
 function Plugin:_home_apply_local_inline_section(refresh_metadata)
@@ -9030,8 +9069,8 @@ function Plugin:_show_home_file_manager_popup(anchor)
         anchor=anchor,preferred_direction="below",width_ratio=.58,
         title="文件管理",subtitle="本地文件入口",
         actions={
-            {icon="▤",label="打开 KOReader 文件管理",detail="进入原生文件浏览器",callback=function() self:_home_close_to_native(true) end},
-            {icon="▦",label="本地书",detail="按文件夹浏览本地书籍",callback=function() self:show_home_local_library() end},
+            {icon="▤",label="浏览本地书",detail="KOReader 文件管理",callback=function() self:_home_open_koreader_filemanager(nil,true) end},
+            {icon="▦",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         },
     }
 end
@@ -9143,7 +9182,7 @@ function Plugin:_home_action_function_actions(key,anchor)
             end
         end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-        {icon="⌕",label="刷新本地书",detail="重新检查本地书籍；文件夹打开时只读取当前层",callback=function() self:_home_scan_local(true,true) end},
+        {icon="⌕",label="刷新本地阅读",detail="重新读取 KOReader 最近阅读",callback=function() self:_home_scan_local(true,true) end},
         {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
     } end
     if key=="search" then return {
@@ -9151,7 +9190,7 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
         {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
-        {icon="▤",label="本地书",detail="按文件夹浏览本地书籍",callback=function() self:show_home_local_library() end},
+        {icon="▤",label="本地书",detail="KOReader 文件管理",callback=function() self:show_home_local_library() end},
         {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
     } end
     if key=="downloads" then return {
@@ -9193,8 +9232,8 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
     } end
     if key=="file_manager" then return {
-        {icon="▤",label="KOReader 文件管理",detail="打开原生文件浏览器",callback=function() self:_home_close_to_native(true) end},
-        {icon="▦",label="本地书",detail="按文件夹浏览本地书籍",callback=function() self:show_home_local_library() end},
+        {icon="▤",label="浏览本地书",detail="KOReader 文件管理",callback=function() self:_home_open_koreader_filemanager(nil,true) end},
+        {icon="▦",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
     } end
     if key=="screenshot" then return {
         {icon="▣",label="开始截图",detail="进入截图模式",callback=function() ScreenshotMode.start(self,anchor) end},
@@ -9300,10 +9339,10 @@ end
 function Plugin:_show_home_local_book_more(book,anchor)
     ActionSheet.show{
         anchor=anchor,preferred_direction="above",width_ratio=.62,
-        title=tostring(book.title or "本地书籍"),subtitle="更多书籍操作",
+        title=tostring(book.title or "本地书籍"),subtitle="KOReader 管理",
         actions={
-            {icon="▤",label="在文件管理中查看",detail="打开 KOReader 文件浏览器",callback=function() self:_home_close_to_native(true) end},
-            {icon="−",label="从觅阅书架隐藏",detail="保留本地文件",callback=function() self:_home_hide_local_book(book) end},
+            {icon="▤",label="在文件管理中查看",detail="由 KOReader 管理文件",callback=function() self:_home_open_koreader_filemanager(book and book.file,true) end},
+            {icon="▦",label="我的分类",detail="打开 KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         },
         footer_action={label="返回书籍操作",callback=function() self:_home_hold_book(book,anchor) end},
     }
@@ -9390,7 +9429,7 @@ function Plugin:_home_hold_book(book,anchor)
                 {icon="book",label="阅读",detail="打开这本本地书",callback=function() self:_home_open_local(book) end},
                 {icon="i",label="查看详情",detail="文件、进度和图书信息",callback=function() self:_home_local_book_details(book) end},
                 {icon="↻",label="更新书籍信息",detail="重新提取并尝试网络补全",callback=function() self:_home_refresh_one_book_metadata(book,true) end},
-                {icon="!",label="删除本地文件",detail="删除后无法通过觅阅恢复",danger=true,callback=function() self:_home_delete_local_book(book,anchor) end},
+                {icon="▤",label="KOReader 管理",detail="文件、文件夹与分类交给 KOReader",callback=function() self:_show_home_local_book_more(book,anchor) end},
             },
             wide_last=false,
         }
@@ -9544,7 +9583,7 @@ function Plugin:_home_library_sections(account_count,generated_count,local_count
         {title="已下载",detail="已保存到设备",count=generated_count,on_tap=function()
             self:_home_leave_and_run("generated shelf",function() self:show_shelf(false,false,"generated") end)
         end},
-        {title="本地书籍",detail="KOReader 普通文件",count=local_count,on_tap=function()
+        {title="本地阅读",detail="最近阅读 · 文件由 KOReader 管理",count=local_count,on_tap=function()
             self:_home_leave_and_run("local shelf",function() self:show_home_local_library() end)
         end},
         {title="公众号",detail="公众号与文章",count=mp_count,on_tap=function()
@@ -9627,8 +9666,8 @@ function Plugin:_home_scan_local(force,user_requested)
     if ok_history and history and type(history.reload)=="function" then pcall(history.reload,history,true) end
     self._home_refreshing=false
     if self._home_sections then self:_home_apply_local_inline_section(true) end
-    if user_requested==true then self:toast("本地书已刷新",1.5) end
-    logger.info("[MiuRead][Home] local refresh","mode=current-directory","recursive=false")
+    if user_requested==true then self:toast("本地阅读已刷新",1.5) end
+    logger.info("[MiuRead][Home] local refresh","source=koreader-history","scanner=disabled")
     return true
 end
 
@@ -10691,13 +10730,7 @@ function Plugin:show_local_browser(path,root,stack,force,request_owner)
 end
 
 function Plugin:_open_local_library_folders()
-    local path=LocalLibrary.normalize(self:_home_root())
-    if path=="" or lfs.attributes(path,"mode")~="directory" then
-        self:info("暂时找不到可用的本地书入口目录。\n\n请在 本地书 → 入口目录 中重新选择。")
-        return false
-    end
-    local root={path=path,name=LocalLibrary.basename(path)~="" and LocalLibrary.basename(path) or "本地书"}
-    return self:show_local_browser(path,root,{},false)
+    return self:_home_open_koreader_filemanager(nil,true)
 end
 
 function Plugin:show_home_local_library(rows)
@@ -23261,18 +23294,12 @@ function Plugin:_reset_local_entry_root()
 end
 
 function Plugin:local_library_settings_menu()
-    local home=self:_home_preferences()
-    local entry=self:_home_root()
-    local explicit=U.trim(tostring(home.local_entry_root or ""))
-    local items={
-        {text="入口目录",post_text=tostring(entry),callback=function() self:choose_local_entry_root_dialog() end},
-        {text="打开本地书",post_text="只读取当前文件夹",callback=function() self:_open_local_library_folders() end},
+    return {
+        {text="打开本地书",post_text="KOReader 文件管理",callback=function() self:_home_open_koreader_filemanager(nil,true) end},
+        {text="我的分类",post_text="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+        {text="说明",post_text="本地书与文件夹由 KOReader 管理",enabled=false},
+        {text="去重",post_text="觅阅下载书不会重复计入本地阅读",enabled=false},
     }
-    if explicit~="" then
-        items[#items+1]={text="恢复默认入口",post_text="由设备/KOReader选择",callback=function() self:_reset_local_entry_root() end}
-    end
-    items[#items+1]={text="说明",post_text="不全盘扫描 · 格式跟随 KOReader",enabled=false}
-    return items
 end
 
 function Plugin:_home_lockscreen_style_label(home)
@@ -23423,7 +23450,7 @@ function Plugin:display_settings_menu()
         {text="主页阅读统计",post_text=self:_home_stats_visibility_label(home),sub_item_table_func=function() return self:home_stats_settings_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
-        {text="本地书籍",post_text="按文件夹读取",sub_item_table_func=function() return self:local_library_settings_menu() end},
+        {text="本地书籍",post_text="KOReader 管理",sub_item_table_func=function() return self:local_library_settings_menu() end},
         {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
         {text="下滑工具栏",post_text="设备与 KOReader",sub_item_table_func=function() return self:home_panel_settings_menu() end},
@@ -23671,7 +23698,7 @@ function Plugin:settings_menu()
         rows[#rows+1]={text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end}
     end
     rows[#rows+1]={text="评论 划线与想法",post_text=self:_thought_display_label(),sub_item_table_func=function() return PluginSettings.comments(self) end}
-    rows[#rows+1]={text="本地书",post_text=LocalLibrary.basename(self:_home_root()),sub_item_table_func=function() return self:local_library_settings_menu() end}
+    rows[#rows+1]={text="本地书",post_text="KOReader 管理",sub_item_table_func=function() return self:local_library_settings_menu() end}
     rows[#rows+1]={text="账户",post_text=self:logged_in() and "已登录" or "未登录",callback=function() self:show_account_status() end}
     rows[#rows+1]={text="阅读同步",post_text=self:_home_sync_status_label(),sub_item_table_func=function() return self:sync_settings_menu() end}
     rows[#rows+1]={text="下载管理",post_text=self:_download_menu_text(),callback=function() self:show_downloads() end}
