@@ -13456,6 +13456,84 @@ function Plugin:_reader_adjust_warmth(delta,source,interaction)
 end
 
 
+function Plugin:_show_frontlight_panel(opts)
+    opts=type(opts)=="table" and opts or {}
+
+    local function brightness_setting()
+        local state=FrontlightController.brightness_state()
+        if not state then return nil end
+        return {
+            label="亮度",min=state.min,max=state.max,value=state.value,
+            on_set=function(value,interaction)
+                local ok,after=FrontlightController.set_brightness(value,"frontlight_panel",interaction,self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法调整前光"); return false end
+                return after and after.value or value
+            end,
+            on_decrease=function()
+                local ok,after=FrontlightController.adjust_brightness(-1,"frontlight_panel","step",self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法调整前光"); return false end
+                return after and after.value or state.value
+            end,
+            on_increase=function()
+                local ok,after=FrontlightController.adjust_brightness(1,"frontlight_panel","step",self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法调整前光"); return false end
+                return after and after.value or state.value
+            end,
+        }
+    end
+
+    local function warmth_setting()
+        local state=FrontlightController.warmth_state()
+        if not state then return nil end
+        return {
+            label="色温",min=state.min,max=state.max,value=state.value,
+            on_set=function(value,interaction)
+                local ok,after=FrontlightController.set_warmth(value,"frontlight_panel",interaction,self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法调整色温"); return false end
+                return after and after.value or value
+            end,
+            on_decrease=function()
+                local ok,after=FrontlightController.adjust_warmth(-1,"frontlight_panel","step",self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法调整色温"); return false end
+                return after and after.value or state.value
+            end,
+            on_increase=function()
+                local ok,after=FrontlightController.adjust_warmth(1,"frontlight_panel","step",self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法调整色温"); return false end
+                return after and after.value or state.value
+            end,
+        }
+    end
+
+    local function toggle_setting()
+        local state=FrontlightController.brightness_state()
+        if not state then return {label="前光",value="不可用",enabled=false} end
+        return {
+            label="前光",value=state.enabled and "开" or "关",selected=state.enabled==true,
+            callback=function()
+                local ok=FrontlightController.toggle("frontlight_panel",self:_koreader_device_listener())
+                if not ok then self:info("当前 KOReader 暂时无法切换前光") end
+            end,
+        }
+    end
+
+    local dialog,err=ReaderFrontlightDialog.show{
+        title=opts.title or "前光与色温",
+        placement=opts.placement or "top",
+        on_back=opts.on_back,
+        brightness=brightness_setting,
+        warmth=warmth_setting,
+        toggle=toggle_setting,
+        actions={{label="关闭",callback=function() ReaderFrontlightDialog.close() end}},
+    }
+    if not dialog then
+        logger.warn("[MiuRead][Frontlight] panel unavailable",tostring(err or "unknown"))
+        self:info("前光面板暂时无法打开")
+        return false
+    end
+    return true
+end
+
 function Plugin:_show_reader_frontlight_panel(back_callback)
     return self:_show_frontlight_panel{
         placement="top",

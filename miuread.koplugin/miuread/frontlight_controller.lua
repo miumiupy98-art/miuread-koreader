@@ -187,23 +187,50 @@ end
 function M.set_warmth(value, source, interaction, listener_override)
     local before = M.warmth_state()
     if not before then return false, nil end
-    local listener = listener_override or device_listener()
-    if not (listener and type(listener.onSetFlWarmth) == "function") then return false, before end
+    local powerd = power_device()
+    if not powerd then return false, before end
 
-    -- DeviceListener:onSetFlWarmth accepts KOReader's native/display warmth
-    -- level and performs KOReader's internal native <-> 0..100 conversion.
-    -- MiuRead therefore never exposes or maintains a private 0..100 scale.
     local target = round(clamp(tonumber(value) or before.value, before.min, before.max))
-    local ok, err = pcall(listener.onSetFlWarmth, listener, target)
-    if not ok then
-        logger.warn("[MiuRead][Frontlight] native warmth failed", tostring(err))
-        return false, before
+    local applied = false
+    local path = "powerd"
+
+    -- Keep the exact same value flow as KOReader's FrontLightWidget:
+    -- native/display level -> KOReader 0..100 warmth -> PowerD:setWarmth().
+    -- This avoids DeviceListener's historical 0..100 clamp truncating devices
+    -- whose native warmth range is not 0..100.
+    if type(powerd.fromNativeWarmth) == "function" and type(powerd.setWarmth) == "function" then
+        local ok_convert, ko_target = pcall(powerd.fromNativeWarmth, powerd, target)
+        ko_target = ok_convert and tonumber(ko_target) or nil
+        if ko_target ~= nil then
+            local ok_set, err = pcall(powerd.setWarmth, powerd, ko_target)
+            if not ok_set then
+                logger.warn("[MiuRead][Frontlight] PowerD warmth failed", tostring(err))
+                return false, before
+            end
+            applied = true
+        else
+            logger.warn("[MiuRead][Frontlight] native warmth conversion failed", tostring(ko_target))
+        end
     end
 
+    -- Compatibility fallback for older/custom KOReader builds.
+    if not applied then
+        path = "listener"
+        local listener = listener_override or device_listener()
+        if not (listener and type(listener.onSetFlWarmth) == "function") then return false, before end
+        local ok, err = pcall(listener.onSetFlWarmth, listener, target)
+        if not ok then
+            logger.warn("[MiuRead][Frontlight] listener warmth failed", tostring(err))
+            return false, before
+        end
+    end
+
+    -- Always reflect the level KOReader actually retained after conversion/rounding.
     local after = M.warmth_state() or before
     if should_log(interaction) then
         logger.info("[MiuRead][Frontlight] warmth",
             "source=", tostring(source or "unknown"),
+            "path=", path,
             "requested_native=", tostring(target),
             "before_native=", tostring(round(before.value) or "-"),
             "after_native=", tostring(round(after.value) or "-"),

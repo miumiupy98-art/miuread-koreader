@@ -1,10 +1,11 @@
-5.0.0-beta.7
+5.0.0-beta.8
 
 Changed files:
 - miuread.koplugin/main.lua
+- miuread.koplugin/miuread/frontlight_controller.lua
 - miuread.koplugin/miuread/config.lua
 - miuread.koplugin/_meta.lua
 - CHANGELOG.md
 - CHANGED_FILES.txt
 
-Focus: open InkStain 3.5.7 settings as an InkStain-owned native KOReader menu so complex actions such as OTA updates are no longer proxied by MiuRead.
+Focus: restore the missing frontlight panel entry and make warmth changes follow KOReader's native FrontLightWidget path with readback.
