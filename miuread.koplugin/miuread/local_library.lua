@@ -66,6 +66,17 @@ local function title_from_path(path)
     return title ~= "" and title or "未命名"
 end
 
+local function should_skip_dir(name)
+    local lower = tostring(name or ""):lower()
+    -- Match KOReader's ordinary hidden-directory expectations without keeping
+    -- a MiuRead-specific blacklist of folder names. A user folder named
+    -- "System" or "Plugins" therefore remains browsable.
+    if lower == "." or lower == ".." then return true end
+    if lower:sub(1, 1) == "." then return true end
+    if lower:match("%.sdr$") then return true end
+    return false
+end
+
 local function should_skip_file(name)
     local lower = tostring(name or ""):lower()
     if lower:sub(1, 1) == "." or lower:sub(1, 2) == "._" then return true end
@@ -94,6 +105,33 @@ function LocalLibrary.is_supported(path)
     return ok and supported == true
 end
 
+-- Kept for compatibility with older callers. The new local-book architecture
+-- no longer uses this heuristic to hide books.
+function LocalLibrary.is_likely_dictionary(path, title)
+    local normalized = LocalLibrary.normalize(path):lower()
+    return normalized:find("/dictionaries/", 1, true) ~= nil
+        or normalized:find("/dictionary/", 1, true) ~= nil
+        or normalized:find("/dict/", 1, true) ~= nil
+end
+
+function LocalLibrary.is_miuread_generated_epub(path)
+    path = LocalLibrary.normalize(path)
+    if path == "" or not path:lower():match("%.epub$") or not exists(path) then return false end
+    local file = io.open(path, "rb")
+    if not file then return false end
+    local size = file:seek("end") or 0
+    file:seek("set", 0)
+    local head = file:read(math.min(size, 768 * 1024)) or ""
+    local tail = ""
+    if size > #head then
+        file:seek("set", math.max(0, size - 1024 * 1024))
+        tail = file:read("*a") or ""
+    end
+    file:close()
+    -- MiuRead-generated EPUBs write this source marker into package.opf.
+    return (head .. "\n" .. tail):find("miuread://book/", 1, true) ~= nil
+end
+
 function LocalLibrary.book_from_path(path, options)
     options = options or {}
     path = LocalLibrary.normalize(path)
@@ -110,6 +148,139 @@ function LocalLibrary.book_from_path(path, options)
         cover_path = options.include_cover == true and cover_path(path) or nil,
         local_file = true,
         source = "local",
+    }
+end
+
+-- Current-directory browsing only. No recursion, no depth limit, and no
+-- fixed item cap unless a caller explicitly supplies one for compatibility.
+local DirectoryScan = {}
+DirectoryScan.__index = DirectoryScan
+
+function DirectoryScan:_close()
+    if self._closed then return end
+    self._closed = true
+    pcall(function()
+        if self.state and self.state.close then self.state:close() end
+    end)
+end
+
+function DirectoryScan:cancel()
+    self.cancelled = true
+    self.done = true
+    self:_close()
+end
+
+function DirectoryScan:_accept(name)
+    if name == "." or name == ".." then return end
+    local full = (self.path == "/" and "/" .. name or self.path .. "/" .. name)
+    local attr = lfs.attributes(full)
+    if attr and attr.mode == "directory" then
+        if not should_skip_dir(name) then
+            self.folders[#self.folders + 1] = {
+                kind = "folder", local_folder = true, title = name,
+                path = full, folder_path = full, modified_at = tonumber(attr.modification) or 0,
+            }
+            self.seen = self.seen + 1
+        end
+    elseif attr and attr.mode == "file" and not should_skip_file(name) then
+        local book = LocalLibrary.book_from_path(full, {include_cover = self.include_cover})
+        if book then
+            self.books[#self.books + 1] = book
+            self.seen = self.seen + 1
+        end
+    end
+    if self.limit and self.seen >= self.limit then
+        self.truncated = true
+        self.done = true
+        self:_close()
+    end
+end
+
+function DirectoryScan:step(batch_size)
+    if self.done or self.cancelled then return true end
+    batch_size = math.max(1, tonumber(batch_size) or 32)
+    local processed = 0
+    while processed < batch_size and not self.done do
+        local ok, name = pcall(self.iter, self.state, self.var)
+        if not ok then
+            self.error = tostring(name or "无法读取目录")
+            self.done = true
+            self:_close()
+            break
+        end
+        self.var = name
+        if not name then
+            self.done = true
+            self:_close()
+            break
+        end
+        processed = processed + 1
+        self:_accept(name)
+    end
+    return self.done
+end
+
+function DirectoryScan:snapshot()
+    if not self._sorted then
+        table.sort(self.folders, function(a, b)
+            return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
+        end)
+        table.sort(self.books, function(a, b)
+            if self.options.sort == "name" then
+                return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
+            end
+            local am, bm = tonumber(a.modified_at) or 0, tonumber(b.modified_at) or 0
+            if am ~= bm then return am > bm end
+            return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
+        end)
+        self._sorted = true
+    end
+    return {
+        path = self.path, scanned_at = os.time(), folders = self.folders, books = self.books,
+        truncated = self.truncated == true, direct_count = #self.folders + #self.books,
+        error = self.error,
+    }
+end
+
+function LocalLibrary.new_directory_scan(path, options)
+    options = options or {}
+    path = LocalLibrary.normalize(path)
+    local explicit_limit = tonumber(options.limit)
+    if explicit_limit and explicit_limit <= 0 then explicit_limit = nil end
+    local scanner = setmetatable({
+        path = path, options = options, limit = explicit_limit and math.max(20, explicit_limit) or nil,
+        include_cover = options.include_cover == true, folders = {}, books = {}, seen = 0,
+        truncated = false, done = false, cancelled = false,
+    }, DirectoryScan)
+    local ok, iter, state, var = pcall(lfs.dir, path)
+    if not ok or not iter then
+        scanner.done = true
+        scanner.error = tostring(iter or state or "无法读取目录")
+        return scanner
+    end
+    scanner.iter, scanner.state, scanner.var = iter, state, var
+    return scanner
+end
+
+function LocalLibrary.list_directory(path, options)
+    local scanner = LocalLibrary.new_directory_scan(path, options)
+    while not scanner:step(256) do end
+    return scanner:snapshot()
+end
+
+-- Compatibility only: old code may still call scan(). It is intentionally a
+-- non-recursive current-directory read, so no missed legacy call can revive the
+-- retired whole-library scanner.
+function LocalLibrary.scan(root, options)
+    local snapshot = LocalLibrary.list_directory(root, options)
+    return {
+        root = LocalLibrary.normalize(root),
+        scanned_at = snapshot.scanned_at or os.time(),
+        books = snapshot.books or {},
+        folders = snapshot.folders or {},
+        truncated = snapshot.truncated == true,
+        error = snapshot.error,
+        non_recursive = true,
     }
 end
 

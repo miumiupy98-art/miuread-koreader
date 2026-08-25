@@ -256,7 +256,7 @@ function LocalBrowserWidget:_build()
             face = UiScale.iconFace("cfont", 20, 28),
         }), function() self:_back() end),
         HorizontalSpan:new{width = title_gap},
-        Ui.textbox(tostring(self.opts and self.opts.title or "本地书籍"), title_w, header_h,
+        Ui.textbox(tostring(self.opts and self.opts.title or "本地书库"), title_w, header_h,
             face("cfont", 16, 22), {bold = true, alignment = "left", halign = "left", valign = "center"}),
         HorizontalSpan:new{width = title_gap},
         tappable(refresh_w, header_h, Ui.icon("refresh", refresh_w, header_h, UiScale.dp(19, 17, 27), {
