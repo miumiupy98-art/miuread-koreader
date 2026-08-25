@@ -4762,6 +4762,9 @@ function Plugin:_home_visible_section_keys(sections,home)
         local entry=sections[section]
         local enabled=home.visible_sections[section]~=false
         local empty=not entry or #(entry.rows or {})==0
+        -- 本地书库本身也是进入真实文件目录的入口，不能因为首帧缓存为空
+        -- 就被“自动隐藏空来源”藏掉，否则用户反而无法进入本地书库。
+        if section=="local" then empty=false end
         if enabled and (home.auto_hide_empty~=true or not empty) then keys[#keys+1]=section end
     end
     -- Never leave the home without a selectable source. When every visible
@@ -5049,7 +5052,7 @@ function Plugin:_set_home_section(section)
     end
     if section=="local" then
         UIManager:scheduleIn(.05,function()
-            if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end
+            if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded(false,false) end
         end)
         self:_home_schedule_stale_checks(1.0)
     end
@@ -5799,7 +5802,7 @@ function Plugin:_toggle_home_auto_hide_empty()
     self:_refresh_home_view(nil,"content")
 end
 
-local HOME_SOURCE_LABELS={account="微信书架",generated="已下载",["local"]="本地书籍",mp="公众号"}
+local HOME_SOURCE_LABELS={account="微信书架",generated="已下载",["local"]="本地书库",mp="公众号"}
 
 function Plugin:_home_move_source(key,delta)
     local home,preferences=self:_home_preferences()
@@ -7249,11 +7252,12 @@ end
 
 
 function Plugin:_home_local_inline_title()
-    return "最近阅读"
+    return "本地书库"
 end
 
 function Plugin:_home_local_empty_text()
-    return "暂无最近阅读的本地书籍\n点击“本地书库”浏览设备中的书"
+    if self._home_local_inline_loading==true then return "正在读取本地书库…" end
+    return "当前目录暂无可显示的本地书\n点击“本地书库”浏览其他文件夹"
 end
 
 
@@ -7363,14 +7367,27 @@ function Plugin:_home_recent_local_rows(limit)
 end
 
 function Plugin:_home_local_rows()
-    local rows=self:_home_recent_local_rows(16)
-    return rows,{root="",scanned_at=0,books={}}
+    -- Home "本地书库" shows the real current KOReader/device directory.
+    -- It never derives this section from ReadHistory and never scans children.
+    local root=LocalLibrary.normalize(self:_home_root())
+    if root=="" or lfs.attributes(root,"mode")~="directory" then
+        return {},{path=root,root=root,scanned_at=0,folders={},books={},error="本地书入口不可用"}
+    end
+    local cache=self:_home_local_tree_cache()
+    local snapshot=type(cache.dirs[root])=="table" and cache.dirs[root] or {
+        path=root,root=root,scanned_at=0,folders={},books={},
+    }
+    local folders,books=self:_local_browser_decorate(snapshot,root)
+    local rows={}
+    for _,folder in ipairs(folders or {}) do rows[#rows+1]=folder end
+    for _,book in ipairs(books or {}) do rows[#rows+1]=book end
+    return rows,snapshot
 end
 
 function Plugin:_home_apply_local_inline_section(refresh_metadata)
     if not self._home_sections then return false end
     local rows=select(1,self:_home_local_rows())
-    self._home_sections["local"]={title="最近阅读",rows=rows,empty=self:_home_local_empty_text()}
+    self._home_sections["local"]={title="本地书库",rows=rows,empty=self:_home_local_empty_text()}
     self:_home_bump_section_revision("local")
     self:_home_rebuild_row_indexes()
     if self._home_active_section~="local" or not HomeView.is_shown() then return true end
@@ -7379,16 +7396,50 @@ function Plugin:_home_apply_local_inline_section(refresh_metadata)
         local home=self:_home_preferences()
         local preview=self:_home_preview_page(rows,self._home_hero,
             home.page_by_section and home.page_by_section["local"],self:_home_page_limit())
+        self:_home_schedule_local_identity_check(preview,nil)
         self:_home_schedule_local_metadata(preview)
         self:_home_schedule_remote_covers(preview)
     end
     return updated
 end
 
+function Plugin:_home_ensure_local_inline_loaded(force,user_requested)
+    local root=LocalLibrary.normalize(self:_home_root())
+    if root=="" or lfs.attributes(root,"mode")~="directory" then
+        self._home_local_inline_loading=false
+        self:_home_apply_local_inline_section(false)
+        if user_requested==true then self:toast("暂时找不到 KOReader 可访问的本地书目录",2) end
+        return false
+    end
+    if self._home_local_inline_loading==true and self._home_local_inline_path==root then return true end
 
+    local cache=self:_home_local_tree_cache()
+    local cached=cache.dirs[root]
+    local scanned_at=tonumber(type(cached)=="table" and cached.scanned_at or 0) or 0
+    local stale=scanned_at<=0 or os.time()-scanned_at>120
+    if force~=true and not stale then
+        self:_home_apply_local_inline_section(true)
+        return true
+    end
 
-function Plugin:_home_ensure_local_inline_loaded()
-    return true
+    self._home_local_inline_loading=true
+    self._home_local_inline_path=root
+    if self._home_sections then self:_home_apply_local_inline_section(false) end
+    local started=self:_home_refresh_local_directory(root,function(_,scanned)
+        if self._home_local_inline_path~=root then return end
+        self._home_local_inline_loading=false
+        self._home_local_inline_path=nil
+        if self._home_sections then self:_home_apply_local_inline_section(true) end
+        if user_requested==true then
+            self:toast(scanned==false and "本地书库已是最新" or "本地书库已刷新",1.5)
+        end
+    end,true,nil)
+    if not started then
+        self._home_local_inline_loading=false
+        self._home_local_inline_path=nil
+        if self._home_sections then self:_home_apply_local_inline_section(false) end
+    end
+    return started==true
 end
 
 function Plugin:_home_handle_back()
@@ -7870,7 +7921,12 @@ function Plugin:_home_open_book(book,anchor,ges,direct_read)
         end
     end
     if book and (book.local_folder==true or book.kind=="folder") then
-        return self:_home_open_koreader_filemanager(book.folder_path or book.path,true)
+        local folder=LocalLibrary.normalize(book.folder_path or book.path or "")
+        if self._home_active_section=="local" and folder~="" then
+            local root=LocalLibrary.normalize(self:_home_root())
+            return self:show_local_browser(folder,{path=root~="" and root or folder,name="本地书库"},{},false)
+        end
+        return self:_home_open_koreader_filemanager(folder,true)
     end
     if book and (book.source=="local" or book.local_file==true) then
         if direct_read==true then return self:_home_open_local(book) end
@@ -8045,7 +8101,7 @@ end
 
 function Plugin:_home_all_books_option_dialog()
     local state=self:_home_all_books_state()
-    local source_labels={all="全部来源",account="微信书架",generated="已下载",["local"]="本地书籍",mp="公众号"}
+    local source_labels={all="全部来源",account="微信书架",generated="已下载",["local"]="本地书库",mp="公众号"}
     local status_labels={all="全部状态",reading="阅读中",unread="尚未开始",finished="已读完",downloaded="已下载",failed="异常"}
     local sort_labels={recent="最近阅读",added="最近加入",title="按书名",author="按作者"}
 
@@ -8099,10 +8155,16 @@ function Plugin:show_home_all_books()
 end
 
 function Plugin:show_home_reading_history()
-    local rows={}
-    for _,book in ipairs(self:_home_all_rows()) do
-        if self:_home_book_time(book)>0 or tonumber(book.progress or 0)>0 then rows[#rows+1]=book end
+    local rows,seen={},{}
+    local function append(book)
+        local key=self:_home_book_key(book)
+        if key~="" and not seen[key] and (self:_home_book_time(book)>0 or tonumber(book.progress or 0)>0) then
+            seen[key]=true
+            rows[#rows+1]=book
+        end
     end
+    for _,book in ipairs(self:_home_all_rows()) do append(book) end
+    for _,book in ipairs(self:_home_recent_local_rows(64)) do append(book) end
     table.sort(rows,function(a,b)
         local at,bt=self:_home_book_time(a),self:_home_book_time(b)
         if at~=bt then return at>bt end
@@ -8114,7 +8176,7 @@ end
 function Plugin:show_home_search_dialog(scope)
     scope=tostring(scope or "all")
     local title=scope=="weread_shelf" and "搜索微信书架"
-        or (scope=="local" and "搜索最近本地书" or "搜索全部书籍")
+        or (scope=="local" and "搜索当前本地目录" or "搜索全部书籍")
     local function rows_for_scope()
         if scope=="weread_shelf" then
             local section=self._home_sections and self._home_sections.account
@@ -8881,7 +8943,7 @@ function Plugin:_home_action_function_actions(key,anchor)
             end
         end},
         {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-        {icon="⌕",label="刷新最近阅读",detail="重新读取 KOReader 最近阅读",callback=function() self:_home_scan_local(true,true) end},
+        {icon="⌕",label="刷新最近阅读",detail="重新读取 KOReader 最近阅读",callback=function() self:_home_refresh_recent_history(true) end},
         {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
     } end
     if key=="search" then return {
@@ -9285,11 +9347,19 @@ function Plugin:_cancel_local_browser_fallback()
 end
 
 function Plugin:_cancel_home_directory_request(reason)
+    local cancelled_inline=self._home_local_inline_loading==true
+        and self._home_directory_request_owner==nil
+        and self._home_directory_active_path~=nil
+        and self._home_directory_active_path==self._home_local_inline_path
     self._home_directory_generation=(tonumber(self._home_directory_generation) or 0)+1
     if self.local_browser_async then self.local_browser_async:cancel(reason or "local folder request cancelled") end
     self:_cancel_local_browser_fallback()
     self._home_directory_active_path=nil
     self._home_directory_request_owner=nil
+    if cancelled_inline then
+        self._home_local_inline_loading=false
+        self._home_local_inline_path=nil
+    end
 end
 
 function Plugin:_home_refresh_local_directory(path,callback,force,owner)
@@ -9386,15 +9456,22 @@ function Plugin:_home_refresh_local_directory(path,callback,force,owner)
 end
 
 function Plugin:_home_scan_local(force,user_requested)
-    -- Compatibility shim for old call sites. beta.13 deliberately performs no
-    -- recursive scan: refresh KOReader history for Home and, if needed, let the
-    -- opened browser reread only its current directory.
+    -- Compatibility name retained for callers, but the operation now means
+    -- exactly one non-recursive read of the local-library entry directory.
+    self._home_refreshing=false
+    local started=self:_home_ensure_local_inline_loaded(force==true,user_requested==true)
+    logger.info("[MiuRead][Home] local-library refresh",
+        "root=",tostring(self:_home_root()),"recursive=false","started=",tostring(started))
+    return started
+end
+
+function Plugin:_home_refresh_recent_history(user_requested)
     local ok_history,history=pcall(require,"readhistory")
     if ok_history and history and type(history.reload)=="function" then pcall(history.reload,history,true) end
-    self._home_refreshing=false
-    if self._home_sections then self:_home_apply_local_inline_section(true) end
+    self._home_recent_read_dirty=true
+    HOME_SESSION.recent_read_dirty=true
+    if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_refresh_recent_hero_cached() end
     if user_requested==true then self:toast("最近阅读已刷新",1.5) end
-    logger.info("[MiuRead][Home] recent-local refresh","source=koreader-history","directory_scan=false")
     return true
 end
 
@@ -10246,7 +10323,14 @@ function Plugin:_home_schedule_local_identity_check(rows,view)
     local worker=self.local_identity_async
     if not worker or not worker:available() then return false end
     local index=1
+    local home_mode=view==nil
     local function remove_generated(path)
+        if home_mode then
+            if HomeView.is_shown() and self._home_active_section=="local" then
+                self:_home_apply_local_inline_section(false)
+            end
+            return
+        end
         if not view or view._miu_closed or type(view.opts)~="table" then return end
         local kept={}
         local changed=false
@@ -10258,7 +10342,12 @@ function Plugin:_home_schedule_local_identity_check(rows,view)
         end
     end
     local function next_item()
-        if generation~=self._home_local_identity_generation or not view or view._miu_closed then return end
+        if generation~=self._home_local_identity_generation then return end
+        if home_mode then
+            if not HomeView.is_shown() or self._home_active_section~="local" or self:_active_reader_ui() then return end
+        elseif not view or view._miu_closed then
+            return
+        end
         local item=queue[index]
         if not item then return end
         if worker:busy() then UIManager:scheduleIn(.3,next_item); return end
@@ -11416,7 +11505,7 @@ function Plugin:maintenance_menu()
     return {
         {text="书库维护",post_text="目录 资料 封面与书架",sub_item_table_func=function()
             return {
-                {text="刷新本地书入口",post_text="不递归扫描",callback=function() self:_home_scan_local(true,true) end},
+                {text="刷新本地书库",post_text="只读取入口目录，不递归扫描",callback=function() self:_home_scan_local(true,true) end},
                 {text="更新缺失书籍资料",callback=function()
                     self:_home_reset_local_metadata(); self:_home_complete_refresh(true)
                 end},
@@ -15794,11 +15883,11 @@ function Plugin:_home_refresh_recent_hero_cached()
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
     local sections=self._home_sections or {}
     local generated=sections.generated and sections.generated.rows or {}
-    local local_rows=sections["local"] and sections["local"].rows or {}
+    local recent_local_rows=self:_home_recent_local_rows(16)
     local account=sections.account and sections.account.rows or {}
-    if #generated==0 and #local_rows==0 and #account==0 then return false end
-    self:_home_apply_recent_read_times(generated,local_rows,account)
-    local hero=self:_home_prepare_hero_book(self:_home_recent_book(generated,local_rows,account))
+    if #generated==0 and #recent_local_rows==0 and #account==0 then return false end
+    self:_home_apply_recent_read_times(generated,recent_local_rows,account)
+    local hero=self:_home_prepare_hero_book(self:_home_recent_book(generated,recent_local_rows,account))
     self._home_recent_read_dirty=false
     HOME_SESSION.recent_read_dirty=false
     if not hero then return false end
@@ -15864,6 +15953,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     if force_scan==true then self:_home_reset_local_metadata() end
     local miuread_rows=self:_home_miuread_rows()
     local local_rows=self:_home_local_rows()
+    local recent_local_rows=self:_home_recent_local_rows(16)
     local cached_books,cached_mp=self.library:cached()
     cached_books=type(cached_books)=="table" and cached_books or {}
     cached_mp=type(cached_mp)=="table" and cached_mp or {}
@@ -15875,8 +15965,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local mp_rows=self:_home_cloud_rows(cached_mp,"mp")
 
     local home,home_preferences=self:_home_preferences()
-    self:_home_apply_recent_read_times(miuread_rows,local_rows,account_rows,mp_rows)
-    local recent_candidate=self:_home_recent_book(miuread_rows,local_rows,account_rows)
+    self:_home_apply_recent_read_times(miuread_rows,local_rows,recent_local_rows,account_rows,mp_rows)
+    local recent_candidate=self:_home_recent_book(miuread_rows,recent_local_rows,account_rows)
     local snapshot=HOME_SESSION.recent_read_snapshot
     if type(snapshot)=="table" then
         local snapshot_time=normalized_home_time(snapshot.read_at)
@@ -15892,7 +15982,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local sections={
         account={title="微信书架",rows=account_rows,empty="这里还没有微信书架内容"},
         generated={title="已下载",rows=miuread_rows,empty="这里还没有已下载书籍"},
-        ["local"]={title="最近阅读",rows=local_rows,empty=self:_home_local_empty_text()},
+        ["local"]={title="本地书库",rows=local_rows,empty=self:_home_local_empty_text()},
         mp={title="公众号",rows=mp_rows,empty="这里还没有公众号内容"},
     }
     self._home_data_revision=(tonumber(self._home_data_revision) or 0)+1
@@ -16020,9 +16110,9 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         self:_home_unschedule_task("_home_stats_apply_task")
     end
     self:_resume_home_preferences_flush(4.8)
-    if active=="local" then
-        UIManager:scheduleIn(.05,function()
-            if HomeView.is_shown() and self._home_active_section=="local" then self:_home_ensure_local_inline_loaded() end
+    if home.visible_sections and home.visible_sections["local"]~=false then
+        UIManager:scheduleIn(active=="local" and .05 or .35,function()
+            if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_ensure_local_inline_loaded(false,false) end
         end)
     end
 
@@ -22810,7 +22900,7 @@ function Plugin:display_settings_menu()
         {text="主页阅读统计",post_text=self:_home_stats_visibility_label(home),sub_item_table_func=function() return self:home_stats_settings_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
-        {text="本地书籍",post_text="KOReader 管理",sub_item_table_func=function() return self:local_library_settings_menu() end},
+        {text="本地书库",post_text="KOReader 管理",sub_item_table_func=function() return self:local_library_settings_menu() end},
         {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
         {text="下滑工具栏",post_text="设备与 KOReader",sub_item_table_func=function() return self:home_panel_settings_menu() end},
