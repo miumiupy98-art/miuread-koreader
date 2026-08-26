@@ -267,7 +267,10 @@ function Service.run(job)
         })
         local ok, result = pcall(Adapter.run, report_job)
         local completed_at = os.time()
-        last_report_at = completed_at
+        -- The elapsed segment ends when the request is dispatched, not when
+        -- the HTTP response returns. Reading continues while the request is in
+        -- flight, so that network time belongs to the next fresh segment.
+        last_report_at = attempted_at
 
         if ok and type(result) == "table" then
             -- A candidate context only becomes authoritative after WeRead
@@ -329,7 +332,16 @@ function Service.run(job)
                 delay=math.min(delay,10)
             end
             out.retry_delay = delay
-            out.next_due = final_flush and 0 or (completed_at + delay)
+            if final_flush then
+                out.next_due=0
+            elseif result.accepted or uncertain then
+                -- Keep the 60 s cadence anchored to the segment boundary. A
+                -- slow HTTP response must not silently erase several seconds
+                -- from every reading interval.
+                out.next_due=math.max(completed_at,attempted_at+delay)
+            else
+                out.next_due=completed_at+delay
+            end
             out.book_id = tostring(current_job.book_id or "")
             out.core_map_hash=tostring(current_job.core_map_hash or "")
             out.record_generation=tonumber(current_job.record_generation or 0) or 0
@@ -397,6 +409,18 @@ function Service.run(job)
                     and tostring(control.core_map_hash or "")~=""
                     and tostring(control.core_map_hash or "")==tostring(loaded.core_map_hash or "")
                     and tonumber(control.record_generation or -1)==tonumber(loaded.record_generation or 0))) then
+                local previous_job=current_job
+                local previous_next_due=next_due
+                local previous_last_report_at=last_report_at
+                local preserve_clock=previous_job~=nil
+                    and tostring(loaded.action or "")~="reset_auth"
+                    and tostring(loaded.reading_time_session_id or "")~=""
+                    and tostring(loaded.reading_time_session_id or "")==tostring(previous_job.reading_time_session_id or "")
+                    and tostring(loaded.reading_time_segment_id or "")~=""
+                    and tostring(loaded.reading_time_segment_id or "")==tostring(previous_job.reading_time_segment_id or "")
+                    and tostring(loaded.book_id or "")==tostring(previous_job.book_id or "")
+                    and tostring(loaded.book_path or "")==tostring(previous_job.book_path or "")
+                    and tostring(loaded.core_map_hash or "")==tostring(previous_job.core_map_hash or "")
                 generation = requested
                 current_job = loaded
                 last_flush_seq = 0
@@ -421,10 +445,20 @@ function Service.run(job)
                     local interval = math.max(10, tonumber(loaded.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
                     local now = os.time()
-                    -- Historical suspend debt is intentionally not replayed.
                     carry_remaining=0
-                    next_due = now + first_delay
-                    last_report_at = now
+                    if preserve_clock then
+                        -- Authentication/session metadata can refresh while the
+                        -- same reading segment is active. Replace credentials,
+                        -- but never restart the 15/60 s clock.
+                        last_report_at=previous_last_report_at>0 and previous_last_report_at or now
+                        next_due=previous_next_due>0 and previous_next_due or (now+first_delay)
+                    else
+                        -- A real new reading segment (new book or resume after
+                        -- suspend) starts a fresh clock; suspended time is never
+                        -- counted or replayed.
+                        next_due = now + first_delay
+                        last_report_at = now
+                    end
                     write_context()
                     write_service_status({
                         generation = generation,
@@ -432,6 +466,9 @@ function Service.run(job)
                         state = "waiting",
                         next_due = next_due,
                         first_delay = first_delay,
+                        clock_preserved = preserve_clock or nil,
+                        reading_time_session_id=tostring(loaded.reading_time_session_id or ""),
+                        reading_time_segment_id=tostring(loaded.reading_time_segment_id or ""),
                         carry_elapsed = 0,
                         carry_consumed = false,
                         carry_remaining = carry_remaining,
@@ -482,7 +519,13 @@ function Service.run(job)
             if pending_flush then
                 last_flush_seq = flush_seq
                 local now = os.time()
-                local elapsed = math.floor(tonumber(control.flush_elapsed) or math.max(0, now - last_report_at))
+                local elapsed
+                if control.flush_auto==true then
+                    elapsed=math.max(0,now-last_report_at)
+                else
+                    elapsed=tonumber(control.flush_elapsed) or math.max(0,now-last_report_at)
+                end
+                elapsed=math.floor(math.max(0,elapsed))
                 if elapsed >= MIN_FINAL_SECONDS then
                     next_due = run_report(control, elapsed, true, tostring(control.flush_reason or "stop"))
                 else
@@ -509,11 +552,9 @@ function Service.run(job)
                 local idle = now - last_activity
 
                 if now >= next_due then
-                    local busy_until = reader_busy_until()
+                    local time_only=current_job.time_only==true or control.time_only==true
+                    local busy_until=time_only and 0 or reader_busy_until()
                     if busy_until > now then
-                        -- Never start a normal interval upload while the user is
-                        -- actively paging or opening a reader panel. Final
-                        -- suspend/close flushes above are intentionally exempt.
                         next_due = math.max(next_due, busy_until + 1)
                     elseif idle <= idle_timeout then
                         local elapsed = math.max(1, now - last_report_at)

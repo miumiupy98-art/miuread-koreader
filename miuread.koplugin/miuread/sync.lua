@@ -19,7 +19,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 23
+local READ_REPORT_SERVICE_VERSION = 24
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -397,6 +397,8 @@ function Sync:new(reader, api, store, host, async, identity_async)
         auto_repair_busy=false, repair_busy=false, repair_book_id=nil, repair_generation=0,
         daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0, suspend_generation=0,
+        reading_time_session_id=nil, reading_time_segment_id=nil,
+        resume_after_finalizer=false,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -3108,6 +3110,11 @@ function Sync:_import_daemon_status(force)
             if self.host.on_read_report_success then
                 pcall(self.host.on_read_report_success, self.host, status.path)
             end
+        else
+            logger.info("[MiuRead][ReadReport] service interval success",
+                "book=",status_book_id,"count=",tostring(self.session_uploads),
+                "elapsed=",tostring(status.elapsed_seconds or "-"),
+                "next_due=",tostring(status.next_due or "-"))
         end
         self:_persist_daemon_session(force or final_flush, status_book_id ~= "" and status_book_id or nil)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
@@ -3254,6 +3261,22 @@ function Sync:_schedule_daemon_poll(delay)
     UIManager:scheduleIn(delay or 10, task)
 end
 
+local function reading_clock_token(prefix,generation)
+    return table.concat({tostring(prefix or "read"),tostring(os.time()),
+        tostring(tonumber(generation or 0) or 0),tostring(math.random(100000,999999))},"-")
+end
+
+function Sync:_ensure_reading_time_ids(new_session,new_segment)
+    if new_session==true or tostring(self.reading_time_session_id or "")=="" then
+        self.reading_time_session_id=reading_clock_token("session",self.record_generation)
+        new_segment=true
+    end
+    if new_segment==true or tostring(self.reading_time_segment_id or "")=="" then
+        self.reading_time_segment_id=reading_clock_token("segment",self.record_generation)
+    end
+    return self.reading_time_session_id,self.reading_time_segment_id
+end
+
 function Sync:_start_daemon(reason)
     local record = self:record()
     if not record then
@@ -3325,6 +3348,8 @@ function Sync:_start_daemon(reason)
         daemon.reason=reason
         daemon.core_map_hash=core_hash
         daemon.record_generation=tonumber(self.record_generation or 0) or 0
+        daemon.reading_time_session_id=tostring(self.reading_time_session_id or daemon.reading_time_session_id or "")
+        daemon.reading_time_segment_id=tostring(self.reading_time_segment_id or daemon.reading_time_segment_id or "")
         self.state="waiting"
         self.last_stage="轻量后台服务运行中"
         if position_snapshot then self:_save_local_snapshot(book_id,position_snapshot) end
@@ -3374,6 +3399,8 @@ function Sync:_start_daemon(reason)
     daemon.account_vid = account_vid
     daemon.core_map_hash=core_hash
     daemon.record_generation=tonumber(self.record_generation or 0) or 0
+    daemon.reading_time_session_id=tostring(self.reading_time_session_id or "")
+    daemon.reading_time_segment_id=tostring(self.reading_time_segment_id or "")
     if not time_only then self.daemon_context=U.copy(legacy_book) end
 
     local job = {
@@ -3385,6 +3412,8 @@ function Sync:_start_daemon(reason)
         book_id = book_id,
         core_map_hash = core_hash,
         record_generation = daemon.record_generation,
+        reading_time_session_id = tostring(self.reading_time_session_id or ""),
+        reading_time_segment_id = tostring(self.reading_time_segment_id or ""),
         book_title = record.book.title,
         book_path = record.path,
         book = legacy_book,
@@ -3556,23 +3585,28 @@ function Sync:_stop_daemon_fast(reason, flush_elapsed)
         extra.writer_barrier_seq=barrier_seq
         extra.writer_barrier_reason=tostring(reason or "stop_fast")
     end
-    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
-    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+    -- beta.8: nil means "let the service calculate now-last_report_at".
+    -- An explicit zero is a no-flush close (used by duplicate/second close
+    -- events), which prevents the same final tail from being submitted twice.
+    local explicit_elapsed=tonumber(flush_elapsed)
+    local request_flush=daemon.book_id and (explicit_elapsed==nil or explicit_elapsed>0)
+    if request_flush then
         local existing = read_json_file(daemon.paths.control) or {}
         extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
-        extra.flush_elapsed = flush_elapsed
+        if explicit_elapsed~=nil then
+            extra.flush_elapsed=math.max(0,math.floor(explicit_elapsed))
+        else
+            extra.flush_auto = true
+            extra.flush_elapsed = nil
+        end
         extra.flush_reason = tostring(reason or "stop")
         daemon.final_book_id = daemon.book_id
         daemon.final_flush_pending = true
     end
 
-    -- beta.8 attaches a writer barrier to every explicit close. The service
-    -- acknowledges it only after any already-running time report and the final
-    -- short flush have left /web/book/read, so final progress can safely write last.
     daemon.active = false
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
-    if not daemon.final_flush_pending and not barrier_seq then daemon.book_id = nil end
     return barrier_seq
 end
 
@@ -3589,11 +3623,16 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
         extra.writer_barrier_seq=barrier_seq
         extra.writer_barrier_reason=tostring(reason or "stop")
     end
-    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
-    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+    local explicit_elapsed=tonumber(flush_elapsed)
+    local request_flush=daemon.book_id and (explicit_elapsed==nil or explicit_elapsed>0)
+    if request_flush then
         local existing = read_json_file(daemon.paths.control) or {}
         extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
-        extra.flush_elapsed = flush_elapsed
+        if explicit_elapsed~=nil then
+            extra.flush_elapsed=math.max(0,math.floor(explicit_elapsed))
+        else
+            extra.flush_auto=true
+        end
         extra.flush_reason = tostring(reason or "stop")
         daemon.final_book_id = daemon.book_id
         daemon.final_flush_pending = true
@@ -3608,22 +3647,6 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     return barrier_seq
 end
 
-function Sync:_final_elapsed(skip_status_import)
-    local record=self:record()
-    if not self.store:preferences().sync.time_enabled or not record or not self:_read_report_allowed(record) then return nil end
-    if skip_status_import ~= true then self:_import_daemon_status(true) end
-    local now = os.time()
-    local started = tonumber(self.session_started_at or 0) or 0
-    if started <= 0 then started = now end
-    local uploaded = tonumber(self.last_upload or 0) or 0
-    local base = math.max(started, uploaded)
-    local elapsed = math.max(0, now - base)
-    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 60)
-    elapsed = math.min(elapsed, maximum)
-    if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
-    return elapsed
-end
-
 function Sync:start(reason)
     self.last_activity = os.time()
     if (self.host and (self.host._reading_end_barrier_active==true
@@ -3635,11 +3658,14 @@ function Sync:start(reason)
             "reason=reading_end_barrier","requested=",tostring(reason or "start"))
         return false,"结束阅读收尾中"
     end
-    if reason == "reader_ready" or reason == "resume" or reason == "enabled"
-        or tonumber(self.session_started_at or 0) <= 0
-    then
+    -- Reading-session/segment identity is owned by lifecycle hooks:
+    -- on_reader_ready creates a new session; on_resume creates a new segment.
+    -- Ordinary start()/ensure calls (including progress_check_finished and
+    -- credential refreshes) must never create a new clock identity.
+    if tonumber(self.session_started_at or 0) <= 0 then
         self.session_started_at = self.last_activity
     end
+    self:_ensure_reading_time_ids(false,false)
     local prefs = self.store:preferences().sync or {}
     local enabled = prefs.time_enabled == true
     self.time_enabled = enabled
@@ -3827,6 +3853,8 @@ function Sync:on_reader_ready()
     self.daemon_restart_count = 0
     self.last_upload = 0
     self.session_started_at = os.time()
+    self:_ensure_reading_time_ids(true,true)
+    self.resume_after_finalizer=false
     self.first_success_notified = false
     self.failure_notified = false
     self.consecutive_failures = 0
@@ -3917,20 +3945,25 @@ function Sync:on_resume(_slept)
     self.suspended = false
     self.last_upload = 0
     self.session_started_at = os.time()
-    -- A user wake cancels the meaning of a previous suspend finalization even
-    -- if its detached HTTP workers are still finishing. The resumed Reader is
-    -- an active reading session again, so the next Home/Suspend must never be
-    -- skipped merely because the earlier lock-screen transaction had started.
+    self:_ensure_reading_time_ids(false,true)
     self.reading_end_finalized=false
     if self.host and self.host._reading_end_sync_active==true then
-        -- A short wake can arrive while the lock-screen final sync is still
-        -- confirming progress. Starting a new 60 s worker here races the old
-        -- book worker and creates stale-result warnings. Let the final sync own
-        -- the session until it finishes.
+        self.resume_after_finalizer=true
         logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_sync_active")
         return true
     end
+    self.resume_after_finalizer=false
     self:start("resume")
+end
+
+function Sync:resume_after_reading_end()
+    if self.resume_after_finalizer~=true then return false end
+    if self.suspended or not (self.host and self.host.ui and self.host.ui.document) then return false end
+    self.resume_after_finalizer=false
+    self.reading_end_finalized=false
+    self:start("resume")
+    logger.info("[MiuRead][ReadReport] resumed after interrupted finalizer")
+    return true
 end
 
 function Sync:on_close(options)
@@ -3976,7 +4009,9 @@ function Sync:on_close(options)
         end
         if options.preserve_async~=true and self.async then self.async:cancel("document_closed") end
     else
-        self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))
+        -- Native/implicit close uses the same service-owned final-tail clock.
+        -- A duplicate close explicitly requests no second flush.
+        self:stop_fast("close", duplicate and 0 or nil)
     end
     self.reading_end_finalized=false
     self.current = nil
