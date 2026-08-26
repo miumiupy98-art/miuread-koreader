@@ -5,6 +5,12 @@ on:
     tags:
       - "v*.*.*"
       - "!v*.*.*-beta.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的正式版本，例如 5.3.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,7 +22,7 @@ concurrency:
 jobs:
   release-stable:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
     env:
       RELEASE_CHANNEL: stable
       CHANNEL_TAG: stable-channel
@@ -29,29 +35,44 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Synchronize stable source identity to tag
+      - name: Resolve and synchronize stable release identity
         shell: bash
         run: |
           set -euo pipefail
 
-          test "${GITHUB_REF_TYPE:-}" = "tag"
-          git fetch --force --tags origin
-
           BRANCH_SHA="$(git rev-parse HEAD)"
-          TAG_SHA="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
-          # 首次运行时 Tag 应指向分支最新提交；若本次发布已自动生成过
-          # 版本同步提交，重新运行 workflow 时允许 Tag 已经指向新的分支 HEAD。
-          if [ "$BRANCH_SHA" != "$GITHUB_SHA" ] && [ "$TAG_SHA" != "$BRANCH_SHA" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME 必须创建在 main 分支最新提交上。"
-            echo "::error::main=$BRANCH_SHA, current_tag=$TAG_SHA, event_source=$GITHUB_SHA"
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            RELEASE_TAG="v$VERSION"
+            EVENT_SHA="$BRANCH_SHA"
+          else
+            test "${GITHUB_REF_TYPE:-}" = "tag"
+            RELEASE_TAG="$GITHUB_REF_NAME"
+            VERSION="${RELEASE_TAG#v}"
+            EVENT_SHA="$GITHUB_SHA"
+
+            # Tag push 必须来自 main 当前 HEAD。
+            # 直接使用 GitHub 事件携带的 SHA，避免刚创建 tag 时的可见性竞态。
+            if [ "$EVENT_SHA" != "$BRANCH_SHA" ]; then
+              echo "::error::Tag $RELEASE_TAG 必须创建在 main 分支最新提交上。"
+              echo "::error::main=$BRANCH_SHA, event_source=$EVENT_SHA"
+              exit 1
+            fi
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无效的正式版本：$VERSION"
+            echo "::error::正确格式示例：5.3.0"
             exit 1
           fi
 
-          VERSION="${GITHUB_REF_NAME#v}"
+          git fetch --force --tags origin
+
           python3 .github/scripts/sync_release_identity.py \
             --channel stable \
             --version "$VERSION" \
-            --tag "$GITHUB_REF_NAME"
+            --tag "$RELEASE_TAG"
 
           if ! git diff --quiet -- \
               miuread.koplugin/miuread/config.lua \
@@ -62,23 +83,32 @@ jobs:
               miuread.koplugin/miuread/config.lua \
               miuread.koplugin/_meta.lua CHANGELOG.md
             git commit -m "同步正式版本至 $VERSION" \
-              -m "根据 $GITHUB_REF_NAME 自动同步源码版本、发布通道与版本记录。"
+              -m "根据 $RELEASE_TAG 自动同步源码版本、发布通道与版本记录。"
             git push origin "HEAD:main"
-
-            # 将用户创建的 Tag 移到版本同步后的提交，确保分支、Tag、Release 一致。
-            git tag -f "$GITHUB_REF_NAME" HEAD
-            git push --force origin "refs/tags/$GITHUB_REF_NAME"
           fi
 
           RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
+          CURRENT_TAG_SHA="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
+          if [ "$CURRENT_TAG_SHA" != "$RELEASE_SOURCE_SHA" ]; then
+            git tag -f "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
+            git push --force origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
           echo "RELEASE_SOURCE_SHA=$RELEASE_SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=miuread-v$VERSION-full.zip" >> "$GITHUB_ENV"
+
+          echo "Stable release:"
+          echo "  version=$VERSION"
+          echo "  tag=$RELEASE_TAG"
+          echo "  source=$RELEASE_SOURCE_SHA"
 
       - name: Read and validate stable identity
         shell: bash
         run: |
           set -euo pipefail
 
-          test "${GITHUB_REF_TYPE:-}" = "tag"
           test -d miuread.koplugin
           test -f miuread.koplugin/main.lua
           test -f miuread.koplugin/_meta.lua
@@ -99,12 +129,12 @@ jobs:
           import re
           import sys
 
-          tag = os.environ.get("GITHUB_REF_NAME", "")
+          version = os.environ["VERSION"]
+          tag = os.environ["RELEASE_TAG"]
           match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag)
-          if not match:
-              print(f"::error::无效的正式 tag：{tag}")
+          if not match or match.group(1) != version:
+              print(f"::error::正式版本与 tag 不一致：version={version}, tag={tag}")
               sys.exit(1)
-          version = match.group(1)
 
           config = Path("miuread.koplugin/miuread/config.lua").read_text(encoding="utf-8")
           meta = Path("miuread.koplugin/_meta.lua").read_text(encoding="utf-8")
