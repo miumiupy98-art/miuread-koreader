@@ -19,7 +19,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 26
+local READ_REPORT_SERVICE_VERSION = 27
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -399,6 +399,7 @@ function Sync:new(reader, api, store, host, async, identity_async)
         control_write_task=nil, session_started_at=0, suspend_generation=0,
         reading_time_session_id=nil, reading_time_segment_id=nil,
         resume_after_finalizer=false,
+        progress_write_fence=false, progress_write_fence_seq=0,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -1486,6 +1487,62 @@ function Sync:_normalize_remote_progress(remote,book_id)
     return catalog_progress_from_remote(remote,chapters)
 end
 
+local function cloud_anchor_from(value, state)
+    value=type(value)=="table" and value or {}
+    local uid=value.chapter_uid or value.chapterUid
+    local offset=tonumber(value.canonical_offset or value.chapter_offset or value.offset or value.chapterOffset)
+    if tostring(uid or "")=="" or offset==nil then return nil end
+    local progress=tonumber(value.protocol_progress or value.raw_progress or value.raw_percent or value.progress)
+    if progress==nil then return nil end
+    return {
+        chapter_uid=uid,
+        chapter_idx=tonumber(value.chapter_idx or value.chapter_index or value.chapterIdx) or 0,
+        chapter_offset=math.max(0,math.floor(offset+.5)),
+        progress=math.max(0,math.min(100,progress)),
+        raw_progress=tonumber(value.raw_progress or value.raw_percent),
+        source=tostring(value.source or state or "cloud"),
+        state=tostring(state or "observed"),
+        server_updated=tonumber(value.updated_at or value.updated),
+        saved_at=os.time(),
+    }
+end
+
+function Sync:cloud_anchor(book_id)
+    book_id=tostring(book_id or "")
+    if book_id=="" then return nil end
+    local session=self.store:session(book_id) or {}
+    local anchor=type(session.cloud_anchor)=="table" and U.copy(session.cloud_anchor) or nil
+    if anchor and tostring(anchor.chapter_uid or "")~="" and tonumber(anchor.chapter_offset)~=nil then return anchor end
+    local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
+    local pending_anchor=cloud_anchor_from(pending,"pending_progress")
+    if pending_anchor then return pending_anchor end
+    local remote=type(session.remote)=="table" and session.remote or nil
+    return cloud_anchor_from(remote,"stored_remote")
+end
+
+function Sync:set_cloud_anchor(book_id, value, state, write_control)
+    book_id=tostring(book_id or "")
+    local anchor=cloud_anchor_from(value,state)
+    if book_id=="" or not anchor then return false end
+    self.store:save_session(book_id,{cloud_anchor=anchor})
+    if write_control~=false and self.daemon
+        and tostring(self.daemon.book_id or self.daemon.final_book_id or "")==book_id then
+        self:_write_daemon_control(self.daemon.active==true,true,{
+            cloud_anchor_chapter_uid=anchor.chapter_uid,
+            cloud_anchor_chapter_idx=anchor.chapter_idx,
+            cloud_anchor_chapter_offset=anchor.chapter_offset,
+            cloud_anchor_progress=anchor.progress,
+            cloud_anchor_raw_progress=anchor.raw_progress,
+            cloud_anchor_source=anchor.source,
+            cloud_anchor_state=anchor.state,
+        })
+    end
+    logger.info("[MiuRead][CloudAnchor] updated","book=",book_id,
+        "state=",anchor.state,"chapter=",tostring(anchor.chapter_uid),
+        "co=",tostring(anchor.chapter_offset),"progress=",tostring(anchor.progress))
+    return true
+end
+
 function Sync:remote(book_id, callback, options)
     options=options or {}
     local detached=options.detached==true
@@ -1598,6 +1655,16 @@ function Sync:remote(book_id, callback, options)
             remote_web_error=value.web_error,
             remote_agent_error=value.agent_error,
         })
+        if not remote.conflict and options.update_cloud_anchor~=false then
+            local current_session=self.store:session(book_id) or {}
+            local has_pending=type(current_session.pending_progress)=="table"
+            if not has_pending or options.replace_pending_anchor==true then
+                self:set_cloud_anchor(book_id,remote,"remote_observed",true)
+            else
+                logger.info("[MiuRead][CloudAnchor] remote observation retained as readback only",
+                    "book=",tostring(book_id),"pending=true")
+            end
+        end
         if remote.conflict then
             logger.warn("[MiuRead][Sync] cloud progress source conflict",
                 "book=",tostring(book_id),
@@ -2440,43 +2507,113 @@ function Sync:upload(elapsed, callback, options)
     return true
 end
 
+function Sync:begin_progress_write(reason, callback)
+    callback=type(callback)=="function" and callback or function() end
+    local daemon=self.daemon
+    if not daemon or daemon.active~=true or not daemon.paths then
+        callback(true,{state="no_active_time_writer"})
+        return true
+    end
+    if self.progress_write_fence==true then
+        callback(false,{state="progress_fence_busy"})
+        return false
+    end
+    local seq=self:_next_writer_barrier(reason or "progress_write_fence")
+    if not seq then callback(true,{state="no_barrier"}); return true end
+    self.progress_write_fence=true
+    self.progress_write_fence_seq=seq
+    self:_write_daemon_control(true,true,{
+        progress_fence=true,writer_barrier_seq=seq,
+        writer_barrier_reason=tostring(reason or "progress_write_fence"),
+    })
+    self:wait_writer_barrier(seq,function(ok,result)
+        if not ok then
+            self.progress_write_fence=false
+            self.progress_write_fence_seq=0
+            self:_write_daemon_control(true,true,{progress_fence=false})
+        end
+        callback(ok,result)
+    end,15)
+    return true
+end
+
+function Sync:end_progress_write(reason)
+    if self.progress_write_fence~=true then return false end
+    self.progress_write_fence=false
+    self.progress_write_fence_seq=0
+    if self.daemon and self.daemon.active==true then
+        self:_write_daemon_control(true,true,{
+            progress_fence=false,writer_barrier_reason=tostring(reason or "progress_write_complete"),
+        })
+    end
+    logger.info("[MiuRead][ProgressWriter] fence released","reason=",tostring(reason or "complete"))
+    return true
+end
+
 function Sync:upload_progress(callback, options)
     options = options or {}
+    callback=type(callback)=="function" and callback or function() end
     self.state = "progress_locating"
     self.last_stage = "正在定位当前阅读位置"
     local detached=options.detached==true or options.reading_end==true
-    if type(options.position_override) == "table" then
-        return self:upload(0,callback,{
-            silent=true,progress_only=true,
-            position_override=options.position_override,
-            record_override=options.record_override,
-            record_generation_override=options.record_generation_override,
-            allow_same_book_generation_change=detached,
-            allow_book_switch_result=detached,
-        })
-    end
-    local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
-        if not position then
-            if callback then callback(false,err,nil,{error_kind=meta and meta.error_kind or "position"}) end
-            return
+    local progress_record=type(options.record_override)=="table" and options.record_override or self:record()
+    local progress_book_id=progress_record and progress_record.book and tostring(progress_record.book.book_id or "") or ""
+
+    local function do_upload()
+        local inner_callback=function(ok,result,position,value)
+            -- Progress-only HTTP 200 without succ is intentionally returned as
+            -- ok=true so readback can decide. Once that exact write has left the
+            -- client, freeze reading-time reports to the same immutable position
+            -- before releasing the shared writer fence.
+            if ok==true and progress_book_id~="" then
+                local anchor_position=type(position)=="table" and position or options.position_override
+                if type(anchor_position)=="table" then
+                    self:set_cloud_anchor(progress_book_id,anchor_position,"progress_submitted",true)
+                end
+            end
+            self:end_progress_write(ok==true and "progress_submitted" or "progress_submit_failed")
+            callback(ok,result,position,value)
         end
-        self:upload(0,callback,{
-            silent=true,progress_only=true,
-            position_override=position,
-            allow_same_book_generation_change=detached,
-            allow_book_switch_result=detached,
+        if type(options.position_override) == "table" then
+            return self:upload(0,inner_callback,{
+                silent=true,progress_only=true,transactional_context=true,
+                position_override=options.position_override,
+                record_override=options.record_override,
+                record_generation_override=options.record_generation_override,
+                allow_same_book_generation_change=detached,
+                allow_book_switch_result=detached,
+            })
+        end
+        local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
+            if not position then
+                self:end_progress_write("position_unavailable")
+                callback(false,err,nil,{error_kind=meta and meta.error_kind or "position"})
+                return
+            end
+            local ok=self:upload(0,inner_callback,{
+                silent=true,progress_only=true,transactional_context=true,
+                position_override=position,
+                allow_same_book_generation_change=detached,
+                allow_book_switch_result=detached,
+            })
+            if not ok then self:end_progress_write("upload_not_started") end
+        end,{
+            precise=true,prepare_catalog=true,require_cloud_coordinate=true,on_stage=options.on_stage,
         })
-    end,{
-        precise=true,
-        prepare_catalog=true,
-        require_cloud_coordinate=true,
-        on_stage=options.on_stage,
-    })
-    if not started then
-        if callback then callback(false,resolve_error,nil,{error_kind="busy"}) end
-        return false
+        if not started then
+            self:end_progress_write("resolver_not_started")
+            callback(false,resolve_error,nil,{error_kind="busy"})
+            return false
+        end
+        return true
     end
-    return true
+
+    local fence_started=self:begin_progress_write("progress_write",function(ok)
+        if not ok then callback(false,"progress_writer_busy",nil,{error_kind="busy"}); return end
+        local started=do_upload()
+        if started==false then self:end_progress_write("upload_not_started") end
+    end)
+    return fence_started~=false
 end
 
 function Sync:_notify_failure()
@@ -2826,6 +2963,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
         local auth=self.store:auth()
         local account=type(auth.account)=="table" and auth.account or {}
         local book_id=tostring(d.book_id or d.final_book_id or "")
+        local cloud_anchor=book_id~="" and self:cloud_anchor(book_id) or nil
         local position=nil
         if not time_only then
             local record=self:record()
@@ -2862,6 +3000,13 @@ function Sync:_write_daemon_control(active, immediate, extra)
             position_basis = position and position.position_basis or existing.position_basis,
             position_precision_ms = position and position.precision_ms or existing.position_precision_ms,
             position_safe = time_only or (position and true or existing.position_safe==true),
+            cloud_anchor_chapter_uid=cloud_anchor and cloud_anchor.chapter_uid or existing.cloud_anchor_chapter_uid,
+            cloud_anchor_chapter_idx=cloud_anchor and cloud_anchor.chapter_idx or existing.cloud_anchor_chapter_idx,
+            cloud_anchor_chapter_offset=cloud_anchor and cloud_anchor.chapter_offset or existing.cloud_anchor_chapter_offset,
+            cloud_anchor_progress=cloud_anchor and cloud_anchor.progress or existing.cloud_anchor_progress,
+            cloud_anchor_raw_progress=cloud_anchor and cloud_anchor.raw_progress or existing.cloud_anchor_raw_progress,
+            cloud_anchor_source=cloud_anchor and cloud_anchor.source or existing.cloud_anchor_source,
+            cloud_anchor_state=cloud_anchor and cloud_anchor.state or existing.cloud_anchor_state,
             last_activity = tonumber(self.last_activity) or os.time(),
             updated_at = os.time(),
         }

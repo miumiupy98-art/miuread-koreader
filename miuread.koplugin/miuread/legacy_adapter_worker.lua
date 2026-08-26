@@ -116,6 +116,7 @@ function Adapter.run(job)
         allow_renewal = job.allow_renewal == true,
         time_only = job.time_only == true,
         report_mode = tostring(job.report_mode or ""),
+        cloud_anchor = copy(job.cloud_anchor or {}),
         force_context = job.force_context == true,
         context_only = job.context_only == true,
     }

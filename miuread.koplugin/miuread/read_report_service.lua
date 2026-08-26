@@ -155,6 +155,7 @@ function Service.run(job)
     local consecutive_unconfirmed = 0
     local blocked = false
     local carry_remaining = 0
+    local progress_fence_seq = 0
 
     local function reader_busy_until()
         if reader_busy_path == "" then return 0 end
@@ -248,6 +249,14 @@ function Service.run(job)
             progress_ratio = time_only and nil or (tonumber(control.progress_ratio) or 0),
             time_only = time_only,
             report_mode = report_mode,
+            cloud_anchor = time_only and {
+                chapter_uid=control.cloud_anchor_chapter_uid,
+                chapter_idx=control.cloud_anchor_chapter_idx,
+                chapter_offset=control.cloud_anchor_chapter_offset,
+                protocol_progress=control.cloud_anchor_progress,
+                raw_progress=control.cloud_anchor_raw_progress,
+                source=control.cloud_anchor_source,
+            } or nil,
             elapsed_seconds = elapsed,
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -520,7 +529,22 @@ function Service.run(job)
                 end
             end
 
-            if pending_flush then
+            local requested_fence_seq=tonumber(control.writer_barrier_seq or 0) or 0
+            if control.progress_fence==true then
+                -- Progress writes and reading-time writes share /web/book/read.
+                -- A fence is acknowledged only after any in-flight report has
+                -- returned to this loop, so foreground progress can safely write.
+                if progress_fence_seq~=requested_fence_seq then
+                    progress_fence_seq=requested_fence_seq
+                    write_service_status({
+                        generation=generation,seq=sequence,state="progress_fenced",
+                        book_id=tostring(current_job.book_id or ""),next_due=next_due,
+                        writer_barrier_seq=requested_fence_seq,
+                        writer_barrier_reason=tostring(control.writer_barrier_reason or "progress_write_fence"),
+                    })
+                end
+            elseif pending_flush then
+                progress_fence_seq=0
                 last_flush_seq = flush_seq
                 local now = os.time()
                 local elapsed
@@ -549,6 +573,7 @@ function Service.run(job)
                     })
                 end
             elseif active and not blocked then
+                progress_fence_seq=0
                 local now = os.time()
                 local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
