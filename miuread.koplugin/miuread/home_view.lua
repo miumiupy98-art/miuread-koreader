@@ -523,33 +523,39 @@ local function welcome_card(width, height, callback)
 end
 
 local function shelf_folder_card(folder, width, height, callback)
-    local inner_w = math.max(1, width - UiScale.dp(8, 6, 12))
-    local icon_h = math.max(UiScale.dp(52, 44, 72), math.floor(height * .48))
-    local title_h = math.max(UiScale.dp(30, 26, 42), math.floor(height * .24))
-    local detail_h = math.max(UiScale.dp(20, 17, 28), height - icon_h - title_h - UiScale.dp(10, 8, 15))
+    -- A folder occupies exactly one normal book slot.  Its visual body uses the
+    -- same cover geometry as a book, so mixed folders/books stay on one grid.
+    local pad = math.max(UiScale.dp(1, 0, 2), math.floor(width * .004))
+    local inner_w = math.max(1, width - pad * 2)
+    local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))
+    local vgap = UiScale.dp(2, 2, 4)
+    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - vgap)
+    local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
     local icon_key = folder.local_parent==true and "back" or "folder"
+    local icon_size = math.max(UiScale.dp(36, 31, 52), math.min(math.floor(cover_w * .58), math.floor(cover_h * .35)))
+    local cover_inset = UiScale.line("thin") + UiScale.dp(2, 1, 4)
+    local icon_area_w = math.max(1, cover_w - cover_inset * 2)
+    local icon_area_h = math.max(1, cover_h - cover_inset * 2)
+    local cover = fixed_frame(cover_w, cover_h, {
+        bordersize = UiScale.line("thin"),
+        radius = UiScale.radius(7, 5, 12),
+        padding = UiScale.dp(2, 1, 4),
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_GRAY,
+    }, Ui.icon(icon_key, icon_area_w, icon_area_h, icon_size, {
+        face = UiScale.iconFace("cfont", 28, 40),
+    }))
     local body = VerticalGroup:new{
         align = "center",
-        Ui.icon(icon_key, inner_w, icon_h, UiScale.dp(34, 29, 48), {
-            face = UiScale.iconFace("cfont", 24, 34),
-        }),
+        cover,
+        VerticalSpan:new{height = vgap},
         TextBoxWidget:new{
             text = tostring(folder.title or "文件夹"), face = face("cfont", 11.8, 16.5), bold = true,
             width = inner_w, height = title_h, height_adjust = false,
             height_overflow_show_ellipsis = true, alignment = "center",
         },
-        TextBoxWidget:new{
-            text = tostring(folder.status_text or "文件夹"), face = face("smallinfofont", 8.7, 12),
-            width = inner_w, height = detail_h, height_adjust = false,
-            height_overflow_show_ellipsis = true, alignment = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-        },
     }
-    local card = fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"), padding = UiScale.dp(4, 3, 7),
-        radius = UiScale.radius(8, 6, 13), background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_GRAY,
-    }, body)
-    return tappable(width, height, card, function(anchor)
+    return tappable(width, height, CenterContainer:new{dimen = Geom:new{w = width, h = height}, body}, function(anchor)
         if callback then callback(folder, anchor) end
     end)
 end
@@ -1070,12 +1076,10 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
     local slot = 0
     for _,book in ipairs(books) do
         local folder=book and (book.local_folder==true or book.kind=="folder")
-        local weight=folder and 2 or 1
-        if folder and slot%columns==columns-1 then slot=slot+1 end
-        if slot+weight>capacity then break end
+        if slot>=capacity then break end
         local row = math.floor(slot / columns)
         local col = slot % columns
-        local item_w = folder and (card_w * 2 + col_gap) or card_w
+        local item_w = card_w
         local item_x = x + col * (card_w + col_gap)
         local item_y = y + row * (card_h + row_gap)
         self:_add(children,item_x,item_y,shelf_book_card(book, item_w, card_h, on_open, on_hold))
@@ -1087,7 +1091,7 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
                 }
             end
         end
-        slot = slot + weight
+        slot = slot + 1
     end
     return rows * card_h + math.max(0, rows - 1) * row_gap
 end

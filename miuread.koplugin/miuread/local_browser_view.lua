@@ -110,31 +110,30 @@ local function book_placeholder(width, height, title, author)
 end
 
 local function folder_card(folder, width, height, callback)
-    local inner_w = math.max(1, width - UiScale.dp(12, 10, 18))
-    local icon_h = math.max(UiScale.dp(42, 38, 64), math.floor(height * .42))
-    local title_h = math.max(UiScale.dp(28, 24, 40), math.floor(height * .28))
-    local detail_h = math.max(UiScale.dp(20, 18, 30), height - icon_h - title_h - UiScale.dp(12, 10, 18))
-    local detail = tostring(folder.status_text or folder.detail or "文件夹")
+    -- Keep folders and books on the same grid: one folder == one cover slot.
+    local title_h = UiScale.dp(31, 27, 44)
+    local gap = UiScale.dp(3, 2, 5)
+    local cover_h = math.max(UiScale.dp(112, 94, 180), height - title_h - gap)
+    local cover_w = math.max(UiScale.dp(74, 62, 122), math.min(math.floor(width * .92), math.floor(cover_h * .715)))
+    local icon_size = math.max(UiScale.dp(40, 34, 58), math.min(math.floor(cover_w * .58), math.floor(cover_h * .35)))
+    local cover_inset = UiScale.line("thin") + UiScale.dp(2, 1, 4)
+    local icon_area_w = math.max(1, cover_w - cover_inset * 2)
+    local icon_area_h = math.max(1, cover_h - cover_inset * 2)
+    local cover = fixed_frame(cover_w, cover_h, {
+        bordersize = UiScale.line("thin"), radius = UiScale.radius(7, 5, 12),
+        padding = UiScale.dp(2, 1, 4), background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
+    }, Ui.icon("folder", icon_area_w, icon_area_h, icon_size, {face = UiScale.iconFace("cfont", 30, 42)}))
     local body = VerticalGroup:new{
         align = "center",
-        Ui.icon("folder", inner_w, icon_h, UiScale.dp(34, 30, 50), {face = UiScale.iconFace("cfont", 24, 34)}),
+        cover,
+        VerticalSpan:new{height = gap},
         TextBoxWidget:new{
-            text = tostring(folder.title or "文件夹"), face = face("cfont", 13, 18), bold = true,
-            width = inner_w, height = title_h, height_adjust = false,
+            text = tostring(folder.title or "文件夹"), face = face("cfont", 11.8, 16.8), bold = true,
+            width = width, height = title_h, height_adjust = false,
             height_overflow_show_ellipsis = true, alignment = "center",
-        },
-        TextBoxWidget:new{
-            text = detail, face = face("smallinfofont", 9, 12),
-            width = inner_w, height = detail_h, height_adjust = false,
-            height_overflow_show_ellipsis = true, alignment = "center",
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
         },
     }
-    return tappable(width, height, fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"), padding = UiScale.dp(5, 4, 8),
-        radius = UiScale.radius(8, 6, 13), background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_GRAY,
-    }, body), callback)
+    return tappable(width, height, body, callback)
 end
 
 local function book_card(book, width, height, callback, hold_callback)
@@ -190,7 +189,7 @@ function LocalBrowserWidget:_entries()
     local entries = {}
     if self.view_mode == "folders" then
         for _, folder in ipairs((self.opts and self.opts.folders) or {}) do
-            entries[#entries + 1] = {kind = "folder", value = folder, weight = 2}
+            entries[#entries + 1] = {kind = "folder", value = folder, weight = 1}
         end
     else
         for _, book in ipairs((self.opts and self.opts.books) or {}) do
@@ -308,12 +307,11 @@ function LocalBrowserWidget:_build()
         local row = math.floor(slot / columns)
         local col = slot % columns
         if entry.kind == "folder" then
-            local width = card_w * 2 + col_gap
             self:_add(layers, margin + col * (card_w + col_gap), grid_y + row * (card_h + row_gap),
-                folder_card(entry.value, width, card_h, function()
+                folder_card(entry.value, card_w, card_h, function()
                     if self.opts and self.opts.on_open_folder then self.opts.on_open_folder(entry.value, self) end
                 end))
-            slot = slot + 2
+            slot = slot + 1
         else
             self._visible_books[#self._visible_books + 1] = entry.value
             self:_add(layers, margin + col * (card_w + col_gap), grid_y + row * (card_h + row_gap),

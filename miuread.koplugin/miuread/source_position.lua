@@ -199,7 +199,7 @@ local function locate_anchor(map, anchor)
     }
 end
 
-function M.locate(reader, record, anchor, options)
+local function locate_single(reader, record, anchor, options)
     options = type(options) == "table" and options or {}
     anchor = type(anchor) == "table" and anchor or {}
     local words = math.max(0, tonumber(anchor.chapter_word_count) or 0)
@@ -268,6 +268,49 @@ function M.locate(reader, record, anchor, options)
         precision_anchor = tostring(anchor.anchor_kind or "source_anchor"),
         precision_anchor_chars = tonumber(anchor.anchor_chars) or 0,
     }
+end
+
+local function neighbour_retryable(error_value)
+    local err = tostring(error_value or "")
+    return err == "not_found" or err == "ambiguous"
+end
+
+function M.locate(reader, record, anchor, options)
+    options = type(options) == "table" and options or {}
+    anchor = type(anchor) == "table" and anchor or {}
+
+    local primary, primary_error = locate_single(reader, record, anchor, options)
+    if primary then return primary end
+    if not neighbour_retryable(primary_error) then return nil, primary_error end
+
+    local matches = {}
+    for _, row in ipairs(type(anchor.chapter_candidates) == "table" and anchor.chapter_candidates or {}) do
+        local candidate = U.copy(anchor)
+        candidate.chapter_candidates = nil
+        candidate.chapter_uid = tostring(row.chapter_uid or "")
+        candidate.chapter_index = tonumber(row.chapter_index) or 0
+        candidate.chapter_title = tostring(row.chapter_title or "")
+        candidate.chapter_word_count = tonumber(row.chapter_word_count) or 0
+        candidate.total_word_count = tonumber(row.total_word_count) or tonumber(anchor.total_word_count) or 0
+        candidate.words_before = tonumber(row.words_before) or 0
+        if candidate.chapter_uid ~= "" and candidate.chapter_word_count > 0 then
+            local value = locate_single(reader, record, candidate, options)
+            if value then
+                matches[#matches + 1] = value
+                if #matches > 1 then return nil, "neighbor_anchor_ambiguous" end
+            end
+        end
+    end
+
+    if #matches == 1 then
+        local recovered = matches[1]
+        recovered.mapping_recovered = true
+        recovered.mapping_recovery = "neighbor_source_anchor"
+        recovered.mapping_original_chapter_uid = tostring(anchor.chapter_uid or "")
+        recovered.mapping_original_chapter_index = tonumber(anchor.chapter_index) or 0
+        return recovered
+    end
+    return nil, tostring(primary_error or "source_anchor_not_found")
 end
 
 local function catalog_row(catalog, wanted_uid, wanted_idx)

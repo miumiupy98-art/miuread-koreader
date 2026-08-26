@@ -239,6 +239,42 @@ local function catalog_position(catalog, wanted_uid, wanted_idx)
     return selected
 end
 
+local function catalog_neighbor_candidates(catalog, primary_index, total_words)
+    catalog = type(catalog) == "table" and catalog or {}
+    primary_index = tonumber(primary_index)
+    total_words = math.max(0, tonumber(total_words) or 0)
+    if not primary_index or total_words <= 0 then return {} end
+
+    local rows, before = {}, 0
+    for index, chapter in ipairs(catalog) do
+        local words = chapter_words(chapter)
+        rows[index] = {chapter=chapter,index=index,before=before,words=words}
+        before = before + words
+    end
+
+    local out = {}
+    -- Only the immediate neighbourhood is eligible. This path is used solely
+    -- after the declared chapter's source text cannot be matched, so ordinary
+    -- books keep the existing exact mapping unchanged.
+    for distance = 1, 2 do
+        for _, index in ipairs({primary_index - distance, primary_index + distance}) do
+            local row = rows[index]
+            local uid = row and chapter_uid(row.chapter) or ""
+            if row and row.words > 0 and uid ~= "" then
+                out[#out + 1] = {
+                    chapter_uid = uid,
+                    chapter_index = chapter_index(row.chapter, index),
+                    chapter_title = tostring(row.chapter.title or ""),
+                    chapter_word_count = row.words,
+                    total_word_count = total_words,
+                    words_before = row.before,
+                }
+            end
+        end
+    end
+    return out
+end
+
 local function unique_match(text, needle)
     if type(text) ~= "string" or type(needle) ~= "string" or needle == "" then return nil end
     local first = text:find(needle, 1, true)
@@ -364,6 +400,7 @@ function M.capture(ui, record, catalog)
         anchor_chars = U.utf8_len(anchor_text),
         book_version = tonumber(record.book and (record.book.version or record.book.bookVersion))
             or tonumber(record.record and (record.record.book_version or record.record.bookVersion)) or 0,
+        chapter_candidates = catalog_neighbor_candidates(catalog, catalog_row.index, catalog_row.total),
     }
 end
 

@@ -114,6 +114,7 @@ function Adapter.run(job)
         wr_ticket = job.wr_ticket or "",
         wr_wrpa = job.wr_wrpa or "",
         allow_renewal = job.allow_renewal == true,
+        time_only = job.time_only == true,
         force_context = job.force_context == true,
         context_only = job.context_only == true,
     }
