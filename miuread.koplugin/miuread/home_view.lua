@@ -1016,7 +1016,7 @@ function HomeWidget:_build_header(children, m)
     add_status("sync",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
         align="center",Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
         HorizontalSpan:new{width=UiScale.dp(2,1,3)},sync_value_cell,
-    }},self.opts.on_quick_panel)
+    }},self.opts.on_sync or self.opts.on_quick_panel)
 
     add_status("battery",status_w,CenterContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
         align="center",Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
@@ -1281,10 +1281,10 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     local actions = self.opts.home_actions or {}
     local tabs_h = math.max(UiScale.dp(34, 31, 44), math.min(UiScale.dp(46, 37, 52), math.floor(m.body_h * .050)))
     local shelf_subtabs = self.opts.shelf_subtabs or {}
-    -- A second shelf-level selector is used by 本地书库 only. It is rendered
-    -- only when both local views are enabled; with a single enabled view the
-    -- row disappears entirely and the grid keeps the original vertical space.
-    local subtabs_h = #shelf_subtabs > 1
+    -- A second shelf-level selector is used by 本地书库 only. The root row is
+    -- hidden when only one view is enabled; inside a child folder one compact
+    -- breadcrumb row remains so the user can go back without leaving Home.
+    local subtabs_h = #shelf_subtabs > 0
         and math.max(UiScale.dp(29, 26, 39), math.min(UiScale.dp(38, 32, 45), math.floor(m.body_h * .041)))
         or 0
     local books = self.opts.shelf_books or {}

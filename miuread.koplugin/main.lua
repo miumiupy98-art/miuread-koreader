@@ -3192,27 +3192,44 @@ function Plugin:_home_preferences()
         changed=true
     end
     if type(home.ui_font_face)~="string" then home.ui_font_face=""; changed=true end
-    -- beta.13 no longer maintains a recursive local-library index. The old
-    -- scan preferences remain untouched for downgrade compatibility; only one
-    -- browser entry directory is used by the new code.
+    -- beta.6 makes the local-library root an explicit user choice. Historical
+    -- device-wide roots such as /mnt/us were selected automatically by older
+    -- builds and must not silently keep scanning unrelated folders after the
+    -- upgrade. Genuine custom roots from older builds are preserved.
     if type(home.local_entry_root)~="string" then home.local_entry_root=""; changed=true end
-    if (tonumber(home.local_entry_version) or 0)<1 then
+    if (tonumber(home.local_entry_version) or 0)<2 then
         local function usable(path)
-            path=U.trim(tostring(path or ""))
+            path=LocalLibrary.normalize(U.trim(tostring(path or "")))
             return path~="" and lfs.attributes(path,"mode")=="directory" and path or nil
         end
-        local entry=usable(home.local_entry_root) or usable(home.local_root)
-        if not entry then
-            for _,root in ipairs(type(home.local_roots)=="table" and home.local_roots or {}) do
-                entry=usable(type(root)=="table" and root.path or root)
-                if entry then break end
+        local function automatic_boundary(path)
+            path=LocalLibrary.normalize(path)
+            return path=="/mnt/us" or path=="/mnt/onboard"
+                or path=="/storage/emulated/0" or path=="/sdcard"
+        end
+        local entry=usable(home.local_entry_root)
+        if not entry and (tonumber(home.local_entry_version) or 0)<1 then
+            entry=usable(home.local_root)
+            if not entry then
+                for _,root in ipairs(type(home.local_roots)=="table" and home.local_roots or {}) do
+                    entry=usable(type(root)=="table" and root.path or root)
+                    if entry then break end
+                end
             end
         end
+        if entry and automatic_boundary(entry) then entry=nil end
         home.local_entry_root=entry or ""
-        home.local_entry_version=1
+        home.local_entry_user_set=entry~=nil
+        home.local_entry_version=2
+        home.local_shelf_folder_path=""
         changed=true
+    elseif home.local_entry_user_set~=true then
+        -- Version 2+ has no automatic fallback. An unset root stays unset until
+        -- the user confirms a folder in the local-library settings.
+        if home.local_entry_root~="" then home.local_entry_root=""; changed=true end
     end
-    if (tonumber(home.local_browse_version) or 0)<4 then home.local_browse_version=4; changed=true end
+    if type(home.local_shelf_folder_path)~="string" then home.local_shelf_folder_path=""; changed=true end
+    if (tonumber(home.local_browse_version) or 0)<5 then home.local_browse_version=5; changed=true end
     -- Local library has two presentation modes on the Home shelf. They share
     -- one physical index; these switches only control which views the user can
     -- select. Keep at least one mode enabled and hide the mode row when only
@@ -5016,11 +5033,13 @@ function Plugin:_home_apply_section(section)
         on_open_book=function(book,anchor,ges) self:_home_open_book(book,anchor,ges) end,
         home_actions=self:_home_action_entries(),
         on_shelf_all=function()
-            if section=="local" then self:show_home_local_library()
+            if section=="local" then
+                if self:_home_root()=="" then self:local_library_directory_dialog()
+                else self:show_home_local_library() end
             else self:show_home_all_books() end
         end,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
-        section_cache_key=section=="local" and (section..":"..self:_home_local_shelf_mode(home)) or section,
+        section_cache_key=section=="local" and (section..":"..self:_home_local_shelf_mode(home)..":"..self:_home_local_current_folder(home)) or section,
         section_revision=self:_home_section_cache_revision(section,page),
     }
     -- Section switching must remain a pure in-memory operation. Metadata,
@@ -7193,47 +7212,69 @@ end
 
 
 
-function Plugin:_home_root()
-    -- beta.4: MiuRead only chooses the device user-storage boundary. File
-    -- discovery and format support below that boundary follow KOReader. This
-    -- deliberately includes sibling folders such as /mnt/us/Books on Kindle.
+function Plugin:_home_device_storage_root()
     local native_home=""
     if _G.G_reader_settings and type(_G.G_reader_settings.readSetting)=="function" then
         local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"home_dir")
         if ok then native_home=LocalLibrary.normalize(U.trim(tostring(value or ""))) end
-    end
-    local download_root=LocalLibrary.normalize(self.store.default_books_dir or "")
-    local function usable(path)
-        path=LocalLibrary.normalize(path or "")
-        if path=="" or path=="/" or lfs.attributes(path,"mode")~="directory" then return nil end
-        if download_root~="" and (path==download_root or path:sub(1,#download_root+1)==download_root.."/") then return nil end
-        return path
     end
     local function device_is(method)
         if not Device or type(Device[method])~="function" then return false end
         local ok,value=pcall(Device[method],Device)
         return ok and value==true
     end
-
     local candidates={}
-    if native_home=="/mnt/us" or native_home:sub(1,8)=="/mnt/us/" or device_is("isKindle") then
-        candidates={"/mnt/us",native_home}
-    elseif native_home=="/mnt/onboard" or native_home:sub(1,13)=="/mnt/onboard/" or device_is("isKobo") then
+    if device_is("isKindle") or native_home=="/mnt/us" or native_home:sub(1,8)=="/mnt/us/" then
+        candidates={"/mnt/us",native_home,"/mnt/us/documents"}
+    elseif device_is("isKobo") or native_home=="/mnt/onboard" or native_home:sub(1,13)=="/mnt/onboard/" then
         candidates={"/mnt/onboard",native_home}
     elseif device_is("isAndroid") then
-        -- Android storage permissions vary by build. Prefer KOReader's own
-        -- configured home first, then the ordinary shared-storage roots.
         candidates={native_home,"/storage/emulated/0","/sdcard"}
     else
         candidates={native_home,"/mnt/us","/mnt/onboard","/storage/emulated/0","/sdcard"}
     end
     for _,candidate in ipairs(candidates) do
-        local path=usable(candidate)
-        if path then return path end
+        local path=LocalLibrary.normalize(candidate)
+        if path~="" and path~="/" and lfs.attributes(path,"mode")=="directory" then return path end
     end
-    local parent=usable(LocalLibrary.dirname(download_root))
-    if parent then return parent end
     return ""
+end
+
+function Plugin:_home_root()
+    -- beta.6: the local-library root is a user-owned setting. Never fall back
+    -- to the whole device storage here; an unset root deliberately means
+    -- "show setup guidance instead of scanning".
+    local home=self:_home_preferences()
+    if home.local_entry_user_set~=true then return "" end
+    local root=LocalLibrary.normalize(U.trim(tostring(home.local_entry_root or "")))
+    if root=="" or root=="/" or lfs.attributes(root,"mode")~="directory" then return "" end
+    return root
+end
+
+function Plugin:_home_local_path_within_root(path,root)
+    path=LocalLibrary.normalize(path)
+    root=LocalLibrary.normalize(root or self:_home_root())
+    if path=="" or root=="" then return false end
+    return path==root or path:sub(1,#root+1)==root.."/"
+end
+
+function Plugin:_home_local_current_folder(home,root)
+    home=type(home)=="table" and home or self:_home_preferences()
+    root=LocalLibrary.normalize(root or self:_home_root())
+    if root=="" then return "" end
+    local path=LocalLibrary.normalize(home.local_shelf_folder_path or "")
+    if not self:_home_local_path_within_root(path,root) or lfs.attributes(path,"mode")~="directory" then
+        path=root
+    end
+    return path
+end
+
+function Plugin:_home_local_relative_path(path,root)
+    path=LocalLibrary.normalize(path)
+    root=LocalLibrary.normalize(root or self:_home_root())
+    if path=="" or root=="" or path==root then return "" end
+    if path:sub(1,#root+1)~=root.."/" then return LocalLibrary.basename(path) end
+    return path:sub(#root+2)
 end
 
 function Plugin:_home_local_excluded_paths(root)
@@ -7292,8 +7333,11 @@ function Plugin:_home_local_inline_title()
 end
 
 function Plugin:_home_local_empty_text()
+    if self:_home_root()=="" then
+        return "请先设置书籍和分类所在文件夹\n\n位置：觅阅设置 → 首页与书架 → 本地书库\n\n点击这里去设置"
+    end
     if self._home_local_inline_loading==true then return "正在读取本地书库…" end
-    return "本地存储中暂无可显示的本地书"
+    return "这个文件夹中暂无可显示的本地书"
 end
 
 
@@ -7416,38 +7460,67 @@ function Plugin:_home_local_shelf_mode(home)
 end
 
 function Plugin:_home_local_rows(home)
-    -- One recursive snapshot backs both Home-shelf views. “全部书籍” flattens
-    -- every readable book; “文件夹” shows the root's real folders plus books
-    -- stored directly at that root. No scan is started by switching modes.
+    -- “全部书籍” always reads the root snapshot. Folder mode may point at a
+    -- child directory, but remains on the Home shelf and consumes that child's
+    -- cached snapshot instead of opening a second full-screen browser.
     home=type(home)=="table" and home or self:_home_preferences()
     local root=LocalLibrary.normalize(self:_home_root())
     if root=="" or lfs.attributes(root,"mode")~="directory" then
-        return {},{path=root,root=root,scanned_at=0,folders={},books={},direct_books={},error="本地书入口不可用"},
-            {books=0,folders=0,direct_books=0}
+        return {},{path=root,root=root,scanned_at=0,folders={},books={},direct_books={},error="本地书库尚未设置"},
+            {books=0,folders=0,direct_books=0,path=root,root=root}
     end
     local cache=self:_home_local_tree_cache()
-    local snapshot=type(cache.dirs[root])=="table" and cache.dirs[root] or {
+    local root_snapshot=type(cache.dirs[root])=="table" and cache.dirs[root] or {
         path=root,root=root,scanned_at=0,folders={},books={},direct_books={},
     }
-    local all_folders,all_books=self:_local_browser_decorate(snapshot,root,false)
-    local direct_folders,direct_books=self:_local_browser_decorate(snapshot,root,true)
-    local counts={books=#(all_books or {}),folders=#(direct_folders or {}),direct_books=#(direct_books or {})}
+    local _,all_books=self:_local_browser_decorate(root_snapshot,root,false)
     local mode=self:_home_local_shelf_mode(home)
-    if mode=="folders" then
-        local rows={}
-        for _,folder in ipairs(direct_folders or {}) do rows[#rows+1]=folder end
-        for _,book in ipairs(direct_books or {}) do rows[#rows+1]=book end
-        return rows,snapshot,counts
+    if mode~="folders" then
+        local root_folders,root_direct_books=self:_local_browser_decorate(root_snapshot,root,true)
+        return all_books or {},root_snapshot,{
+            books=#(all_books or {}),folders=#(root_folders or {}),direct_books=#(root_direct_books or {}),
+            path=root,root=root,
+        }
     end
-    return all_books or {},snapshot,counts
+
+    local path=self:_home_local_current_folder(home,root)
+    local snapshot=type(cache.dirs[path])=="table" and cache.dirs[path] or {
+        path=path,root=path,scanned_at=0,folders={},books={},direct_books={},
+    }
+    local direct_folders,direct_books=self:_local_browser_decorate(snapshot,root,true)
+    local rows={}
+    for _,folder in ipairs(direct_folders or {}) do rows[#rows+1]=folder end
+    for _,book in ipairs(direct_books or {}) do rows[#rows+1]=book end
+    return rows,snapshot,{
+        books=#(all_books or {}),folders=#(direct_folders or {}),direct_books=#(direct_books or {}),
+        path=path,root=root,
+    }
 end
 
 function Plugin:_home_local_shelf_tabs(home)
     home=type(home)=="table" and home or self:_home_preferences()
-    if home.local_shelf_show_folders~=true or home.local_shelf_show_books~=true then return {} end
+    local root=LocalLibrary.normalize(self:_home_root())
+    if root=="" then return {} end
     local entry=self._home_sections and self._home_sections["local"] or nil
     local counts=entry and entry.local_counts or {}
     local mode=self:_home_local_shelf_mode(home)
+    local show_folders=home.local_shelf_show_folders==true
+    local show_books=home.local_shelf_show_books==true
+    local path=self:_home_local_current_folder(home,root)
+
+    if mode=="folders" and path~=root then
+        local relative=self:_home_local_relative_path(path,root)
+        relative=U.utf8_truncate(relative~="" and relative or LocalLibrary.basename(path),28,"…")
+        local tabs={{title="‹ "..relative,selected=true,on_tap=function() self:_home_local_go_up() end}}
+        if show_books then
+            tabs[#tabs+1]={title="全部书籍",count=tonumber(counts.books) or 0,selected=false,on_tap=function()
+                self:_set_home_local_shelf_mode("books")
+            end}
+        end
+        return tabs
+    end
+
+    if not (show_folders and show_books) then return {} end
     return {
         {title="文件夹",count=tonumber(counts.folders) or 0,selected=mode=="folders",on_tap=function()
             self:_set_home_local_shelf_mode("folders")
@@ -7456,6 +7529,53 @@ function Plugin:_home_local_shelf_tabs(home)
             self:_set_home_local_shelf_mode("books")
         end},
     }
+end
+
+function Plugin:_home_local_set_folder_path(path,force_refresh)
+    local root=LocalLibrary.normalize(self:_home_root())
+    path=LocalLibrary.normalize(path)
+    if root=="" then return self:local_library_directory_dialog() end
+    if not self:_home_local_path_within_root(path,root) or lfs.attributes(path,"mode")~="directory" then
+        self:toast("这个文件夹已不存在",2)
+        path=root
+    end
+    local home,preferences=self:_home_preferences()
+    home.local_shelf_mode="folders"
+    home.local_shelf_folder_path=path
+    home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
+    home.page_by_section["local"]=1
+    self:_save_home_preferences(home,preferences)
+
+    local cache=self:_home_local_tree_cache()
+    local cached=type(cache.dirs[path])=="table"
+    self._home_local_inline_loading=not cached
+    if self._home_sections then self:_home_apply_local_inline_section(cached) end
+    if cached and force_refresh~=true then return true end
+
+    self:_home_refresh_local_directory(path,function(_snapshot)
+        self._home_local_inline_loading=false
+        if self._home_sections and self:_home_local_shelf_mode()=="folders"
+            and self:_home_local_current_folder()==path then
+            self:_home_apply_local_inline_section(true)
+        end
+    end,true,nil)
+    return true
+end
+
+function Plugin:_home_local_enter_folder(folder)
+    local path=LocalLibrary.normalize(type(folder)=="table" and (folder.folder_path or folder.path) or folder)
+    return self:_home_local_set_folder_path(path,true)
+end
+
+function Plugin:_home_local_go_up()
+    local home=self:_home_preferences()
+    local root=LocalLibrary.normalize(self:_home_root())
+    if root=="" then return self:local_library_directory_dialog() end
+    local current=self:_home_local_current_folder(home,root)
+    if current==root then return true end
+    local parent=LocalLibrary.normalize(LocalLibrary.dirname(current))
+    if not self:_home_local_path_within_root(parent,root) then parent=root end
+    return self:_home_local_set_folder_path(parent,false)
 end
 
 function Plugin:_set_home_local_shelf_mode(mode)
@@ -7468,7 +7588,16 @@ function Plugin:_set_home_local_shelf_mode(mode)
     home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
     home.page_by_section["local"]=1
     self:_save_home_preferences(home,preferences)
-    if self._home_sections then self:_home_apply_local_inline_section(true) end
+    if self._home_sections then
+        self:_home_apply_local_inline_section(true)
+        if mode=="folders" then
+            local path=self:_home_local_current_folder(home)
+            local cache=self:_home_local_tree_cache()
+            if path~="" and type(cache.dirs[path])~="table" then
+                self:_home_local_set_folder_path(path,true)
+            end
+        end
+    end
     return true
 end
 
@@ -7519,7 +7648,10 @@ function Plugin:_home_ensure_local_inline_loaded(force,user_requested)
     if root=="" or lfs.attributes(root,"mode")~="directory" then
         self._home_local_inline_loading=false
         self:_home_apply_local_inline_section(false)
-        if user_requested==true then self:toast("暂时找不到 KOReader 可访问的本地书目录",2) end
+        if user_requested==true then
+            if root=="" then return self:local_library_directory_dialog() end
+            self:toast("书库位置已不可用，请重新设置",2)
+        end
         return false
     end
     if self._home_local_inline_loading==true and self._home_local_inline_path==root then return true end
@@ -7554,8 +7686,14 @@ function Plugin:_home_ensure_local_inline_loaded(force,user_requested)
 end
 
 function Plugin:_home_handle_back()
-    -- Folder navigation lives in the dedicated local-library browser. Keep
-    -- this compatibility hook from changing Home Back behavior.
+    if self._home_active_section=="local" and self:_home_local_shelf_mode()=="folders" then
+        local root=LocalLibrary.normalize(self:_home_root())
+        local current=self:_home_local_current_folder()
+        if root~="" and current~="" and current~=root then
+            self:_home_local_go_up()
+            return true
+        end
+    end
     return false
 end
 
@@ -8175,8 +8313,9 @@ function Plugin:_home_open_book(book,anchor,ges,direct_read)
     if book and (book.local_folder==true or book.kind=="folder") then
         local folder=LocalLibrary.normalize(book.folder_path or book.path or "")
         if self._home_active_section=="local" and folder~="" then
-            local root=LocalLibrary.normalize(self:_home_root())
-            return self:show_local_browser(folder,{path=root~="" and root or folder,name="本地书库"},{},false)
+            -- Stay on the Home shelf: folder navigation only replaces the local
+            -- shelf content and never opens the separate full-screen browser.
+            return self:_home_local_enter_folder(folder)
         end
         return self:_home_open_koreader_filemanager(folder,true)
     end
@@ -10852,7 +10991,8 @@ end
 function Plugin:_open_local_library_mode(mode)
     local path=LocalLibrary.normalize(self:_home_root())
     if path=="" or lfs.attributes(path,"mode")~="directory" then
-        self:info("暂时找不到 KOReader 可访问的本地书目录。")
+        if path=="" then return self:local_library_directory_dialog() end
+        self:info("书库位置已不可用，请重新设置。")
         return false
     end
     mode=mode=="folders" and "folders" or "books"
@@ -16443,6 +16583,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         screensaver_file=screensaver_file,
         screensaver_book_file=normalized_reader_file(hero and hero.file or nil),
         on_quick_panel=function() self:show_home_quick_panel() end,
+        on_sync=function() self:_home_open_sync_status() end,
         on_bluetooth=function() self:_bluetooth_toggle() end,
         on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
@@ -16454,11 +16595,13 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         on_open_book=function(book,anchor,ges) self:_home_open_book(book,anchor,ges) end,
         home_actions=self:_home_action_entries(),
         on_shelf_all=function()
-            if active=="local" then self:show_home_local_library()
+            if active=="local" then
+                if self:_home_root()=="" then self:local_library_directory_dialog()
+                else self:show_home_local_library() end
             else self:show_home_all_books() end
         end,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
-        section_cache_key=active=="local" and (active..":"..self:_home_local_shelf_mode(home)) or active,
+        section_cache_key=active=="local" and (active..":"..self:_home_local_shelf_mode(home)..":"..self:_home_local_current_folder(home)) or active,
         section_revision=self:_home_section_cache_revision(active,shelf_page),
         on_close=function(current)
             if self._home_view==current then self._home_view=nil end
@@ -20853,7 +20996,7 @@ function Plugin:_home_sync_summary(force)
     local progress,time_count,progress_failed,progress_unconfirmed=0,0,0,0
     local progress_active,progress_waiting=0,0
     local pending_progress_states={
-        waiting_network=true,uploading=true,retrying=true,upload_unconfirmed=true,upload_failed=true,
+        waiting_network=true,uploading=true,retrying=true,finalizing=true,upload_unconfirmed=true,upload_failed=true,
         verifying_upload=true,deferred=true,verification_required=true,remote_jump_unconfirmed=true,
     }
     local now=os.time()
@@ -20867,7 +21010,7 @@ function Plugin:_home_sync_summary(force)
             local replayable=self:_progress_snapshot_replayable(pending)
             local worker_age=now-(tonumber(session.progress_worker_updated_at or 0) or 0)
             local worker_alive=session.progress_worker_active==true and worker_age>=0 and worker_age<=90
-            if (state=="uploading" or state=="retrying" or state=="verifying_upload") and not worker_alive then
+            if (state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="finalizing") and not worker_alive then
                 state=replayable and "deferred" or "verification_required"
             end
             -- beta.6: a historical state string without an immutable pending
@@ -20882,11 +21025,15 @@ function Plugin:_home_sync_summary(force)
                     progress_waiting=progress_waiting+1
                 elseif state=="upload_failed" then
                     progress_failed=progress_failed+1
-                elseif state=="upload_unconfirmed" or state=="remote_jump_unconfirmed" then
+                elseif state=="upload_unconfirmed" or state=="remote_jump_unconfirmed"
+                    or state=="deferred" or state=="verification_required" then
+                    -- These states all describe a durable exact snapshot that
+                    -- has not yet been confirmed by cloud readback. Surface
+                    -- them consistently as “进度待确认”, not “待同步”.
                     progress_unconfirmed=progress_unconfirmed+1
-                elseif state=="uploading" or state=="retrying" or state=="verifying_upload" then
+                elseif state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="finalizing" then
                     progress_active=progress_active+1
-                elseif state=="waiting_network" or state=="deferred" or state=="verification_required" then
+                elseif state=="waiting_network" then
                     progress_waiting=progress_waiting+1
                 end
             elseif live_without_snapshot then
@@ -20948,19 +21095,29 @@ function Plugin:_home_sync_status_label(force)
     return "已同步"
 end
 
+function Plugin:_home_open_sync_status()
+    -- The header sync cell is a real navigation target. Resolve already
+    -- verified ghosts first, then jump straight to actionable progress items;
+    -- otherwise show the ordinary sync overview.
+    self:_clear_verified_progress_ghosts()
+    local items=self:_progress_sync_issue_items()
+    if #items>0 then return self:show_progress_sync_issues() end
+    return self:show_sync_status(false)
+end
+
 function Plugin:_progress_sync_issue_items()
     local sessions=self:_persisted_sessions()
     local library=self:_persisted_library()
     local items={}
     local labels={
-        upload_unconfirmed="等待自动重试",verifying_upload="正在确认",
-        waiting_network="等待网络",upload_failed="等待自动重试",
-        remote_jump_unconfirmed="等待自动重试",verification_required="需要确认",
-        uploading="正在上传",retrying="正在重试",deferred="等待自动重试",
+        upload_unconfirmed="等待云端确认",verifying_upload="正在确认",
+        waiting_network="等待网络",upload_failed="提交失败",
+        remote_jump_unconfirmed="位置待确认",verification_required="需要确认",
+        uploading="正在上传",retrying="正在重试",finalizing="正在提交",deferred="等待确认",
     }
     local pending_states={
         upload_unconfirmed=true,verifying_upload=true,waiting_network=true,upload_failed=true,
-        remote_jump_unconfirmed=true,verification_required=true,uploading=true,retrying=true,deferred=true,
+        remote_jump_unconfirmed=true,verification_required=true,uploading=true,retrying=true,finalizing=true,deferred=true,
     }
     local now=os.time()
     for id,session in pairs(sessions) do
@@ -20974,7 +21131,7 @@ function Plugin:_progress_sync_issue_items()
                 local replayable,replay_reason=self:_progress_snapshot_replayable(pending_progress)
                 local worker_age=now-(tonumber(session.progress_worker_updated_at or 0) or 0)
                 local worker_alive=session.progress_worker_active==true and worker_age>=0 and worker_age<=90
-                if (state=="uploading" or state=="retrying" or state=="verifying_upload") and not worker_alive then
+                if (state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="finalizing") and not worker_alive then
                     state=replayable and "deferred" or "verification_required"
                 end
                 local book=type(library[tostring(id)])=="table" and library[tostring(id)] or {}
@@ -20982,15 +21139,23 @@ function Plugin:_progress_sync_issue_items()
                 if title=="" then title="书籍 "..tostring(id) end
                 local reason=tostring(session.progress_sync_message or session.progress_upload_error or "待处理")
                 local localp=tonumber(session.progress_local_percent) or tonumber(pending_progress.progress)
-                local can_replay=replayable==true and state~="uploading" and state~="retrying" and state~="verifying_upload"
+                local can_replay=replayable==true and state~="uploading" and state~="retrying"
+                    and state~="verifying_upload" and state~="finalizing"
+                local pending_reason=tostring(pending_progress.pending_reason or session.progress_last_verify_reason or "")
+                local explicit_mismatch=pending_reason=="chapter_offset_mismatch" or pending_reason=="chapter_mismatch"
+                    or pending_reason=="position_mismatch" or pending_reason=="remote_position_mismatch"
+                local can_resubmit=replayable==true and (session.progress_resubmit_allowed==true
+                    or state=="upload_failed" or explicit_mismatch)
                 items[#items+1]={
                     book_id=tostring(id),title=title,state=state,
                     state_label=replayable and (labels[state] or "待处理") or "需要打开本书确认",
                     reason=replayable and reason or "本地只剩不完整的位置记录，无法安全重传",
                     local_percent=localp,
                     can_verify=can_replay,
+                    can_resubmit=can_resubmit,
                     replayable=replayable==true,
                     replay_reason=replay_reason,
+                    pending_reason=pending_reason,
                     pending_progress=pending_progress,
                     decided_at=tonumber(session.progress_decided_at or session.progress_upload_pending_at or 0) or 0,
                 }
@@ -21005,6 +21170,10 @@ function Plugin:_progress_sync_issue_items()
 end
 
 function Plugin:_retry_saved_progress_verification(item,callback)
+    -- Despite the historical function name this is now VERIFY-ONLY. A pending
+    -- progress item is often already accepted by WeRead; pressing “重新确认”
+    -- must never create another write unless the user explicitly chooses the
+    -- separate resubmit action after a confirmed mismatch.
     callback=type(callback)=="function" and callback or function() end
     item=type(item)=="table" and item or {}
     local book_id=tostring(item.book_id or "")
@@ -21013,14 +21182,11 @@ function Plugin:_retry_saved_progress_verification(item,callback)
     if not self:logged_in() then callback(false,"请先登录微信读书账号"); return false end
     if self:_network_radio_hint()==false then callback(false,"当前 Wi-Fi 未开启"); return false end
 
-    -- Home and Reader may own different Store instances. Always read the
-    -- persisted per-book snapshot before replaying it so a stale Home item can
-    -- never resurrect an already-verified older sequence.
     local sessions=self:_persisted_sessions()
     local session=type(sessions[book_id])=="table" and sessions[book_id] or {}
     local current=type(session.pending_progress)=="table" and U.copy(session.pending_progress) or nil
     if not current then
-        logger.info("[MiuRead][ProgressRetry] stale home item skipped","book=",book_id,"reason=no_pending")
+        logger.info("[MiuRead][ProgressConfirm] stale home item skipped","book=",book_id,"reason=no_pending")
         callback(true,"已由较新的同步结果处理")
         return true
     end
@@ -21029,13 +21195,12 @@ function Plugin:_retry_saved_progress_verification(item,callback)
     local verified_seq=tonumber(session.progress_verified_sequence or 0) or 0
     if current_seq>0 and verified_seq>=current_seq then
         self:_clear_pending_progress(book_id,current_seq)
-        self:_save_progress_state(book_id,"local_uploaded","此前进度已经确认",tonumber(current.progress),nil,current_seq)
-        logger.info("[MiuRead][ProgressRetry] verified ghost pending cleared","book=",book_id,"seq=",tostring(current_seq))
+        logger.info("[MiuRead][ProgressConfirm] verified ghost pending cleared","book=",book_id,"seq=",tostring(current_seq))
         callback(true,"此前进度已经确认")
         return true
     end
     if requested_seq>0 and current_seq>0 and requested_seq~=current_seq then
-        logger.info("[MiuRead][ProgressRetry] stale home item skipped",
+        logger.info("[MiuRead][ProgressConfirm] stale home item skipped",
             "book=",book_id,"requested_seq=",tostring(requested_seq),"current_seq=",tostring(current_seq))
         callback(true,"已由较新的阅读位置替代")
         return true
@@ -21057,43 +21222,71 @@ function Plugin:_retry_saved_progress_verification(item,callback)
 
     local position=self:_prepare_progress_snapshot(book_id,current) or current
     local seq=tonumber(position.progress_sequence or 0) or 0
+    local original_state=tostring(session.progress_sync_state or "")
+    self.store:save_session(book_id,{progress_resubmit_allowed=false,progress_last_verify_reason=false})
     self:_save_progress_state(book_id,"verifying_upload","正在重新读取云端位置确认",
         tonumber(position.progress),nil,seq)
-    local started=self:_submit_progress_snapshot(book_id,position,{
-        verify_first=true,retry_count=1,detached=true,
-        reason="saved_pending_verified",
-        pending_reason="saved_pending_check",
-        verifying_message="正在重新读取云端位置确认",
-        uploading_message="云端未收到，正在从主页重新提交本地精确位置",
-        retrying_message="正在重新提交同一精确位置",
-        success_message="此前提交的进度已从云端确认",
-        unconfirmed_message="已重新提交，但云端位置仍未确认",
-        record_override=record_snapshot,
+    local started=self:_verify_progress_submission(book_id,position,{
+        reason="saved_pending_verified",verify_delays={1,6,18},detached=true,
         record_snapshot=record_snapshot,
-        verify_delays={2,8,20},retry_delay=1.0,
-    },function(ok,remote,err,submitted)
-        if err=="superseded" then callback(true,"已由较新的阅读位置替代",remote); return end
-        if ok then
-            self:_save_progress_state(book_id,"local_uploaded","此前提交的进度已从云端确认",
-                tonumber(submitted and submitted.progress),remote and remote.percent,
-                submitted and submitted.progress_sequence)
-        else
-            local current_sessions=self:_persisted_sessions()
-            local current_session=type(current_sessions[book_id])=="table" and current_sessions[book_id] or {}
-            local pending_now=type(current_session.pending_progress)=="table" and current_session.pending_progress or nil
-            if pending_now then
-                self:_save_progress_state(book_id,"upload_unconfirmed","已重新提交，等待下次自动重试",
-                    tonumber(submitted and submitted.progress),remote and remote.percent,
-                    submitted and submitted.progress_sequence)
-            end
+    },function(verified,remote,verify_error,meta)
+        if verify_error=="superseded" then callback(true,"已由较新的阅读位置替代",remote); return end
+        if verified then
+            callback(true,"云端位置已经确认",remote)
+            return
         end
-        self._home_sync_summary_cache=nil
-        self._home_sync_summary_cache_at=nil
-        if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("header") end
+        local reason=tostring(verify_error or (meta and meta.reason) or "cloud_not_confirmed")
+        local explicit_mismatch=type(remote)=="table" and (
+            reason=="chapter_offset_mismatch" or reason=="chapter_mismatch"
+            or reason=="position_mismatch" or reason=="remote_position_mismatch"
+        )
+        local can_resubmit=explicit_mismatch or original_state=="upload_failed"
+        self.store:save_session(book_id,{
+            progress_resubmit_allowed=can_resubmit,
+            progress_last_verify_reason=reason,
+            progress_last_verify_at=os.time(),
+        })
+        self:_save_progress_state(book_id,can_resubmit and "upload_unconfirmed" or "verification_required",
+            can_resubmit and "云端位置与已提交位置不一致，可选择重新提交"
+                or "本次重新确认暂未完成，已保留原提交位置",
+            tonumber(position.progress),remote and remote.percent,seq)
+        callback(false,reason,remote)
+    end)
+    if not started then callback(false,"同步确认任务正在运行") end
+    return started
+end
+
+function Plugin:_resubmit_saved_progress(item,callback)
+    callback=type(callback)=="function" and callback or function() end
+    item=type(item)=="table" and item or {}
+    local book_id=tostring(item.book_id or "")
+    local sessions=self:_persisted_sessions()
+    local session=type(sessions[book_id])=="table" and sessions[book_id] or {}
+    local current=type(session.pending_progress)=="table" and U.copy(session.pending_progress) or nil
+    if book_id=="" or not current then callback(false,"当前已没有待确认进度"); return false end
+    if session.progress_resubmit_allowed~=true and tostring(session.progress_sync_state or "")~="upload_failed" then
+        callback(false,"请先重新确认云端位置；只有明确不一致时才允许重新提交")
+        return false
+    end
+    if not self:logged_in() then callback(false,"请先登录微信读书账号"); return false end
+    if self:_network_radio_hint()==false then callback(false,"当前 Wi-Fi 未开启"); return false end
+    local record_snapshot,record_error=self:_stored_progress_record(book_id)
+    if not record_snapshot then callback(false,tostring(record_error or "缺少书籍同步上下文")); return false end
+    local position=self:_prepare_progress_snapshot(book_id,current) or current
+    self.store:save_session(book_id,{progress_resubmit_allowed=false,progress_last_verify_reason=false})
+    return self:_submit_progress_snapshot(book_id,position,{
+        retry_count=0,detached=true,reason="manual_pending_resubmit",
+        pending_reason="manual_resubmit_queued",pending_already_saved=true,
+        uploading_message="正在重新提交同一精确位置",
+        verifying_message="重新提交完成，正在确认云端位置",
+        success_message="重新提交的进度已从云端确认",
+        unconfirmed_message="已重新提交，仍等待云端确认",
+        failed_message="重新提交暂未完成",
+        record_override=record_snapshot,record_snapshot=record_snapshot,
+        verify_delays={3,10,24},
+    },function(ok,remote,err)
         callback(ok,err,remote)
     end)
-    if not started then callback(false,"同步任务正在运行") end
-    return started
 end
 
 function Plugin:_retry_all_saved_progress_verifications(items,silent,on_done)
@@ -21101,12 +21294,12 @@ function Plugin:_retry_all_saved_progress_verifications(items,silent,on_done)
     local queue={}
     for _,item in ipairs(items) do if item.can_verify then queue[#queue+1]=item end end
     if #queue==0 then
-        if silent~=true then self:toast("当前没有可直接重新处理的进度",2) end
+        if silent~=true then self:toast("当前没有可重新确认的进度",2) end
         if on_done then on_done(false,0,0) end
         return false
     end
     if silent~=true then
-        self:status_toast("阅读进度","正在处理 "..tostring(#queue).." 本书的待同步位置……",3)
+        self:status_toast("阅读进度","正在重新确认 "..tostring(#queue).." 本书的云端位置……",3)
     end
     local index,verified=1,0
     local function next_one()
@@ -21115,7 +21308,7 @@ function Plugin:_retry_all_saved_progress_verifications(items,silent,on_done)
             self._home_sync_summary_cache_at=nil
             if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("header") end
             if silent~=true then
-                self:status_toast("阅读进度处理完成","已完成 "..tostring(verified).." / "..tostring(#queue),3)
+                self:status_toast("阅读进度确认完成","已确认 "..tostring(verified).." / "..tostring(#queue).."；其余项目继续保留",3)
             end
             if on_done then on_done(true,verified,#queue) end
             return
@@ -21186,14 +21379,62 @@ function Plugin:_schedule_home_progress_recovery(delay)
     return true
 end
 
+function Plugin:_show_progress_sync_issue_detail(item)
+    item=type(item)=="table" and item or {}
+    local latest
+    for _,candidate in ipairs(self:_progress_sync_issue_items()) do
+        if tostring(candidate.book_id or "")==tostring(item.book_id or "") then latest=candidate; break end
+    end
+    if not latest then self:toast("这条进度已经处理完成",2); return true end
+    item=latest
+    local pending=type(item.pending_progress)=="table" and item.pending_progress or {}
+    local chapter=tostring(pending.chapter_uid or pending.chapter_index or "—")
+    local co=tostring(pending.canonical_offset or pending.chapter_offset or pending.offset or "—")
+    local percent=tonumber(item.local_percent or pending.progress)
+    local rows={
+        {text="书籍",post_text=U.utf8_truncate(item.title,28,"…"),enabled=false},
+        {text="本机位置",post_text=percent and string.format("%.1f%%",percent) or "—",enabled=false},
+        {text="章节坐标",post_text="第"..chapter.."章 · co "..co,enabled=false},
+        {text="状态",post_text=tostring(item.state_label or "待确认"),enabled=false},
+        {text="提交时间",post_text=(tonumber(pending.submitted_at or pending.captured_at or item.decided_at or 0) or 0)>0
+            and U.now_text(tonumber(pending.submitted_at or pending.captured_at or item.decided_at)) or "—",enabled=false},
+        {text="原因",post_text=U.utf8_truncate(tostring(item.reason or "等待云端确认"),42,"…"),enabled=false},
+    }
+    if item.can_verify then
+        rows[#rows+1]={text="重新确认",post_text="只读取云端位置，不重复上传",callback=function()
+            self:status_toast("阅读进度","正在重新确认《"..U.utf8_truncate(item.title,18,"…").."》",3)
+            self:_retry_saved_progress_verification(item,function(ok,err)
+                if ok then
+                    self:status_toast("阅读进度同步完成","云端位置已经确认",3)
+                else
+                    self:status_toast("阅读进度仍待确认",U.first_line(tostring(err or item.reason),60),3)
+                end
+                self._home_sync_summary_cache=nil; self._home_sync_summary_cache_at=nil
+                if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("header") end
+            end)
+        end}
+    end
+    if item.can_resubmit then
+        rows[#rows+1]={text="重新提交进度",post_text="仅在云端位置明确不一致时使用",callback=function()
+            self:status_toast("阅读进度","正在重新提交同一精确位置",3)
+            self:_resubmit_saved_progress(item,function(ok,err)
+                if ok then self:status_toast("阅读进度同步完成","重新提交的进度已从云端确认",3)
+                else self:status_toast("重新提交暂未完成",U.first_line(tostring(err or "等待后续确认"),60),3) end
+            end)
+        end}
+    end
+    return self:_show_miuread_menu("待确认进度",rows,{page_size=8})
+end
+
 function Plugin:show_progress_sync_issues()
+    self:_clear_verified_progress_ghosts()
     local items=self:_progress_sync_issue_items()
-    if #items==0 then self:toast("当前没有未完成的阅读进度同步",2); return true end
+    if #items==0 then self:toast("当前没有待确认的阅读进度",2); return true end
     local rows={}
     local verify_count=0
     for _,item in ipairs(items) do if item.can_verify then verify_count=verify_count+1 end end
     if verify_count>0 then
-        rows[#rows+1]={text="重新处理待同步进度",post_text=tostring(verify_count).." 本 · 先确认云端，必要时从主页重传",
+        rows[#rows+1]={text="重新确认待确认进度",post_text=tostring(verify_count).." 本 · 只读取云端，不重复上传",
             callback=function() self:_retry_all_saved_progress_verifications(items) end}
     end
     for _,item in ipairs(items) do
@@ -21201,21 +21442,10 @@ function Plugin:show_progress_sync_issues()
         rows[#rows+1]={
             text=U.utf8_truncate(item.title,30,"…"),
             post_text=suffix..item.state_label.." · "..U.utf8_truncate(item.reason,34,"…"),
-            callback=function()
-                if item.can_verify then
-                    self:status_toast("阅读进度","正在处理《"..U.utf8_truncate(item.title,18,"…").."》……",3)
-                    self:_retry_saved_progress_verification(item,function(ok,err)
-                        if ok then self:status_toast("阅读进度","进度已处理",3)
-                        else self:info("暂未完成：\n"..tostring(err or item.reason)) end
-                    end)
-                else
-                    self:info("《"..item.title.."》\n\n状态："..item.state_label.."\n"..item.reason
-                        .."\n\n本地缺少可安全重传的精确章节坐标，需要打开本书重新确认一次。")
-                end
-            end,
+            callback=function() self:_show_progress_sync_issue_detail(item) end,
         }
     end
-    return self:list("阅读进度同步状态",rows,"当前没有未完成的阅读进度同步")
+    return self:list("待确认进度",rows,"当前没有待确认的阅读进度")
 end
 
 function Plugin:_sync_all_pending_annotations(on_done)
@@ -21468,6 +21698,14 @@ function Plugin:toggle_progress_sync(_confirmed)
     return self:set_progress_upload_mode("manual")
 end
 
+function Plugin:_invalidate_home_sync_status()
+    self._home_sync_summary_cache=nil
+    self._home_sync_summary_cache_at=nil
+    if HomeView.is_shown() and not self:_active_reader_ui() then
+        self:_notify_home_data_changed("header")
+    end
+end
+
 function Plugin:_save_progress_state(id,state,message,localp,remotep,sequence)
     id=tostring(id or "")
     if id=="" then return false end
@@ -21483,7 +21721,7 @@ function Plugin:_save_progress_state(id,state,message,localp,remotep,sequence)
             return false
         end
     end
-    local worker_active=state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="settling"
+    local worker_active=state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="finalizing" or state=="settling"
     self.store:save_session(id,{
         progress_sync_state=state,
         progress_sync_message=message,
@@ -21493,6 +21731,7 @@ function Plugin:_save_progress_state(id,state,message,localp,remotep,sequence)
         progress_worker_active=worker_active,
         progress_worker_updated_at=os.time(),
     })
+    self:_invalidate_home_sync_status()
     return true
 end
 function Plugin:ensure_read_report_progress(reason,automatic)
@@ -21757,7 +21996,8 @@ function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
     if sync_state~=nil then
         pending_update.progress_sync_state=tostring(sync_state)
         pending_update.progress_sync_message=tostring(reason or "")
-        pending_update.progress_worker_active=sync_state=="uploading" or sync_state=="retrying" or sync_state=="verifying_upload"
+        pending_update.progress_worker_active=sync_state=="uploading" or sync_state=="retrying"
+            or sync_state=="verifying_upload" or sync_state=="finalizing"
         pending_update.progress_worker_updated_at=os.time()
     end
     self.store:save_session(book_id,pending_update)
@@ -21766,6 +22006,7 @@ function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
         "chapter=",tostring(snapshot.chapter_uid or "-"),
         "co=",tostring(snapshot.canonical_offset or snapshot.chapter_offset or snapshot.offset or "-"),
         "reason=",snapshot.pending_reason)
+    self:_invalidate_home_sync_status()
     return true
 end
 
@@ -21782,7 +22023,67 @@ function Plugin:_clear_pending_progress(book_id,position_or_sequence)
             "book=",book_id,"pending_seq=",tostring(pending_seq),"clear_seq=",tostring(target_seq))
         return false
     end
-    self.store:save_session(book_id,{pending_progress=false,progress_upload_error=false,progress_worker_active=false,progress_worker_updated_at=os.time()})
+    local verified_seq=tonumber(session.progress_verified_sequence or 0) or 0
+    local update={
+        pending_progress=false,progress_upload_error=false,progress_upload_pending_at=false,
+        progress_worker_active=false,progress_worker_updated_at=os.time(),
+        progress_resubmit_allowed=false,progress_last_verify_reason=false,
+    }
+    if pending_seq>0 and verified_seq>=pending_seq then
+        update.progress_sync_state="local_uploaded"
+        update.progress_sync_message="阅读进度已从云端确认"
+        update.progress_upload_state="verified"
+        update.progress_decided_at=os.time()
+    end
+    self.store:save_session(book_id,update)
+    self:_invalidate_home_sync_status()
+    return true
+end
+
+function Plugin:_commit_progress_verified(book_id,submitted_position,remote,message)
+    book_id=tostring(book_id or "")
+    if book_id=="" or type(submitted_position)~="table" then return false end
+    local seq=tonumber(submitted_position.progress_sequence or 0) or 0
+    local session=(self:_persisted_sessions()[book_id]) or self.store:session(book_id) or {}
+    local latest=tonumber(session.progress_latest_sequence or 0) or 0
+    local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
+    local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
+    if pending_seq>seq and seq>0 then
+        logger.info("[MiuRead][ProgressFinal] verified result ignored; newer pending exists",
+            "book=",book_id,"seq=",tostring(seq),"pending_seq=",tostring(pending_seq))
+        return false
+    end
+    local localp=tonumber(submitted_position.progress)
+    local remotep=tonumber(remote and remote.percent)
+    self.store:save_session(book_id,{
+        pending_progress=false,
+        progress_sync_state="local_uploaded",
+        progress_sync_message=tostring(message or "阅读进度已从云端确认"),
+        progress_local_percent=localp,
+        progress_remote_percent=remotep,
+        progress_decided_at=os.time(),
+        progress_worker_active=false,
+        progress_worker_updated_at=os.time(),
+        progress_upload_state="verified",
+        progress_upload_error=false,
+        progress_upload_pending_at=false,
+        progress_upload_verified_at=os.time(),
+        progress_upload_source=remote and remote.source,
+        progress_upload_chapter_uid=submitted_position.chapter_uid,
+        progress_upload_co=submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset,
+        progress_upload_remote_co=remote and remote.offset,
+        progress_verified_sequence=seq>0 and seq or nil,
+        progress_latest_sequence=seq>0 and math.max(latest,seq) or latest,
+        progress_verified_epoch=tonumber(submitted_position.progress_epoch),
+        progress_resubmit_allowed=false,
+        progress_last_verify_reason=false,
+        progress_last_verify_at=os.time(),
+    })
+    logger.info("[MiuRead][ProgressFinal] state=verified","book=",book_id,"seq=",tostring(seq),
+        "chapter=",tostring(submitted_position.chapter_uid or "-"),
+        "co=",tostring(submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset or "-"),
+        "remote_co=",tostring(remote and remote.offset or "-"))
+    self:_invalidate_home_sync_status()
     return true
 end
 
@@ -21826,22 +22127,8 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
             if remote then self.sync:set_cloud_anchor(book_id,remote,"progress_verified",true) end
             self.sync:mark_verified(book_id,tostring(options.reason or "progress_upload_verified"),
                 localp,remotep,submitted_position,{detached=detached,record_snapshot=record_snapshot,catalog_snapshot=catalog_snapshot})
-            self:_clear_pending_progress(book_id,submitted_position)
-            self.store:save_session(book_id,{
-                progress_upload_state="verified",progress_verified_sequence=submitted_seq>0 and submitted_seq or nil,
-                progress_latest_sequence=submitted_seq>0 and submitted_seq or nil,
-                progress_verified_epoch=tonumber(submitted_position.progress_epoch),
-                progress_upload_verified_at=os.time(),progress_upload_source=remote and remote.source,
-                progress_upload_chapter_uid=submitted_position.chapter_uid,
-                progress_upload_co=submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset,
-                progress_upload_remote_co=remote and remote.offset,
-            })
-            logger.info("[MiuRead][ProgressFinal] state=verified","book=",book_id,"seq=",tostring(submitted_seq),
-                "chapter=",tostring(submitted_position.chapter_uid or "-"),
-                "co=",tostring(submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset or "-"),
-                "remote_co=",tostring(remote and remote.offset or "-"))
-            self._home_sync_summary_cache=nil; self._home_sync_summary_cache_at=nil
-            if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("header") end
+            self:_commit_progress_verified(book_id,submitted_position,remote,
+                options.success_message or "阅读进度已从云端确认")
         else
             self:_save_pending_progress(book_id,submitted_position,reason or "cloud_not_confirmed")
         end
@@ -21929,10 +22216,13 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
         -- home task unless verification actually finds a mismatch.
         if options.nonblocking_verify~=true then
             self:_save_pending_progress(book_id,snapshot,"awaiting_cloud_confirmation")
-            self:_save_progress_state(book_id,"verifying_upload",
-                options.verifying_message or "请求已提交，正在回读云端位置",
-                tonumber(snapshot.progress),nil,seq)
         end
+        -- Nonblocking only means the Reader/suspend lifecycle does not wait.
+        -- The transaction itself still remains durable and visible as
+        -- “正在确认” until chapter/co readback succeeds or becomes pending.
+        self:_save_progress_state(book_id,"verifying_upload",
+            options.verifying_message or "进度已提交，正在确认云端位置",
+            tonumber(snapshot.progress),nil,seq)
         self:_verify_progress_submission(book_id,snapshot,{
             reason=options.reason or "progress_upload_verified",
             verify_delays=options.verify_delays,
@@ -23220,19 +23510,70 @@ end
 
 
 
+function Plugin:_local_library_root_label()
+    local root=LocalLibrary.normalize(self:_home_root())
+    if root=="" then return "未设置" end
+    return U.utf8_truncate(root,34,"…")
+end
+
+function Plugin:_validate_local_library_root(path)
+    path=LocalLibrary.normalize(U.trim(tostring(path or "")))
+    if path=="" or path=="/" or path:sub(1,1)~="/" then return nil,"路径无效" end
+    if lfs.attributes(path,"mode")~="directory" then return nil,"文件夹不存在" end
+    return true,path
+end
+
+function Plugin:local_library_directory_dialog()
+    if not self:_ensure_path_chooser_base() then
+        self:info("暂时无法打开文件夹选择器，请稍后重试")
+        return false
+    end
+    local current=LocalLibrary.normalize(self:_home_root())
+    if current=="" or lfs.attributes(current,"mode")~="directory" then current=self:_home_device_storage_root() end
+    if current=="" then current="/" end
+    local chooser=PathChooser:new{
+        title="选择书籍和分类所在文件夹",
+        select_directory=true,select_file=false,show_files=false,path=current,
+        onConfirm=function(path)
+            local ok,normalized=self:_validate_local_library_root(path)
+            if not ok then self:info("无法使用此文件夹：\n"..tostring(normalized)); return end
+            local home,preferences=self:_home_preferences()
+            home.local_entry_root=normalized
+            home.local_entry_user_set=true
+            home.local_entry_version=2
+            home.local_shelf_folder_path=normalized
+            home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
+            home.page_by_section["local"]=1
+            self:_save_home_preferences(home,preferences)
+            self._home_local_inline_loading=true
+            if self._home_sections then self:_home_apply_local_inline_section(false) end
+            self:toast("本地书库位置已设置",1.8)
+            self:_home_refresh_local_directory(normalized,function()
+                self._home_local_inline_loading=false
+                if self._home_sections then self:_home_apply_local_inline_section(true) end
+            end,true,nil)
+        end,
+    }
+    UIManager:show(chooser)
+    return true
+end
+
 function Plugin:local_library_settings_menu()
     local root=LocalLibrary.normalize(self:_home_root())
-    local home=self:_home_preferences()
+    local start=root~="" and root or self:_home_device_storage_root()
     return {
+        {text="书籍和分类所在文件夹",post_text=self:_local_library_root_label(),callback=function() self:local_library_directory_dialog() end},
         {text="显示文件夹",checked_func=function() return self:_home_preferences().local_shelf_show_folders==true end,
             keep_menu_open=true,callback=function() self:_toggle_home_local_shelf_view("folders") end},
         {text="显示全部书籍",checked_func=function() return self:_home_preferences().local_shelf_show_books==true end,
             keep_menu_open=true,callback=function() self:_toggle_home_local_shelf_view("books") end},
-        {text="打开本地书库",post_text=root~="" and root or "自动识别设备存储",callback=function() self:show_home_local_library() end},
+        {text="刷新本地书库",post_text=root~="" and "重新读取当前书库位置" or "请先设置书库位置",
+            callback=function() if self:_home_root()=="" then self:local_library_directory_dialog() else self:_home_scan_local(true,true) end end},
+        {text="打开本地书库",post_text=root~="" and "完整浏览与管理" or "请先设置书库位置",
+            callback=function() if self:_home_root()=="" then self:local_library_directory_dialog() else self:show_home_local_library() end end},
         {text="我的分类",post_text="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
-        {text="KOReader 文件管理",post_text="文件移动、删除与重命名",callback=function() self:_home_open_koreader_filemanager(root~="" and root or nil,true) end},
-        {text="说明",post_text="两个入口都显示时可在书架直接切换；只保留一个时隐藏入口名称",enabled=false},
-        {text="去重",post_text="觅阅已下载书不会重复作为普通本地书",enabled=false},
+        {text="KOReader 文件管理",post_text="文件移动、删除与重命名",callback=function() self:_home_open_koreader_filemanager(start~="" and start or nil,true) end},
+        {text="说明",post_text="只扫描上面设置的文件夹及其子文件夹",enabled=false},
     }
 end
 
@@ -23494,8 +23835,8 @@ function Plugin:display_settings_menu()
         {text="主页阅读统计",post_text=self:_home_stats_visibility_label(home),sub_item_table_func=function() return self:home_stats_settings_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
-        {text="本地书库",post_text=(home.local_shelf_show_folders==true and home.local_shelf_show_books==true) and "文件夹 + 全部书籍"
-            or (home.local_shelf_show_folders==true and "仅文件夹" or "仅全部书籍"),
+        {text="本地书库",post_text=self:_home_root()=="" and "未设置" or ((home.local_shelf_show_folders==true and home.local_shelf_show_books==true) and "文件夹 + 全部书籍"
+            or (home.local_shelf_show_folders==true and "仅文件夹" or "仅全部书籍")),
             sub_item_table_func=function() return self:local_library_settings_menu() end},
         {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
