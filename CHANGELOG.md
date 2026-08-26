@@ -1,5 +1,16 @@
 # Changelog
 
+## 5.3.0-beta.2 - 2026-08-26
+
+- 重做结束阅读前台交接：返回觅阅主页时只在 Reader 仍存活时冻结不可变位置锚点与本地状态，随后立即进入 CloseDocument；完整 source mapping、final reading time、final progress 和云端确认全部移到后台，避免 2～12 秒的 local close gate 阻塞。
+- 锁屏改为 visual-first：先允许屏保视觉完成，再用已冻结的位置锚点在后台解析精确 chapter/co；`reader_finalizer` 只保活关键提交阶段，不再让 source mapping 或云端 readback 阻塞用户看到锁屏。
+- 修正休眠后台保活释放过早：`reader_finalizer` 现在至少保持到 final reading time 完成且 final progress 已提交；云端 readback / settling / verification 可在真正休眠后继续等待下次唤醒，不再为了确认结果长期阻止深睡。
+- 强化 Kindle 锁屏下载隔离：`download` 与 `reader_finalizer` 继续作为独立后台任务所有者；阅读收尾完成只释放自己的 task，不清空共享 KindleHold，下载未完成时仍保持 screenSaver 后台运行。
+- detached 精确位置解析改为先冻结 Reader anchor、后等待后台 worker：即使 source worker 暂时繁忙，也不会因为快速关书丢失当前 Reader 的精确定位输入；后台 worker 可在关闭后重试。
+- 阅读同步菜单重新分层：主页面显示“当前书籍｜书名 · 已识别”、阅读时间、阅读进度和批注真实状态；入口统一为“自动同步设置 / 手动同步 / 诊断与修复”，删除多余说明副标题。
+- 自动同步设置明确显示“首次约15秒，之后每60秒”；诊断页改为“诊断与修复”，高级工具增加“检查后台任务状态”，可查看下载、阅读收尾、电源状态、后台保活与 SuspendLease。
+- 本版本冻结 5.3.0-beta.1 已跑通的阅读时间协议、Cloud Anchor、Progress Transaction、云端 settling 与 writer fence，不调整微信读书同步协议语义。
+
 ## 5.3.0-beta.1 - 2026-08-26
 
 - 重做阅读进度事务生命周期：每次精确进度提交携带 sequence + epoch；产生更新位置或执行“重置进度同步”后，旧回读、旧重试和跨 Reader 会话迟到结果自动失效，不能再覆盖新的进度状态。

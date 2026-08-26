@@ -1044,6 +1044,55 @@ function Sync:resolve_local_progress(callback, options)
         if callback then callback(nil, mapping_error, {error_kind="position"}) end
     end
 
+    -- Reading-end fast handoff: capture an immutable Reader anchor first and
+    -- postpone the expensive source mapping. This path deliberately bypasses
+    -- catalog preparation on the foreground close/suspend edge.
+    if options.source_first==true and options.precise~=false then
+        emit("position_locating","source_first")
+        local started, source_error = self:_source_position_async(function(position, err)
+            if position then
+                local exact_cloud=position.native_offset==true
+                    and tostring(position.offset_basis or position.position_basis or "")=="wr_data_co"
+                    and tonumber(position.chapter_offset or position.offset)~=nil
+                position.precision_level=exact_cloud and "exact_cloud" or "precise_local"
+                position.canonical_offset=tonumber(position.chapter_offset or position.offset)
+                logger.info("[MiuRead][ProgressSource] ready", "book=",book_id,
+                    "chapter=",tostring(position.chapter_uid or "-"),
+                    "offset=",tostring(position.offset or "-"),
+                    "basis=",tostring(position.offset_basis or position.position_basis or "-"),
+                    "native=",tostring(position.native_offset == true),
+                    "precision=",tostring(position.precision_level),
+                    "progress=",string.format("%.3f",tonumber(position.progress) or 0),
+                    "cache=",tostring(position.source_cache_hit == true),
+                    "handoff=", "source_first")
+                if options.require_cloud_coordinate==true and not exact_cloud then
+                    if callback then callback(nil,"cloud_coordinate_unavailable",{error_kind="position"}) end
+                elseif callback then
+                    callback(position,nil,{source=position.source or "weread_source_anchor"})
+                end
+                return
+            end
+            emit("position_fallback",err)
+            if options.require_cloud_coordinate==true then
+                if callback then callback(nil,tostring(err or "cloud_coordinate_unavailable"),{error_kind="position"}) end
+            else
+                complete_fallback(false,err)
+            end
+        end,{
+            detached=detached,
+            record_snapshot=record,
+            record_generation_override=generation,
+            ratio_snapshot=ratio_snapshot,
+            defer_seconds=options.defer_seconds,
+        })
+        if started then return true end
+        emit("position_fallback",source_error)
+        if options.require_cloud_coordinate==true then
+            if callback then callback(nil,tostring(source_error or "cloud_coordinate_unavailable"),{error_kind="busy"}) end
+            return true
+        end
+    end
+
     local catalog, catalog_source = self:_progress_catalog(record)
     local prepared = options._catalog_prepared == true
     if type(catalog) ~= "table" or #catalog == 0 then
@@ -1131,7 +1180,11 @@ function Sync:_source_position_async(callback, options)
     -- device cannot fork a worker, keep the existing local precision path
     -- rather than doing a network request on the Reader UI thread.
     if not self.async or not self.async:available() then return false, "source_worker_unavailable" end
-    if self.async:busy() then return false, "source_worker_busy" end
+    -- A detached reading-end resolver must freeze its Reader anchor before the
+    -- document is allowed to close. A busy worker is therefore not a reason to
+    -- skip capture: keep the immutable anchor and launch the subprocess later.
+    local worker_busy=self.async:busy()==true
+    if worker_busy and not detached then return false, "source_worker_busy" end
 
     local anchor, anchor_error = PrecisePosition.capture(
         ui, record, self:_precision_catalog(record))
@@ -1187,24 +1240,22 @@ function Sync:_source_position_async(callback, options)
         end,on_result,40)
     end
     local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)
-    if detached and defer_seconds>0 then
-        -- Capture the Reader anchor now, but postpone network/source mapping until
-        -- after the close transition. This keeps the first Home frame ahead of
-        -- PosMap building or a source-chapter fetch on single-core Kindles. A
-        -- quickly opened next book may briefly own the sync worker, so retry a
-        -- few times in the background instead of dropping the old book immediately.
+    if detached and (defer_seconds>0 or worker_busy) then
+        -- The anchor above is already frozen while ReaderUI/document is alive.
+        -- Mapping can now yield to the close/screen-saver paint and retry behind
+        -- a temporarily busy worker without losing the exact source position.
         local attempts=0
         local function deferred_launch()
             attempts=attempts+1
             local started,run_error=launch()
             if started then return end
-            if tostring(run_error or "")=="source_worker_busy" and attempts<4 then
-                UIManager:scheduleIn(1.2,deferred_launch)
+            if tostring(run_error or "")=="source_worker_busy" and attempts<6 then
+                UIManager:scheduleIn(1.0,deferred_launch)
                 return
             end
             if callback then callback(nil,tostring(run_error or "source_worker_unavailable")) end
         end
-        UIManager:scheduleIn(defer_seconds,deferred_launch)
+        UIManager:scheduleIn(math.max(.02,defer_seconds),deferred_launch)
         return true
     end
     local started,run_error=launch()
@@ -4094,9 +4145,9 @@ function Sync:on_resume(_slept)
     self.session_started_at = os.time()
     self:_ensure_reading_time_ids(false,true)
     self.reading_end_finalized=false
-    if self.host and self.host._reading_end_sync_active==true then
+    if self.host and (self.host._reading_end_sync_active==true or self.host._reading_end_finalizer_active==true) then
         self.resume_after_finalizer=true
-        logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_sync_active")
+        logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_finalizer_active")
         return true
     end
     self.resume_after_finalizer=false
