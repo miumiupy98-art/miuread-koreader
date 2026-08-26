@@ -1,5 +1,9 @@
 # Changelog
 
+## 5.2.0-beta.5 - 2026-08-26
+
+- 修复结束阅读同步时序与本地书库扫描稳定性
+
 ## 5.2.0-beta.4 - 2026-08-26
 
 - 重做本地书发现：Kindle 以 `/mnt/us`、Kobo 以 `/mnt/onboard` 作为用户存储边界，不再把 `/mnt/us/documents` 当作唯一入口；根目录自建 `Books`、`books` 或其它任意文件夹中的书都可以被发现。
