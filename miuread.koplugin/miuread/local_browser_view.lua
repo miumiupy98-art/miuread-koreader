@@ -155,7 +155,7 @@ end
 
 local LocalBrowserWidget = InputContainer:extend{
     name = "miuread_local_browser", _miuread_transient = true,
-    covers_fullscreen = true, opts = nil, page = 1, pages = 1, view_mode = "folders",
+    covers_fullscreen = true, opts = nil, page = 1, pages = 1, view_mode = "books",
     _closed = false, _miu_closed = false,
 }
 
@@ -187,7 +187,14 @@ end
 
 function LocalBrowserWidget:_entries()
     local entries = {}
-    if self.view_mode == "folders" then
+    if self.opts and self.opts.mixed_view == true then
+        for _, folder in ipairs((self.opts and self.opts.folders) or {}) do
+            entries[#entries + 1] = {kind = "folder", value = folder, weight = 1}
+        end
+        for _, book in ipairs((self.opts and self.opts.books) or {}) do
+            entries[#entries + 1] = {kind = "book", value = book, weight = 1}
+        end
+    elseif self.view_mode == "folders" then
         for _, folder in ipairs((self.opts and self.opts.folders) or {}) do
             entries[#entries + 1] = {kind = "folder", value = folder, weight = 1}
         end
@@ -270,32 +277,35 @@ function LocalBrowserWidget:_build()
 
     local folder_count = #((self.opts and self.opts.folders) or {})
     local book_count = #((self.opts and self.opts.books) or {})
-    if self.view_mode == "folders" and folder_count == 0 and book_count > 0 then self.view_mode = "books" end
-    if self.view_mode == "books" and book_count == 0 and folder_count > 0 then self.view_mode = "folders" end
-    local tab_w = math.floor(inner_w / 2)
-    local function tab(label, mode, width)
-        local selected = self.view_mode == mode
-        local layers_tab = OverlapGroup:new{dimen = Geom:new{w = width, h = tab_h}, allow_mirroring = false}
-        layers_tab[#layers_tab + 1] = Ui.textbox(label, width, tab_h, face("cfont", 10.8, 15.2), {
-            bold = selected, alignment = "center", halign = "center", valign = "center",
-            fgcolor = selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
-        })
-        if selected then
-            local line_w = math.max(UiScale.dp(38, 32, 58), math.floor(width * .28))
-            layers_tab[#layers_tab + 1] = OffsetContainer:new{
-                x_off = math.floor((width - line_w) / 2), y_off = tab_h - UiScale.line("thick"),
-                LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = line_w, h = UiScale.line("thick")}},
-            }
+    local mixed_view = self.opts and self.opts.mixed_view == true
+    if not mixed_view then
+        if self.view_mode == "folders" and folder_count == 0 and book_count > 0 then self.view_mode = "books" end
+        if self.view_mode == "books" and book_count == 0 and folder_count > 0 then self.view_mode = "folders" end
+        local tab_w = math.floor(inner_w / 2)
+        local function tab(label, mode, width)
+            local selected = self.view_mode == mode
+            local layers_tab = OverlapGroup:new{dimen = Geom:new{w = width, h = tab_h}, allow_mirroring = false}
+            layers_tab[#layers_tab + 1] = Ui.textbox(label, width, tab_h, face("cfont", 10.8, 15.2), {
+                bold = selected, alignment = "center", halign = "center", valign = "center",
+                fgcolor = selected and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+            })
+            if selected then
+                local line_w = math.max(UiScale.dp(38, 32, 58), math.floor(width * .28))
+                layers_tab[#layers_tab + 1] = OffsetContainer:new{
+                    x_off = math.floor((width - line_w) / 2), y_off = tab_h - UiScale.line("thick"),
+                    LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = line_w, h = UiScale.line("thick")}},
+                }
+            end
+            return tappable(width, tab_h, layers_tab, function() self:_set_view_mode(mode) end)
         end
-        return tappable(width, tab_h, layers_tab, function() self:_set_view_mode(mode) end)
+        local tabs = HorizontalGroup:new{align = "center",
+            tab("全部书籍 " .. tostring(book_count), "books", tab_w),
+            tab("文件夹 " .. tostring(folder_count), "folders", inner_w - tab_w),
+        }
+        self:_add(layers, margin, margin + header_h + UiScale.line("thin"), tabs)
     end
-    local tabs = HorizontalGroup:new{align = "center",
-        tab("文件夹 " .. tostring(folder_count), "folders", tab_w),
-        tab("全部书籍 " .. tostring(book_count), "books", inner_w - tab_w),
-    }
-    self:_add(layers, margin, margin + header_h + UiScale.line("thin"), tabs)
 
-    local grid_y = margin + header_h + UiScale.line("thin") + tab_h + gap
+    local grid_y = margin + header_h + UiScale.line("thin") + (mixed_view and 0 or tab_h) + gap
     local grid_h = math.max(1, sh - grid_y - footer_h - margin)
     local col_gap = UiScale.dp(4, 3, 7)
     local row_gap = UiScale.dp(5, 4, 9)
@@ -323,7 +333,7 @@ function LocalBrowserWidget:_build()
     end
 
     if #(pages[self.page] or {}) == 0 then
-        local empty_label = self.view_mode == "folders" and "这个位置没有子文件夹" or tostring(self.opts and self.opts.empty_text or "这个文件夹里没有可显示的书籍")
+        local empty_label = (self.opts and self.opts.mixed_view == true) and tostring(self.opts and self.opts.empty_text or "这个文件夹里没有可显示的书籍") or (self.view_mode == "folders" and "这个位置没有包含本地书的子文件夹" or tostring(self.opts and self.opts.empty_text or "这个文件夹里没有可显示的书籍"))
         self:_add(layers, margin, grid_y, Ui.textbox(empty_label,
             inner_w, grid_h, face("smallinfofont", 11, 15), {
                 bold = true, alignment = "center", halign = "center", valign = "center",
@@ -369,7 +379,8 @@ function LocalBrowserWidget:init()
     self.page = tonumber(self.opts and self.opts.page) or 1
     local folders = (self.opts and self.opts.folders) or {}
     local books = (self.opts and self.opts.books) or {}
-    self.view_mode = #folders > 0 and "folders" or "books"
+    self.view_mode = (self.opts and self.opts.default_view == "folders") and "folders" or "books"
+    if #books == 0 and #folders > 0 then self.view_mode = "folders" end
     if Device:hasKeys() then
         self.key_events = self.key_events or {}
         if Device.input and Device.input.group and Device.input.group.Back then self.key_events.Back = {{Device.input.group.Back}} end
@@ -386,8 +397,10 @@ function LocalBrowserWidget:updateData(snapshot)
     if self._miu_closed then return false end
     self.opts.folders = snapshot.folders or {}
     self.opts.books = snapshot.books or {}
-    if self.view_mode == "folders" and #self.opts.folders == 0 and #self.opts.books > 0 then self.view_mode = "books" end
-    if self.view_mode == "books" and #self.opts.books == 0 and #self.opts.folders > 0 then self.view_mode = "folders" end
+    if not (self.opts and self.opts.mixed_view == true) then
+        if self.view_mode == "folders" and #self.opts.folders == 0 and #self.opts.books > 0 then self.view_mode = "books" end
+        if self.view_mode == "books" and #self.opts.books == 0 and #self.opts.folders > 0 then self.view_mode = "folders" end
+    end
     self.page = 1
     self.opts.empty_text = snapshot.error and ("无法读取文件夹\n" .. tostring(snapshot.error)) or self.opts.empty_text
     self:_build()

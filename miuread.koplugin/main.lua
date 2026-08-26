@@ -7260,13 +7260,13 @@ function Plugin:_home_local_excluded_paths(root)
 end
 
 function Plugin:_home_local_tree_cache()
-    -- v4 snapshots contain immediate folders plus every KOReader-supported book
-    -- recursively below that path. Bump the key so beta.3's non-recursive cache
-    -- can never be mistaken for a complete library.
-    local cache=self.store:get("home_local_directory_cache_v4",{version=4,dirs={}})
-    cache=type(cache)=="table" and cache or {version=4,dirs={}}
-    if tonumber(cache.version)~=4 then cache={version=4,dirs={}} end
-    cache.version=4
+    -- v5 snapshots are an atomic local-library index: books are recursive,
+    -- direct_books are current-folder only, and folders are pruned to branches
+    -- that actually contain KOReader-readable books.
+    local cache=self.store:get("home_local_directory_cache_v5",{version=5,dirs={}})
+    cache=type(cache)=="table" and cache or {version=5,dirs={}}
+    if tonumber(cache.version)~=5 then cache={version=5,dirs={}} end
+    cache.version=5
     cache.dirs=type(cache.dirs)=="table" and cache.dirs or {}
     return cache
 end
@@ -9151,6 +9151,10 @@ end
 
 function Plugin:_home_hold_book(book,anchor)
     if not book then return end
+    local local_path,local_mode=self:_local_entry_mode(book)
+    if local_mode=="directory" then
+        return self:show_local_browser(local_path,{path=LocalLibrary.normalize(self:_home_root()),name="本地书库"},{},false,nil,true)
+    end
     if book.local_folder==true or book.kind=="folder" then
         return self:_home_open_koreader_filemanager(book.folder_path or book.path,true)
     end
@@ -9180,6 +9184,8 @@ function Plugin:_home_hold_book(book,anchor)
         return
     end
     if book.source=="local" or book.local_file==true then
+        local path_mode=lfs.attributes(LocalLibrary.normalize(book.file or ""),"mode")
+        if path_mode=="directory" then return self:show_local_browser(book.file or book.path,{path=LocalLibrary.normalize(self:_home_root()),name="本地书库"},{},false,nil,true) end
         ActionSheet.show{
             anchor=anchor,
             preferred_direction="above",
@@ -9413,7 +9419,7 @@ function Plugin:_home_store_directory_snapshot(path,snapshot)
     snapshot=self:_home_merge_directory_snapshot(snapshot,cache.dirs[path])
     cache.dirs[path]=snapshot
     cache.updated_at=os.time()
-    self.store:set("home_local_directory_cache_v4",cache)
+    self.store:set("home_local_directory_cache_v5",cache)
     logger.info("[MiuRead][LocalLibrary] snapshot committed",
         "path=",path,"books=",tostring(#(snapshot.books or {})),
         "folders=",tostring(#(snapshot.folders or {})),
@@ -10314,9 +10320,23 @@ function Plugin:_home_schedule_remote_covers(books)
 end
 
 
+function Plugin:_local_entry_path(book)
+    return LocalLibrary.normalize(book and (book.folder_path or book.path or book.file) or "")
+end
+
+function Plugin:_local_entry_mode(book)
+    local path=self:_local_entry_path(book)
+    if path=="" then return "",nil end
+    local mode=lfs.attributes(path,"mode")
+    return path,mode
+end
+
 function Plugin:_home_open_local(book)
-    local path=tostring(book and book.file or "")
-    if path=="" or not U.file_exists(path) then self:info("本地文件不存在"); return end
+    local path,mode=self:_local_entry_mode(book)
+    if mode=="directory" then
+        return self:show_local_browser(path,{path=LocalLibrary.normalize(self:_home_root()),name="本地书库"},{},false,nil,true)
+    end
+    if path=="" or mode~="file" then self:info("本地文件不存在"); return end
     -- Exact-path/filename filtering happens before display. Do one deeper EPUB
     -- identity check at open time so a moved/renamed MiuRead book is still
     -- classified correctly without making every folder listing expensive.
@@ -10327,7 +10347,6 @@ function Plugin:_home_open_local(book)
     end
     return self:_open_file_direct(path,"local","")
 end
-
 function Plugin:_home_schedule_local_shelf_metadata(rows,view)
     self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
     local generation=self._home_metadata_generation
@@ -10489,8 +10508,14 @@ function Plugin:_home_schedule_local_identity_check(rows,view)
     return started==true
 end
 
-function Plugin:_local_browser_decorate(snapshot,root_path)
-    snapshot=type(snapshot)=="table" and snapshot or {folders={},books={}}
+function Plugin:_local_book_list(snapshot, direct_only)
+    snapshot=type(snapshot)=="table" and snapshot or {}
+    if direct_only==true and type(snapshot.direct_books)=="table" then return snapshot.direct_books end
+    return type(snapshot.books)=="table" and snapshot.books or {}
+end
+
+function Plugin:_local_browser_decorate(snapshot,root_path,direct_only)
+    snapshot=type(snapshot)=="table" and snapshot or {folders={},books={},direct_books={}}
     local folders={}
     for _,folder in ipairs(snapshot.folders or {}) do
         local path=LocalLibrary.normalize(folder.folder_path or folder.path)
@@ -10502,7 +10527,7 @@ function Plugin:_local_browser_decorate(snapshot,root_path)
     local books={}
     local source_index=self:_home_local_source_index()
     local metadata_cache=self:_home_recent_local_metadata_cache()
-    for _,book in ipairs(snapshot.books or {}) do
+    for _,book in ipairs(self:_local_book_list(snapshot,direct_only==true)) do
         local path=LocalLibrary.normalize(book.file)
         if path~="" and U.file_exists(path) and not self:_home_local_is_miuread_file(path,source_index,false) then
             local cached=metadata_cache.rows[path]
@@ -10523,12 +10548,14 @@ function Plugin:_local_browser_decorate(snapshot,root_path)
     return folders,books
 end
 
-function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
+function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view)
     path=LocalLibrary.normalize(path)
     root=root or {path=path,name="本地书库"}
     stack=type(stack)=="table" and stack or {}
-    local folders,books=self:_local_browser_decorate(snapshot,root.path)
-    local title=(path==LocalLibrary.normalize(root.path)) and "" or tostring(LocalLibrary.basename(path))
+    local is_child = path ~= LocalLibrary.normalize(root.path)
+    mixed_view = mixed_view == true or is_child
+    local folders,books=self:_local_browser_decorate(snapshot,root.path,mixed_view)
+    local title=(path==LocalLibrary.normalize(root.path)) and "本地书库" or tostring(LocalLibrary.basename(path))
     local view
     local function schedule_visible()
         if not view or view._miu_closed then return end
@@ -10536,15 +10563,20 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
         self:_home_schedule_local_shelf_metadata(visible,view)
     end
     local function open_folder(folder)
+        local folder_path=LocalLibrary.normalize(folder and (folder.folder_path or folder.path) or "")
+        if folder_path=="" or lfs.attributes(folder_path,"mode")~="directory" then
+            self:info("文件夹不存在")
+            return
+        end
         local next_stack=U.copy(stack)
         next_stack[#next_stack+1]={path=path,title=title}
-        self:show_local_browser(folder.folder_path or folder.path,root,next_stack,false,view)
+        self:show_local_browser(folder_path,root,next_stack,false,view,true)
     end
     local function go_back()
         if view and not view._miu_closed then UIManager:close(view) end
     end
     view=LocalBrowserView.show{
-        title=title,folders=folders,books=books,
+        title=title,folders=folders,books=books,mixed_view=mixed_view,default_view=mixed_view and "mixed" or "books",
         empty_text=snapshot.error and ("无法读取文件夹\n"..tostring(snapshot.error)) or "这个文件夹里没有可显示的书籍",
         on_open_folder=open_folder,
         on_open_book=function(book) self:_home_open_local(book) end,
@@ -10556,7 +10588,7 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
         end,
         on_refresh=function()
             self:_home_refresh_local_directory(path,function(fresh)
-                local next_folders,next_books=self:_local_browser_decorate(fresh,root.path)
+                local next_folders,next_books=self:_local_browser_decorate(fresh,root.path,mixed_view)
                 if view and not view._miu_closed then
                     view:updateData{folders=next_folders,books=next_books,error=fresh.error}
                     self:_home_schedule_local_identity_check(next_books,view)
@@ -10570,7 +10602,7 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
     return view
 end
 
-function Plugin:show_local_browser(path,root,stack,force,request_owner)
+function Plugin:show_local_browser(path,root,stack,force,request_owner,mixed_view)
     path=LocalLibrary.normalize(path)
     if path=="" or lfs.attributes(path,"mode")~="directory" then
         path=LocalLibrary.normalize(self:_home_root())
@@ -10585,11 +10617,11 @@ function Plugin:show_local_browser(path,root,stack,force,request_owner)
     local cached=cache.dirs[path]
     local view
     if type(cached)=="table" and force~=true then
-        view=self:_show_local_browser_snapshot(path,root,stack,cached)
+        view=self:_show_local_browser_snapshot(path,root,stack,cached,mixed_view)
         -- Cached data is only the first frame. Refresh the complete subtree atomically.
         self:_home_refresh_local_directory(path,function(fresh,scanned)
             if not scanned or not view or view._miu_closed then return end
-            local folders,books=self:_local_browser_decorate(fresh,root.path)
+            local folders,books=self:_local_browser_decorate(fresh,root.path,mixed_view)
             view:updateData{folders=folders,books=books,error=fresh.error}
             local visible=type(view.visibleBooks)=="function" and view:visibleBooks() or {}
             self:_home_schedule_local_shelf_metadata(visible,view)
@@ -10598,7 +10630,7 @@ function Plugin:show_local_browser(path,root,stack,force,request_owner)
     end
     self:toast("正在打开本地书库…",1.2)
     self:_home_refresh_local_directory(path,function(snapshot)
-        self:_show_local_browser_snapshot(path,root,stack,snapshot)
+        self:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view)
     end,true,request_owner)
     return true
 end
@@ -10609,7 +10641,7 @@ function Plugin:_open_local_library_folders()
         self:info("暂时找不到 KOReader 可访问的本地书目录。")
         return false
     end
-    return self:show_local_browser(path,{path=path,name="本地书库"},{},false)
+    return self:show_local_browser(path,{path=path,name="本地书库"},{},false,nil,false)
 end
 
 function Plugin:show_home_local_library(rows)

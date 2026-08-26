@@ -104,11 +104,6 @@ local function native_dir_visible(name)
     return not name:lower():match("%.sdr$")
 end
 
-local NON_BOOK_IMAGE_EXTENSIONS = {
-    jpg=true,jpeg=true,png=true,gif=true,bmp=true,webp=true,svg=true,
-    tif=true,tiff=true,pbm=true,pgm=true,ppm=true,pnm=true,
-}
-
 local function obvious_runtime_file(name)
     local lower = tostring(name or ""):lower()
     -- Kindle may place crash diagnostics directly in documents. They are text
@@ -125,10 +120,6 @@ local function native_file_visible(name, fullpath)
     if lower:match("%.part$") or lower:match("%.tmp$") or lower:match("%.download$")
         or lower:match("%.crdownload$") then return false end
     if obvious_runtime_file(name) then return false end
-    -- DocumentRegistry also has image providers. A recursive "book library"
-    -- should follow KOReader for document formats without turning wallpapers
-    -- and photos into books.
-    if NON_BOOK_IMAGE_EXTENSIONS[extension(name)] then return false end
     if not LocalLibrary.is_supported(fullpath) then return false end
     local chooser = native_filechooser()
     if chooser and type(chooser.show_file) == "function" then
@@ -241,30 +232,50 @@ function TreeScan:cancel()
     self:_close_current()
 end
 
+function TreeScan:_first_child(path)
+    path = LocalLibrary.normalize(path)
+    local root = LocalLibrary.normalize(self.path)
+    if root == "" or path == root then return nil end
+    local prefix = root == "/" and "/" or root .. "/"
+    if path:sub(1, #prefix) ~= prefix then return nil end
+    local rest = path:sub(#prefix + 1)
+    local name = rest:match("^([^/]+)")
+    if not name or name == "" then return nil end
+    return prefix .. name
+end
+
+function TreeScan:_remember_folder(path, name, attr)
+    path = LocalLibrary.normalize(path)
+    if path == "" or self.folder_seen[path] then return end
+    self.folder_seen[path] = true
+    self.folders[#self.folders + 1] = {
+        kind = "folder", local_folder = true, title = tostring(name or basename(path)),
+        path = path, folder_path = path, modified_at = tonumber(attr and attr.modification) or 0,
+        book_count = 0,
+    }
+end
+
 function TreeScan:_accept(name)
     if name == "." or name == ".." then return end
     local base = self.current_path
     local full = (base == "/" and "/" .. name or base .. "/" .. name)
     if excluded_path(full, self.excluded_paths) then return end
     local attr = lfs.attributes(full)
-    if not attr then
-        self.unreadable_paths[#self.unreadable_paths + 1] = full
-        return
-    end
-    if attr.mode == "directory" then
+    if attr and attr.mode == "directory" then
         if native_dir_visible(name) and not is_symlink(full) then
-            if base == self.path then
-                self.folders[#self.folders + 1] = {
-                    kind = "folder", local_folder = true, title = name,
-                    path = full, folder_path = full, modified_at = tonumber(attr.modification) or 0,
-                }
-            end
+            local child = self:_first_child(full)
+            if child and child == full then self:_remember_folder(full, name, attr) end
             self.queue[#self.queue + 1] = full
         end
     elseif attr and attr.mode == "file" then
         local book = LocalLibrary.book_from_path(full, {include_cover = self.include_cover})
         if book then
+            local parent = dirname(full)
+            book.parent = LocalLibrary.normalize(parent)
             self.books[#self.books + 1] = book
+            if parent == self.path then self.direct_books[#self.direct_books + 1] = book end
+            local child = self:_first_child(full)
+            if child then self.folder_book_counts[child] = (tonumber(self.folder_book_counts[child]) or 0) + 1 end
             self.seen = self.seen + 1
             if self.limit and self.seen >= self.limit then
                 self.truncated = true
@@ -274,7 +285,6 @@ function TreeScan:_accept(name)
         end
     end
 end
-
 function TreeScan:step(batch_size)
     if self.done or self.cancelled then return true end
     batch_size = math.max(1, tonumber(batch_size) or 32)
@@ -303,18 +313,32 @@ end
 
 function TreeScan:snapshot()
     if not self._sorted then
+        local pruned = {}
+        for _, folder in ipairs(self.folders or {}) do
+            local path = LocalLibrary.normalize(folder.path or folder.folder_path)
+            local count = tonumber(self.folder_book_counts[path]) or 0
+            if count > 0 then
+                folder.book_count = count
+                pruned[#pruned + 1] = folder
+            end
+        end
+        self.folders = pruned
         table.sort(self.folders, function(a, b)
             return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
         end)
-        table.sort(self.books, function(a, b)
-            if self.options.sort == "modified" then
-                local am, bm = tonumber(a.modified_at) or 0, tonumber(b.modified_at) or 0
-                if am ~= bm then return am > bm end
-            end
-            local at, bt = tostring(a.title or ""):lower(), tostring(b.title or ""):lower()
-            if at ~= bt then return at < bt end
-            return tostring(a.file or "") < tostring(b.file or "")
-        end)
+        local function sort_books(list)
+            table.sort(list, function(a, b)
+                if self.options.sort == "modified" then
+                    local am, bm = tonumber(a.modified_at) or 0, tonumber(b.modified_at) or 0
+                    if am ~= bm then return am > bm end
+                end
+                local at, bt = tostring(a.title or ""):lower(), tostring(b.title or ""):lower()
+                if at ~= bt then return at < bt end
+                return tostring(a.file or "") < tostring(b.file or "")
+            end)
+        end
+        sort_books(self.books)
+        sort_books(self.direct_books)
         self._sorted = true
     end
     return {
@@ -323,14 +347,14 @@ function TreeScan:snapshot()
         scanned_at = os.time(),
         folders = self.folders,
         books = self.books,
+        direct_books = self.direct_books,
         truncated = self.truncated == true,
         recursive = true,
         direct_count = #self.folders,
         book_count = #self.books,
         directories_scanned = self.directories_scanned,
         unreadable_dirs = self.unreadable_dirs,
-        unreadable_paths = self.unreadable_paths,
-        partial = (#self.unreadable_dirs > 0 or #self.unreadable_paths > 0) and self.error == nil,
+        partial = #self.unreadable_dirs > 0 and self.error == nil,
         error = self.error,
     }
 end
@@ -346,9 +370,9 @@ function LocalLibrary.new_tree_scan(path, options)
         limit = explicit_limit and math.max(20, explicit_limit) or nil,
         include_cover = options.include_cover == true,
         excluded_paths = type(options.exclude_paths) == "table" and options.exclude_paths or {},
-        folders = {}, books = {}, seen = 0,
+        folders = {}, folder_seen = {}, folder_book_counts = {}, books = {}, direct_books = {}, seen = 0,
         queue = {path}, queue_index = 1,
-        directories_scanned = 0, unreadable_dirs = {}, unreadable_paths = {},
+        directories_scanned = 0, unreadable_dirs = {},
         truncated = false, done = false, cancelled = false,
     }, TreeScan)
     if path == "" or lfs.attributes(path, "mode") ~= "directory" then
