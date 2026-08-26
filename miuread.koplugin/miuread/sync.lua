@@ -19,7 +19,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 21
+local READ_REPORT_SERVICE_VERSION = 22
 local FIRST_REPORT_DELAY = 60
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -1156,20 +1156,31 @@ function Sync:_source_position_async(callback, options)
             if callback then callback(nil, "stale_position_result") end
             return
         end
-        if result and result.ok == true and type(result.value) == "table"
-            and result.value.safe == true then
+        local envelope=result and result.ok==true and type(result.value)=="table" and result.value or nil
+        local value=envelope and envelope.position or nil
+        if type(value) == "table" and value.safe == true then
             local mapping_record=detached and record_snapshot or current
-            local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, result.value, ratio_snapshot)
+            local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, value, ratio_snapshot)
             adjusted.captured_at = os.time()
+            if adjusted.mapping_recovered==true then
+                logger.info("[MiuRead][ProgressSource] neighbour chapter mapping recovered",
+                    "book=",book_id,
+                    "from=",tostring(adjusted.mapping_original_chapter_uid or "-"),
+                    "to=",tostring(adjusted.chapter_uid or "-"))
+            end
             if callback then callback(adjusted, nil) end
             return
         end
-        if callback then callback(nil, tostring(result and result.error or "source_position_failed")) end
+        local detail=tostring(envelope and envelope.error or (result and result.error) or "source_position_failed")
+        logger.warn("[MiuRead][ProgressSource] source mapping failed",
+            "book=",book_id,"error=",detail)
+        if callback then callback(nil, "source_position_failed") end
     end
     local function launch()
         if self.async:busy() then return false,"source_worker_busy" end
         return self.async:run("progress_source_position", function()
-            return SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=source_cache_only})
+            local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=source_cache_only})
+            return {position=value,error=source_error}
         end,on_result,40)
     end
     local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)

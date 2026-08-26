@@ -7252,7 +7252,10 @@ end
 
 
 function Plugin:_home_local_inline_title()
-    return "本地书库"
+    -- The selected top tab already says “本地书库”; repeating it above the
+    -- root grid wastes a row.  Child directories show their own name in the
+    -- dedicated browser header instead.
+    return ""
 end
 
 function Plugin:_home_local_empty_text()
@@ -7326,8 +7329,10 @@ function Plugin:_home_recent_local_rows(limit)
         if self:_home_local_is_miuread_file(path,source_index,false) then return true end
         if not tostring(path):lower():match("%.epub$") then return false end
         local cached=metadata_cache.rows[path]
+        local size=tonumber(lfs.attributes(path,"size")) or 0
         if type(cached)=="table"
             and tonumber(cached.miuread_identity_mtime or -1)==tonumber(modified_at or -2)
+            and tonumber(cached.miuread_identity_size or -1)==size
             and cached.miuread_generated~=nil then
             return cached.miuread_generated==true
         end
@@ -7335,6 +7340,7 @@ function Plugin:_home_recent_local_rows(limit)
         cached=type(cached)=="table" and cached or {file=path}
         cached.file=path
         cached.miuread_identity_mtime=tonumber(modified_at) or 0
+        cached.miuread_identity_size=size
         cached.miuread_generated=generated
         cached.cached_at=os.time()
         metadata_cache.rows[path]=cached
@@ -7396,7 +7402,7 @@ function Plugin:_home_apply_local_inline_section(refresh_metadata)
         local home=self:_home_preferences()
         local preview=self:_home_preview_page(rows,self._home_hero,
             home.page_by_section and home.page_by_section["local"],self:_home_page_limit())
-        self:_home_schedule_local_identity_check(preview,nil)
+        self:_home_schedule_local_identity_check(rows,nil)
         self:_home_schedule_local_metadata(preview)
         self:_home_schedule_remote_covers(preview)
     end
@@ -10313,68 +10319,86 @@ function Plugin:_home_schedule_local_identity_check(rows,view)
             and not self:_home_local_is_miuread_file(path,source_index,false) then
             local cached=cache.rows[path]
             local mtime=tonumber(book.modified_at) or tonumber(lfs.attributes(path,"modification")) or 0
+            local size=tonumber(book.size) or tonumber(lfs.attributes(path,"size")) or 0
             local already_checked=type(cached)=="table"
                 and tonumber(cached.miuread_identity_mtime or -1)==mtime
+                and tonumber(cached.miuread_identity_size or -1)==size
                 and cached.miuread_generated~=nil
-            if not already_checked then queue[#queue+1]={path=path,mtime=mtime} end
+            if not already_checked then queue[#queue+1]={path=path,mtime=mtime,size=size} end
         end
     end
     if #queue==0 then return false end
     local worker=self.local_identity_async
     if not worker or not worker:available() then return false end
-    local index=1
+
     local home_mode=view==nil
-    local function remove_generated(path)
+    local function still_current()
+        if generation~=self._home_local_identity_generation then return false end
         if home_mode then
-            if HomeView.is_shown() and self._home_active_section=="local" then
-                self:_home_apply_local_inline_section(false)
+            return HomeView.is_shown() and self._home_active_section=="local" and not self:_active_reader_ui()
+        end
+        return view and not view._miu_closed
+    end
+
+    if worker:busy() then worker:cancel("new local identity batch") end
+    local started=worker:run("local-epub-identity-batch",function()
+        local ok_ffi,ffi=pcall(require,"ffi")
+        if ok_ffi and ffi then
+            pcall(ffi.cdef,"int setpriority(int which, int who, int prio);")
+            pcall(function() ffi.C.setpriority(0,0,12) end)
+        end
+        local Library=require("miuread.local_library")
+        local results={}
+        for _,item in ipairs(queue) do
+            results[#results+1]={
+                path=item.path,mtime=item.mtime,size=item.size,
+                generated=Library.is_miuread_generated_epub(item.path)==true,
+            }
+        end
+        return results
+    end,function(result)
+        if not still_current() then return end
+        if not (result and result.ok==true and type(result.value)=="table") then
+            logger.warn("[MiuRead][LocalBrowser] EPUB identity batch failed",
+                tostring(result and result.error or "unknown"))
+            return
+        end
+
+        local generated_paths={}
+        local latest=self:_home_recent_local_metadata_cache()
+        for _,identity in ipairs(result.value) do
+            local path=LocalLibrary.normalize(identity and identity.path or "")
+            if path~="" then
+                local row=type(latest.rows[path])=="table" and latest.rows[path] or {file=path}
+                row.file=path
+                row.miuread_identity_mtime=tonumber(identity.mtime) or 0
+                row.miuread_identity_size=tonumber(identity.size) or 0
+                row.miuread_generated=identity.generated==true
+                row.cached_at=os.time()
+                latest.rows[path]=row
+                if row.miuread_generated then generated_paths[path]=true end
             end
+        end
+        latest.updated_at=os.time()
+        self.store:set("home_local_recent_metadata_v1",latest)
+
+        if next(generated_paths)==nil then return end
+        if home_mode then
+            -- One repaint after the whole current directory is classified.
+            self:_home_apply_local_inline_section(false)
             return
         end
         if not view or view._miu_closed or type(view.opts)~="table" then return end
         local kept={}
-        local changed=false
         for _,book in ipairs(view.opts.books or {}) do
-            if LocalLibrary.normalize(book.file)==path then changed=true else kept[#kept+1]=book end
+            local path=LocalLibrary.normalize(book.file)
+            if not generated_paths[path] then kept[#kept+1]=book end
         end
-        if changed and type(view.updateData)=="function" then
+        if type(view.updateData)=="function" then
             view:updateData{folders=view.opts.folders or {},books=kept}
         end
-    end
-    local function next_item()
-        if generation~=self._home_local_identity_generation then return end
-        if home_mode then
-            if not HomeView.is_shown() or self._home_active_section~="local" or self:_active_reader_ui() then return end
-        elseif not view or view._miu_closed then
-            return
-        end
-        local item=queue[index]
-        if not item then return end
-        if worker:busy() then UIManager:scheduleIn(.3,next_item); return end
-        local path=item.path
-        local started=worker:run("local-epub-identity",function()
-            local Library=require("miuread.local_library")
-            return Library.is_miuread_generated_epub(path)==true
-        end,function(result)
-            if generation~=self._home_local_identity_generation then return end
-            local generated=result and result.ok==true and result.value==true
-            local latest=self:_home_recent_local_metadata_cache()
-            local row=type(latest.rows[path])=="table" and latest.rows[path] or {file=path}
-            row.file=path
-            row.miuread_identity_mtime=item.mtime
-            row.miuread_generated=generated
-            row.cached_at=os.time()
-            latest.rows[path]=row
-            latest.updated_at=os.time()
-            self.store:set("home_local_recent_metadata_v1",latest)
-            if generated then remove_generated(path) end
-            index=index+1
-            if queue[index] then UIManager:scheduleIn(.12,next_item) end
-        end,20)
-        if not started then UIManager:scheduleIn(.4,next_item) end
-    end
-    UIManager:scheduleIn(.15,next_item)
-    return true
+    end,90)
+    return started==true
 end
 
 function Plugin:_local_browser_decorate(snapshot,root_path)
@@ -10397,6 +10421,7 @@ function Plugin:_local_browser_decorate(snapshot,root_path)
             -- If beta.9 already verified a moved MiuRead EPUB, keep that exclusion.
             local known_generated=type(cached)=="table"
                 and tonumber(cached.miuread_identity_mtime or -1)==tonumber(book.modified_at or -2)
+                and tonumber(cached.miuread_identity_size or -1)==tonumber(book.size or -2)
                 and cached.miuread_generated==true
             if not known_generated then
                 if type(cached)=="table" and tonumber(cached.metadata_mtime or -1)==tonumber(book.modified_at or -2) then
@@ -10415,12 +10440,11 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
     root=root or {path=path,name="本地书库"}
     stack=type(stack)=="table" and stack or {}
     local folders,books=self:_local_browser_decorate(snapshot,root.path)
-    local title=(path==LocalLibrary.normalize(root.path)) and "本地书库" or tostring(LocalLibrary.basename(path))
+    local title=(path==LocalLibrary.normalize(root.path)) and "" or tostring(LocalLibrary.basename(path))
     local view
     local function schedule_visible()
         if not view or view._miu_closed then return end
         local visible=type(view.visibleBooks)=="function" and view:visibleBooks() or {}
-        self:_home_schedule_local_identity_check(visible,view)
         self:_home_schedule_local_shelf_metadata(visible,view)
     end
     local function open_folder(folder)
@@ -10447,11 +10471,13 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot)
                 local next_folders,next_books=self:_local_browser_decorate(fresh,root.path)
                 if view and not view._miu_closed then
                     view:updateData{folders=next_folders,books=next_books,error=fresh.error}
+                    self:_home_schedule_local_identity_check(next_books,view)
                     schedule_visible()
                 end
             end,true,view)
         end,
     }
+    self:_home_schedule_local_identity_check(books,view)
     schedule_visible()
     return view
 end
