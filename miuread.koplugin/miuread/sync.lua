@@ -2983,6 +2983,25 @@ function Sync:_import_daemon_status(force)
     local barrier_seq=tonumber(status.writer_barrier_seq or 0) or 0
     if barrier_seq>0 and tostring(status.state or "")~="reporting" then
         daemon.writer_barrier_ack_seq=math.max(tonumber(daemon.writer_barrier_ack_seq or 0) or 0,barrier_seq)
+        if final_flush then
+            local result_state
+            if status.flush_skipped==true then result_state="skipped"
+            elseif status.accepted==true then result_state="accepted"
+            elseif status.uncertain==true or tostring(status.state or "")=="unconfirmed" then result_state="unconfirmed"
+            elseif status.error or tostring(status.state or "")=="error" then result_state="failed"
+            else result_state="unknown" end
+            daemon.writer_barrier_result_seq=barrier_seq
+            daemon.writer_barrier_result={
+                state=result_state,
+                accepted=status.accepted==true,
+                error=status.error or status.response_summary,
+                elapsed_seconds=tonumber(status.elapsed_seconds),
+                completed_at=tonumber(status.completed_at) or os.time(),
+            }
+        elseif tostring(status.state or "")=="inactive" then
+            daemon.writer_barrier_result_seq=barrier_seq
+            daemon.writer_barrier_result={state="no_flush",accepted=true,completed_at=os.time()}
+        end
     end
     local stamp = daemon_stamp(status)
     if final_flush and stamp and self.store:is_read_report_consumed(stamp) then
@@ -3485,10 +3504,18 @@ function Sync:writer_barrier_done(seq)
     return done
 end
 
+function Sync:writer_barrier_result(seq)
+    seq=tonumber(seq or 0) or 0
+    local daemon=self.daemon
+    if not daemon or seq<=0 then return {state="no_flush",accepted=true} end
+    if (tonumber(daemon.writer_barrier_result_seq or 0) or 0)<seq then return nil end
+    return type(daemon.writer_barrier_result)=="table" and U.copy(daemon.writer_barrier_result) or nil
+end
+
 function Sync:wait_writer_barrier(seq,callback,timeout)
     callback=type(callback)=="function" and callback or function() end
     seq=tonumber(seq or 0) or 0
-    if seq<=0 or self:writer_barrier_done(seq) then callback(true); return true end
+    if seq<=0 or self:writer_barrier_done(seq) then callback(true,self:writer_barrier_result(seq)); return true end
     local started=os.time()
     timeout=math.max(2,tonumber(timeout) or 12)
     local done=false
@@ -3497,14 +3524,14 @@ function Sync:wait_writer_barrier(seq,callback,timeout)
         if done then return end
         if self:writer_barrier_done(seq) then
             done=true
-            callback(true)
+            callback(true,self:writer_barrier_result(seq))
             return
         end
         if os.time()-started>=timeout then
             done=true
             logger.warn("[MiuRead][ReadReport] writer barrier timeout",
                 "seq=",tostring(seq),"timeout=",tostring(timeout))
-            callback(false)
+            callback(false,self:writer_barrier_result(seq))
             return
         end
         UIManager:scheduleIn(.20,poll)

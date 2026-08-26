@@ -1,9 +1,0 @@
-5.2.0-beta.4
-
-miuread.koplugin/miuread/config.lua
-miuread.koplugin/_meta.lua
-miuread.koplugin/main.lua
-miuread.koplugin/miuread/local_library.lua
-miuread.koplugin/miuread/local_browser_view.lua
-CHANGELOG.md
-CHANGED_FILES.txt

@@ -2043,10 +2043,11 @@ function Plugin:_refresh_shelf_async(on_ready,silent,request_options)
     local generation=self._shelf_refresh_generation
     local function succeed(data,mode)
         if generation~=self._shelf_refresh_generation then return end
-        self:_mark_auth_channel_ok("shelf")
-        local books,mp,streamed=self.library:_apply_stream_response(data or {})
+        local books,mp,streamed,kept_cache=self.library:_apply_stream_response(data or {})
+        if kept_cache~=true then self:_mark_auth_channel_ok("shelf") end
         logger.info("[MiuRead][Shelf] refresh completed","mode=",tostring(mode),
-            "books=",tostring(#books),"mp=",tostring(#mp),"streamed=",tostring(streamed==true))
+            "books=",tostring(#books),"mp=",tostring(#mp),"streamed=",tostring(streamed==true),
+            "cache_retained=",tostring(kept_cache==true))
         local stats=self.library.last_shelf_filter
         if stats and stats.kept==0 and stats.filtered>0 then
             self:toast("所选分组没有找到书籍，已跳过 "..tostring(stats.filtered).." 本。\n可在“微信书架范围”重新选择，或临时加载全部书架。",5)
@@ -13912,6 +13913,10 @@ function Plugin:_show_reader_sync_panel(back_callback)
                     {label="打开时检查云端进度",value=sync.pull_on_open~=false and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_pull_on_open() end},
                     {label="结束时上传批注",value=self:_annotation_close_upload_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_close_upload() end},
                 }},
+                {title="提醒",rows={
+                    {label="首次阅读时间同步成功提醒",value=self:_time_first_success_notice_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_first_success_notice() end},
+                    {label="同步异常提醒",value=self:_sync_error_notice_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_sync_error_notice() end},
+                }},
                 {title="诊断",rows={
                     {icon="diagnostics",label="同步诊断",value="查看详情",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
                 }},
@@ -20496,8 +20501,13 @@ function Plugin:_home_sync_summary(force)
             if (state=="uploading" or state=="retrying" or state=="verifying_upload") and not worker_alive then
                 state=replayable and "deferred" or "verification_required"
             end
-            local state_without_snapshot=state=="deferred" or state=="verification_required" or state=="waiting_network"
-            if pending_progress_states[state] and (pending or state_without_snapshot) then progress=progress+1 end
+            -- beta.6: a historical state string without an immutable pending
+            -- snapshot is not actionable and must never reappear as "待同步".
+            -- Only a live worker may surface without a snapshot; all retryable
+            -- work must carry the exact chapter/co snapshot that can be replayed.
+            local live_without_snapshot=worker_alive
+                and (state=="uploading" or state=="retrying" or state=="verifying_upload")
+            if pending_progress_states[state] and (pending or live_without_snapshot) then progress=progress+1 end
             if pending then
                 if not replayable then
                     progress_waiting=progress_waiting+1
@@ -20510,8 +20520,8 @@ function Plugin:_home_sync_summary(force)
                 elseif state=="waiting_network" or state=="deferred" or state=="verification_required" then
                     progress_waiting=progress_waiting+1
                 end
-            elseif state_without_snapshot then
-                progress_waiting=progress_waiting+1
+            elseif live_without_snapshot then
+                progress_active=progress_active+1
             end
             if tonumber(session.pending_report_seconds or 0)>0 then time_count=time_count+1 end
         end
@@ -21341,7 +21351,7 @@ function Plugin:_progress_snapshot_current(book_id,position)
     return seq>=latest
 end
 
-function Plugin:_save_pending_progress(book_id,position,reason)
+function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
     book_id=tostring(book_id or "")
     if book_id=="" or type(position)~="table" then return false end
     local snapshot=self:_prepare_progress_snapshot(book_id,position)
@@ -21356,13 +21366,20 @@ function Plugin:_save_pending_progress(book_id,position,reason)
         return false
     end
     snapshot.pending_reason=tostring(reason or "unconfirmed")
-    self.store:save_session(book_id,{
+    local pending_update={
         pending_progress=snapshot,
         progress_latest_sequence=math.max(latest,seq),
         progress_upload_state="unconfirmed",
         progress_upload_error=snapshot.pending_reason,
         progress_upload_pending_at=os.time(),
-    })
+    }
+    if sync_state~=nil then
+        pending_update.progress_sync_state=tostring(sync_state)
+        pending_update.progress_sync_message=tostring(reason or "")
+        pending_update.progress_worker_active=sync_state=="uploading" or sync_state=="retrying" or sync_state=="verifying_upload"
+        pending_update.progress_worker_updated_at=os.time()
+    end
+    self.store:save_session(book_id,pending_update)
     logger.info("[MiuRead][ProgressFinal] state=pending",
         "book=",book_id,"seq=",tostring(seq),
         "chapter=",tostring(snapshot.chapter_uid or "-"),
@@ -21508,6 +21525,7 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
     local retries=math.max(0,math.min(1,tonumber(options.retry_count) or 1))
     local submit_attempt=0
     local finished=false
+    local accepted_notified=false
 
     local function current()
         return self:_progress_snapshot_current(book_id,snapshot)
@@ -21521,14 +21539,20 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
     local function verify_after_submit()
         if finished then return end
         if not current() then finish(false,nil,"superseded",{superseded=true}); return end
-        self:_save_pending_progress(book_id,snapshot,"awaiting_cloud_confirmation")
-        self:_save_progress_state(book_id,"verifying_upload",
-            options.verifying_message or "请求已提交，正在回读云端位置",
-            tonumber(snapshot.progress),nil,seq)
+        -- Normal close/suspend no longer blocks on WeRead readback latency. The
+        -- immutable pending snapshot remains on disk until verification clears
+        -- it, but "awaiting cloud confirmation" is not exposed as an active
+        -- home task unless verification actually finds a mismatch.
+        if options.nonblocking_verify~=true then
+            self:_save_pending_progress(book_id,snapshot,"awaiting_cloud_confirmation")
+            self:_save_progress_state(book_id,"verifying_upload",
+                options.verifying_message or "请求已提交，正在回读云端位置",
+                tonumber(snapshot.progress),nil,seq)
+        end
         self:_verify_progress_submission(book_id,snapshot,{
             reason=options.reason or "progress_upload_verified",
             first_delay=options.first_delay,second_delay=options.second_delay,
-            detached=options.detached==true,
+            detached=options.detached==true or options.verify_detached==true,
             record_snapshot=options.record_snapshot,
             catalog_snapshot=options.catalog_snapshot,
         },function(verified,remote,verify_error,verify_meta)
@@ -21568,12 +21592,16 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
         if finished then return end
         if not current() then finish(false,nil,"superseded",{superseded=true}); return end
         submit_attempt=submit_attempt+1
-        self:_save_pending_progress(book_id,snapshot,
-            submit_attempt==1 and (options.pending_reason or "upload_queued") or "retry_upload_queued")
-        self:_save_progress_state(book_id,submit_attempt==1 and "uploading" or "retrying",
-            submit_attempt==1 and (options.uploading_message or "正在上传阅读进度")
-                or (options.retrying_message or "正在重新提交同一阅读位置"),
-            tonumber(snapshot.progress),nil,seq)
+        if not (submit_attempt==1 and options.pending_already_saved==true) then
+            self:_save_pending_progress(book_id,snapshot,
+                submit_attempt==1 and (options.pending_reason or "upload_queued") or "retry_upload_queued")
+        end
+        if not (submit_attempt==1 and options.quiet_intermediate_state==true) then
+            self:_save_progress_state(book_id,submit_attempt==1 and "uploading" or "retrying",
+                submit_attempt==1 and (options.uploading_message or "正在上传阅读进度")
+                    or (options.retrying_message or "正在重新提交同一阅读位置"),
+                tonumber(snapshot.progress),nil,seq)
+        end
         local started=self.sync:upload_progress(function(ok,result,_submitted)
             if finished then return end
             if not current() then finish(false,nil,"superseded",{superseded=true}); return end
@@ -21588,6 +21616,27 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
                     tonumber(snapshot.progress),nil,seq)
                 finish(false,nil,tostring(result or kind or "submit_failed"),{error_kind=kind})
                 return
+            end
+            if options.clear_pending_on_accept==true then
+                -- The server has accepted this exact immutable chapter/co. It
+                -- is no longer a "待同步" item. Readback may still restore
+                -- the snapshot later if it detects a real mismatch.
+                self.store:save_session(book_id,{
+                    pending_progress=false,
+                    progress_sync_state="submitted",
+                    progress_sync_message="结束阅读进度已提交，云端后台确认中",
+                    progress_upload_state="submitted",
+                    progress_upload_error=false,
+                    progress_upload_submitted_at=os.time(),
+                    progress_worker_active=false,
+                    progress_worker_updated_at=os.time(),
+                })
+                self._home_sync_summary_cache=nil
+                self._home_sync_summary_cache_at=nil
+            end
+            if not accepted_notified and type(options.accepted_callback)=="function" then
+                accepted_notified=true
+                pcall(options.accepted_callback,snapshot,result)
             end
             verify_after_submit()
         end,{
@@ -21615,7 +21664,7 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
             reason=options.reason or "saved_pending_verified",
             first_delay=options.first_delay or .15,
             second_delay=options.second_delay or .9,
-            detached=options.detached==true,
+            detached=options.detached==true or options.verify_detached==true,
             record_snapshot=options.record_snapshot,
             catalog_snapshot=options.catalog_snapshot,
         },function(verified,remote,verify_error,meta)
@@ -24516,6 +24565,7 @@ function Plugin:_finalize_reader_instance_close(closing_path,session_generation,
 
     local continuous_switch=options.continuous_chapter_switch==true
     local detached_sync=self._reading_end_sync_active==true or self._reading_end_home_detached==true
+        or self._reading_end_background_verify_active==true
     if not continuous_switch and self.sync and self.sync.reading_end_finalized~=true and self.ui and self.ui.document then
         detached_sync=self:_reading_end_sync(options.reason or "关闭书籍",{show_status=false,timeout=8})==true or detached_sync
     end
@@ -25237,17 +25287,27 @@ function Plugin:_reading_end_sync(reason,options,callback)
         if need_annotations then parts[#parts+1]="批注" end
         local detail="正在同步："..table.concat(parts,"、")
         if options.after then detail=detail.."\n完成后将"..tostring(options.after) end
-        self:status_toast("正在保存本次阅读",detail,math.min(timeout,5))
+        self:status_toast("正在同步阅读记录",detail,math.max(3,math.min(timeout,14)))
     end
 
     if need_writer_wait then
-        self.sync:wait_writer_barrier(writer_barrier_seq,function(ok)
+        self.sync:wait_writer_barrier(writer_barrier_seq,function(ok,barrier_result)
             if finished then return end
+            local time_ok=ok==true
             if not ok then
                 logger.warn("[MiuRead][ReadingEnd] reading-time writer did not leave before timeout",
                     "book=",book_id,"barrier=",tostring(writer_barrier_seq))
+            elseif need_time then
+                local result_state=tostring(barrier_result and barrier_result.state or "unknown")
+                time_ok=result_state=="accepted" or result_state=="skipped"
+                if not time_ok then
+                    logger.warn("[MiuRead][ReadingEnd] final reading-time result not confirmed",
+                        "book=",book_id,"barrier=",tostring(writer_barrier_seq),
+                        "state=",result_state,
+                        "error=",tostring(barrier_result and barrier_result.error or "-"))
+                end
             end
-            complete_one(ok)
+            complete_one(time_ok)
         end,math.max(4,timeout-1))
     end
 
@@ -25268,7 +25328,10 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     return
                 end
                 local snapshot=self:_prepare_progress_snapshot(book_id,position) or position
-                self:_save_pending_progress(book_id,snapshot,"final_position_captured")
+                -- One durable snapshot is enough before network I/O. beta.5
+                -- wrote the same pending snapshot again when submit started,
+                -- costing another synchronous settings write on Kindle.
+                self:_save_pending_progress(book_id,snapshot,"final_position_captured","finalizing")
                 logger.info("[MiuRead][ReadingEnd] final position captured",
                     "reason=",reason,"book=",book_id,"seq=",tostring(snapshot.progress_sequence or "-"),
                     "chapter=",tostring(snapshot.chapter_uid or snapshot.chapter_index or "-"),
@@ -25278,6 +25341,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
 
                 local function submit_final_progress()
                     if finished then return end
+                    local gate_completed=false
+                    self._reading_end_background_verify_active=true
+                    local function finish_gate(ok)
+                        if gate_completed then return end
+                        gate_completed=true
+                        complete_one(ok)
+                    end
                     local upload_started=self:_submit_progress_snapshot(book_id,snapshot,{
                         reason="reading_end_verified",retry_count=1,reading_end=true,
                         detached=defer_background_start,
@@ -25285,6 +25355,11 @@ function Plugin:_reading_end_sync(reason,options,callback)
                         record_override=U.copy(record_snapshot),
                         record_generation_override=record_generation_snapshot,
                         pending_reason="final_upload_queued",
+                        pending_already_saved=true,
+                        quiet_intermediate_state=true,
+                        nonblocking_verify=true,
+                        clear_pending_on_accept=true,
+                        verify_detached=true,
                         uploading_message="正在上传结束阅读进度",
                         verifying_message="结束阅读进度已提交，正在确认云端位置",
                         retrying_message="云端尚未确认，正在重提交最终精确位置",
@@ -25292,15 +25367,27 @@ function Plugin:_reading_end_sync(reason,options,callback)
                         unconfirmed_message="最终精确位置已保留，云端仍待确认",
                         failed_message="结束阅读进度暂未完成",
                         first_delay=.55,second_delay=.85,retry_delay=.35,
+                        accepted_callback=function(accepted_snapshot)
+                            logger.info("[MiuRead][ReadingEnd] progress submit accepted; close gate released",
+                                "book=",book_id,"seq=",tostring(accepted_snapshot and accepted_snapshot.progress_sequence or "-"))
+                            finish_gate(true)
+                        end,
                     },function(ok,remote,err,submitted)
+                        self._reading_end_background_verify_active=false
                         if err~="superseded" and not ok then
-                            logger.warn("[MiuRead][ReadingEnd] progress remains pending",
+                            logger.warn("[MiuRead][ReadingEnd] background progress verification pending",
                                 "book=",book_id,"seq=",tostring(submitted and submitted.progress_sequence or "-"),
                                 "reason=",tostring(err or "cloud_not_confirmed"))
                         end
-                        complete_one(ok or err=="superseded")
+                        -- Upload failures occur before accepted_callback and
+                        -- still block the close gate; cloud readback mismatch
+                        -- after acceptance is background-only.
+                        if not gate_completed then finish_gate(ok or err=="superseded") end
                     end)
-                    if not upload_started then complete_one(false) end
+                    if not upload_started then
+                        self._reading_end_background_verify_active=false
+                        finish_gate(false)
+                    end
                 end
 
                 -- beta.12: the final progress request is always rt=0 and uses
@@ -25531,10 +25618,9 @@ end
 
 function Plugin:_reading_end_before_action(reason,after,action)
     if self.sync and self.sync.reading_end_finalized==true then return action() end
-    local started=self:_reading_end_sync(reason,{show_status=true,after=after,timeout=18},function(ok)
-        if not ok and self:_sync_error_notice_enabled() then
-            self:status_toast("阅读记录已保存在本机","云端同步未全部完成，稍后可继续同步",3)
-        end
+    local started=self:_reading_end_sync(reason,{show_status=true,after=after,timeout=14},function(_ok)
+        -- _reading_end_sync already renders the final success/unconfirmed state.
+        -- Do not stack a second toast over it before executing the user action.
         action()
     end)
     if not started then return action() end
@@ -26142,9 +26228,10 @@ function Plugin:onSuspend()
         local lease_ok=SuspendWorkLease.acquire("reader_finalizer")
         self._reading_end_standby_held=lease_ok==true
         sync_continue=self:_reading_end_sync("休眠",{
-            show_status=false,timeout=18,
-            -- beta.5 keeps the Reader/document alive until the final position
-            -- has been frozen and the close transaction has finished.
+            show_status=true,after="进入休眠",timeout=14,
+            -- Keep the Reader/document alive until the exact final snapshot and
+            -- required upload requests have completed. Cloud readback is
+            -- background-only and never holds the power button for extra seconds.
             defer_background_start=false,
         },function(ok)
             self:_finish_suspend_reader_finalizer(ok)
