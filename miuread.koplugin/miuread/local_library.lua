@@ -104,6 +104,11 @@ local function native_dir_visible(name)
     return not name:lower():match("%.sdr$")
 end
 
+local NON_BOOK_IMAGE_EXTENSIONS = {
+    jpg=true,jpeg=true,png=true,gif=true,bmp=true,webp=true,svg=true,
+    tif=true,tiff=true,pbm=true,pgm=true,ppm=true,pnm=true,
+}
+
 local function obvious_runtime_file(name)
     local lower = tostring(name or ""):lower()
     -- Kindle may place crash diagnostics directly in documents. They are text
@@ -120,6 +125,10 @@ local function native_file_visible(name, fullpath)
     if lower:match("%.part$") or lower:match("%.tmp$") or lower:match("%.download$")
         or lower:match("%.crdownload$") then return false end
     if obvious_runtime_file(name) then return false end
+    -- DocumentRegistry also has image providers. A recursive "book library"
+    -- should follow KOReader for document formats without turning wallpapers
+    -- and photos into books.
+    if NON_BOOK_IMAGE_EXTENSIONS[extension(name)] then return false end
     if not LocalLibrary.is_supported(fullpath) then return false end
     local chooser = native_filechooser()
     if chooser and type(chooser.show_file) == "function" then
@@ -238,7 +247,11 @@ function TreeScan:_accept(name)
     local full = (base == "/" and "/" .. name or base .. "/" .. name)
     if excluded_path(full, self.excluded_paths) then return end
     local attr = lfs.attributes(full)
-    if attr and attr.mode == "directory" then
+    if not attr then
+        self.unreadable_paths[#self.unreadable_paths + 1] = full
+        return
+    end
+    if attr.mode == "directory" then
         if native_dir_visible(name) and not is_symlink(full) then
             if base == self.path then
                 self.folders[#self.folders + 1] = {
@@ -316,7 +329,8 @@ function TreeScan:snapshot()
         book_count = #self.books,
         directories_scanned = self.directories_scanned,
         unreadable_dirs = self.unreadable_dirs,
-        partial = #self.unreadable_dirs > 0 and self.error == nil,
+        unreadable_paths = self.unreadable_paths,
+        partial = (#self.unreadable_dirs > 0 or #self.unreadable_paths > 0) and self.error == nil,
         error = self.error,
     }
 end
@@ -334,7 +348,7 @@ function LocalLibrary.new_tree_scan(path, options)
         excluded_paths = type(options.exclude_paths) == "table" and options.exclude_paths or {},
         folders = {}, books = {}, seen = 0,
         queue = {path}, queue_index = 1,
-        directories_scanned = 0, unreadable_dirs = {},
+        directories_scanned = 0, unreadable_dirs = {}, unreadable_paths = {},
         truncated = false, done = false, cancelled = false,
     }, TreeScan)
     if path == "" or lfs.attributes(path, "mode") ~= "directory" then
