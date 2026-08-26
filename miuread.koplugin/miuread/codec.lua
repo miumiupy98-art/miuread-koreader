@@ -300,6 +300,14 @@ function Codec.native_status()
     }
 end
 
+function Codec.prewarm_native()
+    -- Load the optional decoder while the Reader is already idle instead of
+    -- paying the first ffi.load cost during a Home/close progress snapshot.
+    -- This performs no chapter decode, network access or persistent write.
+    local lib=ensure_native()
+    return lib~=nil,Codec.native_status()
+end
+
 function Codec.decode_parts(parts)
     parts=parts or {}
     if not ensure_native() then return lua_decode_parts(parts) end

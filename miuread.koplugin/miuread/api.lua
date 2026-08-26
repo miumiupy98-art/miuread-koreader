@@ -303,8 +303,9 @@ function Api:shelf_stream(options)
     if not ok_index then
         local auth_failure=Http.is_auth_error(index)
         if options.allow_full_fallback==false and not auth_failure then
-            logger.warn("[MiuRead][ShelfStream] index unavailable; keeping cached shelf",tostring(index))
-            error(tostring(index))
+            logger.info("[MiuRead][ShelfStream] index unavailable; cached shelf retained",
+                U.first_line(index,160))
+            return {_miuread_stream={enabled=false,keep_cache=true,reason="index_unavailable",error=tostring(index)}}
         end
         logger.warn("[MiuRead][ShelfStream] index unavailable; falling back to Agent shelf",
             "auth_failure=",tostring(auth_failure),"error=",U.first_line(index,160))
@@ -319,8 +320,9 @@ function Api:shelf_stream(options)
     if not ok_batch or type(batch)~="table" then
         local auth_failure=not ok_batch and Http.is_auth_error(batch)
         if options.allow_full_fallback==false and not auth_failure then
-            logger.warn("[MiuRead][ShelfStream] first batch unavailable; keeping cached shelf",tostring(batch))
-            error(tostring(batch or "first shelf batch unavailable"))
+            logger.info("[MiuRead][ShelfStream] first batch unavailable; cached shelf retained",
+                U.first_line(batch or "first shelf batch unavailable",160))
+            return {_miuread_stream={enabled=false,keep_cache=true,reason="batch_unavailable",error=tostring(batch or "")}}
         end
         logger.warn("[MiuRead][ShelfStream] first batch unavailable; falling back to Agent shelf",
             "auth_failure=",tostring(auth_failure),"error=",U.first_line(batch,160))

@@ -1,17 +1,17 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.2.0",
+    VERSION = "5.3.0-beta.6",
     SCHEMA = 119,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
     -- 当前安装包自身仍有 stable/beta 身份；用户选择的 OTA 通道独立保存。
     -- beta.20 起所有实时更新清单都由统一仓库 miuread-koreader 提供。
-    UPDATE_CHANNEL = "stable",
-    UPDATE_CHANNEL_LABEL = "正式通道",
-    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+    UPDATE_CHANNEL = "beta",
+    UPDATE_CHANNEL_LABEL = "内测通道",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     },
     UPDATE_CHANNELS = {
         stable = {
@@ -65,6 +65,10 @@ local C = {
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
     READ_INTERVAL = 60,
+    -- First confirmed reading-time report is intentionally earlier than the
+    -- steady 60 s cadence so the user can verify sync without waiting a minute.
+    -- This is an internal strategy, not another user-facing setting.
+    READ_FIRST_DELAY = 15,
     -- beta.24 never replays historical/suspend reading-time debt. Normal
     -- reports stay on the established one-minute cadence and every request is
     -- independently capped, avoiding burst uploads after reconnect/resume.

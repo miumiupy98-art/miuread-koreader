@@ -4,6 +4,8 @@ local LocalLibrary = {}
 
 local registry_checked = false
 local registry
+local filechooser_checked = false
+local filechooser
 
 local function document_registry()
     if not registry_checked then
@@ -12,6 +14,15 @@ local function document_registry()
         if ok and value then registry = value end
     end
     return registry
+end
+
+local function native_filechooser()
+    if not filechooser_checked then
+        filechooser_checked = true
+        local ok, value = pcall(require, "ui/widget/filechooser")
+        if ok and value then filechooser = value end
+    end
+    return filechooser
 end
 
 local function basename(path)
@@ -36,8 +47,6 @@ local function exists(path)
 end
 
 local function cover_path(path)
-    -- Reuse KOReader's custom-cover lookup. MiuRead does not define a second
-    -- cover naming policy; the extra candidates only preserve old sidecars.
     local ok, DocSettings = pcall(require, "docsettings")
     if ok and DocSettings and type(DocSettings.findCustomCoverFile) == "function" then
         local found_ok, found = pcall(DocSettings.findCustomCoverFile, DocSettings, path)
@@ -66,26 +75,6 @@ local function title_from_path(path)
     return title ~= "" and title or "未命名"
 end
 
-local function should_skip_dir(name)
-    local lower = tostring(name or ""):lower()
-    -- Match KOReader's ordinary hidden-directory expectations without keeping
-    -- a MiuRead-specific blacklist of folder names. A user folder named
-    -- "System" or "Plugins" therefore remains browsable.
-    if lower == "." or lower == ".." then return true end
-    if lower:sub(1, 1) == "." then return true end
-    if lower:match("%.sdr$") then return true end
-    return false
-end
-
-local function should_skip_file(name)
-    local lower = tostring(name or ""):lower()
-    if lower:sub(1, 1) == "." or lower:sub(1, 2) == "._" then return true end
-    if lower:sub(-1) == "~" then return true end
-    if lower:match("%.part$") or lower:match("%.tmp$") or lower:match("%.download$")
-        or lower:match("%.crdownload$") then return true end
-    return false
-end
-
 function LocalLibrary.normalize(path)
     path = tostring(path or ""):gsub("\\", "/"):gsub("/+", "/")
     if #path > 1 then path = path:gsub("/$", "") end
@@ -96,8 +85,7 @@ function LocalLibrary.basename(path) return basename(LocalLibrary.normalize(path
 function LocalLibrary.dirname(path) return dirname(LocalLibrary.normalize(path)) end
 function LocalLibrary.title_from_path(path) return title_from_path(path) end
 
--- Format discovery belongs to KOReader. No extension whitelist is maintained
--- here, so a format added by KOReader automatically becomes visible to MiuRead.
+-- KOReader owns format support. MiuRead deliberately keeps no extension list.
 function LocalLibrary.is_supported(path)
     local registry_value = document_registry()
     if not registry_value or type(registry_value.hasProvider) ~= "function" then return false end
@@ -105,8 +93,45 @@ function LocalLibrary.is_supported(path)
     return ok and supported == true
 end
 
--- Kept for compatibility with older callers. The new local-book architecture
--- no longer uses this heuristic to hide books.
+local function native_dir_visible(name)
+    name = tostring(name or "")
+    if name == "." or name == ".." or name:sub(1, 1) == "." then return false end
+    local chooser = native_filechooser()
+    if chooser and type(chooser.show_dir) == "function" then
+        local ok, shown = pcall(chooser.show_dir, chooser, name)
+        if ok then return shown ~= false end
+    end
+    return not name:lower():match("%.sdr$")
+end
+
+local function obvious_runtime_file(name)
+    local lower = tostring(name or ""):lower()
+    -- Kindle may place crash diagnostics directly in documents. They are text
+    -- files KOReader can technically open, but they are not user books.
+    if lower:match("^kppmainappv?2?_.*_crash_.*%.txt$") then return true end
+    return false
+end
+
+local function native_file_visible(name, fullpath)
+    name = tostring(name or "")
+    local lower = name:lower()
+    if lower:sub(1, 1) == "." or lower:sub(1, 2) == "._" then return false end
+    if lower:sub(-1) == "~" then return false end
+    if lower:match("%.part$") or lower:match("%.tmp$") or lower:match("%.download$")
+        or lower:match("%.crdownload$") then return false end
+    if obvious_runtime_file(name) then return false end
+    if not LocalLibrary.is_supported(fullpath) then return false end
+    local chooser = native_filechooser()
+    if chooser and type(chooser.show_file) == "function" then
+        -- No fullpath here on purpose: KOReader's status filter is a UI choice,
+        -- not a definition of what belongs to the complete local library.
+        local ok, shown = pcall(chooser.show_file, chooser, name)
+        if ok then return shown ~= false end
+    end
+    return true
+end
+
+-- Compatibility helper retained for old callers.
 function LocalLibrary.is_likely_dictionary(path, title)
     local normalized = LocalLibrary.normalize(path):lower()
     return normalized:find("/dictionaries/", 1, true) ~= nil
@@ -128,7 +153,6 @@ function LocalLibrary.is_miuread_generated_epub(path)
         tail = file:read("*a") or ""
     end
     file:close()
-    -- MiuRead-generated EPUBs write this source marker into package.opf.
     return (head .. "\n" .. tail):find("miuread://book/", 1, true) ~= nil
 end
 
@@ -136,7 +160,8 @@ function LocalLibrary.book_from_path(path, options)
     options = options or {}
     path = LocalLibrary.normalize(path)
     local attr = lfs.attributes(path)
-    if not attr or attr.mode ~= "file" or should_skip_file(basename(path)) or not LocalLibrary.is_supported(path) then return nil end
+    local name = basename(path)
+    if not attr or attr.mode ~= "file" or not native_file_visible(name, path) then return nil end
     return {
         file = path,
         title = title_from_path(path),
@@ -151,137 +176,230 @@ function LocalLibrary.book_from_path(path, options)
     }
 end
 
--- Current-directory browsing only. No recursion, no depth limit, and no
--- fixed item cap unless a caller explicitly supplies one for compatibility.
-local DirectoryScan = {}
-DirectoryScan.__index = DirectoryScan
-
-function DirectoryScan:_close()
-    if self._closed then return end
-    self._closed = true
-    pcall(function()
-        if self.state and self.state.close then self.state:close() end
-    end)
+local function excluded_path(path, excluded)
+    path = LocalLibrary.normalize(path)
+    for _, value in ipairs(excluded or {}) do
+        local root = LocalLibrary.normalize(value)
+        if root ~= "" and (path == root or path:sub(1, #root + 1) == root .. "/") then return true end
+    end
+    return false
 end
 
-function DirectoryScan:cancel()
+local function is_symlink(path)
+    if type(lfs.symlinkattributes) ~= "function" then return false end
+    local ok, mode = pcall(lfs.symlinkattributes, path, "mode")
+    return ok and mode == "link"
+end
+
+-- Recursive KOReader-backed discovery. Folder cards represent immediate child
+-- folders, while books contain every KOReader-supported document below path.
+-- Discovery builds a complete snapshot first; callers swap it into the UI only
+-- after this scan has finished, so page turns never mutate library membership.
+local TreeScan = {}
+TreeScan.__index = TreeScan
+
+function TreeScan:_close_current()
+    local state = self.current_state
+    self.current_iter, self.current_state, self.current_var, self.current_path = nil, nil, nil, nil
+    pcall(function() if state and state.close then state:close() end end)
+end
+
+function TreeScan:_open_next()
+    self:_close_current()
+    while self.queue_index <= #self.queue do
+        local path = self.queue[self.queue_index]
+        self.queue_index = self.queue_index + 1
+        local ok, iter, state, var = pcall(lfs.dir, path)
+        if ok and iter then
+            self.current_path, self.current_iter, self.current_state, self.current_var = path, iter, state, var
+            self.directories_scanned = self.directories_scanned + 1
+            return true
+        end
+        self.unreadable_dirs[#self.unreadable_dirs + 1] = path
+        if path == self.path then
+            self.error = tostring(iter or state or "无法读取目录")
+            self.done = true
+            return false
+        end
+    end
+    self.done = true
+    return false
+end
+
+function TreeScan:cancel()
     self.cancelled = true
     self.done = true
-    self:_close()
+    self:_close_current()
 end
 
-function DirectoryScan:_accept(name)
+function TreeScan:_first_child(path)
+    path = LocalLibrary.normalize(path)
+    local root = LocalLibrary.normalize(self.path)
+    if root == "" or path == root then return nil end
+    local prefix = root == "/" and "/" or root .. "/"
+    if path:sub(1, #prefix) ~= prefix then return nil end
+    local rest = path:sub(#prefix + 1)
+    local name = rest:match("^([^/]+)")
+    if not name or name == "" then return nil end
+    return prefix .. name
+end
+
+function TreeScan:_remember_folder(path, name, attr)
+    path = LocalLibrary.normalize(path)
+    if path == "" or self.folder_seen[path] then return end
+    self.folder_seen[path] = true
+    self.folders[#self.folders + 1] = {
+        kind = "folder", local_folder = true, title = tostring(name or basename(path)),
+        path = path, folder_path = path, modified_at = tonumber(attr and attr.modification) or 0,
+        book_count = 0,
+    }
+end
+
+function TreeScan:_accept(name)
     if name == "." or name == ".." then return end
-    local full = (self.path == "/" and "/" .. name or self.path .. "/" .. name)
+    local base = self.current_path
+    local full = (base == "/" and "/" .. name or base .. "/" .. name)
+    if excluded_path(full, self.excluded_paths) then return end
     local attr = lfs.attributes(full)
     if attr and attr.mode == "directory" then
-        if not should_skip_dir(name) then
-            self.folders[#self.folders + 1] = {
-                kind = "folder", local_folder = true, title = name,
-                path = full, folder_path = full, modified_at = tonumber(attr.modification) or 0,
-            }
-            self.seen = self.seen + 1
+        if native_dir_visible(name) and not is_symlink(full) then
+            local child = self:_first_child(full)
+            if child and child == full then self:_remember_folder(full, name, attr) end
+            self.queue[#self.queue + 1] = full
         end
-    elseif attr and attr.mode == "file" and not should_skip_file(name) then
+    elseif attr and attr.mode == "file" then
         local book = LocalLibrary.book_from_path(full, {include_cover = self.include_cover})
         if book then
+            local parent = dirname(full)
+            book.parent = LocalLibrary.normalize(parent)
             self.books[#self.books + 1] = book
+            if parent == self.path then self.direct_books[#self.direct_books + 1] = book end
+            local child = self:_first_child(full)
+            if child then self.folder_book_counts[child] = (tonumber(self.folder_book_counts[child]) or 0) + 1 end
             self.seen = self.seen + 1
+            if self.limit and self.seen >= self.limit then
+                self.truncated = true
+                self.done = true
+                self:_close_current()
+            end
         end
     end
-    if self.limit and self.seen >= self.limit then
-        self.truncated = true
-        self.done = true
-        self:_close()
-    end
 end
-
-function DirectoryScan:step(batch_size)
+function TreeScan:step(batch_size)
     if self.done or self.cancelled then return true end
     batch_size = math.max(1, tonumber(batch_size) or 32)
     local processed = 0
     while processed < batch_size and not self.done do
-        local ok, name = pcall(self.iter, self.state, self.var)
-        if not ok then
-            self.error = tostring(name or "无法读取目录")
-            self.done = true
-            self:_close()
-            break
+        if not self.current_iter and not self:_open_next() then break end
+        if self.current_iter then
+            local ok, name = pcall(self.current_iter, self.current_state, self.current_var)
+            if not ok then
+                self.unreadable_dirs[#self.unreadable_dirs + 1] = self.current_path
+                if self.current_path == self.path then self.error = tostring(name or "无法读取目录") end
+                self:_close_current()
+            else
+                self.current_var = name
+                if not name then
+                    self:_close_current()
+                else
+                    processed = processed + 1
+                    self:_accept(name)
+                end
+            end
         end
-        self.var = name
-        if not name then
-            self.done = true
-            self:_close()
-            break
-        end
-        processed = processed + 1
-        self:_accept(name)
     end
     return self.done
 end
 
-function DirectoryScan:snapshot()
+function TreeScan:snapshot()
     if not self._sorted then
+        local pruned = {}
+        for _, folder in ipairs(self.folders or {}) do
+            local path = LocalLibrary.normalize(folder.path or folder.folder_path)
+            local count = tonumber(self.folder_book_counts[path]) or 0
+            if count > 0 then
+                folder.book_count = count
+                pruned[#pruned + 1] = folder
+            end
+        end
+        self.folders = pruned
         table.sort(self.folders, function(a, b)
             return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
         end)
-        table.sort(self.books, function(a, b)
-            if self.options.sort == "name" then
-                return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
-            end
-            local am, bm = tonumber(a.modified_at) or 0, tonumber(b.modified_at) or 0
-            if am ~= bm then return am > bm end
-            return tostring(a.title or ""):lower() < tostring(b.title or ""):lower()
-        end)
+        local function sort_books(list)
+            table.sort(list, function(a, b)
+                if self.options.sort == "modified" then
+                    local am, bm = tonumber(a.modified_at) or 0, tonumber(b.modified_at) or 0
+                    if am ~= bm then return am > bm end
+                end
+                local at, bt = tostring(a.title or ""):lower(), tostring(b.title or ""):lower()
+                if at ~= bt then return at < bt end
+                return tostring(a.file or "") < tostring(b.file or "")
+            end)
+        end
+        sort_books(self.books)
+        sort_books(self.direct_books)
         self._sorted = true
     end
     return {
-        path = self.path, scanned_at = os.time(), folders = self.folders, books = self.books,
-        truncated = self.truncated == true, direct_count = #self.folders + #self.books,
+        path = self.path,
+        root = self.path,
+        scanned_at = os.time(),
+        folders = self.folders,
+        books = self.books,
+        direct_books = self.direct_books,
+        truncated = self.truncated == true,
+        recursive = true,
+        direct_count = #self.folders,
+        book_count = #self.books,
+        directories_scanned = self.directories_scanned,
+        unreadable_dirs = self.unreadable_dirs,
+        partial = #self.unreadable_dirs > 0 and self.error == nil,
         error = self.error,
     }
 end
 
-function LocalLibrary.new_directory_scan(path, options)
+function LocalLibrary.new_tree_scan(path, options)
     options = options or {}
     path = LocalLibrary.normalize(path)
     local explicit_limit = tonumber(options.limit)
     if explicit_limit and explicit_limit <= 0 then explicit_limit = nil end
     local scanner = setmetatable({
-        path = path, options = options, limit = explicit_limit and math.max(20, explicit_limit) or nil,
-        include_cover = options.include_cover == true, folders = {}, books = {}, seen = 0,
+        path = path,
+        options = options,
+        limit = explicit_limit and math.max(20, explicit_limit) or nil,
+        include_cover = options.include_cover == true,
+        excluded_paths = type(options.exclude_paths) == "table" and options.exclude_paths or {},
+        folders = {}, folder_seen = {}, folder_book_counts = {}, books = {}, direct_books = {}, seen = 0,
+        queue = {path}, queue_index = 1,
+        directories_scanned = 0, unreadable_dirs = {},
         truncated = false, done = false, cancelled = false,
-    }, DirectoryScan)
-    local ok, iter, state, var = pcall(lfs.dir, path)
-    if not ok or not iter then
+    }, TreeScan)
+    if path == "" or lfs.attributes(path, "mode") ~= "directory" then
         scanner.done = true
-        scanner.error = tostring(iter or state or "无法读取目录")
-        return scanner
+        scanner.error = "文件夹不存在"
     end
-    scanner.iter, scanner.state, scanner.var = iter, state, var
     return scanner
 end
 
-function LocalLibrary.list_directory(path, options)
-    local scanner = LocalLibrary.new_directory_scan(path, options)
+function LocalLibrary.list_tree(path, options)
+    local scanner = LocalLibrary.new_tree_scan(path, options)
     while not scanner:step(256) do end
     return scanner:snapshot()
 end
 
--- Compatibility only: old code may still call scan(). It is intentionally a
--- non-recursive current-directory read, so no missed legacy call can revive the
--- retired whole-library scanner.
+-- Compatibility aliases. 5.2 beta.4 restores complete recursive discovery;
+-- callers using the old names now receive the same KOReader-backed snapshot.
+function LocalLibrary.new_directory_scan(path, options)
+    return LocalLibrary.new_tree_scan(path, options)
+end
+
+function LocalLibrary.list_directory(path, options)
+    return LocalLibrary.list_tree(path, options)
+end
+
 function LocalLibrary.scan(root, options)
-    local snapshot = LocalLibrary.list_directory(root, options)
-    return {
-        root = LocalLibrary.normalize(root),
-        scanned_at = snapshot.scanned_at or os.time(),
-        books = snapshot.books or {},
-        folders = snapshot.folders or {},
-        truncated = snapshot.truncated == true,
-        error = snapshot.error,
-        non_recursive = true,
-    }
+    return LocalLibrary.list_tree(root, options)
 end
 
 return LocalLibrary

@@ -19,8 +19,8 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 22
-local FIRST_REPORT_DELAY = 60
+local READ_REPORT_SERVICE_VERSION = 27
+local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
 
@@ -397,6 +397,9 @@ function Sync:new(reader, api, store, host, async, identity_async)
         auto_repair_busy=false, repair_busy=false, repair_book_id=nil, repair_generation=0,
         daemon_auth_retry_at=0, auth_transitioning=false,
         control_write_task=nil, session_started_at=0, suspend_generation=0,
+        reading_time_session_id=nil, reading_time_segment_id=nil,
+        resume_after_finalizer=false,
+        progress_write_fence=false, progress_write_fence_seq=0,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -1041,6 +1044,55 @@ function Sync:resolve_local_progress(callback, options)
         if callback then callback(nil, mapping_error, {error_kind="position"}) end
     end
 
+    -- Reading-end fast handoff: capture an immutable Reader anchor first and
+    -- postpone the expensive source mapping. This path deliberately bypasses
+    -- catalog preparation on the foreground close/suspend edge.
+    if options.source_first==true and options.precise~=false then
+        emit("position_locating","source_first")
+        local started, source_error = self:_source_position_async(function(position, err)
+            if position then
+                local exact_cloud=position.native_offset==true
+                    and tostring(position.offset_basis or position.position_basis or "")=="wr_data_co"
+                    and tonumber(position.chapter_offset or position.offset)~=nil
+                position.precision_level=exact_cloud and "exact_cloud" or "precise_local"
+                position.canonical_offset=tonumber(position.chapter_offset or position.offset)
+                logger.info("[MiuRead][ProgressSource] ready", "book=",book_id,
+                    "chapter=",tostring(position.chapter_uid or "-"),
+                    "offset=",tostring(position.offset or "-"),
+                    "basis=",tostring(position.offset_basis or position.position_basis or "-"),
+                    "native=",tostring(position.native_offset == true),
+                    "precision=",tostring(position.precision_level),
+                    "progress=",string.format("%.3f",tonumber(position.progress) or 0),
+                    "cache=",tostring(position.source_cache_hit == true),
+                    "handoff=", "source_first")
+                if options.require_cloud_coordinate==true and not exact_cloud then
+                    if callback then callback(nil,"cloud_coordinate_unavailable",{error_kind="position"}) end
+                elseif callback then
+                    callback(position,nil,{source=position.source or "weread_source_anchor"})
+                end
+                return
+            end
+            emit("position_fallback",err)
+            if options.require_cloud_coordinate==true then
+                if callback then callback(nil,tostring(err or "cloud_coordinate_unavailable"),{error_kind="position"}) end
+            else
+                complete_fallback(false,err)
+            end
+        end,{
+            detached=detached,
+            record_snapshot=record,
+            record_generation_override=generation,
+            ratio_snapshot=ratio_snapshot,
+            defer_seconds=options.defer_seconds,
+        })
+        if started then return true end
+        emit("position_fallback",source_error)
+        if options.require_cloud_coordinate==true then
+            if callback then callback(nil,tostring(source_error or "cloud_coordinate_unavailable"),{error_kind="busy"}) end
+            return true
+        end
+    end
+
     local catalog, catalog_source = self:_progress_catalog(record)
     local prepared = options._catalog_prepared == true
     if type(catalog) ~= "table" or #catalog == 0 then
@@ -1128,7 +1180,11 @@ function Sync:_source_position_async(callback, options)
     -- device cannot fork a worker, keep the existing local precision path
     -- rather than doing a network request on the Reader UI thread.
     if not self.async or not self.async:available() then return false, "source_worker_unavailable" end
-    if self.async:busy() then return false, "source_worker_busy" end
+    -- A detached reading-end resolver must freeze its Reader anchor before the
+    -- document is allowed to close. A busy worker is therefore not a reason to
+    -- skip capture: keep the immutable anchor and launch the subprocess later.
+    local worker_busy=self.async:busy()==true
+    if worker_busy and not detached then return false, "source_worker_busy" end
 
     local anchor, anchor_error = PrecisePosition.capture(
         ui, record, self:_precision_catalog(record))
@@ -1184,24 +1240,22 @@ function Sync:_source_position_async(callback, options)
         end,on_result,40)
     end
     local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)
-    if detached and defer_seconds>0 then
-        -- Capture the Reader anchor now, but postpone network/source mapping until
-        -- after the close transition. This keeps the first Home frame ahead of
-        -- PosMap building or a source-chapter fetch on single-core Kindles. A
-        -- quickly opened next book may briefly own the sync worker, so retry a
-        -- few times in the background instead of dropping the old book immediately.
+    if detached and (defer_seconds>0 or worker_busy) then
+        -- The anchor above is already frozen while ReaderUI/document is alive.
+        -- Mapping can now yield to the close/screen-saver paint and retry behind
+        -- a temporarily busy worker without losing the exact source position.
         local attempts=0
         local function deferred_launch()
             attempts=attempts+1
             local started,run_error=launch()
             if started then return end
-            if tostring(run_error or "")=="source_worker_busy" and attempts<4 then
-                UIManager:scheduleIn(1.2,deferred_launch)
+            if tostring(run_error or "")=="source_worker_busy" and attempts<6 then
+                UIManager:scheduleIn(1.0,deferred_launch)
                 return
             end
             if callback then callback(nil,tostring(run_error or "source_worker_unavailable")) end
         end
-        UIManager:scheduleIn(defer_seconds,deferred_launch)
+        UIManager:scheduleIn(math.max(.02,defer_seconds),deferred_launch)
         return true
     end
     local started,run_error=launch()
@@ -1484,6 +1538,62 @@ function Sync:_normalize_remote_progress(remote,book_id)
     return catalog_progress_from_remote(remote,chapters)
 end
 
+local function cloud_anchor_from(value, state)
+    value=type(value)=="table" and value or {}
+    local uid=value.chapter_uid or value.chapterUid
+    local offset=tonumber(value.canonical_offset or value.chapter_offset or value.offset or value.chapterOffset)
+    if tostring(uid or "")=="" or offset==nil then return nil end
+    local progress=tonumber(value.protocol_progress or value.raw_progress or value.raw_percent or value.progress)
+    if progress==nil then return nil end
+    return {
+        chapter_uid=uid,
+        chapter_idx=tonumber(value.chapter_idx or value.chapter_index or value.chapterIdx) or 0,
+        chapter_offset=math.max(0,math.floor(offset+.5)),
+        progress=math.max(0,math.min(100,progress)),
+        raw_progress=tonumber(value.raw_progress or value.raw_percent),
+        source=tostring(value.source or state or "cloud"),
+        state=tostring(state or "observed"),
+        server_updated=tonumber(value.updated_at or value.updated),
+        saved_at=os.time(),
+    }
+end
+
+function Sync:cloud_anchor(book_id)
+    book_id=tostring(book_id or "")
+    if book_id=="" then return nil end
+    local session=self.store:session(book_id) or {}
+    local anchor=type(session.cloud_anchor)=="table" and U.copy(session.cloud_anchor) or nil
+    if anchor and tostring(anchor.chapter_uid or "")~="" and tonumber(anchor.chapter_offset)~=nil then return anchor end
+    local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
+    local pending_anchor=cloud_anchor_from(pending,"pending_progress")
+    if pending_anchor then return pending_anchor end
+    local remote=type(session.remote)=="table" and session.remote or nil
+    return cloud_anchor_from(remote,"stored_remote")
+end
+
+function Sync:set_cloud_anchor(book_id, value, state, write_control)
+    book_id=tostring(book_id or "")
+    local anchor=cloud_anchor_from(value,state)
+    if book_id=="" or not anchor then return false end
+    self.store:save_session(book_id,{cloud_anchor=anchor})
+    if write_control~=false and self.daemon
+        and tostring(self.daemon.book_id or self.daemon.final_book_id or "")==book_id then
+        self:_write_daemon_control(self.daemon.active==true,true,{
+            cloud_anchor_chapter_uid=anchor.chapter_uid,
+            cloud_anchor_chapter_idx=anchor.chapter_idx,
+            cloud_anchor_chapter_offset=anchor.chapter_offset,
+            cloud_anchor_progress=anchor.progress,
+            cloud_anchor_raw_progress=anchor.raw_progress,
+            cloud_anchor_source=anchor.source,
+            cloud_anchor_state=anchor.state,
+        })
+    end
+    logger.info("[MiuRead][CloudAnchor] updated","book=",book_id,
+        "state=",anchor.state,"chapter=",tostring(anchor.chapter_uid),
+        "co=",tostring(anchor.chapter_offset),"progress=",tostring(anchor.progress))
+    return true
+end
+
 function Sync:remote(book_id, callback, options)
     options=options or {}
     local detached=options.detached==true
@@ -1596,6 +1706,16 @@ function Sync:remote(book_id, callback, options)
             remote_web_error=value.web_error,
             remote_agent_error=value.agent_error,
         })
+        if not remote.conflict and options.update_cloud_anchor~=false then
+            local current_session=self.store:session(book_id) or {}
+            local has_pending=type(current_session.pending_progress)=="table"
+            if not has_pending or options.replace_pending_anchor==true then
+                self:set_cloud_anchor(book_id,remote,"remote_observed",true)
+            else
+                logger.info("[MiuRead][CloudAnchor] remote observation retained as readback only",
+                    "book=",tostring(book_id),"pending=true")
+            end
+        end
         if remote.conflict then
             logger.warn("[MiuRead][Sync] cloud progress source conflict",
                 "book=",tostring(book_id),
@@ -2438,43 +2558,113 @@ function Sync:upload(elapsed, callback, options)
     return true
 end
 
+function Sync:begin_progress_write(reason, callback)
+    callback=type(callback)=="function" and callback or function() end
+    local daemon=self.daemon
+    if not daemon or daemon.active~=true or not daemon.paths then
+        callback(true,{state="no_active_time_writer"})
+        return true
+    end
+    if self.progress_write_fence==true then
+        callback(false,{state="progress_fence_busy"})
+        return false
+    end
+    local seq=self:_next_writer_barrier(reason or "progress_write_fence")
+    if not seq then callback(true,{state="no_barrier"}); return true end
+    self.progress_write_fence=true
+    self.progress_write_fence_seq=seq
+    self:_write_daemon_control(true,true,{
+        progress_fence=true,writer_barrier_seq=seq,
+        writer_barrier_reason=tostring(reason or "progress_write_fence"),
+    })
+    self:wait_writer_barrier(seq,function(ok,result)
+        if not ok then
+            self.progress_write_fence=false
+            self.progress_write_fence_seq=0
+            self:_write_daemon_control(true,true,{progress_fence=false})
+        end
+        callback(ok,result)
+    end,15)
+    return true
+end
+
+function Sync:end_progress_write(reason)
+    if self.progress_write_fence~=true then return false end
+    self.progress_write_fence=false
+    self.progress_write_fence_seq=0
+    if self.daemon and self.daemon.active==true then
+        self:_write_daemon_control(true,true,{
+            progress_fence=false,writer_barrier_reason=tostring(reason or "progress_write_complete"),
+        })
+    end
+    logger.info("[MiuRead][ProgressWriter] fence released","reason=",tostring(reason or "complete"))
+    return true
+end
+
 function Sync:upload_progress(callback, options)
     options = options or {}
+    callback=type(callback)=="function" and callback or function() end
     self.state = "progress_locating"
     self.last_stage = "正在定位当前阅读位置"
     local detached=options.detached==true or options.reading_end==true
-    if type(options.position_override) == "table" then
-        return self:upload(0,callback,{
-            silent=true,progress_only=true,
-            position_override=options.position_override,
-            record_override=options.record_override,
-            record_generation_override=options.record_generation_override,
-            allow_same_book_generation_change=detached,
-            allow_book_switch_result=detached,
-        })
-    end
-    local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
-        if not position then
-            if callback then callback(false,err,nil,{error_kind=meta and meta.error_kind or "position"}) end
-            return
+    local progress_record=type(options.record_override)=="table" and options.record_override or self:record()
+    local progress_book_id=progress_record and progress_record.book and tostring(progress_record.book.book_id or "") or ""
+
+    local function do_upload()
+        local inner_callback=function(ok,result,position,value)
+            -- Progress-only HTTP 200 without succ is intentionally returned as
+            -- ok=true so readback can decide. Once that exact write has left the
+            -- client, freeze reading-time reports to the same immutable position
+            -- before releasing the shared writer fence.
+            if ok==true and progress_book_id~="" then
+                local anchor_position=type(position)=="table" and position or options.position_override
+                if type(anchor_position)=="table" then
+                    self:set_cloud_anchor(progress_book_id,anchor_position,"progress_submitted",true)
+                end
+            end
+            self:end_progress_write(ok==true and "progress_submitted" or "progress_submit_failed")
+            callback(ok,result,position,value)
         end
-        self:upload(0,callback,{
-            silent=true,progress_only=true,
-            position_override=position,
-            allow_same_book_generation_change=detached,
-            allow_book_switch_result=detached,
+        if type(options.position_override) == "table" then
+            return self:upload(0,inner_callback,{
+                silent=true,progress_only=true,transactional_context=true,
+                position_override=options.position_override,
+                record_override=options.record_override,
+                record_generation_override=options.record_generation_override,
+                allow_same_book_generation_change=detached,
+                allow_book_switch_result=detached,
+            })
+        end
+        local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
+            if not position then
+                self:end_progress_write("position_unavailable")
+                callback(false,err,nil,{error_kind=meta and meta.error_kind or "position"})
+                return
+            end
+            local ok=self:upload(0,inner_callback,{
+                silent=true,progress_only=true,transactional_context=true,
+                position_override=position,
+                allow_same_book_generation_change=detached,
+                allow_book_switch_result=detached,
+            })
+            if not ok then self:end_progress_write("upload_not_started") end
+        end,{
+            precise=true,prepare_catalog=true,require_cloud_coordinate=true,on_stage=options.on_stage,
         })
-    end,{
-        precise=true,
-        prepare_catalog=true,
-        require_cloud_coordinate=true,
-        on_stage=options.on_stage,
-    })
-    if not started then
-        if callback then callback(false,resolve_error,nil,{error_kind="busy"}) end
-        return false
+        if not started then
+            self:end_progress_write("resolver_not_started")
+            callback(false,resolve_error,nil,{error_kind="busy"})
+            return false
+        end
+        return true
     end
-    return true
+
+    local fence_started=self:begin_progress_write("progress_write",function(ok)
+        if not ok then callback(false,"progress_writer_busy",nil,{error_kind="busy"}); return end
+        local started=do_upload()
+        if started==false then self:end_progress_write("upload_not_started") end
+    end)
+    return fence_started~=false
 end
 
 function Sync:_notify_failure()
@@ -2512,6 +2702,7 @@ function Sync:test_upload(callback)
         return ReadReportWorker.run{
             book_id=book_id,book_title=record.book.title,book=legacy_book,
             core_map_hash=core_hash,progress_ratio=nil,elapsed_seconds=30,time_only=true,
+            report_mode="reading_time_compat",
             cookies=auth.cookies or {},api_key=auth.api_key or "",
             wr_ticket=auth.wr_ticket or "",wr_wrpa=auth.wr_wrpa or "",
             allow_renewal=false,force_context=false,
@@ -2823,6 +3014,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
         local auth=self.store:auth()
         local account=type(auth.account)=="table" and auth.account or {}
         local book_id=tostring(d.book_id or d.final_book_id or "")
+        local cloud_anchor=book_id~="" and self:cloud_anchor(book_id) or nil
         local position=nil
         if not time_only then
             local record=self:record()
@@ -2859,6 +3051,13 @@ function Sync:_write_daemon_control(active, immediate, extra)
             position_basis = position and position.position_basis or existing.position_basis,
             position_precision_ms = position and position.precision_ms or existing.position_precision_ms,
             position_safe = time_only or (position and true or existing.position_safe==true),
+            cloud_anchor_chapter_uid=cloud_anchor and cloud_anchor.chapter_uid or existing.cloud_anchor_chapter_uid,
+            cloud_anchor_chapter_idx=cloud_anchor and cloud_anchor.chapter_idx or existing.cloud_anchor_chapter_idx,
+            cloud_anchor_chapter_offset=cloud_anchor and cloud_anchor.chapter_offset or existing.cloud_anchor_chapter_offset,
+            cloud_anchor_progress=cloud_anchor and cloud_anchor.progress or existing.cloud_anchor_progress,
+            cloud_anchor_raw_progress=cloud_anchor and cloud_anchor.raw_progress or existing.cloud_anchor_raw_progress,
+            cloud_anchor_source=cloud_anchor and cloud_anchor.source or existing.cloud_anchor_source,
+            cloud_anchor_state=cloud_anchor and cloud_anchor.state or existing.cloud_anchor_state,
             last_activity = tonumber(self.last_activity) or os.time(),
             updated_at = os.time(),
         }
@@ -2983,6 +3182,25 @@ function Sync:_import_daemon_status(force)
     local barrier_seq=tonumber(status.writer_barrier_seq or 0) or 0
     if barrier_seq>0 and tostring(status.state or "")~="reporting" then
         daemon.writer_barrier_ack_seq=math.max(tonumber(daemon.writer_barrier_ack_seq or 0) or 0,barrier_seq)
+        if final_flush then
+            local result_state
+            if status.flush_skipped==true then result_state="skipped"
+            elseif status.accepted==true then result_state="accepted"
+            elseif status.uncertain==true or tostring(status.state or "")=="unconfirmed" then result_state="unconfirmed"
+            elseif status.error or tostring(status.state or "")=="error" then result_state="failed"
+            else result_state="unknown" end
+            daemon.writer_barrier_result_seq=barrier_seq
+            daemon.writer_barrier_result={
+                state=result_state,
+                accepted=status.accepted==true,
+                error=status.error or status.response_summary,
+                elapsed_seconds=tonumber(status.elapsed_seconds),
+                completed_at=tonumber(status.completed_at) or os.time(),
+            }
+        elseif tostring(status.state or "")=="inactive" then
+            daemon.writer_barrier_result_seq=barrier_seq
+            daemon.writer_barrier_result={state="no_flush",accepted=true,completed_at=os.time()}
+        end
     end
     local stamp = daemon_stamp(status)
     if final_flush and stamp and self.store:is_read_report_consumed(stamp) then
@@ -3089,6 +3307,11 @@ function Sync:_import_daemon_status(force)
             if self.host.on_read_report_success then
                 pcall(self.host.on_read_report_success, self.host, status.path)
             end
+        else
+            logger.info("[MiuRead][ReadReport] service interval success",
+                "book=",status_book_id,"count=",tostring(self.session_uploads),
+                "elapsed=",tostring(status.elapsed_seconds or "-"),
+                "next_due=",tostring(status.next_due or "-"))
         end
         self:_persist_daemon_session(force or final_flush, status_book_id ~= "" and status_book_id or nil)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
@@ -3235,6 +3458,22 @@ function Sync:_schedule_daemon_poll(delay)
     UIManager:scheduleIn(delay or 10, task)
 end
 
+local function reading_clock_token(prefix,generation)
+    return table.concat({tostring(prefix or "read"),tostring(os.time()),
+        tostring(tonumber(generation or 0) or 0),tostring(math.random(100000,999999))},"-")
+end
+
+function Sync:_ensure_reading_time_ids(new_session,new_segment)
+    if new_session==true or tostring(self.reading_time_session_id or "")=="" then
+        self.reading_time_session_id=reading_clock_token("session",self.record_generation)
+        new_segment=true
+    end
+    if new_segment==true or tostring(self.reading_time_segment_id or "")=="" then
+        self.reading_time_segment_id=reading_clock_token("segment",self.record_generation)
+    end
+    return self.reading_time_session_id,self.reading_time_segment_id
+end
+
 function Sync:_start_daemon(reason)
     local record = self:record()
     if not record then
@@ -3262,6 +3501,8 @@ function Sync:_start_daemon(reason)
     local daemon = self.daemon
     local prefs = self.store:preferences().sync
     local interval = math.max(10, tonumber(prefs.interval) or tonumber(Config.READ_INTERVAL) or 60)
+    local first_delay = math.max(10, math.min(interval,
+        tonumber(Config.READ_FIRST_DELAY) or tonumber(FIRST_REPORT_DELAY) or 15))
     local session = self.store:session(book_id) or {}
     if not time_only and session.sync_repair_required==true then
         local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
@@ -3304,6 +3545,8 @@ function Sync:_start_daemon(reason)
         daemon.reason=reason
         daemon.core_map_hash=core_hash
         daemon.record_generation=tonumber(self.record_generation or 0) or 0
+        daemon.reading_time_session_id=tostring(self.reading_time_session_id or daemon.reading_time_session_id or "")
+        daemon.reading_time_segment_id=tostring(self.reading_time_segment_id or daemon.reading_time_segment_id or "")
         self.state="waiting"
         self.last_stage="轻量后台服务运行中"
         if position_snapshot then self:_save_local_snapshot(book_id,position_snapshot) end
@@ -3353,6 +3596,8 @@ function Sync:_start_daemon(reason)
     daemon.account_vid = account_vid
     daemon.core_map_hash=core_hash
     daemon.record_generation=tonumber(self.record_generation or 0) or 0
+    daemon.reading_time_session_id=tostring(self.reading_time_session_id or "")
+    daemon.reading_time_segment_id=tostring(self.reading_time_segment_id or "")
     if not time_only then self.daemon_context=U.copy(legacy_book) end
 
     local job = {
@@ -3364,10 +3609,13 @@ function Sync:_start_daemon(reason)
         book_id = book_id,
         core_map_hash = core_hash,
         record_generation = daemon.record_generation,
+        reading_time_session_id = tostring(self.reading_time_session_id or ""),
+        reading_time_segment_id = tostring(self.reading_time_segment_id or ""),
         book_title = record.book.title,
         book_path = record.path,
         book = legacy_book,
         time_only = time_only,
+        report_mode = time_only and "reading_time_compat" or "progress",
         carry_elapsed = carry_elapsed,
         auth = {
             cookies = auth.cookies or {},
@@ -3379,20 +3627,20 @@ function Sync:_start_daemon(reason)
             account = U.copy(auth.account or {}),
         },
         interval = interval,
-        first_delay = interval,
+        first_delay = first_delay,
         idle_timeout = tonumber(prefs.idle_timeout) or 600,
     }
     U.atomic_write(daemon.paths.job, Json.encode(job), true)
     self.daemon_status_stamp = nil
     self.daemon_last_persist = os.time()
     self.state = "waiting"
-    self.next_due = os.time() + interval
-    self.last_stage = "阅读时间后台服务运行中，首次约60秒后上传"
+    self.next_due = os.time() + first_delay
+    self.last_stage = "阅读时间后台服务运行中，首次约"..tostring(first_delay).."秒后上传"
     self:_write_daemon_control(true, true, {_time_only=true})
     self:_schedule_daemon_poll(5)
     logger.info("[MiuRead][ReadReport] service activated",
         "pid=", tostring(daemon.pid), "book=", book_id,
-        "core=",core_hash:sub(1,12),"first_delay=", tostring(interval),
+        "core=",core_hash:sub(1,12),"first_delay=", tostring(first_delay),
         "interval=", tostring(interval), "reason=", tostring(reason or "start"))
     return true
 end
@@ -3485,10 +3733,18 @@ function Sync:writer_barrier_done(seq)
     return done
 end
 
+function Sync:writer_barrier_result(seq)
+    seq=tonumber(seq or 0) or 0
+    local daemon=self.daemon
+    if not daemon or seq<=0 then return {state="no_flush",accepted=true} end
+    if (tonumber(daemon.writer_barrier_result_seq or 0) or 0)<seq then return nil end
+    return type(daemon.writer_barrier_result)=="table" and U.copy(daemon.writer_barrier_result) or nil
+end
+
 function Sync:wait_writer_barrier(seq,callback,timeout)
     callback=type(callback)=="function" and callback or function() end
     seq=tonumber(seq or 0) or 0
-    if seq<=0 or self:writer_barrier_done(seq) then callback(true); return true end
+    if seq<=0 or self:writer_barrier_done(seq) then callback(true,self:writer_barrier_result(seq)); return true end
     local started=os.time()
     timeout=math.max(2,tonumber(timeout) or 12)
     local done=false
@@ -3497,14 +3753,14 @@ function Sync:wait_writer_barrier(seq,callback,timeout)
         if done then return end
         if self:writer_barrier_done(seq) then
             done=true
-            callback(true)
+            callback(true,self:writer_barrier_result(seq))
             return
         end
         if os.time()-started>=timeout then
             done=true
             logger.warn("[MiuRead][ReadReport] writer barrier timeout",
                 "seq=",tostring(seq),"timeout=",tostring(timeout))
-            callback(false)
+            callback(false,self:writer_barrier_result(seq))
             return
         end
         UIManager:scheduleIn(.20,poll)
@@ -3527,23 +3783,28 @@ function Sync:_stop_daemon_fast(reason, flush_elapsed)
         extra.writer_barrier_seq=barrier_seq
         extra.writer_barrier_reason=tostring(reason or "stop_fast")
     end
-    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
-    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+    -- beta.8: nil means "let the service calculate now-last_report_at".
+    -- An explicit zero is a no-flush close (used by duplicate/second close
+    -- events), which prevents the same final tail from being submitted twice.
+    local explicit_elapsed=tonumber(flush_elapsed)
+    local request_flush=daemon.book_id and (explicit_elapsed==nil or explicit_elapsed>0)
+    if request_flush then
         local existing = read_json_file(daemon.paths.control) or {}
         extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
-        extra.flush_elapsed = flush_elapsed
+        if explicit_elapsed~=nil then
+            extra.flush_elapsed=math.max(0,math.floor(explicit_elapsed))
+        else
+            extra.flush_auto = true
+            extra.flush_elapsed = nil
+        end
         extra.flush_reason = tostring(reason or "stop")
         daemon.final_book_id = daemon.book_id
         daemon.final_flush_pending = true
     end
 
-    -- beta.8 attaches a writer barrier to every explicit close. The service
-    -- acknowledges it only after any already-running time report and the final
-    -- short flush have left /web/book/read, so final progress can safely write last.
     daemon.active = false
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
-    if not daemon.final_flush_pending and not barrier_seq then daemon.book_id = nil end
     return barrier_seq
 end
 
@@ -3560,11 +3821,16 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
         extra.writer_barrier_seq=barrier_seq
         extra.writer_barrier_reason=tostring(reason or "stop")
     end
-    flush_elapsed = math.floor(tonumber(flush_elapsed) or 0)
-    if daemon.book_id and flush_elapsed >= FINAL_REPORT_MIN_SECONDS then
+    local explicit_elapsed=tonumber(flush_elapsed)
+    local request_flush=daemon.book_id and (explicit_elapsed==nil or explicit_elapsed>0)
+    if request_flush then
         local existing = read_json_file(daemon.paths.control) or {}
         extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
-        extra.flush_elapsed = flush_elapsed
+        if explicit_elapsed~=nil then
+            extra.flush_elapsed=math.max(0,math.floor(explicit_elapsed))
+        else
+            extra.flush_auto=true
+        end
         extra.flush_reason = tostring(reason or "stop")
         daemon.final_book_id = daemon.book_id
         daemon.final_flush_pending = true
@@ -3579,22 +3845,6 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     return barrier_seq
 end
 
-function Sync:_final_elapsed(skip_status_import)
-    local record=self:record()
-    if not self.store:preferences().sync.time_enabled or not record or not self:_read_report_allowed(record) then return nil end
-    if skip_status_import ~= true then self:_import_daemon_status(true) end
-    local now = os.time()
-    local started = tonumber(self.session_started_at or 0) or 0
-    if started <= 0 then started = now end
-    local uploaded = tonumber(self.last_upload or 0) or 0
-    local base = math.max(started, uploaded)
-    local elapsed = math.max(0, now - base)
-    local maximum = math.max(FINAL_REPORT_MIN_SECONDS, tonumber(Config.READ_INTERVAL) or 60)
-    elapsed = math.min(elapsed, maximum)
-    if elapsed < FINAL_REPORT_MIN_SECONDS then return nil end
-    return elapsed
-end
-
 function Sync:start(reason)
     self.last_activity = os.time()
     if (self.host and (self.host._reading_end_barrier_active==true
@@ -3606,11 +3856,14 @@ function Sync:start(reason)
             "reason=reading_end_barrier","requested=",tostring(reason or "start"))
         return false,"结束阅读收尾中"
     end
-    if reason == "reader_ready" or reason == "resume" or reason == "enabled"
-        or tonumber(self.session_started_at or 0) <= 0
-    then
+    -- Reading-session/segment identity is owned by lifecycle hooks:
+    -- on_reader_ready creates a new session; on_resume creates a new segment.
+    -- Ordinary start()/ensure calls (including progress_check_finished and
+    -- credential refreshes) must never create a new clock identity.
+    if tonumber(self.session_started_at or 0) <= 0 then
         self.session_started_at = self.last_activity
     end
+    self:_ensure_reading_time_ids(false,false)
     local prefs = self.store:preferences().sync or {}
     local enabled = prefs.time_enabled == true
     self.time_enabled = enabled
@@ -3798,6 +4051,8 @@ function Sync:on_reader_ready()
     self.daemon_restart_count = 0
     self.last_upload = 0
     self.session_started_at = os.time()
+    self:_ensure_reading_time_ids(true,true)
+    self.resume_after_finalizer=false
     self.first_success_notified = false
     self.failure_notified = false
     self.consecutive_failures = 0
@@ -3888,16 +4143,25 @@ function Sync:on_resume(_slept)
     self.suspended = false
     self.last_upload = 0
     self.session_started_at = os.time()
-    if self.host and self.host._reading_end_sync_active==true then
-        -- A short wake can arrive while the lock-screen final sync is still
-        -- confirming progress. Starting a new 60 s worker here races the old
-        -- book worker and creates stale-result warnings. Let the final sync own
-        -- the session until it finishes.
-        logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_sync_active")
+    self:_ensure_reading_time_ids(false,true)
+    self.reading_end_finalized=false
+    if self.host and (self.host._reading_end_sync_active==true or self.host._reading_end_finalizer_active==true) then
+        self.resume_after_finalizer=true
+        logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_finalizer_active")
         return true
     end
+    self.resume_after_finalizer=false
+    self:start("resume")
+end
+
+function Sync:resume_after_reading_end()
+    if self.resume_after_finalizer~=true then return false end
+    if self.suspended or not (self.host and self.host.ui and self.host.ui.document) then return false end
+    self.resume_after_finalizer=false
     self.reading_end_finalized=false
     self:start("resume")
+    logger.info("[MiuRead][ReadReport] resumed after interrupted finalizer")
+    return true
 end
 
 function Sync:on_close(options)
@@ -3943,7 +4207,9 @@ function Sync:on_close(options)
         end
         if options.preserve_async~=true and self.async then self.async:cancel("document_closed") end
     else
-        self:stop_fast("close", duplicate and 0 or self:_final_elapsed(true))
+        -- Native/implicit close uses the same service-owned final-tail clock.
+        -- A duplicate close explicitly requests no second flush.
+        self:stop_fast("close", duplicate and 0 or nil)
     end
     self.reading_end_finalized=false
     self.current = nil

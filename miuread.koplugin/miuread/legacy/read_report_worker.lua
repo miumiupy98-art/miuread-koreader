@@ -163,11 +163,12 @@ local function read_report_uncertain(result)
     return true
 end
 
-local function result_summary(result)
+local function result_summary(result, meta)
     if type(result) ~= "table" then
         return "non_table_response"
     end
     local parts = {
+        "HTTP=" .. tostring(type(meta)=="table" and meta.code or "-"),
         "succ=" .. tostring(result.succ),
         "has_synckey=" .. tostring(result.synckey ~= nil),
     }
@@ -180,6 +181,10 @@ local function result_summary(result)
         parts[#parts + 1] = "error_message="
             .. U.first_line(tostring(err_message):gsub("[%c]+", " "), 160)
     end
+    local keys = {}
+    for key in pairs(result) do keys[#keys + 1] = tostring(key) end
+    table.sort(keys)
+    if #keys > 0 then parts[#parts + 1] = "keys=" .. table.concat(keys, "|") end
     return table.concat(parts, ", ")
 end
 
@@ -464,11 +469,53 @@ local function estimate_position(book, progress_ratio)
     return nil,"no safe chapter found for report position"
 end
 
-local function build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only)
+local function normalize_cloud_anchor(anchor, book)
+    anchor = type(anchor) == "table" and anchor or {}
+    book = type(book) == "table" and book or {}
+    local uid = anchor.chapter_uid or anchor.chapterUid or book.remote_chapter_uid
+    local idx = tonumber(anchor.chapter_idx or anchor.chapter_index or anchor.chapterIdx
+        or book.remote_chapter_idx or book.chapter_idx)
+    local offset = tonumber(anchor.chapter_offset or anchor.offset or anchor.chapterOffset
+        or book.remote_chapter_offset)
+    local progress = tonumber(anchor.protocol_progress or anchor.raw_progress or anchor.raw_percent
+        or anchor.progress or book.remote_progress)
+    if tostring(uid or "") == "" or offset == nil or progress == nil then return nil end
+    return {
+        chapter_uid = uid,
+        chapter_idx = idx or 0,
+        chapter_offset = math.max(0, math.floor(offset + 0.5)),
+        progress = math.max(0, math.min(100, math.floor(progress + 0.00001))),
+        source = tostring(anchor.source or "cloud_anchor"),
+        native_offset = true,
+        offset_basis = "wr_data_co",
+    }
+end
+
+local function refresh_remote_anchor(client, book_id, book)
+    local ok, result = pcall(function() return client:get_progress(book_id) end)
+    if not ok or type(result) ~= "table" then return false end
+    local remote = type(result.book) == "table" and result.book or result
+    local uid = remote.chapterUid or remote.chapterId or remote.chapter_uid
+    local idx = tonumber(remote.chapterIdx or remote.chapterIndex or remote.chapter_idx)
+    local offset = tonumber(remote.chapterOffset or remote.chapterPos or remote.offset)
+    local progress = tonumber(remote.progress)
+    if tostring(uid or "") == "" or offset == nil or progress == nil then return false end
+    book.remote_progress = progress
+    book.remote_chapter_uid = uid
+    book.remote_chapter_idx = idx or tonumber(book.chapter_idx) or 0
+    book.remote_chapter_offset = offset
+    book.remote_progress_loaded = true
+    return true
+end
+
+local function build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only, position_override)
     local position, position_error
     if time_only ~= true then
-        position, position_error = estimate_position(book, progress_ratio)
-        if not position then return nil, position_error end
+        position = type(position_override) == "table" and deepcopy(position_override) or nil
+        if not position then
+            position, position_error = estimate_position(book, progress_ratio)
+            if not position then return nil, position_error end
+        end
     end
     local payload=WeRead.make_read_payload{
         book_id = book_id,
@@ -506,8 +553,9 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio, tim
     return payload, position, public
 end
 
-local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio, time_only)
-    local payload, position_or_error, payload_public = build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only)
+local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio, time_only, position_override)
+    local payload, position_or_error, payload_public = build_payload(
+        book_id, elapsed_seconds, book, progress_ratio, time_only, position_override)
     if not payload then
         return false, nil, tostring(position_or_error or "reading position unavailable"), "position", nil,
             {payload_fields_complete=false}
@@ -526,7 +574,7 @@ local function attempt_report(client, book_id, elapsed_seconds, book, progress_r
     if read_report_accepted(result) then
         return true, result, nil, nil, position_or_error, payload_public, meta
     end
-    local summary=result_summary(result)
+    local summary=result_summary(result, meta)
     if read_report_uncertain(result) then
         return false, result, summary, "unconfirmed", position_or_error, payload_public, meta
     end
@@ -624,9 +672,11 @@ function Worker.run(job)
         }, context_changed)
     end
 
-    if job.time_only == true then
-        -- A pure reading-time report needs no chapter catalog, progress read or
-        -- local-position reconstruction. Keep only lightweight signing context.
+    local reading_time_compat = tostring(job.report_mode or "") == "reading_time_compat"
+    if job.time_only == true and not reading_time_compat then
+        -- Keep the lightweight path available for diagnostics/legacy callers,
+        -- but normal automatic reading-time sync deliberately does not use it.
+        -- v5.1 actually succeeded through the full Web Reader context path.
         book.reader_url = book.reader_url or WeRead.reader_url(book_id)
         book.app_id = book.app_id or WeRead.web_app_id()
     else
@@ -661,14 +711,34 @@ function Worker.run(job)
         }, true)
     end
 
+    local protocol_time_only = job.time_only == true and not reading_time_compat
+    local position_override
+    if reading_time_compat then
+        -- A reading-time report must never invent/recalculate a new cloud position.
+        -- Prefer the immutable anchor supplied by the parent. If this is the first
+        -- report for a book and no parent anchor exists yet, refresh the Web Reader
+        -- cloud position and repeat that exact position while only changing `rt`.
+        position_override = normalize_cloud_anchor(job.cloud_anchor, book)
+        if not position_override then
+            refresh_remote_anchor(client, book_id, book)
+            position_override = normalize_cloud_anchor(nil, book)
+        end
+        if not position_override then
+            return finish(settings, book, {
+                ok=false,error="cloud reading position unavailable for reading-time report",error_kind="context",
+            }, context_changed)
+        end
+    end
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
-        client, book_id, elapsed_seconds, book, progress_ratio, job.time_only == true
+        client, book_id, elapsed_seconds, book, progress_ratio, protocol_time_only, position_override
     )
+    first_public = type(first_public) == "table" and first_public or {}
+    first_public.report_mode = tostring(job.report_mode or (protocol_time_only and "time_only" or "progress"))
     if accepted then
         return finish(settings, book, {
             ok = true,
             result = confirmation(result),
-            response_summary = result_summary(result),
+            response_summary = result_summary(result, first_meta),
             path = job.force_context == true and "manual_repair" or "initial",
             position = first_position,
             payload_public = first_public,
