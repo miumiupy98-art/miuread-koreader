@@ -24512,10 +24512,24 @@ function Plugin:on_sync_record_ready(current)
             if warm_attempt<4 then UIManager:scheduleIn(1.8,warm_task) end
             return
         end
-        local ok,available=pcall(Codec.prewarm_native)
+        -- Keep codec prewarm completely isolated from the Reader lifecycle.
+        -- beta.8 referenced a non-existent global `Codec` here, which raised
+        -- before pcall could run and terminated KOReader a few seconds after
+        -- ReaderReady. Resolve the module inside pcall so a missing/unsupported
+        -- native codec can never crash the reader.
+        local ok,available=pcall(function()
+            local codec=require("miuread.codec")
+            if type(codec)~="table" or type(codec.prewarm_native)~="function" then
+                return false
+            end
+            return codec.prewarm_native()
+        end)
         if ok then
             logger.info("[MiuRead][ProgressWarm] codec prewarm",
                 "native=",tostring(available==true),"attempt=",tostring(warm_attempt))
+        else
+            logger.warn("[MiuRead][ProgressWarm] codec prewarm skipped",
+                "attempt=",tostring(warm_attempt),"error=",tostring(available))
         end
     end
     UIManager:scheduleIn(2.2,warm_task)
