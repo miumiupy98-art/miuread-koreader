@@ -199,6 +199,7 @@ function Service.run(job)
         -- flag for compatibility with older job files, but never make periodic
         -- reporting depend on foreground position calculation.
         local time_only=current_job.time_only==true or control.time_only==true
+        local report_mode=tostring(current_job.report_mode or (time_only and "reading_time_compat" or "progress"))
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
             or tonumber(control.record_generation or -1)~=tonumber(current_job.record_generation or 0)
@@ -246,6 +247,7 @@ function Service.run(job)
             core_map_hash=tostring(current_job.core_map_hash or ""),
             progress_ratio = time_only and nil or (tonumber(control.progress_ratio) or 0),
             time_only = time_only,
+            report_mode = report_mode,
             elapsed_seconds = elapsed,
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -262,7 +264,7 @@ function Service.run(job)
         write_service_status({
             generation=generation,seq=sequence,state="reporting",accepted=nil,
             attempted_at=attempted_at,elapsed_seconds=elapsed,final_flush=final_flush==true,
-            flush_reason=reason,time_only=time_only,next_due=0,
+            flush_reason=reason,time_only=time_only,report_mode=report_mode,next_due=0,
             writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
         })
         local ok, result = pcall(Adapter.run, report_job)
@@ -287,6 +289,7 @@ function Service.run(job)
 
             local out = public_result(result)
             out.time_only=time_only
+            out.report_mode=report_mode
             out.writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
@@ -375,6 +378,7 @@ function Service.run(job)
             recovery_probe = false,
             final_flush = final_flush == true,
             flush_reason = reason,
+            report_mode = report_mode,
             next_due = due,
             book_id = tostring(current_job.book_id or ""),
             core_map_hash=tostring(current_job.core_map_hash or ""),

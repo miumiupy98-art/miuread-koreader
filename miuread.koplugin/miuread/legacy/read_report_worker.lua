@@ -469,57 +469,9 @@ local function estimate_position(book, progress_ratio)
     return nil,"no safe chapter found for report position"
 end
 
-local function time_anchor_from_web_progress(value, expected_book_id)
-    if type(value) ~= "table" then return nil end
-    local queue, seen, index = { value }, {}, 1
-    while index <= #queue and index <= 48 do
-        local node = queue[index]; index = index + 1
-        if type(node) == "table" and not seen[node] then
-            seen[node] = true
-            local node_book = rawget(node, "bookId") or rawget(node, "book_id")
-            local uid = rawget(node, "chapterUid") or rawget(node, "chapterId") or rawget(node, "chapter_uid")
-            local idx = rawget(node, "chapterIdx") or rawget(node, "chapterIndex") or rawget(node, "chapter_idx")
-            local offset = rawget(node, "chapterOffset") or rawget(node, "chapterPos") or rawget(node, "offset")
-            local progress = rawget(node, "progress") or rawget(node, "readingProgress")
-                or rawget(node, "progressPercent") or rawget(node, "bookProgress")
-            local same_book = node_book == nil or tostring(node_book) == tostring(expected_book_id or "")
-            if same_book and uid ~= nil and tonumber(offset) ~= nil and tonumber(progress) ~= nil then
-                progress = tonumber(progress) or 0
-                if progress > 0 and progress < 1 then progress = progress * 100 end
-                return {
-                    chapter_uid = uid,
-                    chapter_idx = tonumber(idx) or 0,
-                    chapter_offset = math.max(0, math.floor((tonumber(offset) or 0) + 0.5)),
-                    progress = math.max(0, math.min(100, math.floor(progress + 0.00001))),
-                    source = "remote_web_anchor",
-                    native_offset = true,
-                    offset_basis = "wr_data_co",
-                }
-            end
-            for _, child in pairs(node) do
-                if type(child) == "table" then queue[#queue + 1] = child end
-            end
-        end
-    end
-    return nil
-end
-
-local function refresh_time_anchor(client, book_id, book)
-    local ok, value = pcall(client.get_web_progress, client, book_id)
-    if not ok then return nil, tostring(value or "web progress unavailable") end
-    local anchor = time_anchor_from_web_progress(value, book_id)
-    if not anchor then return nil, "web progress has no usable chapter coordinate" end
-    book.time_report_anchor = anchor
-    book.time_report_anchor_at = os.time()
-    return anchor
-end
-
 local function build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only)
     local position, position_error
-    if time_only == true then
-        position = type(book.time_report_anchor) == "table" and deepcopy(book.time_report_anchor) or nil
-        if not position then return nil, "reading-time cloud anchor unavailable" end
-    else
+    if time_only ~= true then
         position, position_error = estimate_position(book, progress_ratio)
         if not position then return nil, position_error end
     end
@@ -536,7 +488,6 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio, tim
         pclts = book.pclts,
         token = book.token,
         time_only = time_only == true,
-        include_position_for_time = time_only == true and position ~= nil,
     }
     local public={
         ci=tonumber(payload.ci), co=tonumber(payload.co), pr=tonumber(payload.pr), rt=tonumber(payload.rt),
@@ -546,8 +497,7 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio, tim
         token_source=tostring(book.token or "")~="" and "reader_context" or "default",
         pc_source=tostring(book.pclts or "")~="" and "reader_context" or "generated",
         payload_fields_complete=tostring(payload.appId or "")~="" and tostring(payload.pc or "")~=""
-            and tostring(payload.s or "")~="" and tonumber(payload.ci)~=nil
-            and tonumber(payload.co)~=nil and tonumber(payload.pr)~=nil,
+            and tostring(payload.s or "")~="",
         position_source=position and position.source or nil,
         report_chapter_uid=position and position.chapter_uid or nil,
         report_chapter_idx=position and position.chapter_idx or nil,
@@ -599,7 +549,6 @@ local BOOK_PATCH_KEYS = {
     "catalog_complete", "remote_progress_loaded", "remote_progress",
     "remote_chapter_uid", "remote_chapter_idx", "remote_chapter_offset",
     "app_id", "read_context_updated_at", "read_context_ready", "core_map_hash",
-    "time_report_anchor", "time_report_anchor_at",
 }
 
 local function make_book_patch(book)
@@ -680,23 +629,13 @@ function Worker.run(job)
         }, context_changed)
     end
 
-    if job.time_only == true then
-        -- /web/book/read is a full reader-state report.  A position-less body can
-        -- return HTTP 2xx without increasing account reading time.  Refresh the
-        -- Web Reader's own current coordinate and send it back unchanged as the
-        -- time-report anchor.  This keeps automatic time sync independent from
-        -- the user's local page while still sending the complete request shape.
+    local reading_time_compat = tostring(job.report_mode or "") == "reading_time_compat"
+    if job.time_only == true and not reading_time_compat then
+        -- Keep the lightweight path available for diagnostics/legacy callers,
+        -- but normal automatic reading-time sync deliberately does not use it.
+        -- v5.1 actually succeeded through the full Web Reader context path.
         book.reader_url = book.reader_url or WeRead.reader_url(book_id)
         book.app_id = book.app_id or WeRead.web_app_id()
-        local anchor, anchor_error = refresh_time_anchor(client, book_id, book)
-        if not anchor then
-            local kind=Http.is_auth_error(anchor_error) and "authentication"
-                or ((Http.is_network_error and Http.is_network_error(anchor_error)) and "transport" or "server")
-            return finish(settings, book, {
-                ok=false,error="reading-time cloud anchor unavailable: "..tostring(anchor_error),
-                error_kind=kind,response_summary="time anchor unavailable",
-            }, context_changed)
-        end
     else
         local context_ok, context_or_error, initial_context_changed = pcall(function()
             return refresh_context(client, book_id, book, job.force_context == true)
@@ -729,9 +668,12 @@ function Worker.run(job)
         }, true)
     end
 
+    local protocol_time_only = job.time_only == true and not reading_time_compat
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
-        client, book_id, elapsed_seconds, book, progress_ratio, job.time_only == true
+        client, book_id, elapsed_seconds, book, progress_ratio, protocol_time_only
     )
+    first_public = type(first_public) == "table" and first_public or {}
+    first_public.report_mode = tostring(job.report_mode or (protocol_time_only and "time_only" or "progress"))
     if accepted then
         return finish(settings, book, {
             ok = true,

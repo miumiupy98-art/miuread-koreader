@@ -19,7 +19,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 25
+local READ_REPORT_SERVICE_VERSION = 26
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -2514,6 +2514,7 @@ function Sync:test_upload(callback)
         return ReadReportWorker.run{
             book_id=book_id,book_title=record.book.title,book=legacy_book,
             core_map_hash=core_hash,progress_ratio=nil,elapsed_seconds=30,time_only=true,
+            report_mode="reading_time_compat",
             cookies=auth.cookies or {},api_key=auth.api_key or "",
             wr_ticket=auth.wr_ticket or "",wr_wrpa=auth.wr_wrpa or "",
             allow_renewal=false,force_context=false,
@@ -3418,6 +3419,7 @@ function Sync:_start_daemon(reason)
         book_path = record.path,
         book = legacy_book,
         time_only = time_only,
+        report_mode = time_only and "reading_time_compat" or "progress",
         carry_elapsed = carry_elapsed,
         auth = {
             cookies = auth.cookies or {},

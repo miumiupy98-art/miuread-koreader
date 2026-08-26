@@ -164,11 +164,10 @@ function WeRead.make_read_payload(opts)
         ps = opts.psvts or opts.ps or "",
         pc = opts.pclts or opts.pc or WeRead.e(now),
     }
-    -- Reading-time reports still need a complete Web Reader payload.  For
-    -- automatic time sync beta.10 supplies a *remote* position anchor read from
-    -- WeRead immediately before the report.  Re-sending that same cloud
-    -- position records time without advancing cloud progress to the local page.
-    if opts.time_only ~= true or opts.include_position_for_time == true then
+    -- Pure time-only reports omit position fields. Automatic reading-time sync
+    -- uses the explicit reading_time_compat mode instead, which deliberately
+    -- calls this builder as a normal full Web Reader report after refresh_context.
+    if opts.time_only ~= true then
         params.c = WeRead.e(opts.chapter_uid or 0)
         params.ci = opts.chapter_idx or 0
         params.co = opts.chapter_offset or 0

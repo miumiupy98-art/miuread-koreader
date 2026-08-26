@@ -115,6 +115,7 @@ function Adapter.run(job)
         wr_wrpa = job.wr_wrpa or "",
         allow_renewal = job.allow_renewal == true,
         time_only = job.time_only == true,
+        report_mode = tostring(job.report_mode or ""),
         force_context = job.force_context == true,
         context_only = job.context_only == true,
     }
@@ -142,7 +143,11 @@ function Adapter.run(job)
             or (result.uncertain == true and ("unconfirmed: " .. tostring(result.error or "no explicit acknowledgement"))
             or tostring(result.error or "compatibility path rejected"))),
         attempts = { { stage = tostring(result.path or "compatibility") } },
-        payload_public = merge({ compatibility_path = true, context_only = job.context_only == true }, result.payload_public or {}),
+        payload_public = merge({
+            compatibility_path = true,
+            context_only = job.context_only == true,
+            report_mode = tostring(job.report_mode or ""),
+        }, result.payload_public or {}),
         meta = result.meta,
     }
 end

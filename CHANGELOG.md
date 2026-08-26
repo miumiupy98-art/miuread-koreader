@@ -1,5 +1,14 @@
 # Changelog
 
+## 5.2.0-beta.11 - 2026-08-26
+
+- 阅读时间协议回归 5.1 实际验证成功的完整 Web Reader 上报路径：新增显式 `reading_time_compat` 模式，时间任务重新执行 `refresh_context()` 并发送完整 Reader report，不再依赖真正的轻量 `time_only` 请求。
+- 保留首次约 15 秒、后续 60 秒的新版单一时间轴；进度检查、登录刷新、工具栏操作不会重置计时，HTTP 请求耗时继续计入下一段阅读。
+- 删除 beta.10 临时加入的云端位置 anchor / `include_position_for_time` 方案；阅读时间由完整 Web Reader context 自行提供微信侧阅读状态，不使用 KOReader 当前页推进云端进度。
+- 15 秒首次、60 秒周期与结束阅读 final tail 统一使用同一个 `reading_time_compat` 协议；只有微信明确返回 `succ=1/true` 才认定成功并触发本阅读会话唯一一次首次成功提醒。
+- HTTP 2xx 但没有明确 `succ` 的响应继续记为“待确认”，不重放该时间段；连续未确认只允许刷新当前 Reader context 后发送新的时间段，禁止累计补传历史阅读时间。
+- 阅读时间后台服务升级到 v26，确保 OTA 后不复用 beta.10 的旧常驻 worker。精确进度、结束阅读后台上传、批注同步和现有 ReaderClose 流程本版本不回滚。
+
 ## 5.2.0-beta.10 - 2026-08-26
 
 - 修复阅读时间“日志成功但云端不记账”：自动时间上报恢复完整 Web Reader 请求结构；每次上报先读取微信读书网页端当前云端位置，并将同一 `chapter/co/progress` 原样作为时间锚点回传，只增加 `rt`，不把本机当前阅读页每 60 秒强行同步到云端。
