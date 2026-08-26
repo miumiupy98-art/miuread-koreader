@@ -147,6 +147,24 @@ local function read_report_accepted(result)
         and (result.succ == true or tonumber(result.succ) == 1)
 end
 
+local function read_report_time_only_http_accepted(result, meta)
+    if type(result) ~= "table" then return false end
+    local code = tonumber(type(meta)=="table" and meta.code or nil)
+    if not code or code < 200 or code >= 300 then return false end
+    local err_code = result.errCode or result.errcode or result.code
+    if err_code ~= nil then
+        local numeric = tonumber(err_code)
+        if numeric == nil or numeric ~= 0 then return false end
+    end
+    local err_message = result.errMsg or result.errmsg or result.message or result.msg
+    if err_message ~= nil and U.trim(tostring(err_message)) ~= "" then return false end
+    -- /web/book/read may acknowledge a pure-time report with HTTP 2xx and an
+    -- empty/partial JSON object instead of succ/synckey. For time-only uploads
+    -- this is enough confirmation: the interval is never replayed anyway, and
+    -- there is no explicit server failure to justify marking it unconfirmed.
+    return true
+end
+
 local function read_report_uncertain(result)
     if type(result) ~= "table" or read_report_accepted(result) then return false end
     local err_code = result.errCode or result.errcode or result.code
@@ -163,11 +181,12 @@ local function read_report_uncertain(result)
     return true
 end
 
-local function result_summary(result)
+local function result_summary(result, meta)
     if type(result) ~= "table" then
         return "non_table_response"
     end
     local parts = {
+        "HTTP=" .. tostring(type(meta)=="table" and meta.code or "-"),
         "succ=" .. tostring(result.succ),
         "has_synckey=" .. tostring(result.synckey ~= nil),
     }
@@ -180,6 +199,10 @@ local function result_summary(result)
         parts[#parts + 1] = "error_message="
             .. U.first_line(tostring(err_message):gsub("[%c]+", " "), 160)
     end
+    local keys = {}
+    for key in pairs(result) do keys[#keys + 1] = tostring(key) end
+    table.sort(keys)
+    if #keys > 0 then parts[#parts + 1] = "keys=" .. table.concat(keys, "|") end
     return table.concat(parts, ", ")
 end
 
@@ -523,10 +546,11 @@ local function attempt_report(client, book_id, elapsed_seconds, book, progress_r
             or ((Http.is_network_error and Http.is_network_error(message)) and "transport" or "server")
         return false, nil, message, kind, position_or_error, payload_public, meta
     end
-    if read_report_accepted(result) then
+    if read_report_accepted(result)
+        or (time_only == true and read_report_time_only_http_accepted(result, meta)) then
         return true, result, nil, nil, position_or_error, payload_public, meta
     end
-    local summary=result_summary(result)
+    local summary=result_summary(result, meta)
     if read_report_uncertain(result) then
         return false, result, summary, "unconfirmed", position_or_error, payload_public, meta
     end
@@ -668,7 +692,7 @@ function Worker.run(job)
         return finish(settings, book, {
             ok = true,
             result = confirmation(result),
-            response_summary = result_summary(result),
+            response_summary = result_summary(result, first_meta),
             path = job.force_context == true and "manual_repair" or "initial",
             position = first_position,
             payload_public = first_public,

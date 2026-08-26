@@ -19,8 +19,8 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 22
-local FIRST_REPORT_DELAY = 60
+local READ_REPORT_SERVICE_VERSION = 23
+local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
 
@@ -3281,6 +3281,8 @@ function Sync:_start_daemon(reason)
     local daemon = self.daemon
     local prefs = self.store:preferences().sync
     local interval = math.max(10, tonumber(prefs.interval) or tonumber(Config.READ_INTERVAL) or 60)
+    local first_delay = math.max(10, math.min(interval,
+        tonumber(Config.READ_FIRST_DELAY) or tonumber(FIRST_REPORT_DELAY) or 15))
     local session = self.store:session(book_id) or {}
     if not time_only and session.sync_repair_required==true then
         local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
@@ -3398,20 +3400,20 @@ function Sync:_start_daemon(reason)
             account = U.copy(auth.account or {}),
         },
         interval = interval,
-        first_delay = interval,
+        first_delay = first_delay,
         idle_timeout = tonumber(prefs.idle_timeout) or 600,
     }
     U.atomic_write(daemon.paths.job, Json.encode(job), true)
     self.daemon_status_stamp = nil
     self.daemon_last_persist = os.time()
     self.state = "waiting"
-    self.next_due = os.time() + interval
-    self.last_stage = "阅读时间后台服务运行中，首次约60秒后上传"
+    self.next_due = os.time() + first_delay
+    self.last_stage = "阅读时间后台服务运行中，首次约"..tostring(first_delay).."秒后上传"
     self:_write_daemon_control(true, true, {_time_only=true})
     self:_schedule_daemon_poll(5)
     logger.info("[MiuRead][ReadReport] service activated",
         "pid=", tostring(daemon.pid), "book=", book_id,
-        "core=",core_hash:sub(1,12),"first_delay=", tostring(interval),
+        "core=",core_hash:sub(1,12),"first_delay=", tostring(first_delay),
         "interval=", tostring(interval), "reason=", tostring(reason or "start"))
     return true
 end
@@ -3915,6 +3917,11 @@ function Sync:on_resume(_slept)
     self.suspended = false
     self.last_upload = 0
     self.session_started_at = os.time()
+    -- A user wake cancels the meaning of a previous suspend finalization even
+    -- if its detached HTTP workers are still finishing. The resumed Reader is
+    -- an active reading session again, so the next Home/Suspend must never be
+    -- skipped merely because the earlier lock-screen transaction had started.
+    self.reading_end_finalized=false
     if self.host and self.host._reading_end_sync_active==true then
         -- A short wake can arrive while the lock-screen final sync is still
         -- confirming progress. Starting a new 60 s worker here races the old
@@ -3923,7 +3930,6 @@ function Sync:on_resume(_slept)
         logger.info("[MiuRead][ReadReport] resume deferred", "reason=reading_end_sync_active")
         return true
     end
-    self.reading_end_finalized=false
     self:start("resume")
 end
 

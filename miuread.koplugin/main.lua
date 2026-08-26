@@ -855,9 +855,9 @@ function Plugin:init()
     self.annotations=Annotations:new(self.api)
     self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
     do
-        local annotation_prefs=self:_annotation_sync_preferences()
+        self:_annotation_sync_preferences()
         logger.info("[MiuRead][AnnotationSync] initialized",
-            "enabled=",tostring(annotation_prefs.enabled==true),"mode=manual")
+            "close_upload=",tostring(self:_annotation_close_upload_enabled()))
     end
     self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http)
     self.download_task=DownloadTask:new(self.store)
@@ -956,6 +956,7 @@ function Plugin:init()
     self._auth_notice_dialog=nil
     self._sync_success_notified=false
     self._time_sync_first_notice_shown=false
+    self._reading_end_local_snapshot_done=false
     self._home_view=nil
     self._home_scan_generation=0
     self._home_refreshing=false
@@ -13848,7 +13849,6 @@ function Plugin:_show_reader_font_panel(back_callback)
 end
 
 function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
-    local diagnostics=self:sync_diagnostics_menu()
     local current=self.sync and self.sync:record() or nil
     local logged_in=self.auth and type(self.auth.is_logged_in)=="function" and self.auth:is_logged_in() or nil
     local current_id=current and current.book and tostring(current.book.book_id or current.book.bookId or "") or ""
@@ -13856,7 +13856,7 @@ function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
     annotation_summary=type(annotation_summary)=="table" and annotation_summary or {}
     ReaderSettingsDialog.show{
         title="同步诊断",
-        subtitle="进度与批注分开显示，失败不会互相覆盖",
+        subtitle="日常只看状态；测试与重置收进高级诊断",
         on_back=back_callback or function() self:_show_reader_sync_panel() end,
         on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
@@ -13864,22 +13864,21 @@ function Plugin:_show_reader_sync_diagnostics_panel(back_callback)
             local annotation_action=tonumber(annotation_summary.action_required or 0) or 0
             local annotation_pending=(tonumber(annotation_summary.pending or 0) or 0)+(tonumber(annotation_summary.delete_pending or 0) or 0)
             local annotation_state=annotation_action>0 and ("需处理 "..tostring(annotation_action))
-                or (annotation_pending>0 and ("待同步 "..tostring(annotation_pending)) or "已同步")
+                or (annotation_pending>0 and ("待同步 "..tostring(annotation_pending)) or "无变化")
             return {
                 {title="当前状态",rows={
-                    {label="当前书籍识别",value=current and current.book and "正常" or "未识别",callback=diagnostics[1] and diagnostics[1].callback},
-                    {label="登录状态",value=logged_in==false and "未登录" or "检查",callback=diagnostics[2] and diagnostics[2].callback},
-                    {label="阅读进度",value=state~="" and state or "检查",arrow=false},
-                    {label="本书批注",value=annotation_state,callback=annotation_action>0 and function() self:show_annotation_sync_issues(current_id) end or nil},
+                    {label="当前书籍",value=current and current.book and "已识别" or "未识别",arrow=false},
+                    {label="登录",value=logged_in==false and "需要检查" or "正常",arrow=false},
+                    {label="阅读时间",value=self:_reading_time_status_label(),arrow=false},
+                    {label="阅读进度",value=state~="" and state or "正常",arrow=false},
+                    {label="批注",value=annotation_state,callback=annotation_action>0 and function() self:show_annotation_sync_issues(current_id) end or nil},
                 }},
-                {title="测试",rows={
-                    {label="测试云端进度读取",value="执行",callback=diagnostics[3] and diagnostics[3].callback},
-                    {label="测试当前进度上传",value="执行",callback=diagnostics[4] and diagnostics[4].callback},
-                    {label="测试阅读时间上传",value="30 秒",callback=diagnostics[5] and diagnostics[5].callback},
-                }},
-                {title="恢复",rows={
-                    {label="重置本书阅读进度同步状态",value="不影响书签、划线与想法",callback=diagnostics[7] and diagnostics[7].callback},
-                    {label="重新检查本书批注同步",value=annotation_action>0 and ("待重新检查 "..tostring(annotation_action).." 条") or "无失败记录",callback=diagnostics[8] and diagnostics[8].callback},
+                {title="高级",rows={
+                    {icon="diagnostics",label="高级诊断",value="测试、错误与重置",callback=function()
+                        self:_show_reader_menu_table("高级同步诊断",self:sync_diagnostics_menu(),function()
+                            self:_show_reader_sync_diagnostics_panel(back_callback)
+                        end)
+                    end},
                 }},
             }
         end,
@@ -13891,34 +13890,24 @@ function Plugin:_show_reader_sync_panel(back_callback)
     local return_to_sync=function() self:_show_reader_sync_panel(back_callback) end
     ReaderSettingsDialog.show{
         title="阅读同步",
-        subtitle=function() return "时间、进度和批注可以分别设置" end,
+        subtitle="自动同步只保留必要设置",
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local sync=self.store:preferences().sync or {}
             return {
-                {title="当前设置",rows={
-                    {label="阅读时间",value=sync.time_enabled==true and "自动上传 · 60 秒" or "已关闭",value_bold=true,arrow=false},
-                    {label="阅读进度",value=self:progress_upload_mode_label(),value_bold=true,arrow=false},
-                    {label="划线与想法",value=self:_annotation_close_upload_enabled() and "结束阅读时上传" or "仅手动",value_bold=true,arrow=false},
-                }},
-                {title="立即操作",rows={
-                    {icon="upload",label="上传当前进度",value="执行",callback=function() self:upload_local_progress(true) end},
-                    {icon="download",label="读取云端进度",value="执行",callback=function() self:manual_sync() end},
-                    {icon="sync",label="同步本书批注",value="执行",callback=function() self:sync_local_annotations_now(false) end},
-                }},
                 {title="自动同步",rows={
-                    {label="自动上传阅读时间",value=sync.time_enabled==true and "已开启 · 60 秒" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_sync() end},
-                    {label="自动上传阅读进度",value=self:progress_upload_mode_label(),value_bold=true,callback=function() self:_show_reader_menu_table("自动上传阅读进度",self:progress_upload_mode_menu(),return_to_sync) end},
+                    {label="阅读时间",value=sync.time_enabled==true and "已开启 · 每 60 秒" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_sync() end},
+                    {label="阅读进度",value=self:progress_upload_mode_label(),value_bold=true,callback=function() self:_show_reader_menu_table("阅读进度",self:progress_upload_mode_menu(),return_to_sync) end},
+                    {label="批注",value=self:_annotation_close_upload_enabled() and "结束阅读时同步" or "仅手动",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_close_upload() end},
                     {label="打开时检查云端进度",value=sync.pull_on_open~=false and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_pull_on_open() end},
-                    {label="结束时上传批注",value=self:_annotation_close_upload_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_close_upload() end},
                 }},
                 {title="提醒",rows={
                     {label="首次阅读时间同步成功提醒",value=self:_time_first_success_notice_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_first_success_notice() end},
-                    {label="同步异常提醒",value=self:_sync_error_notice_enabled() and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_sync_error_notice() end},
                 }},
-                {title="诊断",rows={
-                    {icon="diagnostics",label="同步诊断",value="查看详情",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
+                {title="其他",rows={
+                    {icon="sync",label="手动同步",value="进度与批注",callback=function() self:_show_reader_menu_table("手动同步",self:sync_now_menu(),return_to_sync) end},
+                    {icon="diagnostics",label="同步诊断",value="查看当前状态",callback=function() self:_show_reader_sync_diagnostics_panel(return_to_sync) end},
                 }},
             }
         end,
@@ -20147,6 +20136,45 @@ function Plugin:_show_auto_sync_success(text)
     self._sync_success_notified=true
     self:status_toast("同步完成",text or "已成功上传",3)
 end
+function Plugin:_reading_time_status_label()
+    local prefs=self.store:preferences().sync or {}
+    if prefs.time_enabled~=true then return "已关闭" end
+    local r=self.sync and self.sync:record() or nil
+    if not (r and r.book) then return "等待阅读" end
+    local id=tostring(r.book.book_id or r.book.bookId or "")
+    local session=id~="" and (self.store:session(id) or {}) or {}
+    local state=tostring(session.report_state or "")
+    if state=="ok" or (tonumber(self.sync and self.sync.last_upload or 0) or 0)>0 then return "已同步" end
+    if state=="unconfirmed" then return "待确认" end
+    if state=="time_only_failed" then return "异常" end
+    return "等待首次同步"
+end
+
+function Plugin:sync_now_menu()
+    return {
+        {text="上传当前进度",callback=function() self:upload_local_progress(true) end},
+        {text="读取云端进度",callback=function() self:manual_sync() end},
+        {text="同步本书批注",callback=function() self:sync_local_annotations_now(false) end},
+    }
+end
+
+function Plugin:sync_diagnostics_status_menu()
+    local r=self.sync and self.sync:record() or nil
+    local id=r and r.book and tostring(r.book.book_id or r.book.bookId or "") or ""
+    local summary=id~="" and (LocalAnnotationDatabase.summary(self.store,id) or {}) or {}
+    local pending=(tonumber(summary.pending or 0) or 0)+(tonumber(summary.delete_pending or 0) or 0)
+    local action=tonumber(summary.action_required or 0) or 0
+    local annotation=action>0 and ("需处理 "..tostring(action)) or (pending>0 and ("待同步 "..tostring(pending)) or "无变化")
+    return {
+        {text="当前书籍",post_text=r and r.book and "已识别" or "未识别",enabled=false},
+        {text="登录",post_text=self:logged_in() and "正常" or "需要检查",callback=function() self:show_account_status() end},
+        {text="阅读时间",post_text=self:_reading_time_status_label(),enabled=false},
+        {text="阅读进度",post_text=tostring(self:progress_sync_label() or "正常"),enabled=false},
+        {text="批注",post_text=annotation,callback=action>0 and function() self:show_annotation_sync_issues(id) end or nil},
+        {text="高级诊断",post_text="测试、错误与重置",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
+    }
+end
+
 function Plugin:sync_diagnostics_menu()
     return {
         {text="检查当前书籍识别",callback=function()
@@ -21036,15 +21064,13 @@ function Plugin:sync_settings_menu()
     local prefs=self.store:preferences()
     local sync=prefs.sync or {}
     return {
-        {text="自动上传阅读时间",post_text=sync.time_enabled==true and "已开启 · 60 秒" or "已关闭",checked_func=function() return (self.store:preferences().sync or {}).time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
-        {text="自动上传阅读进度",post_text=self:progress_upload_mode_label(),sub_item_table_func=function() return self:progress_upload_mode_menu() end},
-        {text="打开书籍时检查云端进度",post_text=sync.pull_on_open~=false and "已开启" or "已关闭",checked_func=function() return (self.store:preferences().sync or {}).pull_on_open~=false end,keep_menu_open=true,callback=function() self:toggle_pull_on_open() end},
-        {text="结束阅读时上传批注",post_text=self:_annotation_close_upload_enabled() and "已开启" or "已关闭",checked_func=function() return self:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() self:toggle_annotation_close_upload() end},
-        {text="新想法云端可见范围",post_text=self:annotation_sync_visibility_label(),sub_item_table_func=function() return self:annotation_sync_visibility_menu() end},
-        {text="同步异常提醒",checked_func=function() return self:_sync_error_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_error_notice() end},
-        {text="首次阅读时间同步提醒",post_text=self:_time_first_success_notice_enabled() and "已开启" or "已关闭",checked_func=function() return self:_time_first_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_time_first_success_notice() end},
-        {text="同步成功提醒",post_text=self:_sync_success_notice_enabled() and "已开启" or "已关闭",checked_func=function() return self:_sync_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_sync_success_notice() end},
-        {text="同步诊断",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
+        {text="阅读时间",post_text=sync.time_enabled==true and "已开启 · 每 60 秒" or "已关闭",checked_func=function() return (self.store:preferences().sync or {}).time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="阅读进度",post_text=self:progress_upload_mode_label(),sub_item_table_func=function() return self:progress_upload_mode_menu() end},
+        {text="批注",post_text=self:_annotation_close_upload_enabled() and "结束阅读时同步" or "仅手动",checked_func=function() return self:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() self:toggle_annotation_close_upload() end},
+        {text="打开时检查云端进度",post_text=sync.pull_on_open~=false and "已开启" or "已关闭",checked_func=function() return (self.store:preferences().sync or {}).pull_on_open~=false end,keep_menu_open=true,callback=function() self:toggle_pull_on_open() end},
+        {text="首次阅读时间同步成功提醒",post_text=self:_time_first_success_notice_enabled() and "已开启" or "已关闭",checked_func=function() return self:_time_first_success_notice_enabled() end,keep_menu_open=true,callback=function() self:toggle_time_first_success_notice() end},
+        {text="手动同步",post_text="进度与批注",sub_item_table_func=function() return self:sync_now_menu() end},
+        {text="同步诊断",post_text="查看当前状态",sub_item_table_func=function() return self:sync_diagnostics_status_menu() end},
     }
 end
 
@@ -21052,15 +21078,13 @@ function Plugin:sync_menu()
     local summary=self:_home_sync_summary(false)
     local rows={
         {text="同步状态",post_text=self:_home_sync_status_label(),callback=function() self:show_sync_status(false) end},
-        {text="同步未完成内容",post_text="进度 划线 想法",callback=function() self:_sync_home_pending() end},
+        {text="同步未完成内容",post_text="进度与批注",callback=function() self:_sync_home_pending() end},
     }
     if (tonumber(summary.annotation_action_required or 0) or 0)>0 then
-        rows[#rows+1]={text="批注待确认",post_text=tostring(summary.annotation_action_required).." 条 · 查看书籍与原因",callback=function() self:show_annotation_sync_issues() end}
+        rows[#rows+1]={text="批注待确认",post_text=tostring(summary.annotation_action_required).." 条",callback=function() self:show_annotation_sync_issues() end}
     end
-    for _,row in ipairs(self:sync_settings_menu()) do rows[#rows+1]=row end
-    if self:_current_book_record() then
-        rows[#rows+1]={text="重新读取当前书籍云端进度",callback=function() self:manual_sync() end}
-    end
+    rows[#rows+1]={text="阅读同步设置",post_text="时间 进度 批注",sub_item_table_func=function() return self:sync_settings_menu() end}
+    rows[#rows+1]={text="手动同步",post_text="进度与批注",sub_item_table_func=function() return self:sync_now_menu() end}
     return rows
 end
 
@@ -21078,7 +21102,7 @@ function Plugin:toggle_time_sync(confirmed)
     if p.sync.time_enabled then
         self.sync:start("enabled")
         if self:_original_weread_plugin_present() then
-            self:info("阅读时间同步已开启，每 60 秒自动上传。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。若两边都开启阅读时间同步，可能重复上报；建议只保留一边。")
+            self:info("阅读时间同步已开启。首次约 15 秒确认，之后每 60 秒上传。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。若两边都开启阅读时间同步，可能重复上报；建议只保留一边。")
         else
             self:status_toast("自动上传阅读时间","已开启 · 60 秒",3)
         end
@@ -24519,8 +24543,13 @@ function Plugin:_prepare_reader_disappearance(reason)
     self:_cancel_chapter_prefetch(reason or "reader disappeared")
     self:_reset_chapter_navigation_context(reason or "reader disappeared")
     if self.ui and self.ui.document and self:_reader_session_is_weread() then
-        pcall(function() self:_capture_local_annotation_snapshot("final:"..tostring(reason or "reader_disappeared")) end)
+        if self._reading_end_local_snapshot_done==true then
+            logger.info("[MiuRead][LocalAnnotations] final snapshot skipped; reading-end snapshot already committed")
+        else
+            pcall(function() self:_capture_local_annotation_snapshot("final:"..tostring(reason or "reader_disappeared")) end)
+        end
     end
+    self._reading_end_local_snapshot_done=false
     if self._reader_checkpoint_dirty==true then
         self:_flush_reader_checkpoint(reason or "reader_disappeared",true)
     end
@@ -25145,6 +25174,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
             self._local_annotation_snapshot_task=nil
         end
         pcall(function() self:_capture_local_annotation_snapshot("reading_end:"..reason) end)
+        self._reading_end_local_snapshot_done=true
         if self._reader_checkpoint_dirty==true then
             pcall(function() self:_flush_reader_checkpoint("reading_end:"..reason,true) end)
         end
@@ -25200,7 +25230,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         if self.annotation_async and self.annotation_async:busy() then
             logger.warn("[MiuRead][ReadingEnd] annotation close sync already busy; local queue retained",
                 "book=",book_id)
-            if complete_one then complete_one(false) end
+            if complete_one then complete_one(false,"annotations","待确认") end
             return false
         end
         local started=self.annotation_async and self.annotation_async:run("annotation-reading-end",function()
@@ -25214,12 +25244,12 @@ function Plugin:_reading_end_sync(reason,options,callback)
             else
                 logger.info("[MiuRead][ReadingEnd] annotation close sync completed","book=",book_id)
             end
-            if complete_one then complete_one(ok==true) end
+            if complete_one then complete_one(ok==true,"annotations",ok==true and "✓ 已同步" or "待确认") end
         end,math.max(15,tonumber(options.timeout) or 12))
         if not started then
             logger.warn("[MiuRead][ReadingEnd] annotation close sync could not start; local queue retained",
                 "book=",book_id)
-            if complete_one then complete_one(false) end
+            if complete_one then complete_one(false,"annotations","待确认") end
         end
         return started==true
     end
@@ -25230,6 +25260,24 @@ function Plugin:_reading_end_sync(reason,options,callback)
         return false
     end
 
+    local task_states={
+        time=need_time and "…" or "无需补传",
+        progress=need_progress and "…" or "仅手动",
+        annotations=need_annotations and "…" or "无变化",
+    }
+    local function status_detail()
+        local detail="阅读时间    "..tostring(task_states.time)
+            .."\n阅读进度    "..tostring(task_states.progress)
+            .."\n批注        "..tostring(task_states.annotations)
+        if options.after then detail=detail.."\n完成后将"..tostring(options.after) end
+        return detail
+    end
+    local function update_status(title,duration)
+        if options.show_status~=false then
+            self:status_toast(title or "正在同步阅读记录",status_detail(),duration or 4)
+        end
+    end
+
     self._reading_end_sync_active=true
     self._reading_end_sync_waiters={}
     if callback then self._reading_end_sync_waiters[1]=callback end
@@ -25237,9 +25285,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
     local failed=false
     local finished=false
     local timeout_task
-    complete_one=function(ok)
+    complete_one=function(ok,kind,label)
         if finished then return end
         if ok==false then failed=true end
+        if kind and task_states[kind]~=nil then
+            task_states[kind]=label or (ok==false and "待确认" or "✓")
+            update_status("正在同步阅读记录",3)
+        end
         pending=pending-1
         if pending>0 then return end
         finished=true
@@ -25247,18 +25299,15 @@ function Plugin:_reading_end_sync(reason,options,callback)
         self._reading_end_barrier_active=false
         self._reading_end_barrier_reason=nil
         if timeout_task then UIManager:unschedule(timeout_task); timeout_task=nil end
+        -- A failed/interrupted suspend returns to an active Reader session on
+        -- wake. It must not suppress the next genuine Home/Suspend finalizer.
+        if failed and reason=="休眠" and self.sync then self.sync.reading_end_finalized=false end
         logger.info("[MiuRead][ReadingEnd] finalizer completed",
             "reason=",reason,"ok=",tostring(not failed),"writer_barrier=",tostring(writer_barrier_seq or "-"))
-        if options.show_status~=false then
-            if failed then
-                self:status_toast("阅读记录已保存","部分云端同步未确认，已保留本机状态",3)
-            else
-                self:status_toast("同步完成","阅读时间、阅读进度与批注已处理",2)
-            end
-        end
+        update_status(failed and "阅读记录已保存" or "同步完成",failed and 3 or 2)
         local waiters=self._reading_end_sync_waiters or {}
         self._reading_end_sync_waiters=nil
-        for _,fn in ipairs(waiters) do pcall(fn,not failed,{failed=failed,local_saved=true}) end
+        for _,fn in ipairs(waiters) do pcall(fn,not failed,{failed=failed,local_saved=true,states=U.copy(task_states)}) end
     end
     local timeout=math.max(6,tonumber(options.timeout) or 12)
     timeout_task=function()
@@ -25268,6 +25317,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         self._reading_end_sync_active=false
         self._reading_end_barrier_active=false
         self._reading_end_barrier_reason=nil
+        if reason=="休眠" and self.sync then self.sync.reading_end_finalized=false end
         logger.warn("[MiuRead][ReadingEnd] finalizer timeout",
             "reason=",reason,"timeout=",tostring(timeout),"writer_barrier=",tostring(writer_barrier_seq or "-"))
         if self.sync and self.sync.async then pcall(self.sync.async.cancel,self.sync.async,"reading_end_timeout") end
@@ -25280,15 +25330,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
     end
     UIManager:scheduleIn(timeout,timeout_task)
 
-    if options.show_status~=false then
-        local parts={}
-        if need_time then parts[#parts+1]="阅读时间" end
-        if need_progress then parts[#parts+1]="阅读进度" end
-        if need_annotations then parts[#parts+1]="批注" end
-        local detail="正在同步："..table.concat(parts,"、")
-        if options.after then detail=detail.."\n完成后将"..tostring(options.after) end
-        self:status_toast("正在同步阅读记录",detail,math.max(3,math.min(timeout,14)))
-    end
+    update_status("正在同步阅读记录",math.max(3,math.min(timeout,14)))
 
     if need_writer_wait then
         self.sync:wait_writer_barrier(writer_barrier_seq,function(ok,barrier_result)
@@ -25307,7 +25349,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                         "error=",tostring(barrier_result and barrier_result.error or "-"))
                 end
             end
-            complete_one(time_ok)
+            complete_one(time_ok,"time",need_time and (time_ok and "✓ 已同步" or "待确认") or "无需补传")
         end,math.max(4,timeout-1))
     end
 
@@ -25318,13 +25360,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
             local started,resolve_error=self.sync:resolve_local_progress(function(position,position_error,meta)
                 if finished then return end
                 if not position then
-                    if resolve_attempt<2 and tostring(meta and meta.error_kind or "")=="busy" then
-                        UIManager:scheduleIn(.35,resolve_final_position)
+                    if resolve_attempt<2 then
+                        UIManager:scheduleIn(.25,resolve_final_position)
                         return
                     end
                     logger.warn("[MiuRead][ReadingEnd] exact position unavailable",
                         "reason=",reason,"book=",book_id,"error=",tostring(position_error or "unknown"))
-                    complete_one(false)
+                    complete_one(false,"progress","待确认")
                     return
                 end
                 local snapshot=self:_prepare_progress_snapshot(book_id,position) or position
@@ -25346,10 +25388,10 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     local function finish_gate(ok)
                         if gate_completed then return end
                         gate_completed=true
-                        complete_one(ok)
+                        complete_one(ok,"progress",ok and "✓ 已上传" or "待确认")
                     end
                     local upload_started=self:_submit_progress_snapshot(book_id,snapshot,{
-                        reason="reading_end_verified",retry_count=1,reading_end=true,
+                        reason="reading_end_verified",retry_count=0,reading_end=true,
                         detached=defer_background_start,
                         record_snapshot=U.copy(record_snapshot),
                         record_override=U.copy(record_snapshot),
@@ -25362,11 +25404,11 @@ function Plugin:_reading_end_sync(reason,options,callback)
                         verify_detached=true,
                         uploading_message="正在上传结束阅读进度",
                         verifying_message="结束阅读进度已提交，正在确认云端位置",
-                        retrying_message="云端尚未确认，正在重提交最终精确位置",
+                        retrying_message="云端尚未同步到最新位置，稍后再次读取确认",
                         success_message="结束阅读进度已上传并确认",
                         unconfirmed_message="最终精确位置已保留，云端仍待确认",
                         failed_message="结束阅读进度暂未完成",
-                        first_delay=.55,second_delay=.85,retry_delay=.35,
+                        first_delay=5.0,second_delay=6.0,retry_delay=.35,
                         accepted_callback=function(accepted_snapshot)
                             logger.info("[MiuRead][ReadingEnd] progress submit accepted; close gate released",
                                 "book=",book_id,"seq=",tostring(accepted_snapshot and accepted_snapshot.progress_sequence or "-"))
@@ -25395,7 +25437,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 -- rt!=0 reading-time writer; both may finish in parallel.
                 submit_final_progress()
             end,{
-                precise=true,prepare_catalog=true,require_cloud_coordinate=true,
+                precise=true,prepare_catalog=resolve_attempt>1,require_cloud_coordinate=true,
                 detached=defer_background_start,
                 record_snapshot=defer_background_start and U.copy(record_snapshot) or nil,
                 record_generation_override=defer_background_start and record_generation_snapshot or nil,
@@ -25412,7 +25454,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 else
                     logger.warn("[MiuRead][ReadingEnd] cannot start exact position resolver",
                         "book=",book_id,"error=",tostring(resolve_error or "busy"))
-                    complete_one(false)
+                    complete_one(false,"progress","待确认")
                 end
             end
         end

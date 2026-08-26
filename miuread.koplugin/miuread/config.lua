@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.2.0-beta.6",
+    VERSION = "5.2.0-beta.7",
     SCHEMA = 119,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -65,6 +65,10 @@ local C = {
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
     READ_INTERVAL = 60,
+    -- First confirmed reading-time report is intentionally earlier than the
+    -- steady 60 s cadence so the user can verify sync without waiting a minute.
+    -- This is an internal strategy, not another user-facing setting.
+    READ_FIRST_DELAY = 15,
     -- beta.24 never replays historical/suspend reading-time debt. Normal
     -- reports stay on the established one-minute cadence and every request is
     -- independently capped, avoiding burst uploads after reconnect/resume.
