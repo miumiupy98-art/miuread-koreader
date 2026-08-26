@@ -21216,8 +21216,7 @@ function Plugin:ensure_read_report_progress(reason,automatic)
                 if self.ui and self.ui.document then self:ensure_read_report_progress("mapping_retry",true) end
             end)
         elseif not automatic then
-            self:info(message.."。\n\n"..U.first_line(tostring(err or "未知错误"),220)
-                .."\n\n不会把章节百分比直接当成整书进度上传。")
+            self:info(message.."。\n\n不会把章节百分比直接当成整书进度上传。\n详细原因已写入同步诊断日志。")
         end
     end
 
@@ -21360,7 +21359,7 @@ function Plugin:_remote_matches(remote,target)
     return match(remote)
 end
 
-function Plugin:_prepare_progress_snapshot(book_id,position)
+function Plugin:_prepare_progress_snapshot(book_id,position,persist_sequence)
     book_id=tostring(book_id or "")
     if book_id=="" or type(position)~="table" then return nil end
     local session=(self:_persisted_sessions()[book_id]) or self.store:session(book_id) or {}
@@ -21379,7 +21378,7 @@ function Plugin:_prepare_progress_snapshot(book_id,position)
     -- upload, cloud verification and any one-shot replay.
     position.progress_sequence=seq
     position.captured_at=snapshot.captured_at
-    if seq>latest then
+    if seq>latest and persist_sequence~=false then
         self.store:save_session(book_id,{progress_latest_sequence=seq})
     end
     return snapshot
@@ -21400,7 +21399,9 @@ end
 function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
     book_id=tostring(book_id or "")
     if book_id=="" or type(position)~="table" then return false end
-    local snapshot=self:_prepare_progress_snapshot(book_id,position)
+    -- pending_progress and its sequence belong to one durable transaction;
+    -- avoid an extra synchronous session write on the Reader -> Home path.
+    local snapshot=self:_prepare_progress_snapshot(book_id,position,false)
     if not snapshot then return false end
     local session=(self:_persisted_sessions()[book_id]) or self.store:session(book_id) or {}
     local latest=tonumber(session.progress_latest_sequence or 0) or 0
@@ -21776,6 +21777,12 @@ function Plugin:upload_local_progress(manual,callback)
             unconfirmed_message="已重试一次，云端位置仍未确认",
             failed_message="本次上传暂未完成",
             first_delay=.8,second_delay=1.2,retry_delay=.45,
+            accepted_callback=function(accepted_snapshot)
+                if manual then
+                    local accepted_target=math.floor((tonumber(accepted_snapshot and accepted_snapshot.progress) or target)+.5)
+                    self:toast("阅读进度已提交，正在确认云端位置（"..accepted_target.."%）",3)
+                end
+            end,
         },function(ok,remote,err,submitted)
             if err=="superseded" then
                 self.sync:end_progress_sync("较新的阅读位置已接管同步")
@@ -21786,7 +21793,7 @@ function Plugin:upload_local_progress(manual,callback)
             if ok then
                 self.sync:end_progress_sync("本机阅读进度已上传并确认")
                 if manual then
-                    self:status_toast("阅读进度同步","已上传并确认："..final_target.."%",4)
+                    self:toast("阅读进度已上传，云端已确认当前位置（"..final_target.."%）",4)
                 else
                     self:_show_progress_success("已同步："..final_target.."%")
                 end
@@ -21903,10 +21910,10 @@ function Plugin:on_remote_source_conflict(id,localp,remote,automatic)
         self.sync:end_progress_sync("云端来源冲突尚未确认")
     end
     local buttons={}
-    if remote.web then buttons[#buttons+1]={{text="使用网页云端 "..webp.."%",callback=function()
+    if remote.web then buttons[#buttons+1]={{text="使用云端记录 A "..webp.."%",callback=function()
         closing_for_action=true; UIManager:close(dialog); self:_use_remote_position(id,localp,remote.web)
     end}} end
-    if remote.agent then buttons[#buttons+1]={{text="使用官方云端 "..agentp.."%",callback=function()
+    if remote.agent then buttons[#buttons+1]={{text="使用云端记录 B "..agentp.."%",callback=function()
         closing_for_action=true; UIManager:close(dialog); self:_use_remote_position(id,localp,remote.agent)
     end}} end
     buttons[#buttons+1]={{text="使用本机并上传 "..localp.."%",callback=function()
@@ -21928,8 +21935,7 @@ function Plugin:on_remote_progress(id,localp,remote,automatic)
         return
     end
     self._progress_prompted_book_id=tostring(id)
-    local source=remote.source=="web_cookie" and "网页云端" or (remote.source=="agent_gateway" and "官方云端" or "云端")
-    local text="检测到阅读位置不同\n\n本机位置："..localp.."%\n"..source.."位置："..remotep.."%"
+    local text="检测到阅读位置不同\n\n本机位置："..localp.."%\n云端位置："..remotep.."%"
     local dialog,closing_for_action
     local function defer()
         self:_save_progress_state(id,"deferred","本次暂不处理位置差异",localp,remotep)
@@ -25263,8 +25269,17 @@ function Plugin:_reading_end_sync(reason,options,callback)
         if options.after then text=text.."\n完成本地保存后将"..tostring(options.after) end
         return text
     end
+    local status_task
     local function show_status(title,duration)
-        if options.show_status~=false then self:status_toast(title or "正在保存阅读记录",detail(),duration or 3) end
+        if options.show_status==false then return end
+        -- Do not repaint the e-ink Reader immediately after the Home tap.  Only
+        -- show progress feedback if local capture actually takes noticeable time.
+        status_task=function()
+            if self._reading_end_sync_active==true then
+                self:status_toast(title or "正在保存阅读记录",detail(),duration or 3)
+            end
+        end
+        UIManager:scheduleIn(.9,status_task)
     end
     local function refresh_home_sync_state()
         self._home_sync_summary_cache=nil
@@ -25275,6 +25290,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         if finished then return end
         finished=true
         if timeout_task then UIManager:unschedule(timeout_task); timeout_task=nil end
+        if status_task then UIManager:unschedule(status_task); status_task=nil end
         self._reading_end_sync_active=false
         self._reading_end_barrier_active=false
         self._reading_end_barrier_reason=nil
@@ -25282,10 +25298,6 @@ function Plugin:_reading_end_sync(reason,options,callback)
             "reason=",reason,"ok=",tostring(local_ok==true),
             "time_handoff=",tostring(time_handoff or "-"),
             "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started_at)*1000+.5)))
-        if options.show_status~=false then
-            self:status_toast(local_ok and "阅读记录已保存" or "阅读位置待确认",
-                local_ok and "云端同步将在后台继续" or "已保留本机状态，稍后继续确认",2.2)
-        end
         local waiters=self._reading_end_sync_waiters or {}
         self._reading_end_sync_waiters=nil
         for _,fn in ipairs(waiters) do pcall(fn,local_ok==true,{local_saved=true,background=true,states=U.copy(task_states)}) end
@@ -25350,7 +25362,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                 return
             end
 
-            local snapshot=self:_prepare_progress_snapshot(book_id,position) or position
+            local snapshot=self:_prepare_progress_snapshot(book_id,position,false) or position
             self:_save_pending_progress(book_id,snapshot,"final_position_captured","finalizing")
             task_states.progress=authenticated and "✓ 已保存 · 后台上传" or "✓ 已保存 · 等待网络"
             logger.info("[MiuRead][ReadingEnd] final position captured",
@@ -25438,7 +25450,7 @@ end
 
 function Plugin:_reading_end_before_action(reason,after,action)
     if self.sync and self.sync.reading_end_finalized==true then return action() end
-    local started=self:_reading_end_sync(reason,{show_status=true,after=after,timeout=6},function(_ok)
+    local started=self:_reading_end_sync(reason,{show_status=false,after=after,timeout=5},function(_ok)
         action()
     end)
     if not started then return action() end
