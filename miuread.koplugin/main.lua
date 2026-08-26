@@ -7193,8 +7193,9 @@ end
 
 
 function Plugin:_home_root()
-    -- 5.2 Beta: the local library has one device/KOReader-owned entry point.
-    -- Legacy MiuRead scan roots are intentionally ignored.
+    -- beta.4: MiuRead only chooses the device user-storage boundary. File
+    -- discovery and format support below that boundary follow KOReader. This
+    -- deliberately includes sibling folders such as /mnt/us/Books on Kindle.
     local native_home=""
     if _G.G_reader_settings and type(_G.G_reader_settings.readSetting)=="function" then
         local ok,value=pcall(_G.G_reader_settings.readSetting,_G.G_reader_settings,"home_dir")
@@ -7204,33 +7205,64 @@ function Plugin:_home_root()
     local function usable(path)
         path=LocalLibrary.normalize(path or "")
         if path=="" or path=="/" or lfs.attributes(path,"mode")~="directory" then return nil end
-        -- Never make MiuRead's generated-book directory the local-library root.
         if download_root~="" and (path==download_root or path:sub(1,#download_root+1)==download_root.."/") then return nil end
         return path
     end
-    for _,candidate in ipairs({
-        native_home,
-        "/mnt/us/documents",   -- Kindle
-        "/mnt/onboard",        -- Kobo
-        "/mnt/us/books",
-        "/storage/emulated/0", -- Android fallback
-        "/sdcard",             -- Android fallback
-    }) do
+    local function device_is(method)
+        if not Device or type(Device[method])~="function" then return false end
+        local ok,value=pcall(Device[method],Device)
+        return ok and value==true
+    end
+
+    local candidates={}
+    if native_home=="/mnt/us" or native_home:sub(1,8)=="/mnt/us/" or device_is("isKindle") then
+        candidates={"/mnt/us",native_home}
+    elseif native_home=="/mnt/onboard" or native_home:sub(1,13)=="/mnt/onboard/" or device_is("isKobo") then
+        candidates={"/mnt/onboard",native_home}
+    elseif device_is("isAndroid") then
+        -- Android storage permissions vary by build. Prefer KOReader's own
+        -- configured home first, then the ordinary shared-storage roots.
+        candidates={native_home,"/storage/emulated/0","/sdcard"}
+    else
+        candidates={native_home,"/mnt/us","/mnt/onboard","/storage/emulated/0","/sdcard"}
+    end
+    for _,candidate in ipairs(candidates) do
         local path=usable(candidate)
         if path then return path end
     end
-    -- Last-resort parent of the plugin download directory, if it is readable.
     local parent=usable(LocalLibrary.dirname(download_root))
     if parent then return parent end
     return ""
 end
 
+function Plugin:_home_local_excluded_paths(root)
+    root=LocalLibrary.normalize(root)
+    local out={}
+    local function add(name)
+        local path=LocalLibrary.normalize(root.."/"..tostring(name or ""))
+        if path~="" and lfs.attributes(path,"mode")=="directory" then out[#out+1]=path end
+    end
+    if root=="/mnt/us" then
+        -- These are application/system trees, not Kindle user book folders.
+        -- documents, Books and any other user-created sibling remain visible.
+        for _,name in ipairs({"koreader","system","extensions","mrpackages","linkfonts"}) do add(name) end
+    elseif root=="/storage/emulated/0" or root=="/sdcard" then
+        -- Avoid traversing Android application sandboxes while keeping ordinary
+        -- Books/Documents/Download and arbitrary user folders discoverable.
+        add("Android")
+        add("koreader")
+    end
+    return out
+end
+
 function Plugin:_home_local_tree_cache()
-    -- Cache only directories the user actually opened. This is not a recursive library index.
-    local cache=self.store:get("home_local_directory_cache_v3",{version=3,dirs={}})
-    cache=type(cache)=="table" and cache or {version=3,dirs={}}
-    if tonumber(cache.version)~=3 then cache={version=3,dirs={}} end
-    cache.version=3
+    -- v4 snapshots contain immediate folders plus every KOReader-supported book
+    -- recursively below that path. Bump the key so beta.3's non-recursive cache
+    -- can never be mistaken for a complete library.
+    local cache=self.store:get("home_local_directory_cache_v4",{version=4,dirs={}})
+    cache=type(cache)=="table" and cache or {version=4,dirs={}}
+    if tonumber(cache.version)~=4 then cache={version=4,dirs={}} end
+    cache.version=4
     cache.dirs=type(cache.dirs)=="table" and cache.dirs or {}
     return cache
 end
@@ -7260,7 +7292,7 @@ end
 
 function Plugin:_home_local_empty_text()
     if self._home_local_inline_loading==true then return "正在读取本地书库…" end
-    return "当前目录暂无可显示的本地书\n点击“本地书库”浏览其他文件夹"
+    return "本地存储中暂无可显示的书籍\n点击“本地书库”查看文件夹"
 end
 
 
@@ -7373,8 +7405,9 @@ function Plugin:_home_recent_local_rows(limit)
 end
 
 function Plugin:_home_local_rows()
-    -- Home "本地书库" shows the real current KOReader/device directory.
-    -- It never derives this section from ReadHistory and never scans children.
+    -- The home preview is the complete local-book list. Folder navigation lives
+    -- in the dedicated local-library browser, where “文件夹 / 全部书籍” are
+    -- separate tabs instead of being mixed into one shelf.
     local root=LocalLibrary.normalize(self:_home_root())
     if root=="" or lfs.attributes(root,"mode")~="directory" then
         return {},{path=root,root=root,scanned_at=0,folders={},books={},error="本地书入口不可用"}
@@ -7383,11 +7416,8 @@ function Plugin:_home_local_rows()
     local snapshot=type(cache.dirs[root])=="table" and cache.dirs[root] or {
         path=root,root=root,scanned_at=0,folders={},books={},
     }
-    local folders,books=self:_local_browser_decorate(snapshot,root)
-    local rows={}
-    for _,folder in ipairs(folders or {}) do rows[#rows+1]=folder end
-    for _,book in ipairs(books or {}) do rows[#rows+1]=book end
-    return rows,snapshot
+    local _,books=self:_local_browser_decorate(snapshot,root)
+    return books or {},snapshot
 end
 
 function Plugin:_home_apply_local_inline_section(refresh_metadata)
@@ -7422,7 +7452,7 @@ function Plugin:_home_ensure_local_inline_loaded(force,user_requested)
     local cache=self:_home_local_tree_cache()
     local cached=cache.dirs[root]
     local scanned_at=tonumber(type(cached)=="table" and cached.scanned_at or 0) or 0
-    local stale=scanned_at<=0 or os.time()-scanned_at>120
+    local stale=scanned_at<=0 or os.time()-scanned_at>600
     if force~=true and not stale then
         self:_home_apply_local_inline_section(true)
         return true
@@ -7449,9 +7479,8 @@ function Plugin:_home_ensure_local_inline_loaded(force,user_requested)
 end
 
 function Plugin:_home_handle_back()
-    -- beta.13 no longer embeds folder navigation inside the home section.
-    -- Keep the hook for compatibility, but old local_library_mode values must
-    -- never change Back behavior in the new current-directory browser model.
+    -- Folder navigation lives in the dedicated local-library browser. Keep
+    -- this compatibility hook from changing Home Back behavior.
     return false
 end
 
@@ -9317,6 +9346,42 @@ end
 function Plugin:_home_merge_directory_snapshot(snapshot,old_snapshot)
     snapshot=type(snapshot)=="table" and snapshot or {folders={},books={}}
     old_snapshot=type(old_snapshot)=="table" and old_snapshot or {}
+    snapshot.folders=type(snapshot.folders)=="table" and snapshot.folders or {}
+    snapshot.books=type(snapshot.books)=="table" and snapshot.books or {}
+
+    -- A transient unreadable subdirectory must not make previously known books
+    -- disappear. Keep the last complete rows for only those failed subtrees; a
+    -- later successful refresh can then add/remove files normally.
+    if snapshot.partial==true and type(snapshot.unreadable_dirs)=="table" and #snapshot.unreadable_dirs>0 then
+        local seen={}
+        for _,row in ipairs(snapshot.books) do seen[LocalLibrary.normalize(row.file)]=true end
+        local function under_failed(path)
+            path=LocalLibrary.normalize(path)
+            for _,dir in ipairs(snapshot.unreadable_dirs) do
+                dir=LocalLibrary.normalize(dir)
+                if dir~="" and (path==dir or path:sub(1,#dir+1)==dir.."/") then return true end
+            end
+            return false
+        end
+        local preserved=0
+        for _,row in ipairs(old_snapshot.books or {}) do
+            local path=LocalLibrary.normalize(row.file)
+            if path~="" and not seen[path] and under_failed(path) then
+                snapshot.books[#snapshot.books+1]=row
+                seen[path]=true
+                preserved=preserved+1
+            end
+        end
+        if preserved>0 then
+            snapshot.preserved_from_cache=preserved
+            table.sort(snapshot.books,function(a,b)
+                local at,bt=tostring(a.title or ""):lower(),tostring(b.title or ""):lower()
+                if at~=bt then return at<bt end
+                return tostring(a.file or "")<tostring(b.file or "")
+            end)
+        end
+    end
+
     local old_by_file={}
     for _,row in ipairs(old_snapshot.books or {}) do old_by_file[LocalLibrary.normalize(row.file)]=row end
     local metadata_cache=self:_home_recent_local_metadata_cache()
@@ -9339,7 +9404,7 @@ function Plugin:_home_store_directory_snapshot(path,snapshot)
     snapshot=self:_home_merge_directory_snapshot(snapshot,cache.dirs[path])
     cache.dirs[path]=snapshot
     cache.updated_at=os.time()
-    self.store:set("home_local_directory_cache_v3",cache)
+    self.store:set("home_local_directory_cache_v4",cache)
     return snapshot
 end
 
@@ -9401,9 +9466,13 @@ function Plugin:_home_refresh_local_directory(path,callback,force,owner)
         return true
     end
 
+    local excluded_paths=self:_home_local_excluded_paths(path)
+
     local function start_incremental(reason)
         logger.info("[MiuRead][LocalBrowser] using incremental reader",path,tostring(reason or "worker unavailable"))
-        local scanner=LocalLibrary.new_directory_scan(path,{include_cover=false,sort="name"})
+        local scanner=LocalLibrary.new_tree_scan(path,{
+            include_cover=false,sort="name",exclude_paths=excluded_paths,
+        })
         self._local_browser_fallback_scanner=scanner
         local task
         task=function()
@@ -9440,14 +9509,16 @@ function Plugin:_home_refresh_local_directory(path,callback,force,owner)
 
     local worker=self.local_browser_async
     if not worker or not worker:available() then return start_incremental("background worker unavailable") end
-    local started,err=worker:run("local-folder",function()
+    local started,err=worker:run("local-library-tree",function()
         local ok_ffi,ffi=pcall(require,"ffi")
         if ok_ffi and ffi then
             pcall(ffi.cdef,"int setpriority(int which, int who, int prio);")
             pcall(function() ffi.C.setpriority(0,0,10) end)
         end
         local Library=require("miuread.local_library")
-        return Library.list_directory(path,{include_cover=false,sort="name"})
+        return Library.list_tree(path,{
+            include_cover=false,sort="name",exclude_paths=excluded_paths,
+        })
     end,function(result)
         if generation~=self._home_directory_generation then return end
         if result and result.ok==true and type(result.value)=="table" then
@@ -9462,12 +9533,12 @@ function Plugin:_home_refresh_local_directory(path,callback,force,owner)
 end
 
 function Plugin:_home_scan_local(force,user_requested)
-    -- Compatibility name retained for callers, but the operation now means
-    -- exactly one non-recursive read of the local-library entry directory.
+    -- Compatibility name retained for callers. beta.4 refreshes the complete
+    -- KOReader-backed local library below the device user-storage boundary.
     self._home_refreshing=false
     local started=self:_home_ensure_local_inline_loaded(force==true,user_requested==true)
     logger.info("[MiuRead][Home] local-library refresh",
-        "root=",tostring(self:_home_root()),"recursive=false","started=",tostring(started))
+        "root=",tostring(self:_home_root()),"recursive=true","started=",tostring(started))
     return started
 end
 
@@ -9509,7 +9580,7 @@ function Plugin:_home_reset_local_metadata()
     for _,snapshot in pairs(tree.dirs or {}) do
         for _,book in ipairs(type(snapshot)=="table" and snapshot.books or {}) do if clear_book(book) then changed=true end end
     end
-    if changed then tree.updated_at=os.time(); self.store:set("home_local_directory_cache_v3",tree) end
+    if changed then tree.updated_at=os.time(); self.store:set("home_local_directory_cache_v4",tree) end
     self.store:set("home_local_recent_metadata_v1",{version=1,rows={}})
 end
 
@@ -9530,7 +9601,7 @@ function Plugin:_home_update_local_cache(filepath,metadata)
     end
     if tree_changed then
         tree.updated_at=os.time()
-        self.store:set("home_local_directory_cache_v3",tree)
+        self.store:set("home_local_directory_cache_v4",tree)
         changed=true
     end
 
@@ -10498,7 +10569,7 @@ function Plugin:show_local_browser(path,root,stack,force,request_owner)
     local view
     if type(cached)=="table" and force~=true then
         view=self:_show_local_browser_snapshot(path,root,stack,cached)
-        -- Cached data is only the first frame. Always reread this exact directory.
+        -- Cached data is only the first frame. Refresh the complete subtree atomically.
         self:_home_refresh_local_directory(path,function(fresh,scanned)
             if not scanned or not view or view._miu_closed then return end
             local folders,books=self:_local_browser_decorate(fresh,root.path)
@@ -11531,7 +11602,7 @@ function Plugin:maintenance_menu()
     return {
         {text="书库维护",post_text="目录 资料 封面与书架",sub_item_table_func=function()
             return {
-                {text="刷新本地书库",post_text="只读取入口目录，不递归扫描",callback=function() self:_home_scan_local(true,true) end},
+                {text="刷新本地书库",post_text="重新发现全部本地书",callback=function() self:_home_scan_local(true,true) end},
                 {text="更新缺失书籍资料",callback=function()
                     self:_home_reset_local_metadata(); self:_home_complete_refresh(true)
                 end},
@@ -22663,7 +22734,7 @@ function Plugin:local_library_settings_menu()
         {text="打开本地书库",post_text=root~="" and root or "自动选择 KOReader 可访问目录",callback=function() self:_open_local_library_folders() end},
         {text="我的分类",post_text="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         {text="KOReader 文件管理",post_text="文件移动、删除与重命名",callback=function() self:_home_open_koreader_filemanager(root~="" and root or nil,true) end},
-        {text="说明",post_text="只读取当前文件夹 · 不全盘扫描 · 格式跟随 KOReader",enabled=false},
+        {text="说明",post_text="文件夹 + 全部书籍 · 识别规则跟随 KOReader",enabled=false},
         {text="去重",post_text="觅阅已下载书不会重复作为普通本地书",enabled=false},
     }
 end

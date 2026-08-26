@@ -291,7 +291,7 @@ function LocalBrowserWidget:_build()
     end
     local tabs = HorizontalGroup:new{align = "center",
         tab("文件夹 " .. tostring(folder_count), "folders", tab_w),
-        tab("书籍 " .. tostring(book_count), "books", inner_w - tab_w),
+        tab("全部书籍 " .. tostring(book_count), "books", inner_w - tab_w),
     }
     self:_add(layers, margin, margin + header_h + UiScale.line("thin"), tabs)
 
