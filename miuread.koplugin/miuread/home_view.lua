@@ -1280,6 +1280,13 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     local action_h = math.max(UiScale.dp(58, 54, 76), math.min(UiScale.dp(76, 64, 86), math.floor(m.body_h * .070)))
     local actions = self.opts.home_actions or {}
     local tabs_h = math.max(UiScale.dp(34, 31, 44), math.min(UiScale.dp(46, 37, 52), math.floor(m.body_h * .050)))
+    local shelf_subtabs = self.opts.shelf_subtabs or {}
+    -- A second shelf-level selector is used by 本地书库 only. It is rendered
+    -- only when both local views are enabled; with a single enabled view the
+    -- row disappears entirely and the grid keeps the original vertical space.
+    local subtabs_h = #shelf_subtabs > 1
+        and math.max(UiScale.dp(29, 26, 39), math.min(UiScale.dp(38, 32, 45), math.floor(m.body_h * .041)))
+        or 0
     local books = self.opts.shelf_books or {}
     local title = tostring(self.opts.shelf_title or "")
     local section_h = title ~= "" and math.max(UiScale.dp(22, 20, 30), math.min(UiScale.dp(29, 25, 35), math.floor(m.body_h * .031))) or 0
@@ -1297,6 +1304,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         local shelf_w = math.max(1, w - hero_w - dashboard_w - gap * 2)
         if build_static then
             local shelf_sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            if subtabs_h > 0 then shelf_sy = shelf_sy + subtabs_h + math.max(2, math.floor(gap * .25)) end
             if section_h > 0 then shelf_sy = shelf_sy + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
             local shelf_grid_h = math.max(1, bottom - shelf_sy - shelf_footer_h)
@@ -1361,6 +1369,10 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         if build_section then
             self:_add(children, shelf_x, y, category_tabs(self.opts.tabs, shelf_w, tabs_h, self.opts.on_shelf_all))
             local sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            if subtabs_h > 0 then
+                self:_add(children, shelf_x, sy, category_tabs(shelf_subtabs, shelf_w, subtabs_h, nil))
+                sy = sy + subtabs_h + math.max(2, math.floor(gap * .25))
+            end
             if section_h > 0 then
                 self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, nil))
                 sy = sy + section_h + math.max(2, math.floor(gap * .25))
@@ -1388,6 +1400,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local shelf_y = y + hero_h + gap
             if #actions > 0 and shelf_y + action_h < bottom then shelf_y = shelf_y + action_h + gap end
             if shelf_y + tabs_h < bottom then shelf_y = shelf_y + tabs_h + math.max(3, math.floor(gap * .35)) end
+            if subtabs_h > 0 and shelf_y + subtabs_h < bottom then shelf_y = shelf_y + subtabs_h + math.max(2, math.floor(gap * .25)) end
             if section_h > 0 and shelf_y + section_h < bottom then shelf_y = shelf_y + section_h + math.max(2, math.floor(gap * .25)) end
             local shelf_footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
             local shelf_grid_h = math.max(1, bottom - shelf_y - shelf_footer_h)
@@ -1459,6 +1472,10 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     if y + tabs_h < bottom then
         self:_add(children, x, y, category_tabs(self.opts.tabs, w, tabs_h, self.opts.on_shelf_all))
         y = y + tabs_h + math.max(3, math.floor(gap * .35))
+    end
+    if subtabs_h > 0 and y + subtabs_h < bottom then
+        self:_add(children, x, y, category_tabs(shelf_subtabs, w, subtabs_h, nil))
+        y = y + subtabs_h + math.max(2, math.floor(gap * .25))
     end
     if section_h > 0 and y + section_h < bottom then
         self:_add(children, x, y, section_header(title, w, section_h, nil))
@@ -1719,6 +1736,7 @@ function HomeWidget:updateSection(opts)
     local started=os.clock()
     opts = opts or {}
     self.opts.tabs = opts.tabs or self.opts.tabs
+    self.opts.shelf_subtabs = opts.shelf_subtabs or {}
     self.opts.shelf_title = opts.shelf_title or self.opts.shelf_title
     self.opts.shelf_books = opts.shelf_books or {}
     self.opts.empty_text = opts.empty_text or self.opts.empty_text

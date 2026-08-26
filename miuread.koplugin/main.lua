@@ -3212,7 +3212,24 @@ function Plugin:_home_preferences()
         home.local_entry_version=1
         changed=true
     end
-    if (tonumber(home.local_browse_version) or 0)<3 then home.local_browse_version=3; changed=true end
+    if (tonumber(home.local_browse_version) or 0)<4 then home.local_browse_version=4; changed=true end
+    -- Local library has two presentation modes on the Home shelf. They share
+    -- one physical index; these switches only control which views the user can
+    -- select. Keep at least one mode enabled and hide the mode row when only
+    -- one remains.
+    if home.local_shelf_show_folders==nil then home.local_shelf_show_folders=true; changed=true end
+    if home.local_shelf_show_books==nil then home.local_shelf_show_books=true; changed=true end
+    if home.local_shelf_show_folders~=true and home.local_shelf_show_books~=true then
+        home.local_shelf_show_books=true; changed=true
+    end
+    if home.local_shelf_mode~="folders" and home.local_shelf_mode~="books" then
+        home.local_shelf_mode="books"; changed=true
+    end
+    if home.local_shelf_mode=="folders" and home.local_shelf_show_folders~=true then
+        home.local_shelf_mode="books"; changed=true
+    elseif home.local_shelf_mode=="books" and home.local_shelf_show_books~=true then
+        home.local_shelf_mode="folders"; changed=true
+    end
     if type(home.visible_sections)~="table" then home.visible_sections={}; changed=true end
     for _,section in ipairs(HOME_SECTION_ORDER) do
         if home.visible_sections[section]==nil then home.visible_sections[section]=true; changed=true end
@@ -4792,7 +4809,7 @@ function Plugin:_home_build_tabs(active)
         local entry=self._home_sections and self._home_sections[tab_section] or nil
         tabs[#tabs+1]={
             title=entry and entry.title or tab_section,
-            count=entry and #(entry.rows or {}) or 0,
+            count=entry and (tonumber(entry.count) or #(entry.rows or {})) or 0,
             selected=active==tab_section,
             on_tap=function() self:_set_home_section(tab_section) end,
         }
@@ -4809,35 +4826,14 @@ function Plugin:_home_preview_page(rows,hero,page,limit)
     limit=math.max(1,tonumber(limit) or self:_home_page_limit())
     local filtered,seen={},{}
     -- “继续阅读”是快捷入口，不应从对应书架中隐藏同一本书。
-    -- 保留书架项目，确保标题数量、分页数量和实际可见内容一致。
+    -- Folder cards use the same one-slot geometry as book covers, so every
+    -- local item participates in the same stable 4×2 pagination.
     for _,book in ipairs(rows or {}) do
         local key=self:_home_book_key(book)
         if key~="" and not seen[key] then
             seen[key]=true
             filtered[#filtered+1]=book
         end
-    end
-    local has_folders=false
-    for _,book in ipairs(filtered) do if book.local_folder==true or book.kind=="folder" then has_folders=true; break end end
-    if has_folders then
-        local packed,current,used={}, {}, 0
-        local columns=4
-        for _,book in ipairs(filtered) do
-            local weight=(book.local_folder==true or book.kind=="folder") and 2 or 1
-            -- A two-column folder card may not start in the last column. Count
-            -- the unused slot before pagination so rendering never crosses the
-            -- right edge when folders and books are mixed.
-            local padding=(weight==2 and used%columns==columns-1) and 1 or 0
-            if used>0 and used+padding+weight>limit then
-                packed[#packed+1]=current; current={}; used=0; padding=0
-            end
-            used=used+padding
-            current[#current+1]=book; used=used+weight
-        end
-        if #current>0 or #packed==0 then packed[#packed+1]=current end
-        local total_pages=math.max(1,#packed)
-        page=math.max(1,math.min(total_pages,tonumber(page) or 1))
-        return packed[page] or {},page,total_pages,#filtered
     end
     local total_pages=math.max(1,math.ceil(#filtered/limit))
     page=math.max(1,math.min(total_pages,tonumber(page) or 1))
@@ -5011,6 +5007,7 @@ function Plugin:_home_apply_section(section)
     local started=os.clock()
     local updated=HomeView.update_section{
         tabs=self:_home_build_tabs(section),
+        shelf_subtabs=section=="local" and self:_home_local_shelf_tabs(home) or {},
         shelf_title=section=="local" and self:_home_local_inline_title() or "",
         shelf_books=preview,
         shelf_page=page,
@@ -5023,7 +5020,7 @@ function Plugin:_home_apply_section(section)
             else self:show_home_all_books() end
         end,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
-        section_cache_key=section,
+        section_cache_key=section=="local" and (section..":"..self:_home_local_shelf_mode(home)) or section,
         section_revision=self:_home_section_cache_revision(section,page),
     }
     -- Section switching must remain a pure in-memory operation. Metadata,
@@ -7296,7 +7293,7 @@ end
 
 function Plugin:_home_local_empty_text()
     if self._home_local_inline_loading==true then return "正在读取本地书库…" end
-    return "本地存储中暂无可显示的书籍\n点击“本地书库”查看文件夹"
+    return "本地存储中暂无可显示的本地书"
 end
 
 
@@ -7408,32 +7405,106 @@ function Plugin:_home_recent_local_rows(limit)
     return rows
 end
 
-function Plugin:_home_local_rows()
-    -- The home preview is the complete local-book list. Folder navigation lives
-    -- in the dedicated local-library browser, where “文件夹 / 全部书籍” are
-    -- separate tabs instead of being mixed into one shelf.
+function Plugin:_home_local_shelf_mode(home)
+    home=type(home)=="table" and home or self:_home_preferences()
+    local show_folders=home.local_shelf_show_folders==true
+    local show_books=home.local_shelf_show_books==true
+    if not show_folders and not show_books then return "books" end
+    if show_folders and not show_books then return "folders" end
+    if show_books and not show_folders then return "books" end
+    return home.local_shelf_mode=="folders" and "folders" or "books"
+end
+
+function Plugin:_home_local_rows(home)
+    -- One recursive snapshot backs both Home-shelf views. “全部书籍” flattens
+    -- every readable book; “文件夹” shows the root's real folders plus books
+    -- stored directly at that root. No scan is started by switching modes.
+    home=type(home)=="table" and home or self:_home_preferences()
     local root=LocalLibrary.normalize(self:_home_root())
     if root=="" or lfs.attributes(root,"mode")~="directory" then
-        return {},{path=root,root=root,scanned_at=0,folders={},books={},error="本地书入口不可用"}
+        return {},{path=root,root=root,scanned_at=0,folders={},books={},direct_books={},error="本地书入口不可用"},
+            {books=0,folders=0,direct_books=0}
     end
     local cache=self:_home_local_tree_cache()
     local snapshot=type(cache.dirs[root])=="table" and cache.dirs[root] or {
-        path=root,root=root,scanned_at=0,folders={},books={},
+        path=root,root=root,scanned_at=0,folders={},books={},direct_books={},
     }
-    local _,books=self:_local_browser_decorate(snapshot,root)
-    return books or {},snapshot
+    local all_folders,all_books=self:_local_browser_decorate(snapshot,root,false)
+    local direct_folders,direct_books=self:_local_browser_decorate(snapshot,root,true)
+    local counts={books=#(all_books or {}),folders=#(direct_folders or {}),direct_books=#(direct_books or {})}
+    local mode=self:_home_local_shelf_mode(home)
+    if mode=="folders" then
+        local rows={}
+        for _,folder in ipairs(direct_folders or {}) do rows[#rows+1]=folder end
+        for _,book in ipairs(direct_books or {}) do rows[#rows+1]=book end
+        return rows,snapshot,counts
+    end
+    return all_books or {},snapshot,counts
+end
+
+function Plugin:_home_local_shelf_tabs(home)
+    home=type(home)=="table" and home or self:_home_preferences()
+    if home.local_shelf_show_folders~=true or home.local_shelf_show_books~=true then return {} end
+    local entry=self._home_sections and self._home_sections["local"] or nil
+    local counts=entry and entry.local_counts or {}
+    local mode=self:_home_local_shelf_mode(home)
+    return {
+        {title="文件夹",count=tonumber(counts.folders) or 0,selected=mode=="folders",on_tap=function()
+            self:_set_home_local_shelf_mode("folders")
+        end},
+        {title="全部书籍",count=tonumber(counts.books) or 0,selected=mode=="books",on_tap=function()
+            self:_set_home_local_shelf_mode("books")
+        end},
+    }
+end
+
+function Plugin:_set_home_local_shelf_mode(mode)
+    mode=mode=="folders" and "folders" or "books"
+    local home,preferences=self:_home_preferences()
+    if mode=="folders" and home.local_shelf_show_folders~=true then return false end
+    if mode=="books" and home.local_shelf_show_books~=true then return false end
+    if self:_home_local_shelf_mode(home)==mode then return true end
+    home.local_shelf_mode=mode
+    home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
+    home.page_by_section["local"]=1
+    self:_save_home_preferences(home,preferences)
+    if self._home_sections then self:_home_apply_local_inline_section(true) end
+    return true
+end
+
+function Plugin:_toggle_home_local_shelf_view(kind)
+    local home,preferences=self:_home_preferences()
+    local key=kind=="folders" and "local_shelf_show_folders" or "local_shelf_show_books"
+    local other=kind=="folders" and "local_shelf_show_books" or "local_shelf_show_folders"
+    local next_value=home[key]~=true
+    if not next_value and home[other]~=true then
+        self:toast("本地书库至少保留一个入口",2)
+        return false
+    end
+    home[key]=next_value
+    if not next_value and home.local_shelf_mode==kind then
+        home.local_shelf_mode=kind=="folders" and "books" or "folders"
+    end
+    home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
+    home.page_by_section["local"]=1
+    self:_save_home_preferences(home,preferences)
+    if self._home_sections then self:_home_apply_local_inline_section(true) end
+    return true
 end
 
 function Plugin:_home_apply_local_inline_section(refresh_metadata)
     if not self._home_sections then return false end
-    local rows=select(1,self:_home_local_rows())
-    self._home_sections["local"]={title="本地书库",rows=rows,empty=self:_home_local_empty_text()}
+    local home=self:_home_preferences()
+    local rows,_,counts=self:_home_local_rows(home)
+    self._home_sections["local"]={
+        title="本地书库",rows=rows,count=tonumber(counts.books) or 0,
+        local_counts=counts,empty=self:_home_local_empty_text(),
+    }
     self:_home_bump_section_revision("local")
     self:_home_rebuild_row_indexes()
     if self._home_active_section~="local" or not HomeView.is_shown() then return true end
     local updated=self:_home_apply_section("local")
     if refresh_metadata and updated then
-        local home=self:_home_preferences()
         local preview=self:_home_preview_page(rows,self._home_hero,
             home.page_by_section and home.page_by_section["local"],self:_home_page_limit())
         self:_home_schedule_local_identity_check(rows,nil)
@@ -10548,7 +10619,7 @@ function Plugin:_local_browser_decorate(snapshot,root_path,direct_only)
     return folders,books
 end
 
-function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view)
+function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view,default_view)
     path=LocalLibrary.normalize(path)
     root=root or {path=path,name="本地书库"}
     stack=type(stack)=="table" and stack or {}
@@ -10576,7 +10647,8 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view
         if view and not view._miu_closed then UIManager:close(view) end
     end
     view=LocalBrowserView.show{
-        title=title,folders=folders,books=books,mixed_view=mixed_view,default_view=mixed_view and "mixed" or "books",
+        title=title,folders=folders,books=books,mixed_view=mixed_view,
+        default_view=mixed_view and "mixed" or (default_view=="folders" and "folders" or "books"),
         empty_text=snapshot.error and ("无法读取文件夹\n"..tostring(snapshot.error)) or "这个文件夹里没有可显示的书籍",
         on_open_folder=open_folder,
         on_open_book=function(book) self:_home_open_local(book) end,
@@ -10602,7 +10674,7 @@ function Plugin:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view
     return view
 end
 
-function Plugin:show_local_browser(path,root,stack,force,request_owner,mixed_view)
+function Plugin:show_local_browser(path,root,stack,force,request_owner,mixed_view,default_view)
     path=LocalLibrary.normalize(path)
     if path=="" or lfs.attributes(path,"mode")~="directory" then
         path=LocalLibrary.normalize(self:_home_root())
@@ -10617,7 +10689,7 @@ function Plugin:show_local_browser(path,root,stack,force,request_owner,mixed_vie
     local cached=cache.dirs[path]
     local view
     if type(cached)=="table" and force~=true then
-        view=self:_show_local_browser_snapshot(path,root,stack,cached,mixed_view)
+        view=self:_show_local_browser_snapshot(path,root,stack,cached,mixed_view,default_view)
         -- Cached data is only the first frame. Refresh the complete subtree atomically.
         self:_home_refresh_local_directory(path,function(fresh,scanned)
             if not scanned or not view or view._miu_closed then return end
@@ -10630,22 +10702,31 @@ function Plugin:show_local_browser(path,root,stack,force,request_owner,mixed_vie
     end
     self:toast("正在打开本地书库…",1.2)
     self:_home_refresh_local_directory(path,function(snapshot)
-        self:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view)
+        self:_show_local_browser_snapshot(path,root,stack,snapshot,mixed_view,default_view)
     end,true,request_owner)
     return true
 end
 
-function Plugin:_open_local_library_folders()
+function Plugin:_open_local_library_mode(mode)
     local path=LocalLibrary.normalize(self:_home_root())
     if path=="" or lfs.attributes(path,"mode")~="directory" then
         self:info("暂时找不到 KOReader 可访问的本地书目录。")
         return false
     end
-    return self:show_local_browser(path,{path=path,name="本地书库"},{},false,nil,false)
+    mode=mode=="folders" and "folders" or "books"
+    return self:show_local_browser(path,{path=path,name="本地书库"},{},false,nil,false,mode)
+end
+
+function Plugin:_open_local_library_folders()
+    return self:_open_local_library_mode("folders")
+end
+
+function Plugin:_open_local_library_all_books()
+    return self:_open_local_library_mode("books")
 end
 
 function Plugin:show_home_local_library(rows)
-    return self:_open_local_library_folders()
+    return self:_open_local_library_mode(self:_home_local_shelf_mode())
 end
 
 function Plugin:_home_account_name()
@@ -16109,8 +16190,9 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     persist_home_session()
 
     if force_scan==true then self:_home_reset_local_metadata() end
+    local home,home_preferences=self:_home_preferences()
     local miuread_rows=self:_home_miuread_rows()
-    local local_rows=self:_home_local_rows()
+    local local_rows,_,local_counts=self:_home_local_rows(home)
     local recent_local_rows=self:_home_recent_local_rows(16)
     local cached_books,cached_mp=self.library:cached()
     cached_books=type(cached_books)=="table" and cached_books or {}
@@ -16122,7 +16204,6 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local account_rows=self:_home_cloud_rows(cached_books,"account")
     local mp_rows=self:_home_cloud_rows(cached_mp,"mp")
 
-    local home,home_preferences=self:_home_preferences()
     self:_home_apply_recent_read_times(miuread_rows,local_rows,recent_local_rows,account_rows,mp_rows)
     local recent_candidate=self:_home_recent_book(miuread_rows,recent_local_rows,account_rows)
     local snapshot=HOME_SESSION.recent_read_snapshot
@@ -16140,7 +16221,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local sections={
         account={title="微信书架",rows=account_rows,empty="这里还没有微信书架内容"},
         generated={title="已下载",rows=miuread_rows,empty="这里还没有已下载书籍"},
-        ["local"]={title="本地书库",rows=local_rows,empty=self:_home_local_empty_text()},
+        ["local"]={title="本地书库",rows=local_rows,count=tonumber(local_counts.books) or 0,
+            local_counts=local_counts,empty=self:_home_local_empty_text()},
         mp={title="公众号",rows=mp_rows,empty="这里还没有公众号内容"},
     }
     self._home_data_revision=(tonumber(self._home_data_revision) or 0)+1
@@ -16202,6 +16284,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         display_size=home.display_size,
         hero=hero,
         tabs=tabs,
+        shelf_subtabs=active=="local" and self:_home_local_shelf_tabs(home) or {},
         shelf_title=active=="local" and self:_home_local_inline_title() or "",
         shelf_books=selected_preview,
         shelf_page=shelf_page,
@@ -16231,7 +16314,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
             else self:show_home_all_books() end
         end,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
-        section_cache_key=active,
+        section_cache_key=active=="local" and (active..":"..self:_home_local_shelf_mode(home)) or active,
         section_revision=self:_home_section_cache_revision(active,shelf_page),
         on_close=function(current)
             if self._home_view==current then self._home_view=nil end
@@ -22995,11 +23078,16 @@ end
 
 function Plugin:local_library_settings_menu()
     local root=LocalLibrary.normalize(self:_home_root())
+    local home=self:_home_preferences()
     return {
-        {text="打开本地书库",post_text=root~="" and root or "自动选择 KOReader 可访问目录",callback=function() self:_open_local_library_folders() end},
+        {text="显示文件夹",checked_func=function() return self:_home_preferences().local_shelf_show_folders==true end,
+            keep_menu_open=true,callback=function() self:_toggle_home_local_shelf_view("folders") end},
+        {text="显示全部书籍",checked_func=function() return self:_home_preferences().local_shelf_show_books==true end,
+            keep_menu_open=true,callback=function() self:_toggle_home_local_shelf_view("books") end},
+        {text="打开本地书库",post_text=root~="" and root or "自动识别设备存储",callback=function() self:show_home_local_library() end},
         {text="我的分类",post_text="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         {text="KOReader 文件管理",post_text="文件移动、删除与重命名",callback=function() self:_home_open_koreader_filemanager(root~="" and root or nil,true) end},
-        {text="说明",post_text="文件夹 + 全部书籍 · 识别规则跟随 KOReader",enabled=false},
+        {text="说明",post_text="两个入口都显示时可在书架直接切换；只保留一个时隐藏入口名称",enabled=false},
         {text="去重",post_text="觅阅已下载书不会重复作为普通本地书",enabled=false},
     }
 end
@@ -23262,7 +23350,9 @@ function Plugin:display_settings_menu()
         {text="主页阅读统计",post_text=self:_home_stats_visibility_label(home),sub_item_table_func=function() return self:home_stats_settings_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
-        {text="本地书库",post_text="KOReader 管理",sub_item_table_func=function() return self:local_library_settings_menu() end},
+        {text="本地书库",post_text=(home.local_shelf_show_folders==true and home.local_shelf_show_books==true) and "文件夹 + 全部书籍"
+            or (home.local_shelf_show_folders==true and "仅文件夹" or "仅全部书籍"),
+            sub_item_table_func=function() return self:local_library_settings_menu() end},
         {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return self:mp_settings_menu() end},
         {text="主页快捷工具",post_text="最多六项",sub_item_table_func=function() return self:home_action_settings_menu() end},
         {text="下滑工具栏",post_text="设备与 KOReader",sub_item_table_func=function() return self:home_panel_settings_menu() end},
