@@ -7783,6 +7783,148 @@ function Plugin:_home_build_recent_snapshot(book_id,path,stamp,book,record)
     snapshot.last_read_at=math.max(normalized_home_time(snapshot.last_read_at),stamp)
     return snapshot
 end
+
+
+-- 5.3.0-beta.5: Recent Reading has one authoritative identity. The last
+-- successful Reader session owns that identity; shelf scans and metadata jobs
+-- may enrich its presentation, but may never select a different book.
+function Plugin:_normalize_recent_authoritative_state(raw)
+    raw=type(raw)=="table" and U.copy(raw) or {}
+    raw.version=2
+    raw.seq=math.max(0,tonumber(raw.seq or 0) or 0)
+    local current=type(raw.current)=="table" and U.copy(raw.current) or nil
+    if current then
+        local id=tostring(current.book_id or current.bookId or "")
+        local file=LocalLibrary.normalize(current.file or "")
+        local key=tostring(current.key or current.recent_key or "")
+        if key=="" then key=id~="" and ("book:"..id) or (file~="" and ("file:"..file) or "") end
+        if key=="" then
+            current=nil
+        else
+            current.book_id=id
+            current.bookId=id
+            current.file=file
+            current.key=key
+            current.recent_key=key
+            current.seq=math.max(1,tonumber(current.seq or current.recent_seq or raw.seq or 1) or 1)
+            current.recent_seq=current.seq
+            current.read_at=normalized_home_time(current.read_at)
+            current.local_recent_read_at=current.read_at
+            current.reader_session_generation=math.max(0,tonumber(current.reader_session_generation or 0) or 0)
+            current.kind=tostring(current.kind or (id~="" and "weread" or "local"))
+            raw.seq=math.max(raw.seq,current.seq)
+        end
+    end
+    raw.current=current
+    return raw
+end
+
+function Plugin:_recent_authoritative_state()
+    local shared=HOME_SESSION.recent_authoritative_state
+    if type(shared)=="table" and tonumber(shared.version)==2 then
+        return self:_normalize_recent_authoritative_state(shared)
+    end
+
+    local stored=self.store and self.store:get("recent_read_state",nil) or nil
+    local state=self:_normalize_recent_authoritative_state(stored)
+    if not state.current then
+        -- One-time compatibility migration from the existing recent-read
+        -- history. That history is already newest-first because ReaderReady
+        -- commits are prepended. Once migrated, history never chooses Hero
+        -- identity again.
+        local history
+        if self.store and self.store.recent_reads then history=self.store:recent_reads()
+        elseif self.store then history=self.store:get("recent_reads",{version=1,items={}}) end
+        history=type(history)=="table" and history or {items={}}
+        for _,item in ipairs(type(history.items)=="table" and history.items or {}) do
+            local id,file=home_recent_item_identity(item)
+            local stamp=normalized_home_time(item.read_at)
+            if (id~="" or file~="") and stamp>0 then
+                local snapshot=self:_home_build_recent_snapshot(id,file,stamp,nil,nil)
+                snapshot.seq=1
+                snapshot.recent_seq=1
+                snapshot.key=id~="" and ("book:"..id) or ("file:"..file)
+                snapshot.recent_key=snapshot.key
+                snapshot.kind=id~="" and "weread" or "local"
+                snapshot.reader_session_generation=0
+                state={version=2,seq=1,current=snapshot}
+                if self.store and self.store.set then
+                    local ok,err=self.store:set("recent_read_state",U.copy(state))
+                    if ok~=true then logger.warn("[MiuRead][RecentState] migration persist failed",tostring(err)) end
+                end
+                logger.info("[MiuRead][RecentState] migrated",
+                    "seq=1","key=",tostring(snapshot.key),"read_at=",tostring(stamp))
+                break
+            end
+        end
+    end
+    HOME_SESSION.recent_authoritative_state=U.copy(state)
+    if state.current then HOME_SESSION.recent_read_snapshot=U.copy(state.current) end
+    return state
+end
+
+function Plugin:_recent_store_authoritative_state(state,flush_now)
+    state=self:_normalize_recent_authoritative_state(state)
+    HOME_SESSION.recent_authoritative_state=U.copy(state)
+    HOME_SESSION.recent_read_snapshot=state.current and U.copy(state.current) or nil
+    if self.store and self.store.set_deferred then
+        self.store:set_deferred("recent_read_state",U.copy(state))
+    end
+    local owner=home_owner()
+    if owner and owner~=self and owner.store and owner.store.set_deferred then
+        owner.store:set_deferred("recent_read_state",U.copy(state))
+    end
+    if flush_now==true and self.store and self.store.flush then
+        local ok,err=self.store:flush()
+        if ok~=true then logger.warn("[MiuRead][RecentState] persist failed",tostring(err)) end
+    end
+    return state
+end
+
+function Plugin:_home_authoritative_recent_candidate(...)
+    local state=self:_recent_authoritative_state()
+    local current=state.current
+    if type(current)~="table" then return nil,nil end
+    local target_id=tostring(current.book_id or current.bookId or "")
+    local target_file=LocalLibrary.normalize(current.file or "")
+    local matched
+    for index=1,select("#",...) do
+        local rows=select(index,...)
+        for _,row in ipairs(type(rows)=="table" and rows or {}) do
+            if not (row.local_folder==true or row.kind=="folder") then
+                local row_id=tostring(row.bookId or row.book_id or "")
+                local row_file=LocalLibrary.normalize(row.file or "")
+                if (target_id~="" and row_id==target_id)
+                    or (target_id=="" and target_file~="" and row_file==target_file) then
+                    matched=row
+                    break
+                end
+            end
+        end
+        if matched then break end
+    end
+
+    -- Start with the durable identity snapshot, then take richer live metadata
+    -- from the matching row. Re-assert identity/order fields afterwards so no
+    -- cache row can redirect Recent Reading to another book.
+    local candidate=U.copy(current)
+    if matched then
+        for key,value in pairs(matched) do candidate[key]=U.copy(value) end
+    end
+    candidate.book_id=target_id
+    candidate.bookId=target_id
+    candidate.file=target_file
+    candidate.key=tostring(current.key or current.recent_key or home_recent_item_key(current))
+    candidate.recent_key=candidate.key
+    candidate.seq=tonumber(current.seq or current.recent_seq or state.seq) or 0
+    candidate.recent_seq=candidate.seq
+    candidate.read_at=normalized_home_time(current.read_at)
+    candidate.local_recent_read_at=candidate.read_at
+    candidate.last_read_at=math.max(normalized_home_time(candidate.last_read_at),candidate.read_at)
+    candidate.reader_session_generation=tonumber(current.reader_session_generation or 0) or 0
+    candidate.kind=tostring(current.kind or candidate.kind or (target_id~="" and "weread" or "local"))
+    return candidate,state
+end
 function Plugin:_home_recent_read_state()
     local stored
     if self.store.recent_reads then stored=self.store:recent_reads()
@@ -16058,38 +16200,18 @@ function Plugin:_home_prepare_hero_book(book)
 end
 
 function Plugin:_home_apply_recent_snapshot_to_home(reason)
-    local snapshot=HOME_SESSION.recent_read_snapshot
-    if type(snapshot)~="table" or not HomeView.is_shown() then return false end
-    local target_id=tostring(snapshot.book_id or snapshot.bookId or "")
-    local target_file=LocalLibrary.normalize(snapshot.file or "")
-    if target_id=="" and target_file=="" then return false end
-
-    -- Prefer the already-prepared Home row when it represents the same book;
-    -- it has richer cached metadata/cover state and requires no shelf rescan.
-    local matched
+    if not HomeView.is_shown() then return false end
     local sections=self._home_sections or {}
-    for _,section in ipairs({"generated","local","account","mp"}) do
-        local rows=sections[section] and sections[section].rows or {}
-        for _,row in ipairs(type(rows)=="table" and rows or {}) do
-            local row_id=tostring(row.bookId or row.book_id or "")
-            local row_file=LocalLibrary.normalize(row.file or "")
-            if (target_id~="" and row_id==target_id) or (target_file~="" and row_file==target_file) then
-                matched=row
-                break
-            end
-        end
-        if matched then break end
-    end
-
-    local candidate=matched and U.merge(matched,snapshot) or U.copy(snapshot)
-    candidate.local_recent_read_at=normalized_home_time(snapshot.read_at)
-    if target_file~="" then candidate.file=target_file end
-    if target_id~="" then
-        candidate.bookId=tostring(candidate.bookId or candidate.book_id or target_id)
-        candidate.book_id=tostring(candidate.book_id or candidate.bookId or target_id)
-    end
+    local candidate,state=self:_home_authoritative_recent_candidate(
+        sections.generated and sections.generated.rows or {},
+        self:_home_recent_local_rows(16),
+        sections.account and sections.account.rows or {},
+        sections.mp and sections.mp.rows or {})
+    if not candidate then return false end
     local hero=self:_home_prepare_hero_book(candidate)
     if not hero then return false end
+    hero.recent_seq=tonumber(candidate.recent_seq or candidate.seq or (state and state.seq) or 0) or 0
+    hero.recent_key=tostring(candidate.recent_key or candidate.key or self:_home_book_key(candidate))
     local updated=HomeView.update_hero(hero)
     if updated==false then return false end
 
@@ -16109,11 +16231,11 @@ function Plugin:_home_apply_recent_snapshot_to_home(reason)
     self._home_visible_metadata_targets=metadata_targets
     self._home_visible_cover_targets=cover_targets
 
-    logger.info("[MiuRead][Recent] hero applied",
-        "book=",tostring(self:_home_book_key(hero)),
+    logger.info("[MiuRead][RecentHero] applied",
+        "seq=",tostring(hero.recent_seq),
+        "key=",tostring(hero.recent_key),
         "read_at=",tostring(self:_home_book_time(hero)),
-        "phase=",tostring(reason or "snapshot"),
-        "source=",matched and "prepared_row" or "snapshot")
+        "phase=",tostring(reason or "authoritative"))
     return true
 end
 
@@ -16124,21 +16246,41 @@ function Plugin:_home_refresh_recent_hero_cached()
     local generated=sections.generated and sections.generated.rows or {}
     local recent_local_rows=self:_home_recent_local_rows(16)
     local account=sections.account and sections.account.rows or {}
-    if #generated==0 and #recent_local_rows==0 and #account==0 then return false end
-    self:_home_apply_recent_read_times(generated,recent_local_rows,account)
-    local hero=self:_home_prepare_hero_book(self:_home_recent_book(generated,recent_local_rows,account))
+    local mp=sections.mp and sections.mp.rows or {}
+    self:_home_apply_recent_read_times(generated,recent_local_rows,account,mp)
+
+    local candidate,state=self:_home_authoritative_recent_candidate(generated,recent_local_rows,account,mp)
     self._home_recent_read_dirty=false
     HOME_SESSION.recent_read_dirty=false
+    if not candidate then return false end
+    local hero=self:_home_prepare_hero_book(candidate)
     if not hero then return false end
-    local previous_key=self:_home_book_key(self._home_hero)
-    local current_key=self:_home_book_key(hero)
+    hero.recent_seq=tonumber(candidate.recent_seq or candidate.seq or (state and state.seq) or 0) or 0
+    hero.recent_key=tostring(candidate.recent_key or candidate.key or self:_home_book_key(candidate))
+
+    local previous_key=tostring(self._home_hero and (self._home_hero.recent_key or self:_home_book_key(self._home_hero)) or "")
+    local previous_seq=tonumber(self._home_hero and self._home_hero.recent_seq or 0) or 0
+    local current_key=hero.recent_key
+    local current_seq=hero.recent_seq
+    if previous_seq>current_seq then
+        logger.warn("[MiuRead][RecentHero] stale update ignored",
+            "candidate_seq=",tostring(current_seq),"current_seq=",tostring(previous_seq),
+            "candidate=",tostring(current_key),"current=",tostring(previous_key))
+        return false
+    end
+    if previous_seq==current_seq and previous_key~="" and previous_key~=current_key then
+        logger.warn("[MiuRead][RecentHero] foreign update ignored",
+            "seq=",tostring(current_seq),"candidate=",tostring(current_key),"current=",tostring(previous_key))
+        return false
+    end
+
     local previous_time=self:_home_book_time(self._home_hero)
     local current_time=self:_home_book_time(hero)
     self._home_hero=hero
-    if previous_key~=current_key or previous_time~=current_time then
+    if previous_key~=current_key or previous_seq~=current_seq or previous_time~=current_time then
         HomeView.update_hero(hero)
-        logger.info("[MiuRead][Recent] hero updated",
-            "book=",tostring(current_key),"read_at=",tostring(current_time))
+        logger.info("[MiuRead][RecentHero] refreshed",
+            "seq=",tostring(current_seq),"key=",tostring(current_key),"read_at=",tostring(current_time))
     end
     local current=HomeView.current()
     local shelf=(current and current.opts and current.opts.shelf_books) or {}
@@ -16205,18 +16347,20 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     local mp_rows=self:_home_cloud_rows(cached_mp,"mp")
 
     self:_home_apply_recent_read_times(miuread_rows,local_rows,recent_local_rows,account_rows,mp_rows)
-    local recent_candidate=self:_home_recent_book(miuread_rows,recent_local_rows,account_rows)
-    local snapshot=HOME_SESSION.recent_read_snapshot
-    if type(snapshot)=="table" then
-        local snapshot_time=normalized_home_time(snapshot.read_at)
-        local snapshot_key=self:_home_book_key(snapshot)
-        local candidate_key=self:_home_book_key(recent_candidate)
-        if snapshot_time>0 and snapshot_key~=""
-            and (snapshot_key~=candidate_key or snapshot_time>=self:_home_book_time(recent_candidate)) then
-            recent_candidate=snapshot
-        end
+    local recent_candidate,recent_state=self:_home_authoritative_recent_candidate(
+        miuread_rows,recent_local_rows,account_rows,mp_rows)
+    -- Fresh installs may not have an authoritative event yet. Keep the old
+    -- presentation fallback only until the first real ReaderReady commit; it
+    -- is never persisted as RecentReadState and therefore cannot override a
+    -- later real reading event.
+    if not recent_candidate then
+        recent_candidate=self:_home_recent_book(miuread_rows,recent_local_rows,account_rows)
     end
     local hero=self:_home_prepare_hero_book(recent_candidate)
+    if hero and recent_state and recent_state.current then
+        hero.recent_seq=tonumber(recent_state.current.seq or recent_state.seq or 0) or 0
+        hero.recent_key=tostring(recent_state.current.key or recent_state.current.recent_key or self:_home_book_key(hero))
+    end
 
     local sections={
         account={title="微信书架",rows=account_rows,empty="这里还没有微信书架内容"},
@@ -24650,48 +24794,84 @@ function Plugin:_record_recent_read(path,book,record)
         or (record and (record.book_id or record.bookId)) or "")
     if path=="" and book_id=="" then return false end
     local stamp=os.time()
-    if self.store.record_recent_read then
-        self.store:record_recent_read(book_id,path,stamp)
-    elseif book_id~="" then
-        self.store:mark_last_read(book_id,path,nil,false,stamp)
+    local key=book_id~="" and ("book:"..book_id) or ("file:"..LocalLibrary.normalize(path))
+    local session_generation=math.max(0,tonumber(HOME_SESSION.reader_session_generation or self._reader_session_generation or 0) or 0)
+    local state=self:_recent_authoritative_state()
+    local current=type(state.current)=="table" and state.current or nil
+    local current_seq=math.max(0,tonumber(state.seq or (current and current.seq) or 0) or 0)
+    local current_file=current and LocalLibrary.normalize(current.file or "") or ""
+    local same_session=current and session_generation>0
+        and tonumber(current.reader_session_generation or 0)==session_generation
+    local same_file=same_session and current_file~="" and current_file==LocalLibrary.normalize(path)
+    local same_book=same_session and book_id~=""
+        and tostring(current.book_id or current.bookId or "")==book_id
+    local duplicate_session=same_session and (same_file or same_book or tostring(current.key or "")==key)
+    local seq=duplicate_session and math.max(1,tonumber(current.seq or current_seq) or 1) or (current_seq+1)
+    local effective_stamp=duplicate_session and normalized_home_time(current.read_at) or stamp
+    if effective_stamp<=0 then effective_stamp=stamp end
+
+    local snapshot=self:_home_build_recent_snapshot(book_id,path,effective_stamp,book,record)
+    if duplicate_session and current then
+        -- A late canonical WeRead identity is an enrichment of the same Reader
+        -- session, not another read event. Keep the original sequence/time and
+        -- fill only missing presentation fields from the older snapshot.
+        for field,value in pairs(current) do
+            if snapshot[field]==nil or snapshot[field]=="" then snapshot[field]=U.copy(value) end
+        end
     end
-    self:_home_share_recent_read(book_id,path,stamp)
+    snapshot.book_id=book_id
+    snapshot.bookId=book_id
+    snapshot.file=LocalLibrary.normalize(path)
+    snapshot.key=key
+    snapshot.recent_key=key
+    snapshot.seq=seq
+    snapshot.recent_seq=seq
+    snapshot.read_at=effective_stamp
+    snapshot.local_recent_read_at=effective_stamp
+    snapshot.last_read_at=math.max(normalized_home_time(snapshot.last_read_at),effective_stamp)
+    snapshot.reader_session_generation=session_generation
+    snapshot.kind=(self:_reader_session_is_weread() or book_id~="") and "weread" or "local"
+    state.version=2
+    state.seq=math.max(current_seq,seq)
+    state.current=snapshot
+    self:_recent_store_authoritative_state(state,false)
+
+    -- Keep the existing history for the History page and upgrade migrations.
+    -- recent_read_state was staged first, so this existing history flush also
+    -- persists the authoritative identity without introducing another write.
+    if self.store.record_recent_read then
+        self.store:record_recent_read(book_id,path,effective_stamp)
+    elseif book_id~="" then
+        self.store:mark_last_read(book_id,path,nil,false,effective_stamp)
+    elseif self.store and self.store.flush then
+        self.store:flush()
+    end
+    self:_home_share_recent_read(book_id,path,effective_stamp)
     self._home_recent_read_dirty=true
     HOME_SESSION.recent_read_dirty=true
 
-    -- Keep one authoritative in-memory snapshot for the current session. Home
-    -- Hero and Home lockscreen both consume this same object, so neither waits
-    -- for a shelf rescan or a manual refresh after the Reader closes.
-    local snapshot=self:_home_build_recent_snapshot(book_id,path,stamp,book,record)
-    HOME_SESSION.recent_read_snapshot=snapshot
-
     local owner=home_owner()
     if owner and owner~=self then
-        -- Keep the parked Home instance's store and dirty marker current too.
-        -- Store writes remain deferred; no network/shelf scan is introduced on
-        -- ReaderReady or page turns.
         if owner.store and owner.store.record_recent_read then
-            owner.store:record_recent_read(book_id,path,stamp)
+            owner.store:record_recent_read(book_id,path,effective_stamp)
         elseif owner.store and book_id~="" then
-            owner.store:mark_last_read(book_id,path,nil,false,stamp)
+            owner.store:mark_last_read(book_id,path,nil,false,effective_stamp)
         end
         owner._home_recent_read_dirty=true
     end
 
-    -- Lockscreen target changes immediately when Reader identifies the book.
-    -- This is local-only and avoids the old window where Home still pointed to
-    -- the previous Hero until its delayed refresh ran.
     local lock_owner=owner or self
     if lock_owner and type(lock_owner._home_update_lockscreen_session)=="function" then
         local ok_lock,lock_err=pcall(lock_owner._home_update_lockscreen_session,lock_owner,snapshot)
         if not ok_lock then
-            logger.warn("[MiuRead][Recent] lockscreen target update failed",tostring(lock_err))
+            logger.warn("[MiuRead][RecentState] lockscreen target update failed",tostring(lock_err))
         end
     end
 
-    logger.info("[MiuRead][Recent] committed",
-        "book=",book_id~="" and book_id or "local","file=",tostring(path),
-        "read_at=",tostring(stamp),"shared=true","lockscreen=updated")
+    logger.info(duplicate_session and "[MiuRead][RecentState] duplicate commit enriched" or "[MiuRead][RecentState] committed",
+        "seq=",tostring(seq),"key=",tostring(key),"kind=",tostring(snapshot.kind),
+        "session=",tostring(session_generation),"read_at=",tostring(effective_stamp),
+        "file=",tostring(path))
     return true
 end
 
