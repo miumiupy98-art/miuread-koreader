@@ -1,4 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
@@ -287,7 +288,7 @@ local NativePopup = InputContainer:extend{
 function NativePopup:handleEvent(event)
     if not self.closing and event and event.handler == "onGesture" then
         local ges = event.args and event.args[1]
-        if ges and self.on_interact_callback and (ges.ges == "tap" or ges.ges == "swipe") then
+        if ges and self.on_interact_callback and (ges.ges == "tap" or ges.ges == "swipe" or ges.ges == "hold") then
             pcall(self.on_interact_callback)
         end
     end
@@ -316,6 +317,7 @@ end
 
 function NativePopup:_close()
     if self.closing then return true end
+    self:_close_action_dialog()
     self.closing = true
     UIManager:close(self)
     return true
@@ -595,8 +597,6 @@ function NativePopup:_paginate_next_page(width, maximum_height, metrics)
                 if whole_height <= available then
                     add(probe_piece, whole_height)
                     clear_item(true)
-                    -- Keep action targets unambiguous: one logical comment per page.
-                    break
                 else
                     local prefix, remainder, piece_height = self:_fit_prefix(
                         item, remaining_content, available, width, metrics,
@@ -788,8 +788,6 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
                     end
                 end
             end
-            -- Keep action targets unambiguous: one logical comment per page.
-            flush()
         end
     end
     flush()
@@ -798,8 +796,31 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         return {{}}, {0}
     end
 
-    -- Pages intentionally remain bound to a single logical comment so the
-    -- action row always operates on the comment currently being viewed.
+    -- Balance the last two pages when the final page would otherwise contain
+    -- only a tiny amount of text. Moving complete trailing pieces preserves
+    -- reading order and avoids a large, unnecessary blank block.
+    if #pages >= 2 then
+        local previous = pages[#pages - 1]
+        local last = pages[#pages]
+        local previous_h = page_height(previous)
+        local last_h = page_height(last)
+        local target = math.floor(maximum_height * 0.62)
+        while last_h < target and #previous > 1 do
+            local candidate = previous[#previous]
+            table.remove(previous, #previous)
+            table.insert(last, 1, candidate)
+            local next_previous_h = page_height(previous)
+            local next_last_h = page_height(last)
+            if next_last_h > maximum_height or next_previous_h < maximum_height * 0.38 then
+                table.remove(last, 1)
+                previous[#previous + 1] = candidate
+                break
+            end
+            previous_h, last_h = next_previous_h, next_last_h
+        end
+        heights[#heights - 1] = previous_h
+        heights[#heights] = last_h
+    end
     self._measurement_cache = nil
     return pages, heights
 end
@@ -837,25 +858,42 @@ end
 function NativePopup:_build_comment_page(width, metrics, target_height)
     local page = (self.pages and self.pages[self.page_index]) or {}
     local group = VerticalGroup:new{align = "left"}
+    local hit_targets = {}
+    local cursor_y = 0
     if #page == 0 then
         local empty_h = math.max(metrics.body_size * 2, Screen:scaleBySize(38))
-        group[#group + 1] = VerticalSpan:new{height = math.max(6, Screen:scaleBySize(5))}
+        local top_gap = math.max(6, Screen:scaleBySize(5))
+        group[#group + 1] = VerticalSpan:new{height = top_gap}
+        cursor_y = cursor_y + top_gap
         group[#group + 1] = self:_text_box("没有评论内容", metrics.meta_face, width, {
             height = empty_h,
             alignment = "center",
             line_height = 0.08,
             fgcolor = Blitbuffer.COLOR_DARK_GRAY,
         })
+        cursor_y = cursor_y + empty_h
     else
         for index, piece in ipairs(page) do
             if index > 1 and needs_comment_separator(page[index - 1], piece) then
                 group[#group + 1] = self:_separator_widget(width, metrics, true, false)
+                cursor_y = cursor_y + metrics.comment_separator_height
             end
-            local widget = self:_piece_widget(piece, width, metrics)
+            local widget, piece_h = self:_piece_widget(piece, width, metrics)
+            piece_h = math.max(1, tonumber(piece_h) or widget:getSize().h)
             group[#group + 1] = widget
+            local comment_index = tonumber(piece.comment_index)
+            if comment_index then
+                hit_targets[#hit_targets + 1] = {
+                    y = cursor_y,
+                    h = piece_h,
+                    comment_index = comment_index,
+                }
+            end
+            cursor_y = cursor_y + piece_h
         end
     end
 
+    self.comment_hit_targets = hit_targets
     if group.resetLayout then group:resetLayout() end
     local natural_h = math.max(1, group:getSize().h)
     local final_h = natural_h
@@ -936,41 +974,35 @@ function NativePopup:_current_comment()
     return index and self.comments and self.comments[index] or nil,index
 end
 
-function NativePopup:_is_current_favorite()
-    local comment=self:_current_comment()
+function NativePopup:_comment_at_position(pos)
+    if not pos or not self.comments_dimen then return nil,nil end
+    local py=tonumber(pos.y)
+    if not py then return nil,nil end
+    local relative_y=py-tonumber(self.comments_dimen.y or 0)
+    for _,target in ipairs(self.comment_hit_targets or {}) do
+        local top=tonumber(target.y) or 0
+        local height=math.max(1,tonumber(target.h) or 0)
+        if relative_y>=top and relative_y<top+height then
+            local index=tonumber(target.comment_index)
+            return index and self.comments and self.comments[index] or nil,index
+        end
+    end
+    return nil,nil
+end
+
+function NativePopup:_is_current_favorite(comment)
+    comment=comment or self:_current_comment()
     if not comment or type(self.is_favorite_callback)~="function" then return false end
     local ok,value=pcall(self.is_favorite_callback,comment,self.source_text)
     return ok and value==true
 end
 
-function NativePopup:_action_texts()
-    return {"复制评论","复制原文+评论",self:_is_current_favorite() and "取消收藏" or "收藏"}
+function NativePopup:_action_texts(comment)
+    return {"复制评论","复制原文+评论",self:_is_current_favorite(comment) and "取消收藏" or "收藏"}
 end
 
-function NativePopup:_build_action_bar(width,metrics,height)
-    local texts=self:_action_texts()
-    local face=make_face(self.font_name,math.max(10,math.floor(metrics.meta_size*.90+.5)),"smallinfofont")
-    local cell_w=math.max(1,math.floor(width/3))
-    local widths={cell_w,cell_w,math.max(1,width-cell_w*2)}
-    local row=HorizontalGroup:new{}
-    self.action_label_widgets={}
-    for index,text in ipairs(texts) do
-        local label=TextWidget:new{text=text,face=face,fgcolor=Blitbuffer.COLOR_DARK_GRAY}
-        self.action_label_widgets[index]=label
-        row[#row+1]=CenterContainer:new{dimen=Geom:new{w=widths[index],h=height},label}
-    end
-    return row,height,widths
-end
-
-function NativePopup:_sync_action_bar()
-    local texts=self:_action_texts()
-    for index,label in ipairs(self.action_label_widgets or {}) do
-        if label and type(label.setText)=="function" then label:setText(texts[index] or "") end
-    end
-end
-
-function NativePopup:_handle_action(index)
-    local comment=self:_current_comment()
+function NativePopup:_handle_action(index,comment)
+    comment=comment or self:_current_comment()
     if not comment then return true end
     if self.on_interact_callback then pcall(self.on_interact_callback) end
     if index==1 or index==2 then
@@ -980,15 +1012,45 @@ function NativePopup:_handle_action(index)
         return true
     end
     if index==3 and type(self.toggle_favorite_callback)=="function" then
-        local ok,state=pcall(self.toggle_favorite_callback,comment,self.source_text)
-        if ok and state~=nil then
-            self:_sync_action_bar()
-            if self.action_dimen then
-                UIManager:setDirty(self,function() return "partial",self.action_dimen end)
-            end
-        end
+        pcall(self.toggle_favorite_callback,comment,self.source_text)
         return true
     end
+    return true
+end
+
+function NativePopup:_close_action_dialog()
+    local dialog=self.action_dialog
+    self.action_dialog=nil
+    if dialog then pcall(UIManager.close,UIManager,dialog) end
+end
+
+function NativePopup:_show_action_menu(comment)
+    comment=comment or self:_current_comment()
+    if not comment or self.closing then return true end
+    self:_close_action_dialog()
+    local texts=self:_action_texts(comment)
+    local dialog
+    local function run(index)
+        if dialog then
+            pcall(UIManager.close,UIManager,dialog)
+            if self.action_dialog==dialog then self.action_dialog=nil end
+        end
+        return self:_handle_action(index,comment)
+    end
+    dialog=ButtonDialog:new{
+        title="评论操作",
+        title_align="center",
+        buttons={
+            {{text=texts[1],callback=function() return run(1) end}},
+            {{text=texts[2],callback=function() return run(2) end}},
+            {{text=texts[3],callback=function() return run(3) end}},
+        },
+        close_callback=function()
+            if self.action_dialog==dialog then self.action_dialog=nil end
+        end,
+    }
+    self.action_dialog=dialog
+    UIManager:show(dialog,"ui")
     return true
 end
 
@@ -1020,14 +1082,10 @@ function NativePopup:_build(reset_pages, anchor_comment)
     local bottom_padding = math.max(4, Screen:scaleBySize(3))
     local indicator_gap = math.max(4, Screen:scaleBySize(3))
     local indicator_height = math.max(metrics.meta_size + math.max(4, Screen:scaleBySize(2)), Screen:scaleBySize(14))
-    local action_gap = math.max(5, Screen:scaleBySize(3))
-    local action_height = math.max(metrics.meta_size + math.max(10, Screen:scaleBySize(6)), Screen:scaleBySize(24))
-    local action_separator_h = metrics.separator_line_size + math.max(5, Screen:scaleBySize(3))
     local indicator_reserve = indicator_gap + indicator_height
-    local action_reserve = action_gap + action_separator_h + action_height
     local maximum_comments_h = math.max(
         metrics.body_size * 3,
-        maximum_height - inset * 2 - source_h - source_separator_h - bottom_padding - indicator_reserve - action_reserve
+        maximum_height - inset * 2 - source_h - source_separator_h - bottom_padding - indicator_reserve
     )
 
     if reset_pages or not self.pages then
@@ -1088,7 +1146,6 @@ function NativePopup:_build(reset_pages, anchor_comment)
     }
     local indicator_container, indicator_h, indicator_label =
         self:_build_page_indicator(inner_w, metrics, indicator_height)
-    local action_container, action_h, action_widths = self:_build_action_bar(inner_w,metrics,action_height)
 
     local content_group = VerticalGroup:new{align = "left"}
     content_group[#content_group + 1] = source_group
@@ -1104,16 +1161,6 @@ function NativePopup:_build(reset_pages, anchor_comment)
         indicator_index = #content_group + 1
         content_group[indicator_index] = indicator_container
     end
-    content_group[#content_group + 1] = VerticalSpan:new{height = action_gap}
-    content_group[#content_group + 1] = Separator:new{
-        dimen=Geom:new{w=inner_w,h=action_separator_h},
-        inset=frame_guard,
-        top_padding=math.max(2,action_separator_h-metrics.separator_line_size),
-        line_size=metrics.separator_line_size,
-        color=SEPARATOR_COLOR,
-    }
-    local action_index=#content_group+1
-    content_group[action_index]=action_container
     content_group[#content_group + 1] = VerticalSpan:new{height = bottom_padding}
     if content_group.resetLayout then content_group:resetLayout() end
 
@@ -1151,11 +1198,9 @@ function NativePopup:_build(reset_pages, anchor_comment)
     else
         self.page_indicator_dimen = nil
     end
-    local action_y=(self.page_indicator_dimen and (self.page_indicator_dimen.y+self.page_indicator_dimen.h)
-        or (self.comments_dimen.y+self.comments_dimen.h)) + action_gap + action_separator_h
-    self.action_dimen=Geom:new{x=popup_x+inset,y=action_y,w=inner_w,h=action_h}
-    self.action_widths=action_widths
-    local refresh_bottom=self.action_dimen.y+self.action_dimen.h
+    local refresh_bottom=self.page_indicator_dimen
+        and (self.page_indicator_dimen.y+self.page_indicator_dimen.h)
+        or (self.comments_dimen.y+self.comments_dimen.h)
     self.content_refresh_dimen = Geom:new{
         x = popup_x + inset,
         y = self.comments_dimen.y,
@@ -1208,10 +1253,6 @@ function NativePopup:_build(reset_pages, anchor_comment)
         indicator_gap = indicator_gap,
         indicator_height = indicator_height,
         indicator_index = indicator_index,
-        action_index = action_index,
-        action_gap = action_gap,
-        action_separator_h = action_separator_h,
-        action_height = action_height,
     }
     self.comment_group = comment_group
     self.guarded_comments = guarded_comments
@@ -1221,7 +1262,6 @@ function NativePopup:_build(reset_pages, anchor_comment)
     self.close_button = close
     self.page_indicator_container = indicator_container
     self.page_indicator_widget = indicator_label
-    self.action_container = action_container
 
     if previous_root and previous_root ~= self[1] and type(previous_root.free) == "function" then
         pcall(previous_root.free, previous_root)
@@ -1255,7 +1295,6 @@ function NativePopup:_replace_comment_page()
         self.page_indicator_container = indicator_container
         self.page_indicator_widget = indicator_label
     end
-    self:_sync_action_bar()
     if self.guarded_comments.resetLayout then self.guarded_comments:resetLayout() end
     if self.content_group.resetLayout then self.content_group:resetLayout() end
 
@@ -1370,6 +1409,7 @@ function NativePopup:init()
         self.ges_events = {
             TapPage = {GestureRange:new{ges = "tap", range = self.dimen}},
             SwipePage = {GestureRange:new{ges = "swipe", range = self.dimen}},
+            HoldComment = {GestureRange:new{ges = "hold", range = self.dimen}},
         }
     end
     if Device:hasKeys() and Device.input and Device.input.group then
@@ -1393,17 +1433,20 @@ function NativePopup:onTapPage(_, ges)
     if not pos then return false end
     if self.close_dimen and not pos:notIntersectWith(self.close_dimen) then return self:_close() end
     if pos:notIntersectWith(self.popup_dimen) then return self:_close() end
-    if self.action_dimen and not pos:notIntersectWith(self.action_dimen) then
-        local rel=math.max(0,pos.x-self.action_dimen.x)
-        local first=(self.action_widths and self.action_widths[1]) or math.floor(self.action_dimen.w/3)
-        local second=(self.action_widths and self.action_widths[2]) or first
-        local action=rel<first and 1 or (rel<first+second and 2 or 3)
-        return self:_handle_action(action)
-    end
     if pos.x < self.popup_dimen.x + math.floor(self.popup_dimen.w / 2) then
         return self:_change_page(-1)
     end
     return self:_change_page(1)
+end
+
+function NativePopup:onHoldComment(_, ges)
+    local pos=ges and ges.pos
+    if not pos or not self.comments_dimen or pos:notIntersectWith(self.comments_dimen) then
+        return false
+    end
+    local comment=self:_comment_at_position(pos)
+    if not comment then return true end
+    return self:_show_action_menu(comment)
 end
 
 function NativePopup:onSwipePage(_, ges)
@@ -1432,6 +1475,7 @@ function NativePopup:onClose() return self:_close() end
 
 function NativePopup:onCloseWidget()
     local region = self.popup_dimen and self.popup_dimen:copy() or nil
+    self:_close_action_dialog()
     self.closing = true
     if live_popup == self then live_popup = nil end
     self.page_changing = false
@@ -1445,6 +1489,7 @@ end
 
 function NativePopup:_reopen(opts)
     opts = opts or {}
+    self:_close_action_dialog()
     self.source_text = opts.source_text
     self.comments = opts.comments
     self.cache_key = opts.cache_key

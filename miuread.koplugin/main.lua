@@ -7287,7 +7287,7 @@ function Plugin:_home_local_excluded_paths(root)
     if root=="/mnt/us" then
         -- These are application/system trees, not Kindle user book folders.
         -- documents, Books and any other user-created sibling remain visible.
-        for _,name in ipairs({"koreader","system","extensions","mrpackages","linkfonts"}) do add(name) end
+        for _,name in ipairs({"koreader","system","extensions","mrpackages","linkfonts","fonts"}) do add(name) end
     elseif root=="/storage/emulated/0" or root=="/sdcard" then
         -- Avoid traversing Android application sandboxes while keeping ordinary
         -- Books/Documents/Download and arbitrary user folders discoverable.
@@ -7317,6 +7317,14 @@ function Plugin:_home_recent_local_metadata_cache()
     if tonumber(cache.version)~=1 then cache={version=1,rows={}} end
     cache.version=1
     cache.rows=type(cache.rows)=="table" and cache.rows or {}
+    local cleaned=false
+    for path in pairs(cache.rows) do
+        if LocalLibrary.is_resource_path(path) then
+            cache.rows[path]=nil
+            cleaned=true
+        end
+    end
+    if cleaned then self.store:set("home_local_recent_metadata_v1",cache) end
     return cache
 end
 
@@ -7960,10 +7968,24 @@ end
 function Plugin:_recent_authoritative_state()
     local shared=HOME_SESSION.recent_authoritative_state
     if type(shared)=="table" and tonumber(shared.version)==2 then
-        return self:_normalize_recent_authoritative_state(shared)
+        local shared_file=type(shared.current)=="table" and LocalLibrary.normalize(shared.current.file or "") or ""
+        if shared_file~="" and LocalLibrary.is_resource_path(shared_file) then
+            logger.info("[MiuRead][RecentState] stale resource session cleared",shared_file)
+            HOME_SESSION.recent_authoritative_state=nil
+            HOME_SESSION.recent_read_snapshot=nil
+        else
+            return self:_normalize_recent_authoritative_state(shared)
+        end
     end
 
     local stored=self.store and self.store:get("recent_read_state",nil) or nil
+    local stored_file=type(stored)=="table" and type(stored.current)=="table"
+        and LocalLibrary.normalize(stored.current.file or "") or ""
+    if stored_file~="" and LocalLibrary.is_resource_path(stored_file) then
+        logger.info("[MiuRead][RecentState] stale resource record cleared",stored_file)
+        stored={version=2,seq=math.max(0,tonumber(stored.seq or 0) or 0),current=nil}
+        if self.store and self.store.set then self.store:set("recent_read_state",U.copy(stored)) end
+    end
     local state=self:_normalize_recent_authoritative_state(stored)
     if not state.current then
         -- One-time compatibility migration from the existing recent-read
@@ -7977,7 +7999,9 @@ function Plugin:_recent_authoritative_state()
         for _,item in ipairs(type(history.items)=="table" and history.items or {}) do
             local id,file=home_recent_item_identity(item)
             local stamp=normalized_home_time(item.read_at)
-            if (id~="" or file~="") and stamp>0 then
+            if file~="" and LocalLibrary.is_resource_path(file) then
+                logger.info("[MiuRead][RecentState] migration resource skipped",file)
+            elseif (id~="" or file~="") and stamp>0 then
                 local snapshot=self:_home_build_recent_snapshot(id,file,stamp,nil,nil)
                 snapshot.seq=1
                 snapshot.recent_seq=1
@@ -8320,6 +8344,14 @@ function Plugin:_home_open_book(book,anchor,ges,direct_read)
         return self:_home_open_koreader_filemanager(folder,true)
     end
     if book and (book.source=="local" or book.local_file==true) then
+        local local_path=LocalLibrary.normalize(book.file or "")
+        if local_path~="" and LocalLibrary.is_resource_path(local_path) then
+            logger.warn("[MiuRead][HomeInput] resource book open discarded",local_path)
+            self._home_recent_read_dirty=true
+            HOME_SESSION.recent_read_dirty=true
+            self:toast("已忽略非书籍资源文件",2)
+            return true
+        end
         if direct_read==true then return self:_home_open_local(book) end
         return self:_home_hold_book(book,anchor)
     end
@@ -10873,17 +10905,20 @@ function Plugin:_local_browser_decorate(snapshot,root_path,direct_only)
     local folders={}
     for _,folder in ipairs(snapshot.folders or {}) do
         local path=LocalLibrary.normalize(folder.folder_path or folder.path)
-        folders[#folders+1]={
-            kind="folder",local_folder=true,source="local",title=tostring(folder.title or LocalLibrary.basename(path)),
-            folder_path=path,path=path,root_path=LocalLibrary.normalize(root_path or path),status_text="文件夹",
-        }
+        if not LocalLibrary.is_resource_path(path) then
+            folders[#folders+1]={
+                kind="folder",local_folder=true,source="local",title=tostring(folder.title or LocalLibrary.basename(path)),
+                folder_path=path,path=path,root_path=LocalLibrary.normalize(root_path or path),status_text="文件夹",
+            }
+        end
     end
     local books={}
     local source_index=self:_home_local_source_index()
     local metadata_cache=self:_home_recent_local_metadata_cache()
     for _,book in ipairs(self:_local_book_list(snapshot,direct_only==true)) do
         local path=LocalLibrary.normalize(book.file)
-        if path~="" and U.file_exists(path) and not self:_home_local_is_miuread_file(path,source_index,false) then
+        if path~="" and U.file_exists(path) and not LocalLibrary.is_resource_path(path)
+            and not self:_home_local_is_miuread_file(path,source_index,false) then
             local cached=metadata_cache.rows[path]
             -- If beta.9 already verified a moved MiuRead EPUB, keep that exclusion.
             local known_generated=type(cached)=="table"
@@ -16315,6 +16350,11 @@ end
 
 function Plugin:_home_prepare_hero_book(book)
     if type(book)~="table" then return nil end
+    local hero_path=LocalLibrary.normalize(book.file or "")
+    if hero_path~="" and LocalLibrary.is_resource_path(hero_path) then
+        logger.warn("[MiuRead][RecentHero] resource entry ignored",hero_path)
+        return nil
+    end
     local source=tostring(book.source or "")
     if source=="account" or source=="mp" then
         local prepared=self:_home_prepare_cloud_page(source,{book},nil)
@@ -19702,6 +19742,10 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
     local open_request_clock=monotonic_wall_time()
     path=normalized_reader_file(path)
     if not path or not U.file_exists(path) then self:info(_("No cached file")); return false end
+    if tostring(session_kind or "")=="local" and LocalLibrary.is_resource_path(path) then
+        logger.warn("[MiuRead][Reader] resource local open blocked",path)
+        return false
+    end
 
     local supported,support_error=self:_reader_provider_supported(path)
     if supported==false then
@@ -25343,6 +25387,10 @@ end
 
 function Plugin:_record_recent_read(path,book,record)
     path=normalized_reader_file(path) or tostring(path or "")
+    if path~="" and LocalLibrary.is_resource_path(path) then
+        logger.warn("[MiuRead][RecentState] resource read ignored",path)
+        return false
+    end
     local book_id=tostring((book and (book.book_id or book.bookId))
         or (record and (record.book_id or record.bookId)) or "")
     if path=="" and book_id=="" then return false end
