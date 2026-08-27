@@ -6191,6 +6191,7 @@ function Plugin:reader_quick_panel_settings_menu()
                 self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
             end},
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="显示划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
@@ -13080,6 +13081,121 @@ function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
 end
 
+-- 划线显示：下载的“带想法”书籍把划线/想法标记直接写进 EPUB 的内联 CSS
+-- （.miu-inline-mark 实线下划线、.miu-thought-mark 橙色虚线）。关闭划线不
+-- 重写书籍文件，而是在阅读时向 KOReader 追加一段样式覆盖，把两类标记的
+-- 可见装饰去掉；标记本身与评论数据仍保留，想法链接也依旧可以点按。
+-- 注意：CSS 常量必须定义在函数内部而非文件顶层——main.lua 顶层局部变量
+-- 数已逼近 LuaJIT 的 200 上限，顶层再加 local 会令整个插件无法加载。
+
+function Plugin:_marks_enabled()
+    return (self.store:preferences().thoughts or {}).show_marks~=false
+end
+
+function Plugin:_marks_enabled_label()
+    return self:_marks_enabled() and "已开启" or "已关闭"
+end
+
+function Plugin:_annotation_mark_hide_css()
+    local ANNOTATION_MARK_HIDE_CSS=[[/* MiuRead: hide annotation marks (reader preference) */
+.miu-inline-mark, .miu-thought-mark, .miu-has-thought {
+    text-decoration: none !important;
+    border-bottom: 0 !important;
+    padding-bottom: 0 !important;
+}
+]]
+    if self:_marks_enabled() then return nil end
+    return ANNOTATION_MARK_HIDE_CSS
+end
+
+function Plugin:_apply_annotation_mark_style(reason)
+    local doc=self.ui and self.ui.document or nil
+    if not doc or type(doc.setStyleSheet)~="function" then return false end
+    if not self:_reader_is_reflowable() then return false end
+    local hide_css=self:_annotation_mark_hide_css()
+    local want_hidden=hide_css~=nil
+    if (self._annotation_mark_style_hidden==true)==want_hidden then return false end
+    local ui=self.ui
+    local st=ui.styletweak or nil
+    local applied=false
+    if st and type(st.getCssText)=="function" then
+        -- Preferred path: wrap the aggregated style-tweak css so any later
+        -- native re-application (style tweak / font changes) keeps our rules.
+        if rawget(st,"_miuread_marks_original_getCssText")==nil then
+            local original=st.getCssText
+            st._miuread_marks_original_getCssText=original
+            st.getCssText=function(instance)
+                local base=original(instance)
+                local extra=self:_annotation_mark_hide_css()
+                if extra==nil then return base end
+                if base==nil or base=="" then return extra end
+                return base.."\n"..extra
+            end
+        end
+        if type(ui.handleEvent)=="function" then
+            ui:handleEvent(Event:new("ApplyStyleSheet"))
+            applied=true
+        end
+    elseif hide_css~=nil or self._annotation_mark_style_direct==true then
+        -- Fallback for builds without ReaderStyleTweak: append the override
+        -- stylesheet next to KOReader's main document css.
+        local main_css=(ui.typeset and ui.typeset.css) or doc.default_css
+        local base=""
+        if st and type(st.css_text)=="string" then base=st.css_text end
+        local appended
+        if hide_css~=nil then
+            appended=(base~="" and base.."\n" or "")..hide_css
+        else
+            appended=base
+        end
+        local ok=pcall(doc.setStyleSheet,doc,main_css,appended)
+        if ok and type(ui.handleEvent)=="function" then
+            ui:handleEvent(Event:new("UpdatePos"))
+        end
+        self._annotation_mark_style_direct=ok
+        applied=ok
+    end
+    if applied then
+        self._annotation_mark_style_hidden=want_hidden
+        logger.info("[MiuRead][AnnotationStyle] mark display updated",
+            "reason=",tostring(reason or ""),"hidden=",tostring(want_hidden))
+    end
+    return applied
+end
+
+function Plugin:_sync_reader_annotation_mark_style(reason)
+    -- A fresh ReaderUI rebuilds the styletweak instance, so drop the cached
+    -- applied state and re-install the hide rules for the current book. A
+    -- preserved rebuild keeps both the wrapper and the applied state, and is
+    -- left untouched to avoid a needless reflow.
+    local st=self.ui and self.ui.styletweak or nil
+    if st~=nil and rawget(st,"_miuread_marks_original_getCssText")~=nil
+        and (self._annotation_mark_style_hidden==true)==(self:_annotation_mark_hide_css()~=nil) then
+        return false
+    end
+    self._annotation_mark_style_hidden=nil
+    return self:_apply_annotation_mark_style(reason)
+end
+
+function Plugin:_set_marks_enabled(enabled)
+    enabled=enabled~=false
+    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+    if (p.thoughts.show_marks~=false)==enabled then return true end
+    p.thoughts.show_marks=enabled
+    self:_save_ui_preferences(p,"marks_enabled")
+    self:_apply_annotation_mark_style(enabled and "marks enabled" or "marks disabled")
+    if enabled then
+        self:toast("划线显示已开启",1.5)
+    else
+        self:toast("划线已隐藏，划线和评论数据不会删除",2)
+    end
+    return true
+end
+
+function Plugin:_toggle_marks_enabled()
+    return self:_set_marks_enabled(not self:_marks_enabled())
+end
+
 function Plugin:_thought_font_size_value(prefs)
     prefs=prefs or (self.store:preferences().thoughts or {})
     local numeric=tonumber(prefs.font_size)
@@ -13134,7 +13250,11 @@ function Plugin:_show_reader_comment_settings(back_callback)
     ReaderTypographyDialog.show{
         title="评论显示",
         subtitle=function()
-            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线与评论数据仍保留" end
+            if not self:_thoughts_enabled() then
+                if not self:_marks_enabled() then return "阅读评论已关闭 · 划线已隐藏 · 数据仍保留" end
+                return "阅读评论已关闭 · 划线与评论数据仍保留"
+            end
+            if not self:_marks_enabled() then return "划线已隐藏 · 评论数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
@@ -13145,6 +13265,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
             local follow=prefs.follow_body_font==true
             return {
                 {kind="select",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_toggle_thoughts_enabled() end},
+                {kind="select",label="显示划线",value=self:_marks_enabled_label(),value_bold=true,callback=function() self:_toggle_marks_enabled() end},
                 {kind="select",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),close=true,callback=function()
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
@@ -13166,8 +13287,10 @@ function Plugin:_show_reader_comment_settings(back_callback)
                 {label="恢复默认",callback=function()
                     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
                     p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+                    p.thoughts.show_marks=true
                     self:_save_ui_preferences(p,"thought_font_reset")
                     self:_refresh_thought_display(p.thoughts)
+                    self:_apply_annotation_mark_style("thought font reset")
                     self:toast("评论显示已恢复默认",1.5)
                 end},
                 {label="应用到全部评论",primary=true,callback=function()
@@ -24101,6 +24224,7 @@ function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="显示划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()
@@ -25229,6 +25353,7 @@ function Plugin:on_sync_record_ready(current)
         local variant=tostring(current.variant or record.variant or "")
         if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
+            self:_sync_reader_annotation_mark_style("sync record ready")
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
@@ -25600,6 +25725,54 @@ function Plugin:_reader_rebuild_ready_state()
     return true,false
 end
 
+-- 划线隐藏样式必须在 KOReader 首次应用文档 CSS（ReadSettings 阶段、
+-- 文档渲染之前）就挂载好，这样第一帧渲染自带隐藏规则，避免打开书后
+-- 再 ApplyStyleSheet 整页重排造成的闪屏。ReaderTypeset 模块注册在插件
+-- 之前，其 onReadSettings 一定先执行完（此时样式表已按基础 tweaks 应用），
+-- 此处补装包装器并重放样式表即可进入首帧。
+-- 注意：CSS 常量保持在 _annotation_mark_hide_css 函数内部，不要提升到
+-- 文件顶层（顶层局部变量数已逼近 LuaJIT 200 上限，会导致插件无法加载）。
+function Plugin:onReadSettings()
+    local st=self.ui and self.ui.styletweak or nil
+    if not (st and type(st.getCssText)=="function") then
+        -- PDF/KOpt 等非 reflowable 文档没有 styletweak 模块，无样式可挂；
+        -- 保持未知状态，交给 _sync_reader_annotation_mark_style 兜底。
+        self._annotation_mark_style_hidden=nil
+        return false
+    end
+    if rawget(st,"_miuread_marks_original_getCssText")==nil then
+        local original=st.getCssText
+        st._miuread_marks_original_getCssText=original
+        st.getCssText=function(instance)
+            local base=original(instance)
+            local extra=self:_annotation_mark_hide_css()
+            if extra==nil then return base end
+            if base==nil or base=="" then return extra end
+            return base.."\n"..extra
+        end
+    end
+    local want_hidden=self:_annotation_mark_hide_css()~=nil
+    if want_hidden then
+        -- 包装器装好后，把样式表重放一次让隐藏规则进入首帧。此时文档
+        -- 尚未 loadDocument/render，直接重设样式表即可，不发 ApplyStyleSheet
+        -- （其附带的 UpdatePos 会触发不必要的视图动作）。
+        local typeset=self.ui.typeset or nil
+        local doc=self.ui and self.ui.document or nil
+        if typeset and doc and type(doc.setStyleSheet)=="function" then
+            local base_css=typeset.css or doc.default_css
+            local ok=pcall(doc.setStyleSheet,doc,base_css,st:getCssText())
+            if ok then
+                self._annotation_mark_style_hidden=true
+                return false
+            end
+        end
+        self._annotation_mark_style_hidden=nil
+        return false
+    end
+    self._annotation_mark_style_hidden=false
+    return false
+end
+
 function Plugin:onReaderReady()
     HOME_SESSION.home_restore_generation=(tonumber(HOME_SESSION.home_restore_generation) or 0)+1
     HOME_SESSION.home_restore_active=false
@@ -25715,6 +25888,7 @@ function Plugin:onReaderReady()
         end
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
+            self:_sync_reader_annotation_mark_style("reader ready")
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
         end
         local pending=HOME_SESSION.pending_annotation_jump
