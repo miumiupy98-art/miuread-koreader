@@ -24,10 +24,19 @@ local Toast = InputContainer:extend{
     _closing_with_refresh = false,
 }
 
-local function repaint(widget, dimen)
+local function repaint(widget, dimen, refresh_type)
     if not dimen then return end
-    UIManager:setDirty(widget, function()
-        return "partial", dimen
+    UIManager:setDirty(widget, refresh_type or "ui", dimen)
+end
+
+local function repaint_uncovered(dimen)
+    if not dimen then return end
+    local region=dimen:copy()
+    UIManager:nextTick(function()
+        -- CloseWidget is dispatched before UIManager removes the toast from its
+        -- window stack. Repaint on the next tick so the widgets now exposed
+        -- underneath it are actually painted before the E-Ink refresh.
+        UIManager:setDirty("all", "ui", region)
     end)
 end
 
@@ -87,14 +96,15 @@ function Toast:_close()
     self.closed = true
     self._closing_with_refresh = true
     local region = self.popup_dimen and self.popup_dimen:copy() or nil
-    -- Supplying the known region to close() makes UIManager repaint the
-    -- uncovered ReaderUI and refresh exactly the former toast rectangle.
-    UIManager:close(self, "partial", region)
+    -- A toast may sit over ReaderUI or over a MiuRead full-screen menu. Use an
+    -- UI waveform for the small former-toast rectangle so menu pixels cannot
+    -- remain as ghosting after the timer fires.
+    UIManager:close(self, "ui", region)
     return true
 end
 
 function Toast:onShow()
-    repaint(self, self.popup_dimen)
+    repaint(self, self.popup_dimen, "ui")
     local timeout = tonumber(self.timeout)
     if timeout and timeout > 0 then
         self._timeout_func = function()
@@ -118,9 +128,11 @@ function Toast:onCloseWidget()
         self.on_close_callback = nil
         pcall(callback)
     end
-    -- Fallback for an external direct UIManager:close() call. Normal timeout
-    -- and replacement paths already pass the region directly to close().
-    if not self._closing_with_refresh then repaint(nil, old_dimen) end
+    -- Always repaint the newly uncovered stack after this CloseWidget event.
+    -- This is deliberately deferred because UIManager removes us from the
+    -- stack only after CloseWidget returns. It fixes stale toast pixels on
+    -- Kindle when a status message expires while a MiuRead menu is open.
+    repaint_uncovered(old_dimen)
     self._closing_with_refresh = false
 end
 

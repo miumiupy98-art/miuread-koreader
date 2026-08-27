@@ -14,6 +14,7 @@ local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
+local FaceFactory = require("miuread.thought_face_factory")
 local TransientGuard = require("miuread.transient_guard")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
@@ -128,11 +129,92 @@ function Dialog:_run_row(row)
     return self:_close(row.callback)
 end
 
+function Dialog:_run_inline(callback)
+    if type(callback) ~= "function" then return true end
+    local ok, err = pcall(callback)
+    if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] inline action failed", tostring(err)) end
+    UIManager:scheduleIn(.04, function()
+        if not self.closed then self:_rebuild() end
+    end)
+    return true
+end
+
+function Dialog:_step_button(icon, width, height, callback)
+    local tap = TapBox:new{
+        dimen = Geom:new{w = width, h = height},
+        enabled = type(callback) == "function",
+        callback = function() self:_run_inline(callback) end,
+    }
+    tap[1] = Skin.frame(width, height, {
+        bordersize = Skin.line("thin"),
+        radius = math.floor(height / 2),
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_DARK_GRAY,
+    }, Ui.icon(icon, width, height, Skin.dp(19, 16, 25), {
+        icon_key = icon, face = Skin.face("cfont", 18, 23, 15),
+    }))
+    return tap
+end
+
 function Dialog:_row_widget(row, width, height)
     local enabled = row.enabled ~= false
     local pad = Skin.dp(8, 6, 11)
     local icon = tostring(row.icon or "")
-    local value = tostring(row.value or row.detail or "")
+    local kind = tostring(row.kind or "select")
+    local gap = Skin.dp(4, 3, 6)
+    local inner_h = math.max(1, height - pad * 2)
+
+    if kind == "step" then
+        local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
+        local button = math.min(inner_h, Skin.dp(38, 33, 50))
+        local label_w = math.max(Skin.dp(105, 88, 142), math.floor(width * .30))
+        local value_w = math.max(Skin.dp(50, 42, 68), math.floor(width * .10))
+        local consumed = pad * 2 + icon_w + label_w + button * 2 + value_w
+        local spacer_count = 4 + (icon_w > 0 and 1 or 0)
+        local step_gap = math.max(gap, math.floor(math.max(0, width - consumed) / spacer_count))
+        local group = HorizontalGroup:new{align = "center"}
+        if icon_w > 0 then
+            group[#group + 1] = Ui.icon(icon, icon_w, inner_h, Skin.dp(20, 17, 27), {
+                icon_key = icon, face = Skin.face("cfont", 12.7, 17.2, 10.8),
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+            })
+            group[#group + 1] = HorizontalSpan:new{width = step_gap}
+        end
+        group[#group + 1] = Ui.textbox(tostring(row.label or row.text or ""), label_w, inner_h,
+            Skin.face("cfont", 10.9, 14.8, 9.4), {alignment = "left",
+                fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY})
+        group[#group + 1] = HorizontalSpan:new{width = step_gap}
+        group[#group + 1] = self:_step_button("minus", button, button, enabled and row.on_decrease or nil)
+        group[#group + 1] = HorizontalSpan:new{width = step_gap}
+        group[#group + 1] = Ui.textbox(tostring(resolved(row.value, "")), value_w, inner_h,
+            Skin.face("cfont", 14.5, 19.0, 12.0), {alignment = "center", halign = "center", bold = true})
+        group[#group + 1] = HorizontalSpan:new{width = step_gap}
+        group[#group + 1] = self:_step_button("plus", button, button, enabled and row.on_increase or nil)
+        return CenterContainer:new{dimen = Geom:new{w = width, h = height}, group}
+    end
+
+    if kind == "preview" then
+        local label_w = math.max(Skin.dp(86, 72, 118), math.floor(width * .20))
+        local sample_w = math.max(1, width - pad * 2 - label_w - gap)
+        local logical_size = math.max(12, math.min(48, tonumber(resolved(row.size, 22)) or 22))
+        local font_name = resolved(row.font, nil)
+        local ok, face = pcall(FaceFactory.getFace, FaceFactory, font_name, logical_size, "cfont")
+        if not ok or not face then face = Skin.face("cfont", logical_size, logical_size, logical_size) end
+        local sample = TextBoxWidget:new{
+            text = tostring(resolved(row.text or row.value, "这是一段评论文字，用来预览当前字体与字号。") or ""),
+            face = face, width = sample_w, height = inner_h, height_adjust = false,
+            height_overflow_show_ellipsis = true, alignment = "left", auto_para_direction = true,
+            justified = false, line_height = tonumber(row.line_height) or .18, fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+        local group = HorizontalGroup:new{align = "center"}
+        group[#group + 1] = Ui.textbox(tostring(row.label or "评论预览"), label_w, inner_h,
+            Skin.face("smallinfofont", 9.5, 12.6, 8.1), {alignment = "left", bold = true, fgcolor = Blitbuffer.COLOR_DARK_GRAY})
+        group[#group + 1] = HorizontalSpan:new{width = gap}
+        group[#group + 1] = sample
+        return CenterContainer:new{dimen = Geom:new{w = width, h = height}, group}
+    end
+
+    local value = tostring(resolved(row.value or row.detail, "") or "")
     if row.checked == true then value = value ~= "" and (value .. "  ✓") or "✓" end
     -- Reader settings stay visually flat by default. A chevron is shown only
     -- when a caller explicitly requests one for a true child-page affordance.
@@ -140,10 +222,8 @@ function Dialog:_row_widget(row, width, height)
     local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
     local arrow_w = arrow and Skin.dp(17, 14, 23) or 0
     local value_w = value ~= "" and math.max(Skin.dp(88, 72, 118), math.floor(width * .32)) or 0
-    local gap = Skin.dp(4, 3, 6)
     local label_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
         - gap * ((icon_w > 0 and 1 or 0) + (value_w > 0 and 1 or 0) + (arrow_w > 0 and 1 or 0)))
-    local inner_h = math.max(1, height - pad * 2)
     local row_content = HorizontalGroup:new{align = "center"}
 
     if icon_w > 0 then

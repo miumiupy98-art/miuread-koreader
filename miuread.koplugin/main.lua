@@ -13270,14 +13270,22 @@ function Plugin:_show_reader_comment_center(back_callback)
                 {icon="font",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),arrow=true,callback=function()
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),reopen)
                 end},
-                {icon="font",label="评论字号",value=self:_thought_font_size_label(),arrow=true,callback=function()
-                    self:_show_reader_menu_table("评论字号",self:thought_font_menu(),reopen)
-                end},
+                {kind="step",icon="font",label="评论字号",value=function() return self:_thought_font_size_label() end,
+                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
+                    on_increase=function() self:_adjust_thought_font_size(1) end},
                 {icon="settings",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function()
                     self:_toggle_thought_follow_body_font()
                 end},
-                {icon="display",label="显示预览与恢复默认",value="预览当前评论样式",arrow=true,callback=function()
-                    self:_show_reader_comment_settings(reopen)
+                {kind="preview",label="评论预览",
+                    text="这是一段评论文字，用来预览当前字体与字号。",
+                    font=function() return self:_thought_font_name(self.store:preferences().thoughts or {}) end,
+                    size=function() return self:_thought_font_size_value() end},
+                {icon="undo",label="恢复默认",value="字体、字号与跟随设置",keep_open=true,callback=function()
+                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+                    p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+                    self:_save_ui_preferences(p,"thought_font_reset")
+                    self:_refresh_thought_display(p.thoughts)
+                    self:toast("评论显示已恢复默认",1.5)
                 end},
             }
             return {
