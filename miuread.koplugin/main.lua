@@ -9221,7 +9221,7 @@ function Plugin:_show_home_settings_center()
     return self:_show_standalone_menu("觅阅设置",{
         {text="首页与书架",post_text="布局 书架与快捷入口",sub_item_table_func=function() return self:display_settings_menu() end},
         {text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
-        {text="评论、划线与想法",post_text="评论显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
+        {text="评论、划线与想法",post_text="评论收藏、显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
         {text="时间与时区",post_text="时间来源与地区显示",sub_item_table_func=function() return self:time_display_settings_menu() end},
         {text="更新与关于",post_text="版本 更新通道与说明",sub_item_table_func=function() return PluginSettings.update_about(self) end},
         {text="工具与维护",post_text="修复 清理与诊断",sub_item_table_func=function() return self:maintenance_menu() end},
@@ -13220,6 +13220,75 @@ function Plugin:_show_reader_comment_settings(back_callback)
     return true
 end
 
+function Plugin:_show_reader_comment_center(back_callback)
+    local function reopen() self:_show_reader_comment_center(back_callback) end
+    ReaderSettingsDialog.show{
+        title="评论",
+        subtitle=function()
+            local scope=self:_current_thought_favorite_scope()
+            local total=self:_thought_favorite_count()
+            local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
+            return "评论收藏 "..tostring(book_count).." / "..tostring(total).." · "..self:_thoughts_enabled_label()
+        end,
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
+        sections=function()
+            local scope=self:_current_thought_favorite_scope()
+            local total=self:_thought_favorite_count()
+            local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
+            local chapter_count=(scope.book_id~="" and scope.chapter_uid~="")
+                and self:_thought_favorite_count({book_id=scope.book_id,chapter_uid=scope.chapter_uid}) or 0
+            local prefs=self.store:preferences().thoughts or {}
+            local follow=prefs.follow_body_font==true
+            local content_rows={
+                {icon="bookmark",label="本章评论收藏",value=scope.chapter_uid~="" and (tostring(chapter_count).." 条") or "当前章节不可识别",
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
+                        self:show_thought_favorites{
+                            book_id=scope.book_id,chapter_uid=scope.chapter_uid,scope_label="本章评论收藏",
+                            reader_context=true,back_callback=reopen,
+                        }
+                    end},
+                {icon="current-book",label="本书评论收藏",value=scope.book_id~="" and (tostring(book_count).." 条") or "当前书籍不可识别",
+                    enabled=scope.book_id~="",arrow=true,callback=function()
+                        self:show_thought_favorites{
+                            book_id=scope.book_id,scope_label="本书评论收藏",
+                            reader_context=true,back_callback=reopen,
+                        }
+                    end},
+                {icon="bookmark",label="全部评论收藏",value=tostring(total).." 条",enabled=total>0,arrow=true,callback=function()
+                    self:show_thought_favorites{reader_context=true,scope_label="全部评论收藏",back_callback=reopen}
+                end},
+                {icon="search",label="搜索收藏评论",value=total>0 and "评论、原文、作者、书名" or "暂无收藏",
+                    enabled=total>0,arrow=true,callback=function()
+                        self:_search_thought_favorites{reader_context=true,back_callback=reopen}
+                    end},
+            }
+            local display_rows={
+                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thoughts_enabled()
+                end},
+                {icon="font",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),arrow=true,callback=function()
+                    self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),reopen)
+                end},
+                {icon="font",label="评论字号",value=self:_thought_font_size_label(),arrow=true,callback=function()
+                    self:_show_reader_menu_table("评论字号",self:thought_font_menu(),reopen)
+                end},
+                {icon="settings",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thought_follow_body_font()
+                end},
+                {icon="display",label="显示预览与恢复默认",value="预览当前评论样式",arrow=true,callback=function()
+                    self:_show_reader_comment_settings(reopen)
+                end},
+            }
+            return {
+                {title="评论内容",rows=content_rows},
+                {title="评论显示",rows=display_rows},
+            }
+        end,
+    }
+    return true
+end
+
 function Plugin:_reader_font_label()
     local ui=self.ui
     local font=ui and ui.font
@@ -15185,7 +15254,7 @@ function Plugin:_reader_control_categories()
                 callback=function() self:_open_next_single_chapter() end,
             })
         end
-        reading_items[#reading_items+1]={icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end}
+        reading_items[#reading_items+1]={icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_center(back_to("reading")) end}
     end
 
     local book_items
@@ -15284,7 +15353,7 @@ function Plugin:_reader_quick_definitions()
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
         comments={key="comments",icon="comment",label="评论",icon_scale=1.16,icon_nudge_y=-1,active=self:_thoughts_enabled(),callback=function()
-            self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
+            self:_show_reader_comment_center(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
@@ -25066,10 +25135,46 @@ function Plugin:_copy_thought_comment(comment,source_text,include_source)
     return true
 end
 
-function Plugin:_thought_favorite_count()
+function Plugin:_thought_favorite_count(options)
     local ThoughtFavorites=require("miuread.thought_favorites")
-    local ok,value=pcall(ThoughtFavorites.count,self.store)
+    local ok,value=pcall(ThoughtFavorites.count,self.store,type(options)=="table" and options or nil)
     return ok and (tonumber(value) or 0) or 0
+end
+
+function Plugin:_current_thought_favorite_scope()
+    local scope={book_id="",book_title="",chapter_uid="",chapter_title=""}
+    if not self:_reader_session_is_weread() then return scope end
+    local current=self:_current_book_record()
+    if not (current and current.book) then return scope end
+    local book=current.book or {}
+    local record=current.record or {}
+    scope.book_id=tostring(book.book_id or book.bookId or "")
+    scope.book_title=U.trim(tostring(book.title or book.name or ""))
+    scope.chapter_uid=tostring(record.chapter_uid or record.chapterUid or "")
+    if self.sync and type(self.sync.local_position)=="function" then
+        local ok,position=pcall(self.sync.local_position,self.sync)
+        if ok and type(position)=="table" and tostring(position.chapter_uid or "")~="" then
+            scope.chapter_uid=tostring(position.chapter_uid)
+        end
+    end
+    scope.chapter_title=self:_thought_chapter_title_from_rows(record.chapter_map,scope.chapter_uid)
+    if scope.chapter_title=="" then
+        scope.chapter_title=self:_thought_chapter_title_from_rows(book.catalog,scope.chapter_uid)
+    end
+    if scope.chapter_title=="" and self.sync and type(self.sync.chapter_catalog_context)=="function" then
+        local ok,context=pcall(self.sync.chapter_catalog_context,self.sync,current)
+        if ok and type(context)=="table" then
+            scope.chapter_title=self:_thought_chapter_title_from_rows(context.chapters,scope.chapter_uid)
+        end
+    end
+    return scope
+end
+
+function Plugin:_thought_favorite_sort_label(sort)
+    sort=tostring(sort or "saved")
+    if sort=="created" then return "评论时间" end
+    if sort=="likes" then return "点赞最多" end
+    return "最近收藏"
 end
 
 function Plugin:_thought_favorite_callbacks(context)
@@ -25103,7 +25208,18 @@ function Plugin:_thought_favorite_callbacks(context)
     }
 end
 
-function Plugin:_open_saved_thought_favorite(favorite)
+function Plugin:_favorite_comment_from_saved(favorite)
+    favorite=type(favorite)=="table" and favorite or {}
+    return {
+        author=tostring(favorite.comment_author or "微信读书用户"),
+        content=tostring(favorite.comment_content or ""),
+        likes=tonumber(favorite.likes or 0) or 0,
+        review_id=tostring(favorite.review_id or ""),
+        created=tonumber(favorite.comment_created or 0) or 0,
+    }
+end
+
+function Plugin:_open_saved_thought_favorite(favorite,on_close)
     favorite=type(favorite)=="table" and favorite or {}
     local context={
         book_id=tostring(favorite.book_id or ""),
@@ -25117,13 +25233,7 @@ function Plugin:_open_saved_thought_favorite(favorite)
     local prefs=self.store:preferences().thoughts or {}
     return ThoughtNativePopup.show{
         source_text=tostring(favorite.source_text or ""),
-        comments={{
-            author=tostring(favorite.comment_author or "微信读书用户"),
-            content=tostring(favorite.comment_content or ""),
-            likes=tonumber(favorite.likes or 0) or 0,
-            review_id=tostring(favorite.review_id or ""),
-            created=tonumber(favorite.comment_created or 0) or 0,
-        }},
+        comments={self:_favorite_comment_from_saved(favorite)},
         cache_key="favorite|"..tostring(favorite.favorite_id or ""),
         font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
         font_name=self:_thought_font_name(prefs),
@@ -25133,52 +25243,246 @@ function Plugin:_open_saved_thought_favorite(favorite)
         toggle_favorite_callback=callbacks.toggle_favorite,
         copy_callback=callbacks.copy,
         on_interact=function() self:_mark_reader_busy(15) end,
+        on_close=on_close,
         on_error=function() self:info("收藏评论暂时无法显示。") end,
     }
 end
 
-function Plugin:show_thought_favorites(book_id)
+function Plugin:_show_saved_thought_favorite_actions(favorite,reopen)
+    favorite=type(favorite)=="table" and favorite or {}
+    local comment=self:_favorite_comment_from_saved(favorite)
+    local dialog
+    local function finish(action)
+        if dialog then pcall(UIManager.close,UIManager,dialog) end
+        if action then pcall(action) end
+        if reopen then UIManager:scheduleIn(.08,reopen) end
+        return true
+    end
+    dialog=ButtonDialog:new{
+        title="收藏评论操作",
+        title_align="center",
+        buttons={
+            {{text="复制评论",callback=function()
+                return finish(function() self:_copy_thought_comment(comment,favorite.source_text,false) end)
+            end}},
+            {{text="复制原文+评论",callback=function()
+                return finish(function() self:_copy_thought_comment(comment,favorite.source_text,true) end)
+            end}},
+            {{text="取消收藏",callback=function()
+                return finish(function()
+                    local ThoughtFavorites=require("miuread.thought_favorites")
+                    local ok,err=ThoughtFavorites.remove(self.store,tostring(favorite.favorite_id or ""))
+                    if ok then self:toast("已取消收藏",1.8)
+                    else self:info("取消收藏失败：\n"..U.first_line(err,120)) end
+                end)
+            end}},
+            {{text="返回",callback=function() return finish() end}},
+        },
+    }
+    UIManager:show(dialog,"ui")
+    return true
+end
+
+function Plugin:_show_thought_favorite_sort(options)
+    options=type(options)=="table" and U.copy(options) or {}
+    local dialog
+    local function choose(sort)
+        if dialog then pcall(UIManager.close,UIManager,dialog) end
+        options.sort=sort
+        UIManager:scheduleIn(.06,function() self:show_thought_favorites(options) end)
+        return true
+    end
+    dialog=ButtonDialog:new{
+        title="评论收藏排序",
+        title_align="center",
+        buttons={
+            {{text="最近收藏",callback=function() return choose("saved") end}},
+            {{text="评论时间",callback=function() return choose("created") end}},
+            {{text="点赞最多",callback=function() return choose("likes") end}},
+            {{text="返回",callback=function()
+                if dialog then pcall(UIManager.close,UIManager,dialog) end
+                UIManager:scheduleIn(.06,function() self:show_thought_favorites(options) end)
+                return true
+            end}},
+        },
+    }
+    UIManager:show(dialog,"ui")
+    return true
+end
+
+function Plugin:_show_thought_favorite_books(options)
+    options=type(options)=="table" and U.copy(options) or {}
     local ThoughtFavorites=require("miuread.thought_favorites")
-    local rows,err=ThoughtFavorites.list(self.store,{book_id=book_id,limit=300})
-    if not rows then self:info("本地收藏暂时无法读取：\n"..U.first_line(err,120)); return end
-    if #rows==0 then
-        self:info(book_id and "这本书还没有收藏评论。" or "还没有收藏评论。\n\n阅读时打开评论，点击“收藏”即可保存到本地。")
+    local books=ThoughtFavorites.books(self.store) or {}
+    if #books==0 then self:info("还没有收藏评论。") return true end
+    local items={}
+    for _,book in ipairs(books) do
+        local saved=book
+        local label=U.trim(tostring(saved.book_title or ""))
+        if label=="" then label="未命名书籍" end
+        items[#items+1]={
+            label=label,text=label,
+            detail=U.trim(tostring(saved.book_author or "")),
+            value=tostring(saved.count or 0).." 条",post_text=tostring(saved.count or 0).." 条",
+            callback=function()
+                local next_options=U.copy(options)
+                next_options.book_id=tostring(saved.book_id or "")
+                next_options.chapter_uid=nil
+                next_options.scope_label="本书评论收藏"
+                self:show_thought_favorites(next_options)
+            end,
+        }
+    end
+    local back=function() self:show_thought_favorites(options) end
+    if options.reader_context==true then
+        return ReaderListDialog.show{
+            title="按书籍查看",subtitle=tostring(#books).." 本有评论收藏",items=items,page_size=6,
+            on_back=back,on_home=function() return self:_reader_home_action("thought favorites") end,
+        }
+    end
+    local menu_items={}
+    for _,item in ipairs(items) do
+        menu_items[#menu_items+1]={text=item.text,post_text=item.post_text,close_before_action=true,callback=item.callback}
+    end
+    return self:_show_standalone_menu("按书籍查看",menu_items,{page_size=8,on_close=back})
+end
+
+function Plugin:_search_thought_favorites(options)
+    options=type(options)=="table" and U.copy(options) or {}
+    local dialog
+    dialog=InputDialog:new{
+        title="搜索评论收藏",
+        description="搜索评论、原文、作者、书名和章节",
+        input=tostring(self._thought_favorite_last_search or options.query or ""),
+        buttons={{
+            {text="取消",id="close",callback=function()
+                UIManager:close(dialog)
+                if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
+            end},
+            {text="搜索",is_enter_default=true,callback=function()
+                local query=U.trim(dialog:getInputText())
+                UIManager:close(dialog)
+                if query=="" then
+                    if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
+                    return
+                end
+                self._thought_favorite_last_search=query
+                options.query=query
+                options.scope_label="搜索评论收藏"
+                UIManager:scheduleIn(.05,function() self:show_thought_favorites(options) end)
+            end},
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+    return true
+end
+
+function Plugin:show_thought_favorites(options)
+    if type(options)=="string" then options={book_id=options} end
+    options=type(options)=="table" and U.copy(options) or {}
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local query_options={
+        book_id=options.book_id,chapter_uid=options.chapter_uid,query=options.query,
+        sort=options.sort or "saved",limit=tonumber(options.limit) or 300,
+    }
+    local rows,err=ThoughtFavorites.list(self.store,query_options)
+    if not rows then
+        self:info("本地收藏暂时无法读取：\n"..U.first_line(err,120))
+        if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
         return
     end
+    if #rows==0 then
+        local message
+        if U.trim(tostring(options.query or ""))~="" then
+            message="没有找到包含“"..tostring(options.query).."”的收藏评论。"
+        elseif U.trim(tostring(options.chapter_uid or ""))~="" then
+            message="本章还没有收藏的评论。\n\n阅读时长按评论即可收藏。"
+        elseif U.trim(tostring(options.book_id or ""))~="" then
+            message="本书还没有收藏的评论。\n\n阅读时长按评论即可收藏。"
+        else
+            message="还没有收藏评论。\n\n阅读时长按感兴趣的评论即可收藏到本地。"
+        end
+        self:info(message)
+        if options.back_callback then UIManager:scheduleIn(.08,options.back_callback) end
+        return
+    end
+
+    local title=tostring(options.scope_label or "")
+    if title=="" then
+        if U.trim(tostring(options.query or ""))~="" then title="搜索评论收藏"
+        elseif U.trim(tostring(options.chapter_uid or ""))~="" then title="本章评论收藏"
+        elseif U.trim(tostring(options.book_id or ""))~="" then title="本书评论收藏"
+        else title="我的评论收藏" end
+    end
+    local sort=options.sort or "saved"
+    local reopen=function() self:show_thought_favorites(options) end
     local items={}
-    if not book_id then
+    if #rows>1 then
+        items[#items+1]={
+            icon="settings",label="排序方式",text="排序方式",
+            value=self:_thought_favorite_sort_label(sort),post_text=self:_thought_favorite_sort_label(sort),
+            callback=function() self:_show_thought_favorite_sort(options) end,
+        }
+    end
+    if U.trim(tostring(options.book_id or ""))=="" then
         local books=ThoughtFavorites.books(self.store) or {}
         if #books>1 then
-            items[#items+1]={text="按书籍查看",post_text=tostring(#books).." 本",sub_item_table_func=function()
-                local out={}
-                for _,book in ipairs(books) do
-                    local id=tostring(book.book_id or "")
-                    out[#out+1]={
-                        text=U.trim(tostring(book.book_title or ""))~="" and tostring(book.book_title) or "未命名书籍",
-                        post_text=tostring(book.count or 0).." 条",
-                        callback=function() self:show_thought_favorites(id) end,
-                    }
-                end
-                return out
-            end}
+            items[#items+1]={
+                icon="current-book",label="按书籍查看",text="按书籍查看",
+                value=tostring(#books).." 本",post_text=tostring(#books).." 本",
+                callback=function() self:_show_thought_favorite_books(options) end,
+            }
         end
     end
+
     for _,favorite in ipairs(rows) do
         local saved=favorite
-        local title=U.trim(tostring(saved.book_title or ""))
+        local book_title=U.trim(tostring(saved.book_title or ""))
         local chapter=U.trim(tostring(saved.chapter_title or ""))
         local author=U.trim(tostring(saved.comment_author or ""))
         local preview=U.trim(tostring(saved.comment_content or "")):gsub("%s+"," ")
-        if U.utf8_len(preview)>42 then preview=U.utf8_sub(preview,1,42).."…" end
-        local left=book_id and (chapter~="" and chapter or author) or (title~="" and title or "未命名书籍")
-        local right=book_id and author or (chapter~="" and chapter or author)
+        if U.utf8_len(preview)>48 then preview=U.utf8_sub(preview,1,48).."…" end
+        local source_preview=U.trim(tostring(saved.source_text or "")):gsub("%s+"," ")
+        if U.utf8_len(source_preview)>34 then source_preview=U.utf8_sub(source_preview,1,34).."…" end
+        local label
+        if U.trim(tostring(options.book_id or ""))=="" then
+            label=(book_title~="" and ("《"..book_title.."》") or "未命名书籍")..(chapter~="" and (" · "..chapter) or "")
+        else
+            label=chapter~="" and chapter or (author~="" and author or "收藏评论")
+        end
+        local meta=author~="" and author or "微信读书用户"
+        if tonumber(saved.likes or 0)>0 then meta=meta.." · 赞 "..tostring(saved.likes) end
+        local detail=meta..(preview~="" and (" · "..preview) or "")
+        if source_preview~="" and U.utf8_len(detail)<72 then detail=detail.." · 原文“"..source_preview.."”" end
+        local saved_date=tonumber(saved.saved_at or 0)>0 and os.date("%Y-%m-%d",tonumber(saved.saved_at)) or ""
         items[#items+1]={
-            text=preview~="" and (left.." · "..preview) or left,
-            post_text=right,
-            callback=function() self:_open_saved_thought_favorite(saved) end,
+            icon="bookmark",label=label,text=label..(preview~="" and (" · "..preview) or ""),
+            detail=detail,value=saved_date,post_text=author,
+            callback=function()
+                self:_open_saved_thought_favorite(saved,function() UIManager:scheduleIn(.05,reopen) end)
+            end,
+            hold_callback=function()
+                self:_show_saved_thought_favorite_actions(saved,reopen)
+            end,
         }
     end
-    return self:_show_standalone_menu(book_id and "本书评论收藏" or "我的评论收藏",items,{page_size=8})
+
+    if options.reader_context==true then
+        local subtitle=tostring(#rows).." 条 · "..self:_thought_favorite_sort_label(sort)
+        if U.trim(tostring(options.query or ""))~="" then subtitle="“"..tostring(options.query).."” · "..subtitle end
+        return ReaderListDialog.show{
+            title=title,subtitle=subtitle,items=items,page_size=6,
+            on_back=options.back_callback or function() self:_show_reader_comment_center() end,
+            on_home=function() return self:_reader_home_action("thought favorites") end,
+        }
+    end
+
+    local menu_items={}
+    for _,item in ipairs(items) do
+        menu_items[#menu_items+1]={text=item.text,post_text=item.post_text,close_before_action=true,callback=item.callback}
+    end
+    return self:_show_standalone_menu(title,menu_items,{page_size=8,on_close=options.back_callback})
 end
 
 function Plugin:_close_active_thought_popup(reason)

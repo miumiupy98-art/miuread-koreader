@@ -12,6 +12,8 @@ local logger = require("logger")
 local FaceFactory = {
     initialized = false,
     emoji_path = nil,
+    emoji_checked = false,
+    emoji_missing_logged = false,
     font_paths_cache = {},
     face_cache = {},
     fallback_cache = {},
@@ -65,7 +67,11 @@ local EMOJI_FONT_NAMES = {
 }
 
 function FaceFactory:findEmojiFont()
-    if self.emoji_path and file_exists(self.emoji_path) then return self.emoji_path end
+    if self.emoji_path and file_exists(self.emoji_path) then
+        self.emoji_checked = true
+        return self.emoji_path
+    end
+    if self.emoji_checked then return nil end
 
     -- Prefer fonts already known to KOReader. This keeps the comment popup
     -- independent from any other plugin and also respects user-installed fonts.
@@ -73,6 +79,7 @@ function FaceFactory:findEmojiFont()
         local resolved = resolve_bundled_font(fontname)
         if resolved then
             self.emoji_path = resolved
+            self.emoji_checked = true
             logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
             return resolved
         end
@@ -113,6 +120,7 @@ function FaceFactory:findEmojiFont()
         local resolved = realpath(path)
         if resolved then
             self.emoji_path = resolved
+            self.emoji_checked = true
             logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
             return resolved
         end
@@ -128,6 +136,7 @@ function FaceFactory:findEmojiFont()
                 local resolved = realpath(path)
                 if resolved then
                     self.emoji_path = resolved
+                    self.emoji_checked = true
                     logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
                     return resolved
                 end
@@ -136,8 +145,36 @@ function FaceFactory:findEmojiFont()
     end
 
     self.emoji_path = nil
-    logger.info("[MiuRead][ThoughtPopup] no dedicated emoji font found; using KOReader symbol fallbacks")
+    self.emoji_checked = true
+    if not self.emoji_missing_logged then
+        self.emoji_missing_logged = true
+        logger.info("[MiuRead][ThoughtPopup] no dedicated emoji font found; using text emoji fallbacks")
+    end
     return nil
+end
+
+
+local EMOJI_TEXT_FALLBACKS = {
+    {"❤️", "[爱心]"}, {"❤", "[爱心]"}, {"💔", "[心碎]"},
+    {"🤣", "[笑哭]"}, {"😂", "[笑哭]"}, {"😄", "[笑]"}, {"😁", "[笑]"},
+    {"😊", "[微笑]"}, {"😅", "[汗]"}, {"😭", "[哭]"}, {"😢", "[难过]"},
+    {"😍", "[喜欢]"}, {"😘", "[亲亲]"}, {"😡", "[生气]"}, {"🤔", "[思考]"},
+    {"😱", "[惊讶]"}, {"😎", "[酷]"}, {"👍", "[赞]"}, {"👎", "[不赞]"},
+    {"👏", "[鼓掌]"}, {"🙏", "[谢谢]"}, {"🔥", "[火]"}, {"🎉", "[庆祝]"},
+    {"✨", "[闪亮]"}, {"💯", "[100]"}, {"🥹", "[感动]"}, {"🥰", "[喜欢]"},
+}
+
+function FaceFactory:displayText(value)
+    local text = tostring(value or "")
+    self:init()
+    if self.emoji_path then return text end
+    for _, pair in ipairs(EMOJI_TEXT_FALLBACKS) do
+        text = text:gsub(pair[1], pair[2])
+    end
+    -- Variation selectors are useful only to Emoji-capable fonts. Removing
+    -- them prevents visible tofu boxes after a known Emoji was converted.
+    text = text:gsub("️", "")
+    return text
 end
 
 function FaceFactory:init()
@@ -347,6 +384,8 @@ function FaceFactory:clearCache()
     self.face_cache = {}
     self.fallback_cache = {}
     self.emoji_path = nil
+    self.emoji_checked = false
+    self.emoji_missing_logged = false
     self.initialized = false
 end
 

@@ -458,7 +458,7 @@ end
 
 function NativePopup:_piece_widget(piece, width, metrics)
     local group = VerticalGroup:new{align = "left"}
-    local author = clean(piece.author)
+    local author = ThoughtFaceFactory:displayText(clean(piece.author))
     if author == "" then author = "微信读书用户" end
     local likes = tonumber(piece.likes or 0) or 0
     local meta
@@ -469,7 +469,7 @@ function NativePopup:_piece_widget(piece, width, metrics)
     else
         meta = author
     end
-    local content = clean_body(piece.content)
+    local content = ThoughtFaceFactory:displayText(clean_body(piece.content))
     if content == "" then content = " " end
 
     -- Let KOReader measure the author row with the same face it will paint.
@@ -826,7 +826,7 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
 end
 
 function NativePopup:_build_source(width, metrics, close_size)
-    local source = clean(self.source_text)
+    local source = ThoughtFaceFactory:displayText(clean(self.source_text))
     if source == "" then
         local empty = VerticalGroup:new{align = "left"}
         empty[#empty + 1] = Widget:new{dimen = Geom:new{w = width, h = close_size}}

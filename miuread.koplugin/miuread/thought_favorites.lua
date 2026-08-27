@@ -4,8 +4,10 @@ local U = require("miuread.util")
 local lfs = require("libs/libkoreader-lfs")
 
 local Favorites = {}
-Favorites.SCHEMA_VERSION = 1
+Favorites.SCHEMA_VERSION = 2
 Favorites.FILE_NAME = "thought_favorites.sqlite3"
+
+local unpack_args = table.unpack or unpack
 
 local function clean(value)
     return U.trim(tostring(value or ""))
@@ -38,8 +40,14 @@ local function initialize(conn)
             ON thought_favorites(saved_at DESC);
         CREATE INDEX IF NOT EXISTS idx_thought_favorites_book
             ON thought_favorites(book_id, saved_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_thought_favorites_book_chapter
+            ON thought_favorites(book_id, chapter_uid, saved_at DESC);
         CREATE INDEX IF NOT EXISTS idx_thought_favorites_review
             ON thought_favorites(review_id);
+        CREATE INDEX IF NOT EXISTS idx_thought_favorites_created
+            ON thought_favorites(comment_created DESC);
+        CREATE INDEX IF NOT EXISTS idx_thought_favorites_likes
+            ON thought_favorites(likes DESC, saved_at DESC);
     ]])
     SQLiteStore.set_text(conn, "thought_favorites_schema_version",
         tostring(Favorites.SCHEMA_VERSION))
@@ -130,9 +138,9 @@ function Favorites.save(store, row)
     local ok, result = xpcall(function()
         if item.saved_at <= 0 then
             local existing = conn:prepare("SELECT saved_at FROM thought_favorites WHERE favorite_id = ? LIMIT 1")
-            local row = existing:bind(item.favorite_id):step()
+            local existing_row = existing:bind(item.favorite_id):step()
             existing:close()
-            item.saved_at = math.max(0, tonumber(row and row[1] or 0) or 0)
+            item.saved_at = math.max(0, tonumber(existing_row and existing_row[1] or 0) or 0)
             if item.saved_at <= 0 then item.saved_at = now end
         end
         local stmt = conn:prepare([[
@@ -205,11 +213,50 @@ local function row_from_sql(row)
     }
 end
 
+local function build_where(options)
+    options = type(options) == "table" and options or {}
+    local clauses, params = {}, {}
+    local book_id = clean(options.book_id)
+    local chapter_uid = clean(options.chapter_uid)
+    local query = clean(options.query)
+    if book_id ~= "" then
+        clauses[#clauses + 1] = "book_id = ?"
+        params[#params + 1] = book_id
+    end
+    if chapter_uid ~= "" then
+        clauses[#clauses + 1] = "chapter_uid = ?"
+        params[#params + 1] = chapter_uid
+    end
+    if query ~= "" then
+        local pattern = "%" .. query .. "%"
+        clauses[#clauses + 1] = [[(
+            book_title LIKE ? COLLATE NOCASE OR
+            book_author LIKE ? COLLATE NOCASE OR
+            chapter_title LIKE ? COLLATE NOCASE OR
+            source_text LIKE ? COLLATE NOCASE OR
+            comment_author LIKE ? COLLATE NOCASE OR
+            comment_content LIKE ? COLLATE NOCASE
+        )]]
+        for _ = 1, 6 do params[#params + 1] = pattern end
+    end
+    return clauses, params
+end
+
+local function order_sql(sort)
+    sort = tostring(sort or "saved")
+    if sort == "created" then
+        return "CASE WHEN comment_created > 0 THEN 0 ELSE 1 END, comment_created DESC, saved_at DESC, favorite_id DESC"
+    elseif sort == "likes" then
+        return "likes DESC, saved_at DESC, favorite_id DESC"
+    end
+    return "saved_at DESC, favorite_id DESC"
+end
+
 function Favorites.list(store, options)
     options = type(options) == "table" and options or {}
     if not Favorites.exists(store) then return {} end
     local limit = math.max(1, math.min(500, tonumber(options.limit) or 200))
-    local book_id = clean(options.book_id)
+    local clauses, params = build_where(options)
     local conn = open(store, true)
     if not conn then return {} end
     local ok, result = xpcall(function()
@@ -220,14 +267,15 @@ function Favorites.list(store, options)
                    comment_created, saved_at, updated_at
               FROM thought_favorites
         ]]
-        if book_id ~= "" then sql = sql .. " WHERE book_id = ?" end
-        sql = sql .. " ORDER BY saved_at DESC, favorite_id DESC LIMIT ?"
+        if #clauses > 0 then sql = sql .. " WHERE " .. table.concat(clauses, " AND ") end
+        sql = sql .. " ORDER BY " .. order_sql(options.sort) .. " LIMIT ?"
+        params[#params + 1] = limit
         local stmt = conn:prepare(sql)
-        if book_id ~= "" then stmt:bind(book_id, limit) else stmt:bind(limit) end
-        local rows, row = {}, {}
-        while stmt:step(row) do
-            rows[#rows + 1] = row_from_sql(row)
-            row = {}
+        stmt:bind(unpack_args(params))
+        local rows, sql_row = {}, {}
+        while stmt:step(sql_row) do
+            rows[#rows + 1] = row_from_sql(sql_row)
+            sql_row = {}
         end
         stmt:close()
         return rows
@@ -248,16 +296,16 @@ function Favorites.books(store)
              GROUP BY book_id
              ORDER BY MAX(saved_at) DESC, MAX(book_title) ASC
         ]])
-        local rows, row = {}, {}
-        while stmt:step(row) do
+        local rows, sql_row = {}, {}
+        while stmt:step(sql_row) do
             rows[#rows + 1] = {
-                book_id=tostring(row[1] or ""),
-                book_title=tostring(row[2] or ""),
-                book_author=tostring(row[3] or ""),
-                count=tonumber(row[4] or 0) or 0,
-                saved_at=tonumber(row[5] or 0) or 0,
+                book_id=tostring(sql_row[1] or ""),
+                book_title=tostring(sql_row[2] or ""),
+                book_author=tostring(sql_row[3] or ""),
+                count=tonumber(sql_row[4] or 0) or 0,
+                saved_at=tonumber(sql_row[5] or 0) or 0,
             }
-            row = {}
+            sql_row = {}
         end
         stmt:close()
         return rows
@@ -267,15 +315,20 @@ function Favorites.books(store)
     return result
 end
 
-function Favorites.count(store)
+function Favorites.count(store, options)
     if not Favorites.exists(store) then return 0 end
+    options = type(options) == "table" and options or {}
+    local clauses, params = build_where(options)
     local conn = open(store, true)
     if not conn then return 0 end
     local ok, count = pcall(function()
-        local stmt = conn:prepare("SELECT COUNT(*) FROM thought_favorites")
-        local row = stmt:step()
+        local sql = "SELECT COUNT(*) FROM thought_favorites"
+        if #clauses > 0 then sql = sql .. " WHERE " .. table.concat(clauses, " AND ") end
+        local stmt = conn:prepare(sql)
+        if #params > 0 then stmt:bind(unpack_args(params)) end
+        local sql_row = stmt:step()
         stmt:close()
-        return tonumber(row and row[1] or 0) or 0
+        return tonumber(sql_row and sql_row[1] or 0) or 0
     end)
     pcall(conn.close, conn)
     return ok and count or 0
