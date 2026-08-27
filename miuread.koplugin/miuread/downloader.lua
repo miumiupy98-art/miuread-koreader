@@ -30,7 +30,7 @@ local LEGACY_TITLE_TRANSFORM_VERSION = 1
 local TITLE_TRANSFORM_VERSION = 2
 local LEGACY_ANNOTATION_TRANSFORM_VERSION = 1
 local ANNOTATION_TRANSFORM_VERSION = 5
-local IMAGE_TRANSFORM_VERSION = 3
+local IMAGE_TRANSFORM_VERSION = 2
 local LEGACY_CONTENT_TRANSFORM_VERSION = 1
 local CONTENT_TRANSFORM_VERSION = 2
 
@@ -703,25 +703,9 @@ local function txt_catalog_title(title, chapter_idx)
         or ("第" .. tostring(idx) .. "章 " .. title)
 end
 
-local function catalog_resource_namespace(source, book_id)
-    local expected=tostring(book_id or "")
-    local found
-    for _,chapter in ipairs(source or {}) do
-        local namespace=tostring(chapter.tar or ""):match("/tar_([%w_-]+)_%d+")
-        if namespace then
-            local suffix=namespace:match("([^_]+)$") or namespace
-            if expected=="" or suffix~=expected then return nil,true end
-            if found and found~=namespace then return nil,true end
-            found=namespace
-        end
-    end
-    return found or expected,false
-end
-
 function Downloader:catalog(id, request_options)
     local catalog = self.reader:catalog(id, request_options)
     local source = catalog.updated or catalog.chapterInfos or catalog.chapters or {}
-    local resource_namespace,resource_ambiguous=catalog_resource_namespace(source,id)
     -- chapterInfos does not reliably expose the book format. Use the reader
     -- page context when available; on failure keep the source titles unchanged.
     local book_format
@@ -737,8 +721,6 @@ function Downloader:catalog(id, request_options)
         local uid = tostring(chapter.chapterUid or chapter.uid or "")
         chapter._miuread_has_children = catalog_has_children(source, index)
         chapter._miuread_catalog_index = index
-        chapter._miuread_resource_book_id = resource_namespace
-        chapter._miuread_resource_book_ambiguous = resource_ambiguous
         -- Do not decide readability from title or wordCount. Those fields are
         -- hints only and are inconsistent for short, image-only and special
         -- catalog items. Actual EPUB/TXT responses determine the result.
@@ -2211,7 +2193,6 @@ Downloader._prepare_chapter_body_legacy = prepare_chapter_body_legacy
 Downloader._prepare_chapter_body_current = prepare_chapter_body_current
 Downloader._namespace_assets = namespace_assets
 Downloader._catalog_signature = catalog_signature
-Downloader._catalog_resource_namespace = catalog_resource_namespace
 Downloader._option_key = option_key
 Downloader._validate_epub = function(path,expected)
     if type(expected)=="number" then

@@ -213,12 +213,7 @@ local function image_only_xhtml(assets)
 end
 
 local function readable_text_length(html)
-    local text=tostring(html or ""):gsub("<[^>]+>"," ")
-    text=text:gsub("&[nN][bB][sS][pP];",""):gsub("&#0*160;","")
-        :gsub("&#[xX]0*[aA]0;",""):gsub("&#0*12288;","")
-        :gsub("&#[xX]0*3000;",""):gsub("\194\160",""):gsub("\227\128\128","")
-        :gsub("%s+","")
-    return #text
+    return #visible_text(html)
 end
 
 local function is_empty_error(value)
@@ -419,82 +414,6 @@ local function image_remote_url(value)
     if url:match("^https?://") then return url end
 end
 
-local function image_is_safe_weread_url(value)
-    local url=image_remote_url(value)
-    local host=url and url:lower():match("^https?://([^/:]+)") or nil
-    return host=="weread.qq.com" or (host and host:sub(-14)==".weread.qq.com") or false
-end
-
-local function image_url_path_encode(value)
-    return (tostring(value or ""):gsub("([^%w%-%._~/])",function(char)
-        return string.format("%%%02X",char:byte())
-    end))
-end
-
-local function image_weread_resource_url(value,state)
-    local clean=image_trim(value)
-    if clean=="" or clean:match("^https?://") or clean:sub(1,2)=="//" then return nil end
-    local raw_path=clean:match("^[^%?#]+") or clean
-    if raw_path:find("\\",1,true) then return nil end
-    local undecoded=raw_path:gsub("%%[%x][%x]","")
-    if undecoded:find("%",1,true) then return nil end
-    local path=image_url_decode(raw_path)
-    if path:find("\\",1,true) then return nil end
-    if not path:lower():match("^%.%./images/") then return nil end
-    local namespace=tostring(state and state.image_resource_book_id or "")
-    if namespace=="" or not namespace:match("^[%w_-]+$") then return nil end
-    local relative=path:sub(11)
-    if relative=="" or relative:sub(1,1)=="/" or relative:sub(-1)=="/"
-        or relative:find("//",1,true) or relative:find("[%z\1-\31\127]") then return nil end
-    for segment in (relative.."/"):gmatch("(.-)/") do
-        if segment=="" or segment=="." or segment==".." then return nil end
-    end
-    return "https://res.weread.qq.com/wrepub/web/"..namespace.."/"..image_url_path_encode(relative)
-end
-
-local function css_body_background_source(xhtml,css)
-    local attrs=tostring(xhtml or ""):match("<[bB][oO][dD][yY]([^>]*)>")
-    local classes=attrs and image_attr(attrs,"class") or ""
-    local active={}
-    for class in tostring(classes):gmatch("[^%s]+") do active["."..class]=true end
-    local source
-    local clean_css=tostring(css or ""):gsub("/%*.-%*/","")
-    for selectors,block in clean_css:gmatch("([^{}]+)(%b{})") do
-        local matches=false
-        for selector in selectors:gmatch("[^,]+") do
-            selector=image_trim(selector)
-            if active[selector] then matches=true; break end
-        end
-        if matches then
-            for declaration in block:sub(2,-2):gmatch("[^;]+") do
-                local property,value=declaration:match("^%s*([%w%-]+)%s*:%s*(.-)%s*$")
-                property=tostring(property or ""):lower()
-                if property=="background" then return nil,true end
-                if property=="background-image" then
-                    local values={}
-                    for _,candidate in tostring(value or ""):gmatch([=[[uU][rR][lL]%s*%(%s*(["']?)(.-)%1%s*%)]=]) do
-                        candidate=image_trim(candidate)
-                        if candidate~="" then values[#values+1]=candidate end
-                    end
-                    if #values~=1 then return nil,true end
-                    local remainder=tostring(value or ""):gsub([=[[uU][rR][lL]%s*%(%s*(["']?)(.-)%1%s*%)]=],"",1)
-                        :gsub("%s*![iI][mM][pP][oO][rR][tT][aA][nN][tT]%s*$",""):gsub("%s+","")
-                    if remainder~="" then return nil,true end
-                    if source and source~=values[1] then return nil,true end
-                    source=values[1]
-                end
-            end
-        end
-    end
-    return source,false
-end
-
-local function xhtml_first_heading(xhtml)
-    local tag,attrs,inner=tostring(xhtml or ""):match("<([hH][1-6])([^>]*)>(.-)</%1%s*>")
-    if not tag then return nil end
-    return "<"..tag..attrs..">"..inner.."</"..tag..">"
-end
-
 local function image_is_font_reference(value)
     local clean=image_trim(value):lower():gsub("[?#].*$", "")
     return clean:match("%.woff2?$") ~= nil
@@ -577,8 +496,6 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         optional_dropped=0,stale_dropped=0,embedded=0,fonts_skipped=0,
     }
     local text_length = readable_text_length(xhtml)
-    local active_background,background_ambiguous=css_body_background_source(xhtml,css)
-    local source_heading=xhtml_first_heading(xhtml)
 
     -- WeRead chapter CSS may reference remote web fonts. Fonts are presentation
     -- resources, not正文 images: a dead font CDN must never make a chapter
@@ -658,49 +575,15 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         return href
     end
 
-    local function resolve_source(source, prefix, allow_web_resource)
+    local function resolve_source(source, prefix)
         local clean=image_trim(source)
         if clean=="" or clean:sub(1,1)=="#" or clean:lower():match("^data:image/") then return nil,nil end
         local mapped=image_map_get(source_map,clean)
         local href=mapped and normalize_asset_href(mapped) or nil
         local remote_url=image_remote_url(clean)
-        if not remote_url and allow_web_resource then
-            remote_url=image_weread_resource_url(clean,state)
-        end
         if not href and remote_url then href=download_remote(remote_url) end
         if href and href~="" then return tostring(prefix or "")..href,href end
         return nil,nil,remote_url~=nil
-    end
-
-    -- Some EPUB part/divider pages contain only whitespace and paint their
-    -- artwork through a body-class background in the shared stylesheet. Turn
-    -- that one active background into an ordinary EPUB image; otherwise the
-    -- unrelated shared CSS references can be discarded and leave a blank page.
-    if text_length==0 and source_heading and active_background and not background_ambiguous then
-        local background=active_background
-        summary.discovered=summary.discovered+1
-        summary.required_discovered=summary.required_discovered+1
-        local mapped=image_map_get(source_map,background)
-        local remote=image_remote_url(background)
-        local trusted=mapped~=nil or remote==nil or image_is_safe_weread_url(remote)
-        local _,href
-        if trusted then _,href=resolve_source(background,"",true) end
-        if href then
-            summary.localized=summary.localized+1
-            summary.required_localized=summary.required_localized+1
-            local page='<div class="miu-image-only-title-marker">'..source_heading.."</div>"
-                ..image_only_xhtml({{href=href}})
-            return page,assets,summary,[[
-.miu-image-only-title-marker { display: none !important; }
-.miu-image-only-page { text-align: center; }
-.miu-image-only-item { margin: 0; }
-.miu-image-only-item img { display: inline-block; max-width: 100%; height: auto; }
-]]
-        end
-        summary.missing=summary.missing+1
-        summary.required_missing=summary.required_missing+1
-        logger.warn("[MiuRead][Reader] body background image unresolved","src=",tostring(background))
-        return xhtml,assets,summary,css or ""
     end
 
     -- EPUBs often use <picture><source srcset=...><img ...></picture>.
@@ -746,7 +629,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         summary.discovered=summary.discovered+1
         summary.required_discovered=summary.required_discovered+1
 
-        local local_src,href,was_remote = resolve_source(clean_source,"../",true)
+        local local_src,href,was_remote = resolve_source(clean_source,"../")
         if local_src then
             used_local_src[href] = true
             summary.localized = summary.localized + 1
@@ -776,7 +659,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         end
         summary.discovered=summary.discovered+1
         summary.required_discovered=summary.required_discovered+1
-        local local_src,href,was_remote=resolve_source(clean,"../",true)
+        local local_src,href,was_remote=resolve_source(clean,"../")
         if local_src then
             used_local_src[href]=true
             summary.localized=summary.localized+1
@@ -796,7 +679,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
 
     -- Some illustrated books place images in inline or chapter CSS rather than
     -- img tags. Resolve url(...) against the same TAR/remote asset map.
-    local function localize_css_urls(value,prefix,relative_source)
+    local function localize_css_urls(value,prefix)
         return tostring(value or ""):gsub("url%s*%(%s*([\\\"']?)(.-)%1%s*%)",function(_,source)
             local clean=image_trim(source)
             if clean=="" or clean:sub(1,1)=="#" then
@@ -813,8 +696,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
                 return "url("..tostring(source or "")..")"
             end
             summary.discovered=summary.discovered+1
-            local allow_web_resource=relative_source~=nil and clean==relative_source
-            local local_src,href,was_remote=resolve_source(clean,prefix,allow_web_resource)
+            local local_src,href,was_remote=resolve_source(clean,prefix)
             if local_src then
                 used_local_src[href]=true
                 summary.localized=summary.localized+1
@@ -835,9 +717,9 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         end)
     end
     xhtml=xhtml:gsub("([sS][tT][yY][lL][eE]%s*=%s*)([\\\"'])(.-)%2",function(prefix,quote,value)
-        return prefix..quote..localize_css_urls(value,"../",nil)..quote
+        return prefix..quote..localize_css_urls(value,"../")..quote
     end)
-    local localized_css=localize_css_urls(css or "","",nil)
+    local localized_css=localize_css_urls(css or "","")
 
     -- Some books contain valid TAR assets whose internal names no longer match
     -- the HTML paths. When the remaining counts match exactly, map them by order
@@ -1101,8 +983,6 @@ function Reader:_epub_once(book, chapter, opt, state)
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
     state = state or self:state(id, uid)
-    state.image_resource_book_id=chapter._miuread_resource_book_ambiguous and nil
-        or tostring(chapter._miuread_resource_book_id or id)
 
     local a = self:shard("/web/book/chapter/e_0", id, uid, state.psvts, false)
     if a:match("^%s*{") and a:find('"bookId"', 1, true) then
