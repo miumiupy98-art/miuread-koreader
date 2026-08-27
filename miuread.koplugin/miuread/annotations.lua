@@ -771,7 +771,12 @@ local function render_text_token(token, marks, data)
                 end
                 local mark_class = Thoughts.mark_class(active.key)
                 local display_class = active.thought and "miu-thought-mark" or "miu-inline-mark"
-                out[#out + 1] = '<span class="' .. display_class .. ' ' .. mark_class .. '" data-miu-range="' .. active.key .. '">'
+                -- id 与 <a href="#miuthought-..."> 完全一致：让 cre 引擎能解析出
+                -- 有效锚点。无触摸设备（Kindle 3）用 Tab+Press 激活链接时走
+                -- KOReader 默认链接处理，若文档里没有对应 id 会被判定为
+                -- "Invalid or external link"；有 id 后即为合法内部链接。
+                out[#out + 1] = '<span id="' .. Thoughts.anchor(data.book_id, data.chapter_uid, active.key)
+                    .. '" class="' .. display_class .. ' ' .. mark_class .. '" data-miu-range="' .. active.key .. '">'
             end
         end
         out[#out + 1] = unit
