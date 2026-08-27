@@ -762,6 +762,11 @@ function Plugin:init()
         self:_install_marks_getCssText_wrapper(self.ui.styletweak)
         self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
     end
+    -- 想法链接拦截（设备无关）：Kindle 3 无触摸，tap touch zone 不生效，
+    -- 必须靠包装 ReaderLink:onGotoLink 覆盖键盘 Tab+Press 激活路径。这里
+    -- 提前装好，避免等 sync 识别；非带想法的书没有 miuthought 链接，
+    -- 包装零副作用（全部走原逻辑）。
+    self:_install_thought_link_guard()
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._download_ui_yield_path="/tmp/miuread-download-ui-yield.until"
@@ -24878,6 +24883,14 @@ end
 function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
+    if self._thought_link_guard and self.ui and self.ui.link then
+        local link_mod=self.ui.link
+        local original=rawget(link_mod,"_miuread_original_onGotoLink")
+        if type(original)=="function" then link_mod.onGotoLink=original end
+        link_mod._miuread_original_onGotoLink=nil
+        self._thought_link_guard=nil
+        logger.info("[MiuRead][ThoughtPopup] link guard removed")
+    end
 end
 function Plugin:_thought_font_size(value)
     -- The native comment popup uses this same final size for layout metrics and
@@ -25271,8 +25284,48 @@ function Plugin:_on_thought_tap(ges)
     if GestureBridge.dispatch(ges) then return true end
     return false
 end
+function Plugin:_install_thought_link_guard()
+    -- Kindle 3 等无触摸设备没有 tap 手势，想法链接的点击拦截（touch zone）
+    -- 完全不生效；Tab 选中链接 + Press 激活会走 ReaderLink:onGotoLink。
+    -- 触摸设备的 tap_link、滑动跟随链接最终也汇聚到 onGotoLink，因此包装
+    -- 这一个方法即可覆盖全部激活路径（键盘/触摸/滑动），设备无关。
+    -- 拦截 #miuthought 想法链接并打开评论弹窗；其他链接原样交给 KOReader。
+    -- 幂等：每个 ReaderUI 有独立的 ReaderLink 实例，重复安装直接返回。
+    local ui=self.ui
+    local link_mod=ui and ui.link or nil
+    if not link_mod or type(link_mod.onGotoLink)~="function" then return false end
+    if rawget(link_mod,"_miuread_original_onGotoLink")~=nil then return true end
+    local original=link_mod.onGotoLink
+    link_mod._miuread_original_onGotoLink=original
+    link_mod.onGotoLink=function(self2,link_obj,...)
+        if link_obj then
+            local href=extract_thought_href(link_obj,{},0)
+            if not href then
+                -- 兜底：个别 crengine 版本只暴露目标 xpointer，扫描字符串字段
+                for _,v in pairs(link_obj) do
+                    if type(v)=="string" then
+                        local found=tostring(v):match("(#?miuthought%-[%x%.]+)")
+                        if found then href=found; break end
+                    end
+                end
+            end
+            if href and Thoughts.parse_href(href) then
+                return self:_show_thought_href(href)
+            end
+        end
+        return original(self2,link_obj,...)
+    end
+    self._thought_link_guard=true
+    logger.info("[MiuRead][ThoughtPopup] link guard installed (keyboard/non-touch path)")
+    return true
+end
+
 function Plugin:_setup_thought_tap()
-    if self._thought_tap_setup or not self.ui or not self.ui.registerTouchZones then return end
+    if self._thought_tap_setup or not self.ui then return end
+    -- 设备无关：无触摸设备（Kindle 3）没有 tap 手势，靠包装 onGotoLink
+    -- 拦截键盘（Tab+Press）激活的想法链接；触摸设备也装一份作兜底。
+    self:_install_thought_link_guard()
+    if not self.ui.registerTouchZones then return end
     local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
     self.ui:registerTouchZones({{id="miuread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
     self._thought_tap_setup=true
