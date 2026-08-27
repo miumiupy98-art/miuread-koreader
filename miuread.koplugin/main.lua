@@ -9179,6 +9179,7 @@ function Plugin:_show_home_search_popup(anchor)
             {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
             {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
             {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
+            {icon="bookmark",label="评论收藏",detail="离线查看已收藏的微信读书评论",callback=function() self:show_thought_favorites() end},
         },
     }
 end
@@ -9341,6 +9342,7 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
         {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
         {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
+        {icon="bookmark",label="评论收藏",detail="离线查看已收藏评论",callback=function() self:show_thought_favorites() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
         {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
         {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
@@ -24930,6 +24932,211 @@ function Plugin:_schedule_thought_prewarm()
     UIManager:scheduleIn(math.max(1.8,tonumber(Config.THOUGHT_PREWARM_DELAY) or 2.8),task)
 end
 
+function Plugin:_thought_chapter_title_from_rows(rows, wanted_uid)
+    wanted_uid=tostring(wanted_uid or "")
+    if wanted_uid=="" or type(rows)~="table" then return "" end
+    for _,chapter in ipairs(rows) do
+        if type(chapter)=="table" then
+            local uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or chapter.chapterId or "")
+            if uid==wanted_uid then
+                return U.trim(tostring(chapter.title or chapter.name or chapter.chapterTitle or ""))
+            end
+        end
+    end
+    return ""
+end
+
+function Plugin:_thought_favorite_context(info)
+    info=type(info)=="table" and info or {}
+    local book_id=tostring(info.book_id or "")
+    local chapter_uid=tostring(info.chapter_uid or "")
+    local book=self.store and self.store:book(book_id) or nil
+    local current=self:_current_book_record()
+    if current and current.book and tostring(current.book.book_id or current.book.bookId or "")==book_id then
+        book=current.book
+    end
+    book=type(book)=="table" and book or {}
+    local chapter_title=""
+    if current and current.record then
+        chapter_title=self:_thought_chapter_title_from_rows(current.record.chapter_map,chapter_uid)
+    end
+    if chapter_title=="" then chapter_title=self:_thought_chapter_title_from_rows(book.catalog,chapter_uid) end
+    if chapter_title=="" and self.sync and type(self.sync.chapter_catalog_context)=="function" then
+        local ok,ctx=pcall(self.sync.chapter_catalog_context,self.sync,current)
+        if ok and type(ctx)=="table" then
+            chapter_title=self:_thought_chapter_title_from_rows(ctx.chapters,chapter_uid)
+        end
+    end
+    return {
+        book_id=book_id,
+        book_title=U.trim(tostring(book.title or book.name or "")),
+        book_author=U.trim(tostring(book.author or "")),
+        chapter_uid=chapter_uid,
+        chapter_title=chapter_title,
+        range_key=tostring(info.range or ""),
+    }
+end
+
+function Plugin:_thought_favorite_row(context,comment,source_text)
+    context=type(context)=="table" and context or {}
+    comment=type(comment)=="table" and comment or {}
+    return {
+        book_id=tostring(context.book_id or ""),
+        book_title=tostring(context.book_title or ""),
+        book_author=tostring(context.book_author or ""),
+        chapter_uid=tostring(context.chapter_uid or ""),
+        chapter_title=tostring(context.chapter_title or ""),
+        range_key=tostring(context.range_key or ""),
+        review_id=tostring(comment.review_id or ""),
+        source_text=tostring(source_text or ""),
+        comment_author=tostring(comment.author or ""),
+        comment_content=tostring(comment.content or ""),
+        likes=tonumber(comment.likes or 0) or 0,
+        comment_created=tonumber(comment.created or 0) or 0,
+    }
+end
+
+function Plugin:_copy_thought_comment(comment,source_text,include_source)
+    comment=type(comment)=="table" and comment or {}
+    local author=U.trim(tostring(comment.author or ""))
+    local content=U.trim(tostring(comment.content or ""))
+    local source=U.trim(tostring(source_text or ""))
+    if content=="" then self:toast("没有可复制的评论",2); return false end
+    local text
+    if include_source==true and source~="" then
+        text="“"..source.."”\n\n"..(author~="" and (author.."：") or "")..content
+    else
+        text=(author~="" and (author.."：") or "")..content
+    end
+    if not (Device and Device.input and type(Device.input.setClipboardText)=="function") then
+        self:toast("当前设备不支持系统剪贴板",2.5)
+        return false
+    end
+    local ok,err=pcall(Device.input.setClipboardText,Device.input,text)
+    if not ok then
+        logger.warn("[MiuRead][ThoughtFavorite] clipboard failed",tostring(err))
+        self:toast("复制失败",2)
+        return false
+    end
+    self:toast(include_source==true and "原文和评论已复制" or "评论已复制",2)
+    return true
+end
+
+function Plugin:_thought_favorite_count()
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local ok,value=pcall(ThoughtFavorites.count,self.store)
+    return ok and (tonumber(value) or 0) or 0
+end
+
+function Plugin:_thought_favorite_callbacks(context)
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local host=self
+    return {
+        is_favorite=function(comment,source_text)
+            local row=host:_thought_favorite_row(context,comment,source_text)
+            local ok,value=pcall(ThoughtFavorites.contains,host.store,row)
+            return ok and value==true
+        end,
+        toggle_favorite=function(comment,source_text)
+            local row=host:_thought_favorite_row(context,comment,source_text)
+            local ok,state_or_err,detail=pcall(ThoughtFavorites.toggle,host.store,row)
+            if not ok then
+                logger.warn("[MiuRead][ThoughtFavorite] toggle failed",tostring(state_or_err))
+                host:toast("收藏保存失败",2.5)
+                return nil
+            end
+            if state_or_err==nil then
+                logger.warn("[MiuRead][ThoughtFavorite] toggle failed",tostring(detail or "unknown"))
+                host:toast("收藏保存失败",2.5)
+                return nil
+            end
+            host:toast(state_or_err and "已收藏到本地" or "已取消收藏",2)
+            return state_or_err==true
+        end,
+        copy=function(comment,source_text,include_source)
+            return host:_copy_thought_comment(comment,source_text,include_source==true)
+        end,
+    }
+end
+
+function Plugin:_open_saved_thought_favorite(favorite)
+    favorite=type(favorite)=="table" and favorite or {}
+    local context={
+        book_id=tostring(favorite.book_id or ""),
+        book_title=tostring(favorite.book_title or ""),
+        book_author=tostring(favorite.book_author or ""),
+        chapter_uid=tostring(favorite.chapter_uid or ""),
+        chapter_title=tostring(favorite.chapter_title or ""),
+        range_key=tostring(favorite.range_key or ""),
+    }
+    local callbacks=self:_thought_favorite_callbacks(context)
+    local prefs=self.store:preferences().thoughts or {}
+    return ThoughtNativePopup.show{
+        source_text=tostring(favorite.source_text or ""),
+        comments={{
+            author=tostring(favorite.comment_author or "微信读书用户"),
+            content=tostring(favorite.comment_content or ""),
+            likes=tonumber(favorite.likes or 0) or 0,
+            review_id=tostring(favorite.review_id or ""),
+            created=tonumber(favorite.comment_created or 0) or 0,
+        }},
+        cache_key="favorite|"..tostring(favorite.favorite_id or ""),
+        font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
+        font_name=self:_thought_font_name(prefs),
+        width_ratio=tonumber(prefs.width_ratio) or 0.91,
+        height_ratio=tonumber(prefs.height_ratio) or 0.55,
+        is_favorite_callback=callbacks.is_favorite,
+        toggle_favorite_callback=callbacks.toggle_favorite,
+        copy_callback=callbacks.copy,
+        on_interact=function() self:_mark_reader_busy(15) end,
+        on_error=function() self:info("收藏评论暂时无法显示。") end,
+    }
+end
+
+function Plugin:show_thought_favorites(book_id)
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local rows,err=ThoughtFavorites.list(self.store,{book_id=book_id,limit=300})
+    if not rows then self:info("本地收藏暂时无法读取：\n"..U.first_line(err,120)); return end
+    if #rows==0 then
+        self:info(book_id and "这本书还没有收藏评论。" or "还没有收藏评论。\n\n阅读时打开评论，点击“收藏”即可保存到本地。")
+        return
+    end
+    local items={}
+    if not book_id then
+        local books=ThoughtFavorites.books(self.store) or {}
+        if #books>1 then
+            items[#items+1]={text="按书籍查看",post_text=tostring(#books).." 本",sub_item_table_func=function()
+                local out={}
+                for _,book in ipairs(books) do
+                    local id=tostring(book.book_id or "")
+                    out[#out+1]={
+                        text=U.trim(tostring(book.book_title or ""))~="" and tostring(book.book_title) or "未命名书籍",
+                        post_text=tostring(book.count or 0).." 条",
+                        callback=function() self:show_thought_favorites(id) end,
+                    }
+                end
+                return out
+            end}
+        end
+    end
+    for _,favorite in ipairs(rows) do
+        local saved=favorite
+        local title=U.trim(tostring(saved.book_title or ""))
+        local chapter=U.trim(tostring(saved.chapter_title or ""))
+        local author=U.trim(tostring(saved.comment_author or ""))
+        local preview=U.trim(tostring(saved.comment_content or "")):gsub("%s+"," ")
+        if U.utf8_len(preview)>42 then preview=U.utf8_sub(preview,1,42).."…" end
+        local left=book_id and (chapter~="" and chapter or author) or (title~="" and title or "未命名书籍")
+        local right=book_id and author or (chapter~="" and chapter or author)
+        items[#items+1]={
+            text=preview~="" and (left.." · "..preview) or left,
+            post_text=right,
+            callback=function() self:_open_saved_thought_favorite(saved) end,
+        }
+    end
+    return self:_show_standalone_menu(book_id and "本书评论收藏" or "我的评论收藏",items,{page_size=8})
+end
+
 function Plugin:_close_active_thought_popup(reason)
     local popup=self._thought_popup
     self._thought_popup_generation=(tonumber(self._thought_popup_generation) or 0)+1
@@ -24967,6 +25174,8 @@ function Plugin:_open_thought_info(info,generation)
         local parts_ms=math.floor((monotonic_wall_time()-parts_started)*1000+.5)
         if tostring(source or "")=="" and #(comments or {})==0 then notice="没有想法内容"; return end
         local show_started=monotonic_wall_time()
+        local favorite_context=self:_thought_favorite_context(info)
+        local favorite_callbacks=self:_thought_favorite_callbacks(favorite_context)
         popup=ThoughtNativePopup.show{
             source_text=source,
             comments=comments,
@@ -24978,6 +25187,9 @@ function Plugin:_open_thought_info(info,generation)
             font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.55,
+            is_favorite_callback=favorite_callbacks.is_favorite,
+            toggle_favorite_callback=favorite_callbacks.toggle_favorite,
+            copy_callback=favorite_callbacks.copy,
             on_close=on_close,
             on_interact=function() self:_mark_reader_busy(30) end,
             on_error=function()

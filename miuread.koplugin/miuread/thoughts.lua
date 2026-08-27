@@ -509,7 +509,7 @@ end
 
 function Thoughts.native_parts(group)
     if type(group) ~= "table" then return "", {}, 0 end
-    local source = preview(Thoughts.group_abstract(group), 240)
+    local source = clean_body(Thoughts.group_abstract(group))
     local comments, seen = {}, {}
     for _, item in ipairs(group.texts or {}) do
         local content = clean_body(item.content)
@@ -525,6 +525,7 @@ function Thoughts.native_parts(group)
                     content = content,
                     likes = tonumber(item.likes or 0) or 0,
                     review_id = review_id,
+                    created = tonumber(item.created or 0) or 0,
                 }
             end
         end

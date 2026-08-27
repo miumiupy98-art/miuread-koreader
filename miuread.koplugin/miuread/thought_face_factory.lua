@@ -55,22 +55,58 @@ local function resolve_bundled_font(fontname)
     return nil
 end
 
+local EMOJI_FONT_NAMES = {
+    "NotoEmoji-Regular.ttf",
+    "NotoEmoji-VariableFont_wght.ttf",
+    "NotoColorEmoji.ttf",
+    "Symbola.ttf",
+    "SegoeUIEmoji.ttf",
+    "Segoe UI Emoji.ttf",
+}
+
 function FaceFactory:findEmojiFont()
     if self.emoji_path and file_exists(self.emoji_path) then return self.emoji_path end
 
+    -- Prefer fonts already known to KOReader. This keeps the comment popup
+    -- independent from any other plugin and also respects user-installed fonts.
+    for _, fontname in ipairs(EMOJI_FONT_NAMES) do
+        local resolved = resolve_bundled_font(fontname)
+        if resolved then
+            self.emoji_path = resolved
+            logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
+            return resolved
+        end
+    end
+
     local candidates = {
         "plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf",
-        "plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf",
         "/mnt/us/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf",
-        "/mnt/us/koreader/plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf",
+        "/mnt/us/koreader/fonts/NotoEmoji-Regular.ttf",
         "/mnt/us/fonts/NotoEmoji-Regular.ttf",
+        "/mnt/onboard/.adds/koreader/fonts/NotoEmoji-Regular.ttf",
+        "/mnt/onboard/fonts/NotoEmoji-Regular.ttf",
+        "/sdcard/koreader/fonts/NotoEmoji-Regular.ttf",
+        "/sdcard/fonts/NotoEmoji-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     }
     local ok_ds, DataStorage = pcall(require, "datastorage")
-    if ok_ds and DataStorage and type(DataStorage.getDataDir) == "function" then
-        local data_dir = DataStorage:getDataDir()
-        candidates[#candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf"
-        candidates[#candidates + 1] = data_dir .. "/plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf"
+    if ok_ds and DataStorage then
+        if type(DataStorage.getDataDir) == "function" then
+            local ok_dir, data_dir = pcall(DataStorage.getDataDir, DataStorage)
+            if ok_dir and type(data_dir) == "string" and data_dir ~= "" then
+                candidates[#candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf"
+                candidates[#candidates + 1] = data_dir .. "/fonts/NotoEmoji-Regular.ttf"
+            end
+        end
+        if type(DataStorage.getFullDataDir) == "function" then
+            local ok_dir, data_dir = pcall(DataStorage.getFullDataDir, DataStorage)
+            if ok_dir and type(data_dir) == "string" and data_dir ~= "" then
+                candidates[#candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf"
+                candidates[#candidates + 1] = data_dir .. "/fonts/NotoEmoji-Regular.ttf"
+            end
+        end
     end
 
     for _, path in ipairs(candidates) do
@@ -81,7 +117,26 @@ function FaceFactory:findEmojiFont()
             return resolved
         end
     end
+
+    -- Last chance: some KOReader builds expose user/system font paths without
+    -- a predictable basename. Accept only paths whose names explicitly say
+    -- Emoji, avoiding accidental dependency on unrelated plugin assets.
+    local ok, fonts = pcall(FontList.getFontList, FontList)
+    if ok and type(fonts) == "table" then
+        for _, path in ipairs(fonts) do
+            if type(path) == "string" and path:lower():find("emoji", 1, true) then
+                local resolved = realpath(path)
+                if resolved then
+                    self.emoji_path = resolved
+                    logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
+                    return resolved
+                end
+            end
+        end
+    end
+
     self.emoji_path = nil
+    logger.info("[MiuRead][ThoughtPopup] no dedicated emoji font found; using KOReader symbol fallbacks")
     return nil
 end
 
