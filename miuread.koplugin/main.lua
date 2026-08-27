@@ -752,6 +752,16 @@ function Plugin:init()
     else
         self:_set_navigation_state("native","file manager plugin initialized")
     end
+    -- 划线隐藏：在 ReaderTypeset 首次组装样式（ReadSettings）之前装好
+    -- getCssText 包装器，让隐藏规则进入首帧且与 cre 渲染缓存 key 一致
+    -- （打开书不再整本重排，消除卡顿）。init 在每次 reader 打开时都会
+    -- 执行且早于 ReadSettings；onDocSettingsLoad 与 onReadSettings 再提供
+    -- 兜底（本处无副作用：非 reader 上下文时 self.ui.styletweak 为空）。
+    if self.ui and self.ui.styletweak
+        and type(self.ui.styletweak.getCssText)=="function" then
+        self:_install_marks_getCssText_wrapper(self.ui.styletweak)
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
+    end
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._download_ui_yield_path="/tmp/miuread-download-ui-yield.until"
@@ -13108,6 +13118,31 @@ function Plugin:_annotation_mark_hide_css()
     return ANNOTATION_MARK_HIDE_CSS
 end
 
+function Plugin:_install_marks_getCssText_wrapper(st)
+    -- Wrap the aggregated style-tweak css so any later native re-application
+    -- (style tweak / font changes / chapter switches) keeps our hide rules.
+    -- Must run before ReaderTypeset:onReadSettings assembles the first
+    -- stylesheet of a ReaderUI: then the hidden-mark rules land in the very
+    -- first rendered frame, and the assembled stylesheet matches the cre
+    -- rendering-cache key, so opening a book does not invalidate the cached
+    -- layout (no full re-render -> no lag, no flicker).
+    -- This wrapper lives on the styletweak instance (per ReaderUI) and is
+    -- idempotent; a fresh ReaderUI rebuild gets a fresh styletweak and simply
+    -- re-installs it via onDocSettingsLoad / Plugin:init.
+    if not (st and type(st.getCssText)=="function") then return false end
+    if rawget(st,"_miuread_marks_original_getCssText")~=nil then return true end
+    local original=st.getCssText
+    st._miuread_marks_original_getCssText=original
+    st.getCssText=function(instance)
+        local base=original(instance)
+        local extra=self:_annotation_mark_hide_css()
+        if extra==nil then return base end
+        if base==nil or base=="" then return extra end
+        return base.."\n"..extra
+    end
+    return true
+end
+
 function Plugin:_apply_annotation_mark_style(reason)
     local doc=self.ui and self.ui.document or nil
     if not doc or type(doc.setStyleSheet)~="function" then return false end
@@ -13118,20 +13153,10 @@ function Plugin:_apply_annotation_mark_style(reason)
     local ui=self.ui
     local st=ui.styletweak or nil
     local applied=false
-    if st and type(st.getCssText)=="function" then
-        -- Preferred path: wrap the aggregated style-tweak css so any later
-        -- native re-application (style tweak / font changes) keeps our rules.
-        if rawget(st,"_miuread_marks_original_getCssText")==nil then
-            local original=st.getCssText
-            st._miuread_marks_original_getCssText=original
-            st.getCssText=function(instance)
-                local base=original(instance)
-                local extra=self:_annotation_mark_hide_css()
-                if extra==nil then return base end
-                if base==nil or base=="" then return extra end
-                return base.."\n"..extra
-            end
-        end
+    if self:_install_marks_getCssText_wrapper(st) then
+        -- Preferred path: re-apply via ApplyStyleSheet so the updated rules
+        -- enter the live document. ReaderTypeset:onApplyStyleSheet re-sets the
+        -- stylesheet from typeset.css + styletweak:getCssText() (now wrapped).
         if type(ui.handleEvent)=="function" then
             ui:handleEvent(Event:new("ApplyStyleSheet"))
             applied=true
@@ -25726,12 +25751,33 @@ function Plugin:_reader_rebuild_ready_state()
 end
 
 -- 划线隐藏样式必须在 KOReader 首次应用文档 CSS（ReadSettings 阶段、
--- 文档渲染之前）就挂载好，这样第一帧渲染自带隐藏规则，避免打开书后
--- 再 ApplyStyleSheet 整页重排造成的闪屏。ReaderTypeset 模块注册在插件
--- 之前，其 onReadSettings 一定先执行完（此时样式表已按基础 tweaks 应用），
--- 此处补装包装器并重放样式表即可进入首帧。
+-- 文档渲染之前）就挂载好，这样第一帧渲染自带隐藏规则。更关键的是：
+-- cre 的渲染缓存以"最终样式表内容"为 key，若打开书后再改样式表，
+-- 缓存必然失效并触发整本 full rendering（Kindle 上即卡顿）。因此包装器
+-- 必须在 ReaderTypeset:onReadSettings 组装样式之前安装（onDocSettingsLoad
+-- 与 Plugin:init 双保险），让 typeset 首次应用的样式就含隐藏规则，与
+-- 缓存 key 一致 → 打开书不重排、不闪屏、不卡顿。
 -- 注意：CSS 常量保持在 _annotation_mark_hide_css 函数内部，不要提升到
 -- 文件顶层（顶层局部变量数已逼近 LuaJIT 200 上限，会导致插件无法加载）。
+function Plugin:onDocSettingsLoad()
+    -- DocSettingsLoad 先于 ReadSettings 派发。此时 ReaderUI 模块已创建
+    -- （styletweak 可用）、文档尚未应用样式表；装好包装器后，typeset 在
+    -- ReadSettings 阶段组装出的样式天然包含隐藏规则。
+    local st=self.ui and self.ui.styletweak or nil
+    if not (st and type(st.getCssText)=="function") then
+        -- PDF/KOpt 等非 reflowable 文档没有 styletweak 模块，无样式可挂；
+        -- 保持未知状态，交给 _sync_reader_annotation_mark_style 兜底。
+        self._annotation_mark_style_hidden=nil
+        return false
+    end
+    if self:_install_marks_getCssText_wrapper(st) then
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
+    else
+        self._annotation_mark_style_hidden=nil
+    end
+    return false
+end
+
 function Plugin:onReadSettings()
     local st=self.ui and self.ui.styletweak or nil
     if not (st and type(st.getCssText)=="function") then
@@ -25740,27 +25786,24 @@ function Plugin:onReadSettings()
         self._annotation_mark_style_hidden=nil
         return false
     end
-    if rawget(st,"_miuread_marks_original_getCssText")==nil then
-        local original=st.getCssText
-        st._miuread_marks_original_getCssText=original
-        st.getCssText=function(instance)
-            local base=original(instance)
-            local extra=self:_annotation_mark_hide_css()
-            if extra==nil then return base end
-            if base==nil or base=="" then return extra end
-            return base.."\n"..extra
-        end
+    if rawget(st,"_miuread_marks_original_getCssText")~=nil then
+        -- 包装器已在 DocSettingsLoad / Plugin:init 阶段装好，ReaderTypeset
+        -- 组装样式时已包含隐藏规则：首帧即最终效果，样式与 cre 渲染缓存
+        -- 一致，无需重放（不触发整本重排，也不闪屏）。
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
+        return false
     end
+    -- 兜底：DocSettingsLoad 未派发到本插件（非标准流程）。ReaderTypeset 已
+    -- 用未包装的样式表应用过一遍；这里补装包装器并重放，保证划线隐藏
+    -- 生效。main_css 用 typeset.css（ReaderTypeset:onReadSettings 已赋值，
+    -- 与它实际应用的主样式一致），避免样式被替换成不匹配的默认样式。
+    self:_install_marks_getCssText_wrapper(st)
     local want_hidden=self:_annotation_mark_hide_css()~=nil
     if want_hidden then
-        -- 包装器装好后，把样式表重放一次让隐藏规则进入首帧。此时文档
-        -- 尚未 loadDocument/render，直接重设样式表即可，不发 ApplyStyleSheet
-        -- （其附带的 UpdatePos 会触发不必要的视图动作）。
         local typeset=self.ui.typeset or nil
         local doc=self.ui and self.ui.document or nil
-        if typeset and doc and type(doc.setStyleSheet)=="function" then
-            local base_css=typeset.css or doc.default_css
-            local ok=pcall(doc.setStyleSheet,doc,base_css,st:getCssText())
+        if typeset and doc and type(doc.setStyleSheet)=="function" and typeset.css then
+            local ok=pcall(doc.setStyleSheet,doc,typeset.css,st:getCssText())
             if ok then
                 self._annotation_mark_style_hidden=true
                 return false
