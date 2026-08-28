@@ -862,6 +862,8 @@ function Plugin:init()
     self.api=Api:new(self.http,self.store,self.reader)
     self.mp=MP:new(self.reader,self.http,self.store,self.api)
     self.annotations=Annotations:new(self.api)
+    self.thought_service=require("miuread.thought_service"):new(self.annotations,self.store)
+    self.thought_runtime=require("miuread.thought_runtime"):new(self)
     self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
     do
         self:_annotation_sync_preferences()
@@ -897,6 +899,9 @@ function Plugin:init()
     -- Current-chapter thought prewarming is read-only and optional. Keep it on
     -- its own worker so SQLite cold opens never compete with taps or sync.
     self.thought_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
+    self.thought_fetch_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    self._thought_fetch_generation=0
+    self._thought_next_prefetch_key=nil
     self._thought_prewarm_task=nil
     self._thought_prewarm_generation=0
     self._thought_prewarm_key=nil
@@ -13128,9 +13133,11 @@ function Plugin:_set_thoughts_enabled(enabled)
     local variant=tostring(current and (current.variant or record.variant) or "")
     local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
-        if annotation_book then self:_setup_thought_tap() end
+        if annotation_book or self:_reader_session_is_weread() then self:_setup_thought_tap() end
+        if not annotation_book then self:_schedule_runtime_thought_refresh(.25,"comments enabled") end
         if changed then self:toast("阅读评论已开启",1.5) end
     else
+        if self.thought_runtime then self.thought_runtime:clear() end
         self:_close_active_thought_popup("comments disabled")
         -- Keep the MiuRead internal-link guard installed. Hiding comments must
         -- not hand #miuthought links back to KOReader as invalid external links.
@@ -13354,6 +13361,308 @@ function Plugin:_show_reader_comment_settings(back_callback)
     return true
 end
 
+
+function Plugin:_thought_prefetch_next_enabled()
+    return (self.store:preferences().thoughts or {}).prefetch_next~=false
+end
+
+function Plugin:_thought_prefetch_next_label()
+    return self:_thought_prefetch_next_enabled() and "已开启" or "已关闭"
+end
+
+function Plugin:_toggle_thought_prefetch_next()
+    local p=self.store:preferences(); p.thoughts=type(p.thoughts)=="table" and p.thoughts or {}
+    p.thoughts.prefetch_next=p.thoughts.prefetch_next==false
+    self:_save_ui_preferences(p,"thought_prefetch_next")
+    self:toast(p.thoughts.prefetch_next and "下一章评论预加载已开启" or "下一章评论预加载已关闭",1.5)
+    return true
+end
+
+function Plugin:_thought_current_scope()
+    return self:_current_thought_favorite_scope()
+end
+
+function Plugin:_thought_current_catalog()
+    local current=self:_current_book_record()
+    if not (current and self.sync and type(self.sync.chapter_catalog_context)=="function") then return {} end
+    local ok,ctx=pcall(self.sync.chapter_catalog_context,self.sync,current)
+    return ok and type(ctx)=="table" and type(ctx.chapters)=="table" and ctx.chapters or {}
+end
+
+function Plugin:_thought_cache_status(scope)
+    scope=type(scope)=="table" and scope or self:_thought_current_scope()
+    if not (self.thought_service and scope.book_id~="" and scope.chapter_uid~="") then
+        return {known=false,status="missing",groups=0,comments=0,complete=false}
+    end
+    local ok,value=pcall(self.thought_service.chapter_status,self.thought_service,scope.book_id,scope.chapter_uid)
+    return ok and type(value)=="table" and value or {known=false,status="error",groups=0,comments=0,complete=false}
+end
+
+function Plugin:_thought_cache_status_label(scope)
+    local status=self:_thought_cache_status(scope)
+    if status.known~=true then return "尚未获取" end
+    local suffix=tostring(tonumber(status.comments or 0) or 0).." 条"
+    if status.complete==true then return "已缓存 · "..suffix end
+    return "已缓存 · "..suffix.." · 待补全"
+end
+
+function Plugin:_schedule_runtime_thought_refresh(delay,reason)
+    self._thought_runtime_generation=(tonumber(self._thought_runtime_generation) or 0)+1
+    local generation=self._thought_runtime_generation
+    if self._thought_runtime_task then UIManager:unschedule(self._thought_runtime_task) end
+    local task
+    task=function()
+        if self._thought_runtime_task~=task or generation~=self._thought_runtime_generation then return end
+        self._thought_runtime_task=nil
+        if not self:_thoughts_enabled() or not self:_active_reader_ui() or not self:_reader_session_is_weread() then
+            if self.thought_runtime then self.thought_runtime:clear() end
+            return
+        end
+        if self:_current_book_supports_miuread_marks() then
+            if self.thought_runtime then self.thought_runtime:clear(false) end
+            return
+        end
+        -- Pure EPUBs have no embedded #miuthought links, so their runtime
+        -- underline layer also needs the shared full-screen tap dispatcher.
+        -- ReaderReady deliberately tears this dispatcher down before cloud
+        -- identity settles; reinstalling here makes late sync and rebuilds safe.
+        self:_setup_thought_tap()
+        if RuntimePressure.active() or (tonumber(self._reader_busy_until) or 0)>os.time() then
+            self:_schedule_runtime_thought_refresh(1.2,"reader busy")
+            return
+        end
+        local scope=self:_thought_current_scope()
+        if scope.book_id=="" or scope.chapter_uid=="" then return end
+        -- XPointer mappings remain valid while paging within the same chapter.
+        -- Avoid reopening SQLite and re-running fulltext searches on every page.
+        if self.thought_runtime and self.thought_runtime:is_scope(scope.book_id,scope.chapter_uid) then return end
+        local groups=select(1,Thoughts.load(self.store,scope.book_id,scope.chapter_uid))
+        if type(groups)~="table" or #groups==0 then
+            if self.thought_runtime then self.thought_runtime:clear() end
+            return
+        end
+        local ok,result=pcall(self.thought_runtime.map_current,self.thought_runtime,
+            scope.book_id,scope.chapter_uid,groups,{max_groups=Config.THOUGHT_RUNTIME_MAX_GROUPS})
+        if not ok then
+            logger.warn("[MiuRead][ThoughtRuntime] refresh failed",tostring(result))
+        else
+            logger.info("[MiuRead][ThoughtRuntime] refresh", "reason=",tostring(reason or "idle"),
+                "chapter=",scope.chapter_uid,"mapped=",tostring(result and result.mapped or 0))
+        end
+    end
+    self._thought_runtime_task=task
+    UIManager:scheduleIn(math.max(.2,tonumber(delay) or .8),task)
+end
+
+function Plugin:_fetch_thought_chapter(scope,force,options)
+    options=type(options)=="table" and options or {}
+    scope=type(scope)=="table" and scope or self:_thought_current_scope()
+    if scope.book_id=="" or scope.chapter_uid=="" then
+        if options.quiet~=true then self:toast("当前章节无法识别",2) end
+        return false
+    end
+    if not self.thought_fetch_async or not self.thought_fetch_async:available() then
+        if options.quiet~=true then self:toast("当前设备暂时无法启动评论任务",2) end
+        return false
+    end
+    if self.thought_fetch_async:busy() then
+        if options.quiet~=true then self:toast("已有评论获取任务正在进行",2) end
+        return false
+    end
+    self._thought_fetch_generation=(tonumber(self._thought_fetch_generation) or 0)+1
+    local generation=self._thought_fetch_generation
+    local service=self.thought_service
+    local book_id,chapter_uid=scope.book_id,scope.chapter_uid
+    if options.quiet~=true then self:status_toast("正在获取评论",scope.chapter_title~="" and scope.chapter_title or "当前章节",2.5) end
+    local started,err=self.thought_fetch_async:run("thought-fetch-chapter",function()
+        local value,fetch_err,detail=service:fetch_chapter(book_id,chapter_uid,{force_refresh=force==true})
+        if not value then error(tostring(fetch_err or (detail and detail.error_kind) or "评论获取失败")) end
+        return value
+    end,function(result)
+        if generation~=self._thought_fetch_generation then return end
+        if not result or result.ok~=true or type(result.value)~="table" then
+            logger.warn("[MiuRead][ThoughtFetch] chapter failed","book=",book_id,"chapter=",chapter_uid,
+                "error=",tostring(result and result.error or "unknown"))
+            if options.quiet~=true then self:toast("评论获取失败："..U.first_line(result and result.error or "未知原因",70),3) end
+            if options.done then options.done(false,result and result.error) end
+            return
+        end
+        Thoughts.clear_memory_cache()
+        self._thought_prewarm_key=nil
+        local value=result.value
+        if options.quiet~=true then
+            self:toast((force and "本章评论已更新 · " or "本章评论已获取 · ")..tostring(value.comments or 0).." 条",2)
+        end
+        self:_schedule_thought_prewarm()
+        if self.thought_runtime then self.thought_runtime:clear(false) end
+        self:_schedule_runtime_thought_refresh(.25,"chapter fetched")
+        if options.prefetch_next~=false then self:_schedule_next_thought_prefetch(1.5) end
+        if options.done then options.done(true,value) end
+    end,90)
+    if not started then
+        if options.quiet~=true then self:toast("无法开始评论获取："..tostring(err or "未知原因"),2.5) end
+        return false
+    end
+    return true
+end
+
+function Plugin:_fetch_current_thoughts(force,reopen)
+    return self:_fetch_thought_chapter(self:_thought_current_scope(),force,{done=function() if reopen then reopen() end end})
+end
+
+function Plugin:_next_thought_scope()
+    local scope=self:_thought_current_scope()
+    if scope.book_id=="" or scope.chapter_uid=="" then return nil end
+    local chapters=self:_thought_current_catalog()
+    local current_index
+    for index,ch in ipairs(chapters) do
+        local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
+        if uid==scope.chapter_uid then current_index=index; break end
+    end
+    if not current_index then return nil end
+    for index=current_index+1,#chapters do
+        local ch=chapters[index]
+        local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
+        if uid~="" and ch.structural~=true then
+            return {book_id=scope.book_id,book_title=scope.book_title,chapter_uid=uid,
+                chapter_title=U.trim(tostring(ch.title or ch.name or ""))}
+        end
+    end
+end
+
+function Plugin:_schedule_next_thought_prefetch(delay)
+    if not self:_thought_prefetch_next_enabled() or not self:_thoughts_enabled() then return false end
+    local next_scope=self:_next_thought_scope(); if not next_scope then return false end
+    local key=next_scope.book_id.."|"..next_scope.chapter_uid
+    local status=self:_thought_cache_status(next_scope)
+    if status.complete==true or self._thought_next_prefetch_key==key then return false end
+    self._thought_next_prefetch_generation=(tonumber(self._thought_next_prefetch_generation) or 0)+1
+    local generation=self._thought_next_prefetch_generation
+    if self._thought_next_prefetch_task then UIManager:unschedule(self._thought_next_prefetch_task) end
+    local task
+    task=function()
+        if self._thought_next_prefetch_task~=task or generation~=self._thought_next_prefetch_generation then return end
+        self._thought_next_prefetch_task=nil
+        if not self:_thought_prefetch_next_enabled() or RuntimePressure.active() or not self:_reader_background_idle()
+            or self._miuread_suspended==true or HOME_SESSION.suspended==true or PowerState.state()~="NORMAL"
+            or (self.download_task and self.download_task:busy()) then return end
+        self._thought_next_prefetch_key=key
+        local started=self:_fetch_thought_chapter(next_scope,false,{quiet=true,prefetch_next=false,done=function(ok,value)
+            if not ok then self._thought_next_prefetch_key=nil
+            else logger.info("[MiuRead][ThoughtPrefetch] next chapter ready","book=",next_scope.book_id,
+                "chapter=",next_scope.chapter_uid,"comments=",tostring(value and value.comments or 0)) end
+        end})
+        if started~=true then self._thought_next_prefetch_key=nil end
+    end
+    self._thought_next_prefetch_task=task
+    UIManager:scheduleIn(math.max(1,tonumber(delay) or tonumber(Config.THOUGHT_NEXT_PREFETCH_DELAY) or 8),task)
+    return true
+end
+
+function Plugin:_fetch_book_thoughts(reopen)
+    local scope=self:_thought_current_scope(); local chapters=self:_thought_current_catalog()
+    if scope.book_id=="" or #chapters==0 then self:toast("暂时无法取得完整章节目录",2.5); return false end
+    if not self.thought_fetch_async or self.thought_fetch_async:busy() then self:toast("已有评论获取任务正在进行",2); return false end
+    local service=self.thought_service; local book_id=scope.book_id; local targets={}
+    for _,ch in ipairs(chapters) do
+        local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
+        if uid~="" and ch.structural~=true then targets[#targets+1]={uid=uid,title=tostring(ch.title or "")} end
+    end
+    self._thought_fetch_generation=(tonumber(self._thought_fetch_generation) or 0)+1
+    local generation=self._thought_fetch_generation
+    self:status_toast("正在获取整本评论","已有缓存章节会自动跳过",3)
+    local started,err=self.thought_fetch_async:run("thought-fetch-book",function()
+        local summary={total=#targets,processed=0,fetched=0,skipped=0,partial=0,failed=0,comments=0,stopped_reason=""}
+        local consecutive_failures=0
+        for _,ch in ipairs(targets) do
+            local state=service:chapter_status(book_id,ch.uid)
+            if state.complete==true then
+                summary.skipped=summary.skipped+1
+                consecutive_failures=0
+            else
+                local value,fetch_err,detail=service:fetch_chapter(book_id,ch.uid,{force_refresh=false})
+                local error_kind=tostring((value and value.error_kind) or (detail and detail.error_kind) or "")
+                if value and value.complete==true then
+                    summary.fetched=summary.fetched+1
+                    summary.comments=summary.comments+(tonumber(value.comments) or 0)
+                    consecutive_failures=0
+                elseif value then
+                    -- Partial data is still kept transactionally, but do not
+                    -- describe this chapter as complete. A later run resumes it.
+                    summary.partial=summary.partial+1
+                    summary.comments=summary.comments+(tonumber(value.comments) or 0)
+                    consecutive_failures=consecutive_failures+1
+                else
+                    summary.failed=summary.failed+1
+                    consecutive_failures=consecutive_failures+1
+                    summary.last_error=tostring(fetch_err or "评论获取失败")
+                end
+                if error_kind=="authentication" or error_kind=="forbidden" or error_kind=="rate_limit"
+                    or error_kind=="network" or error_kind=="server" then
+                    summary.stopped_reason=error_kind
+                    summary.processed=summary.processed+1
+                    break
+                end
+                if consecutive_failures>=3 then
+                    summary.stopped_reason="consecutive_failures"
+                    summary.processed=summary.processed+1
+                    break
+                end
+            end
+            summary.processed=summary.processed+1
+        end
+        return summary
+    end,function(result)
+        if generation~=self._thought_fetch_generation then return end
+        if not result or result.ok~=true then
+            self:toast("整本评论获取未完成："..U.first_line(result and result.error or "未知原因",70),3)
+        else
+            local v=result.value or {}
+            Thoughts.clear_memory_cache(); self._thought_prewarm_key=nil
+            local stopped=tostring(v.stopped_reason or "")~=""
+            local prefix=stopped and "整本评论已暂停" or "整本评论完成"
+            local detail=prefix.." · 完成 "..tostring(v.fetched or 0).." 章 · 跳过 "..tostring(v.skipped or 0).." 章"
+            if tonumber(v.partial or 0)>0 or tonumber(v.failed or 0)>0 then
+                detail=detail.." · 待补 "..tostring((tonumber(v.partial or 0) or 0)+(tonumber(v.failed or 0) or 0)).." 章"
+            end
+            self:toast(detail,3)
+            if self.thought_runtime then self.thought_runtime:clear(false) end
+            self:_schedule_runtime_thought_refresh(.3,"book fetched")
+        end
+        if reopen then reopen() end
+    end,600)
+    if not started then self:toast("无法开始整本评论任务："..tostring(err or "未知原因"),2.5); return false end
+    return true
+end
+
+function Plugin:_show_thought_cache_manager(back_callback)
+    local function reopen() self:_show_thought_cache_manager(back_callback) end
+    ReaderSettingsDialog.show{
+        title="评论缓存",
+        subtitle="删除缓存不会删除已收藏的评论",
+        on_back=back_callback,
+        on_home=function() return self:_reader_home_action("reader surface") end,
+        sections=function()
+            local scope=self:_thought_current_scope(); local current=self:_thought_cache_status(scope)
+            local chapters=self:_thought_current_catalog(); local ids={}
+            for _,ch in ipairs(chapters) do local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or ""); if uid~="" then ids[#ids+1]=uid end end
+            local book=self.thought_service and self.thought_service:book_status(scope.book_id,ids) or {cached=0,chapters=#ids,comments=0}
+            return {{title="当前书籍",rows={
+                {label="本章评论缓存",value=current.known and (tostring(current.comments or 0).." 条") or "无缓存",enabled=current.known==true,callback=function()
+                    UIManager:show(ConfirmBox:new{text="删除本章评论缓存？\n\n已收藏的评论不会删除。",ok_text="删除缓存",cancel_text="取消",ok_callback=function()
+                        self.thought_service:delete_chapter(scope.book_id,scope.chapter_uid); Thoughts.clear_memory_cache(); if self.thought_runtime then self.thought_runtime:clear() end; self:toast("本章评论缓存已删除",2); reopen()
+                    end})
+                end},
+                {label="本书评论缓存",value=tostring(book.cached or 0).." / "..tostring(book.chapters or #ids).." 章 · "..tostring(book.comments or 0).." 条",enabled=scope.book_id~="",callback=function()
+                    UIManager:show(ConfirmBox:new{text="删除本书评论缓存？\n\n需要时可以重新获取；已收藏的评论不会删除。",ok_text="删除缓存",cancel_text="取消",ok_callback=function()
+                        self.thought_service:delete_book(scope.book_id); Thoughts.clear_memory_cache(); if self.thought_runtime then self.thought_runtime:clear() end; self:toast("本书评论缓存已删除",2); reopen()
+                    end})
+                end},
+            }}}
+        end,
+    }
+end
+
 function Plugin:_show_reader_comment_center(back_callback)
     local function reopen() self:_show_reader_comment_center(back_callback) end
     ReaderSettingsDialog.show{
@@ -13372,40 +13681,58 @@ function Plugin:_show_reader_comment_center(back_callback)
             local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
             local chapter_count=(scope.book_id~="" and scope.chapter_uid~="")
                 and self:_thought_favorite_count({book_id=scope.book_id,chapter_uid=scope.chapter_uid}) or 0
-            local content_rows={
+            local display_rows={
+                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thoughts_enabled()
+                    self:_schedule_runtime_thought_refresh(.25,"comments toggled")
+                end},
+                {icon="settings",label="评论显示设置",value="字号 "..self:_thought_font_size_label(),
+                    arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
+            }
+            local status=self:_thought_cache_status(scope)
+            local fetch_rows={
+                {icon="comment",label=status.known and "更新本章评论" or "获取本章评论",
+                    value=scope.chapter_uid~="" and self:_thought_cache_status_label(scope) or "当前章节不可识别",
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",callback=function()
+                        self:_fetch_current_thoughts(status.known==true,reopen)
+                    end},
+                {icon="download",label="下一章评论预加载",value=self:_thought_prefetch_next_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thought_prefetch_next()
+                    if self:_thought_prefetch_next_enabled() then self:_schedule_next_thought_prefetch(1.0) end
+                end},
+                {icon="download",label="获取整本评论",value="已有缓存章节自动跳过",enabled=scope.book_id~="",callback=function()
+                    self:_fetch_book_thoughts(reopen)
+                end},
+            }
+            local favorite_rows={
                 {icon="bookmark",label="本章评论收藏",value=scope.chapter_uid~="" and (tostring(chapter_count).." 条") or "当前章节不可识别",
                     enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
-                        self:show_thought_favorites{
-                            book_id=scope.book_id,chapter_uid=scope.chapter_uid,scope_label="本章评论收藏",
-                            reader_context=true,back_callback=reopen,
-                        }
+                        self:show_thought_favorites{book_id=scope.book_id,chapter_uid=scope.chapter_uid,scope_label="本章评论收藏",reader_context=true,back_callback=reopen}
                     end},
                 {icon="current-book",label="本书评论收藏",value=scope.book_id~="" and (tostring(book_count).." 条") or "当前书籍不可识别",
                     enabled=scope.book_id~="",arrow=true,callback=function()
-                        self:show_thought_favorites{
-                            book_id=scope.book_id,scope_label="本书评论收藏",
-                            reader_context=true,back_callback=reopen,
-                        }
+                        self:show_thought_favorites{book_id=scope.book_id,scope_label="本书评论收藏",reader_context=true,back_callback=reopen}
                     end},
                 {icon="bookmark",label="全部评论收藏",value=tostring(total).." 条",enabled=total>0,arrow=true,callback=function()
                     self:show_thought_favorites{reader_context=true,scope_label="全部评论收藏",back_callback=reopen}
                 end},
                 {icon="search",label="搜索收藏评论",value=total>0 and "评论、原文、作者、书名" or "暂无收藏",
-                    enabled=total>0,arrow=true,callback=function()
-                        self:_search_thought_favorites{reader_context=true,back_callback=reopen}
-                    end},
+                    enabled=total>0,arrow=true,callback=function() self:_search_thought_favorites{reader_context=true,back_callback=reopen} end},
             }
-            local display_rows={
-                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
-                    self:_toggle_thoughts_enabled()
-                end},
-                {icon="settings",label="评论显示设置",
-                    value="字号 "..self:_thought_font_size_label(),
-                    arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
+            local chapters=self:_thought_current_catalog(); local ids={}
+            for _,ch in ipairs(chapters) do local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or ""); if uid~="" then ids[#ids+1]=uid end end
+            local book_status=(self.thought_service and scope.book_id~="") and self.thought_service:book_status(scope.book_id,ids) or {cached=0,chapters=#ids,comments=0}
+            local cache_rows={
+                {icon="settings",label="评论缓存管理",
+                    value=(#ids>0 and (tostring(book_status.cached or 0).." / "..tostring(#ids).." 章") or (status.known and "本章已有缓存" or "暂无缓存")),
+                    arrow=true,callback=function() self:_show_thought_cache_manager(reopen) end},
             }
-            local sections={{title="评论内容",rows=content_rows}}
-            sections[#sections+1]={title="评论显示",rows=display_rows}
-            return sections
+            return {
+                {title="评论显示",rows=display_rows},
+                {title="评论获取",rows=fetch_rows},
+                {title="评论收藏",rows=favorite_rows},
+                {title="评论缓存",rows=cache_rows},
+            }
         end,
     }
     return true
@@ -24969,6 +25296,7 @@ local function extract_thought_href(value,seen,depth)
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
 function Plugin:_teardown_thought_tap()
+    if self.thought_runtime then self.thought_runtime:clear(false) end
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
     if self._thought_link_guard and self.ui and self.ui.link then
@@ -25805,6 +26133,10 @@ function Plugin:_on_thought_tap(ges)
         logger.info("[MiuRead][ReaderGesture] stale reader tap suppressed")
         return true
     end
+    local runtime_info=self.thought_runtime and self.thought_runtime:hit_test(ges and ges.pos) or nil
+    if runtime_info then
+        return self:_show_thought_href(Thoughts.href(runtime_info.book_id,runtime_info.chapter_uid,runtime_info.range))
+    end
     local link
     if self.ui and self.ui.link and self.ui.link.getLinkFromGes then
         local ok,value=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges)
@@ -25967,9 +26299,14 @@ function Plugin:on_sync_record_ready(current)
         local book_id,path=tostring(current.book.book_id),current.path
         local record=current.record or {}
         local variant=tostring(current.variant or record.variant or "")
-        if record.annotation_requested==true or variant:find("notes",1,true) then
-            self:_setup_thought_tap()
+        local annotation_book=record.annotation_requested==true or variant:find("notes",1,true)~=nil
+        -- All WeRead books own the comment tap dispatcher in beta.9. Legacy
+        -- notes EPUBs use embedded links; clean EPUBs use runtime hit boxes.
+        self:_setup_thought_tap()
+        if annotation_book then
             self:_sync_reader_annotation_mark_style("sync record ready")
+        else
+            self:_schedule_runtime_thought_refresh(.25,"sync record ready")
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
@@ -26083,6 +26420,10 @@ end
 function Plugin:_prepare_reader_disappearance(reason)
     self:_uninstall_reader_toolbar_hooks(self.ui,reason or "reader disappeared")
     self:_cancel_chapter_prefetch(reason or "reader disappeared")
+    self:_cancel_thought_prewarm(reason or "reader disappeared")
+    if self._thought_runtime_task then UIManager:unschedule(self._thought_runtime_task); self._thought_runtime_task=nil end
+    if self._thought_next_prefetch_task then UIManager:unschedule(self._thought_next_prefetch_task); self._thought_next_prefetch_task=nil end
+    if self.thought_fetch_async and self.thought_fetch_async:busy() then self.thought_fetch_async:cancel(reason or "reader disappeared") end
     self:_reset_chapter_navigation_context(reason or "reader disappeared")
     if self.ui and self.ui.document and self:_reader_session_is_weread() then
         if self._reading_end_local_snapshot_done==true then
@@ -26500,10 +26841,16 @@ function Plugin:onReaderReady()
             end
             self:_record_recent_read(path,book,record)
         end
-        if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
+        if record then
+            local annotation_book=record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)~=nil
             self:_setup_thought_tap()
-            self:_sync_reader_annotation_mark_style("reader ready")
-            logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
+            if annotation_book then
+                self:_sync_reader_annotation_mark_style("reader ready")
+            else
+                self:_schedule_runtime_thought_refresh(.75,"reader ready")
+            end
+            logger.info("[MiuRead][ThoughtPopup] tap layer ready before cloud sync",
+                "runtime=",tostring(not annotation_book))
         end
         local pending=HOME_SESSION.pending_annotation_jump
         if type(pending)=="table" then
@@ -26554,6 +26901,15 @@ function Plugin:onReaderReady()
         -- chapter. Prefetch remains delayed until the normal 30 s quiet point.
         self:_schedule_chapter_navigation_context(ready_session,1.8)
         if not preserve_session or continuous_switch then self:_schedule_chapter_prefetch(ready_session) end
+        -- Let the catalog context settle first; comment prefetch resolves its
+        -- target by chapter_uid and is independent from the body pre-reader.
+        UIManager:scheduleIn(2.8,function()
+            if self.ui and self.ui.document
+                and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
+                and not reader_close_active() then
+                self:_schedule_next_thought_prefetch(Config.THOUGHT_NEXT_PREFETCH_DELAY)
+            end
+        end)
     end
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
@@ -26715,6 +27071,8 @@ function Plugin:onPageUpdate(page)
     if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
+        self:_schedule_runtime_thought_refresh(1.05,"page update")
+        self:_schedule_next_thought_prefetch(2.2)
     end
 end
 function Plugin:_annotation_sync_preferences()
@@ -27750,6 +28108,15 @@ function Plugin:onSuspend()
     StatusToast.set_blocked(true)
     StatusToast.close()
     self:_cancel_thought_prewarm("suspend")
+    self._thought_runtime_generation=(tonumber(self._thought_runtime_generation) or 0)+1
+    if self._thought_runtime_task then UIManager:unschedule(self._thought_runtime_task); self._thought_runtime_task=nil end
+    self._thought_next_prefetch_generation=(tonumber(self._thought_next_prefetch_generation) or 0)+1
+    if self._thought_next_prefetch_task then UIManager:unschedule(self._thought_next_prefetch_task); self._thought_next_prefetch_task=nil end
+    self._thought_next_prefetch_key=nil
+    if self.thought_fetch_async and self.thought_fetch_async:busy() then
+        self.thought_fetch_async:cancel("device suspended")
+        self._thought_fetch_generation=(tonumber(self._thought_fetch_generation) or 0)+1
+    end
     self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)
@@ -28025,6 +28392,10 @@ function Plugin:onResume()
         UIManager:scheduleIn(.12,repaint_task)
         self:_schedule_download_resume_after_wake(3.5)
         self:_schedule_hibernated_download_resume("resume into reader")
+        if self:_reader_session_is_weread() then
+            self:_schedule_runtime_thought_refresh(2.0,"resume")
+            self:_schedule_next_thought_prefetch(math.max(5,tonumber(Config.THOUGHT_NEXT_PREFETCH_DELAY) or 8))
+        end
     end
     if not close_pending and not native_menu_pending and not reader_active and HomeView.is_shown() then
         self:_set_foreground("home")

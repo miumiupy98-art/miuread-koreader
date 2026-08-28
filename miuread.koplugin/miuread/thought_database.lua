@@ -4,7 +4,7 @@ local lfs = require("libs/libkoreader-lfs")
 
 local ThoughtDatabase = {}
 
-ThoughtDatabase.SCHEMA_VERSION = 2
+ThoughtDatabase.SCHEMA_VERSION = 3
 ThoughtDatabase.FILE_NAME = "thoughts.sqlite3"
 
 local function chapter_key(value)
@@ -52,6 +52,13 @@ local function initialize(conn)
             ON thought_comments(review_id);
         CREATE INDEX IF NOT EXISTS idx_thought_comment_created
             ON thought_comments(created);
+        CREATE TABLE IF NOT EXISTS thought_fetch_state (
+            chapter_uid TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            fetched_at INTEGER NOT NULL DEFAULT 0,
+            complete INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS thought_migration (
             source_path TEXT PRIMARY KEY,
             source_signature TEXT NOT NULL,
@@ -375,6 +382,123 @@ function ThoughtDatabase.chapter_counts(store, book_id, chapter_uid)
     return ok and result or {groups=0, comments=0}
 end
 
+function ThoughtDatabase.set_fetch_state(store, book_id, chapter_uid, status, complete, last_error)
+    local conn = open(store, book_id, false)
+    local ok, err = pcall(function()
+        local statement=conn:prepare([[
+            INSERT OR REPLACE INTO thought_fetch_state(
+                chapter_uid, status, fetched_at, complete, last_error
+            ) VALUES(?, ?, ?, ?, ?)
+        ]])
+        statement:bind(chapter_key(chapter_uid), tostring(status or "unknown"), os.time(), complete==true and 1 or 0,
+            tostring(last_error or "")):step()
+        statement:close()
+    end)
+    pcall(conn.close, conn)
+    if not ok then return nil,tostring(err) end
+    return true
+end
+
+function ThoughtDatabase.chapter_status(store, book_id, chapter_uid)
+    if not ThoughtDatabase.exists(store,book_id) then
+        return {known=false,status="missing",groups=0,comments=0,complete=false,fetched_at=0}
+    end
+    local ok,result=pcall(function()
+        local conn=open(store,book_id,false)
+        local key=chapter_key(chapter_uid)
+        local counts=chapter_counts_conn(conn,key)
+        local statement=conn:prepare([[
+            SELECT status, fetched_at, complete, last_error
+              FROM thought_fetch_state WHERE chapter_uid = ? LIMIT 1
+        ]])
+        local row=statement:bind(key):step()
+        statement:close()
+        local known_statement=conn:prepare("SELECT 1 FROM thought_chapters WHERE chapter_uid = ? LIMIT 1")
+        local known=known_statement:bind(key):step()~=nil
+        known_statement:close()
+        conn:close()
+        return {
+            known=known,status=tostring(row and row[1] or (known and "cached" or "missing")),
+            fetched_at=tonumber(row and row[2] or 0) or 0,complete=tonumber(row and row[3] or 0)==1,
+            last_error=tostring(row and row[4] or ""),groups=counts.groups,comments=counts.comments,
+        }
+    end)
+    return ok and result or {known=false,status="error",groups=0,comments=0,complete=false,fetched_at=0}
+end
+
+function ThoughtDatabase.book_status(store, book_id, chapter_uids)
+    local ids=type(chapter_uids)=="table" and chapter_uids or {}
+    local result={chapters=#ids,cached=0,complete=0,comments=0,groups=0}
+    if #ids==0 or not ThoughtDatabase.exists(store,book_id) then return result end
+    local wanted={}
+    for _,uid in ipairs(ids) do
+        local key=chapter_key(uid)
+        if key~="" then wanted[key]=true end
+    end
+    local ok,value=pcall(function()
+        -- Open once for the whole menu/status calculation. Opening one SQLite
+        -- connection per chapter made the comment center unnecessarily costly
+        -- on e-ink devices with long books. Writable open also initializes the
+        -- beta.9 fetch-state table when this is an older beta.8 database.
+        local conn=open(store,book_id,false)
+        local rows={}
+        local chapter_stmt=conn:prepare([[
+            SELECT chapter_uid, group_count, comment_count FROM thought_chapters
+        ]])
+        while true do
+            local row=chapter_stmt:step()
+            if not row then break end
+            local key=tostring(row[1] or "")
+            if wanted[key] then
+                rows[key]={groups=tonumber(row[2] or 0) or 0,comments=tonumber(row[3] or 0) or 0}
+            end
+        end
+        chapter_stmt:close()
+        local complete={}
+        local state_stmt=conn:prepare([[
+            SELECT chapter_uid, complete FROM thought_fetch_state
+        ]])
+        while true do
+            local row=state_stmt:step()
+            if not row then break end
+            local key=tostring(row[1] or "")
+            if wanted[key] and tonumber(row[2] or 0)==1 then complete[key]=true end
+        end
+        state_stmt:close()
+        conn:close()
+        return {rows=rows,complete=complete}
+    end)
+    if not ok or type(value)~="table" then return result end
+    for key,row in pairs(value.rows or {}) do
+        result.cached=result.cached+1
+        result.groups=result.groups+(tonumber(row.groups) or 0)
+        result.comments=result.comments+(tonumber(row.comments) or 0)
+        if value.complete and value.complete[key] then result.complete=result.complete+1 end
+    end
+    return result
+end
+
+function ThoughtDatabase.delete_chapter(store, book_id, chapter_uid)
+    if not ThoughtDatabase.exists(store,book_id) then return true end
+    local conn=open(store,book_id,false)
+    local ok,err=xpcall(function()
+        SQLiteStore.transaction(conn,function()
+            local key=chapter_key(chapter_uid)
+            for _,sql in ipairs({
+                "DELETE FROM thought_comments WHERE chapter_uid = ?",
+                "DELETE FROM thought_groups WHERE chapter_uid = ?",
+                "DELETE FROM thought_chapters WHERE chapter_uid = ?",
+                "DELETE FROM thought_fetch_state WHERE chapter_uid = ?",
+            }) do
+                local st=conn:prepare(sql); st:bind(key):step(); st:close()
+            end
+        end)
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(err) end
+    return true
+end
+
 function ThoughtDatabase.record_migration(store, book_id, source_path, source_signature, chapter_uid, counts)
     local conn = open(store, book_id, false)
     local ok, err = pcall(record_migration_conn, conn, source_path, source_signature, chapter_uid, counts)
@@ -510,6 +634,7 @@ function ThoughtDatabase.remove(store, book_id)
     os.remove(path)
     os.remove(path .. "-wal")
     os.remove(path .. "-shm")
+    return true
 end
 
 return ThoughtDatabase
