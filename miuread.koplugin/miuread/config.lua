@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.4.0-beta.9",
-    SCHEMA = 121,
+    VERSION = "5.4.0-beta.10",
+    SCHEMA = 122,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -55,6 +55,9 @@ local C = {
     -- beta.9 keeps on-demand comment fetching independent from EPUB downloads.
     THOUGHT_RUNTIME_MAX_GROUPS = 120,
     THOUGHT_NEXT_PREFETCH_DELAY = 8,
+    -- beta.10 switches new downloads to one正文 EPUB. Comments are an
+    -- independent cache task and never select a second EPUB variant.
+    THOUGHT_INITIAL_PRELOAD_DEFAULT = 5,
 
     -- Single-chapter reading may prepare exactly one following chapter after
     -- the reader has been stable for a while. It never wakes a sleeping device
