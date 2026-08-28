@@ -1,5 +1,6 @@
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
+local DialogTransition = require("miuread.dialog_transition")
 
 local M = {}
 
@@ -7,6 +8,9 @@ local M = {}
 -- progress overlays or toasts. A new primary panel retires the previous primary
 -- panel before it is submitted to UIManager.
 function M.close_all(except)
+    -- A fresh modal request invalidates any delayed parent reopen left by a
+    -- previous navigation gesture.
+    DialogTransition.cancel_pending()
     local closed = 0
     local seen = {}
     local stack = UIManager._window_stack or {}

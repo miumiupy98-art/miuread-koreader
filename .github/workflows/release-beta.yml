@@ -260,6 +260,27 @@ jobs:
           sudo apt-get install -y lua5.1
           find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
 
+      - name: Stage bundled Noto Emoji font
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOOGLE_FONTS_COMMIT="ade3d1533e06b2b1462ffcde8e08b129627ca360"
+          FONT_URL="https://raw.githubusercontent.com/google/fonts/${GOOGLE_FONTS_COMMIT}/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf"
+          LICENSE_URL="https://raw.githubusercontent.com/google/fonts/${GOOGLE_FONTS_COMMIT}/ofl/notoemoji/OFL.txt"
+          FONT_OUT="miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf"
+          LICENSE_OUT="miuread.koplugin/licenses/NotoEmoji-OFL.txt"
+
+          mkdir -p "$(dirname "$FONT_OUT")" "$(dirname "$LICENSE_OUT")"
+          curl --fail --location --retry 3 --retry-delay 2 --output "$FONT_OUT" "$FONT_URL"
+          curl --fail --location --retry 3 --retry-delay 2 --output "$LICENSE_OUT" "$LICENSE_URL"
+
+          # The source is pinned to an immutable google/fonts commit. Keep an
+          # additional size/license sanity check so an HTML/error payload can
+          # never be silently packaged as a font.
+          test "$(stat -c %s "$FONT_OUT")" = "1982596"
+          grep -Fq "SIL OPEN FONT LICENSE Version 1.1" "$LICENSE_OUT"
+          echo "Noto Emoji staged from google/fonts@$GOOGLE_FONTS_COMMIT"
+
       - name: Build beta full package and manifest
         shell: bash
         run: |
@@ -373,6 +394,8 @@ jobs:
               "miuread.koplugin/LICENSE",
               "miuread.koplugin/NOTICE",
               "miuread.koplugin/THIRD_PARTY_NOTICES",
+              "miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+              "miuread.koplugin/licenses/NotoEmoji-OFL.txt",
           }
           forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
           forbidden_suffixes = {".md", ".epub", ".log"}

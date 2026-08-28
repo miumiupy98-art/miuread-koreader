@@ -16,6 +16,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local FaceFactory = require("miuread.thought_face_factory")
+local DialogTransition = require("miuread.dialog_transition")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -392,17 +393,7 @@ function Dialog:onCloseWidget()
     end
     local action = self.pending_action
     self.pending_action = nil
-    -- CloseWidget is dispatched before UIManager actually removes this dialog
-    -- from the window stack. Reopen the parent (when requested) and repaint the
-    -- newly uncovered area on the next tick so Kindle/E-Ink does not keep the
-    -- old typography page as ghost pixels.
-    UIManager:nextTick(function()
-        if action then
-            local ok,err=pcall(action)
-            if not ok then logger.warn("[MiuRead][TypographyDialog] close action failed",tostring(err)) end
-        end
-        if old_region then UIManager:setDirty("all", "ui", old_region) end
-    end)
+    DialogTransition.after_close(old_region, action, "TypographyDialog")
     return true
 end
 

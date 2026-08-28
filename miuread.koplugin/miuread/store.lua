@@ -1548,6 +1548,21 @@ function Store:migrate()
             logger.info("[MiuRead][Migration] schema 118 -> 119 done",
                 "logged_in=",tostring(logged),"revision=",tostring(auth.auth_revision))
         end
+        if schema<120 then
+            logger.info("[MiuRead][Migration] schema 119 -> 120 begin","from=",tostring(schema))
+            -- beta.8 makes "阅读评论" the single presentation switch for both
+            -- WeRead comments and their in-book marks. beta.6/beta.7 may have
+            -- persisted a second show_marks value; discard it once so the two
+            -- surfaces can never drift apart again. No EPUB/comment/favorite
+            -- data is rewritten by this migration.
+            local current=self:preferences()
+            current.thoughts=type(current.thoughts)=="table" and current.thoughts or {}
+            current.thoughts.enabled=current.thoughts.enabled~=false
+            current.thoughts.show_marks=nil
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 119 -> 120 done",
+                "comments_enabled=",tostring(current.thoughts.enabled))
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end

@@ -58,8 +58,8 @@ local function resolve_bundled_font(fontname)
 end
 
 local EMOJI_FONT_NAMES = {
-    "NotoEmoji-Regular.ttf",
     "NotoEmoji-VariableFont_wght.ttf",
+    "NotoEmoji-Regular.ttf",
     "NotoColorEmoji.ttf",
     "Symbola.ttf",
     "SegoeUIEmoji.ttf",
@@ -73,14 +73,44 @@ function FaceFactory:findEmojiFont()
     end
     if self.emoji_checked then return nil end
 
-    -- Prefer fonts already known to KOReader. This keeps the comment popup
-    -- independent from any other plugin and also respects user-installed fonts.
+    -- Release packages stage a pinned Google Noto Emoji monochrome font inside
+    -- MiuRead. Prefer that deterministic asset before any device/user font so
+    -- Kindle, Kobo and Android render the same real Emoji glyphs.
+    local bundled_candidates = {
+        "plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+        "/mnt/us/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+        "/mnt/onboard/.adds/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+        "/sdcard/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+    }
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if ok_ds and DataStorage then
+        for _, method in ipairs({"getDataDir", "getFullDataDir"}) do
+            if type(DataStorage[method]) == "function" then
+                local ok_dir, data_dir = pcall(DataStorage[method], DataStorage)
+                if ok_dir and type(data_dir) == "string" and data_dir ~= "" then
+                    bundled_candidates[#bundled_candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf"
+                end
+            end
+        end
+    end
+    for _, path in ipairs(bundled_candidates) do
+        local resolved = realpath(path)
+        if resolved then
+            self.emoji_path = resolved
+            self.emoji_checked = true
+            logger.info("[MiuRead][ThoughtEmoji] bundled emoji font:", resolved)
+            return resolved
+        end
+    end
+
+    -- Development/source installs may not contain the release-staged font.
+    -- Fall back to fonts already known to KOReader or installed by the user.
     for _, fontname in ipairs(EMOJI_FONT_NAMES) do
         local resolved = resolve_bundled_font(fontname)
         if resolved then
             self.emoji_path = resolved
             self.emoji_checked = true
-            logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
+            logger.info("[MiuRead][ThoughtEmoji] fallback emoji font:", resolved)
             return resolved
         end
     end
@@ -98,7 +128,6 @@ function FaceFactory:findEmojiFont()
         "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     }
-    local ok_ds, DataStorage = pcall(require, "datastorage")
     if ok_ds and DataStorage then
         if type(DataStorage.getDataDir) == "function" then
             local ok_dir, data_dir = pcall(DataStorage.getDataDir, DataStorage)
@@ -121,7 +150,7 @@ function FaceFactory:findEmojiFont()
         if resolved then
             self.emoji_path = resolved
             self.emoji_checked = true
-            logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
+            logger.info("[MiuRead][ThoughtEmoji] fallback emoji font:", resolved)
             return resolved
         end
     end
@@ -137,7 +166,7 @@ function FaceFactory:findEmojiFont()
                 if resolved then
                     self.emoji_path = resolved
                     self.emoji_checked = true
-                    logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
+                    logger.info("[MiuRead][ThoughtEmoji] fallback emoji font:", resolved)
                     return resolved
                 end
             end
@@ -148,7 +177,7 @@ function FaceFactory:findEmojiFont()
     self.emoji_checked = true
     if not self.emoji_missing_logged then
         self.emoji_missing_logged = true
-        logger.info("[MiuRead][ThoughtPopup] no dedicated emoji font found; using text emoji fallbacks")
+        logger.info("[MiuRead][ThoughtEmoji] bundled/system emoji font missing; using emergency text fallbacks")
     end
     return nil
 end

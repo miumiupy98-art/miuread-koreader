@@ -6200,7 +6200,6 @@ function Plugin:reader_quick_panel_settings_menu()
                 self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
             end},
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="显示微信读书划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
@@ -13111,22 +13110,32 @@ end
 function Plugin:_set_thoughts_enabled(enabled)
     enabled=enabled~=false
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    if (p.thoughts.enabled~=false)==enabled then return true end
+    local changed=(p.thoughts.enabled~=false)~=enabled
+    local legacy_marks=p.thoughts.show_marks~=nil
     p.thoughts.enabled=enabled
-    self:_save_ui_preferences(p,"thoughts_enabled")
+    -- show_marks was a beta.6/beta.7 compatibility field. Keep it absent from
+    -- current preferences so "阅读评论" remains the only source of truth.
+    p.thoughts.show_marks=nil
+    if changed or legacy_marks then self:_save_ui_preferences(p,"thoughts_enabled") end
+
+    -- WeRead marks and their comments are one presentation feature. Applying
+    -- the stylesheet here makes the underline visibility follow this switch
+    -- immediately without rewriting the EPUB or deleting any local data.
+    self:_apply_annotation_mark_style(enabled and "comments enabled" or "comments disabled")
+
     local current=self.sync and self.sync.current or nil
     local record=current and current.record or {}
     local variant=tostring(current and (current.variant or record.variant) or "")
     local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
         if annotation_book then self:_setup_thought_tap() end
-        self:toast("阅读评论已开启",1.5)
+        if changed then self:toast("阅读评论已开启",1.5) end
     else
         self:_close_active_thought_popup("comments disabled")
         -- Keep the MiuRead internal-link guard installed. Hiding comments must
         -- not hand #miuthought links back to KOReader as invalid external links.
         if annotation_book then self:_setup_thought_tap() end
-        self:toast("阅读评论已关闭，划线和评论数据不会删除",2)
+        if changed then self:toast("阅读评论已关闭，划线和评论数据不会删除",2) end
     end
     return true
 end
@@ -13139,15 +13148,15 @@ function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
 end
 
--- Downloaded annotation/thought books encode visible marks in EPUB CSS.  This
--- preference changes only their presentation; annotation and comment data stay
--- intact and thought links remain interactive.
+-- Downloaded annotation/thought books encode visible marks in EPUB CSS.
+-- beta.8 deliberately derives mark visibility from the single comments switch;
+-- these compatibility helpers no longer own or persist a second preference.
 function Plugin:_marks_enabled()
-    return (self.store:preferences().thoughts or {}).show_marks~=false
+    return self:_thoughts_enabled()
 end
 
 function Plugin:_marks_enabled_label()
-    return self:_marks_enabled() and "已开启" or "已关闭"
+    return self:_thoughts_enabled_label()
 end
 
 function Plugin:_annotation_mark_hide_css()
@@ -13240,22 +13249,13 @@ function Plugin:_sync_reader_annotation_mark_style(reason)
 end
 
 function Plugin:_set_marks_enabled(enabled)
-    enabled=enabled~=false
-    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    if (p.thoughts.show_marks~=false)==enabled then return true end
-    p.thoughts.show_marks=enabled
-    self:_save_ui_preferences(p,"marks_enabled")
-    self:_apply_annotation_mark_style(enabled and "marks enabled" or "marks disabled")
-    if enabled then
-        self:toast("划线显示已开启",1.5)
-    else
-        self:toast("划线已隐藏，划线和评论数据不会删除",2)
-    end
-    return true
+    -- Compatibility entry point for older callbacks. There is no independent
+    -- mark state from beta.8 onward.
+    return self:_set_thoughts_enabled(enabled)
 end
 
 function Plugin:_toggle_marks_enabled()
-    return self:_set_marks_enabled(not self:_marks_enabled())
+    return self:_toggle_thoughts_enabled()
 end
 
 function Plugin:_thought_font_size_value(prefs)
@@ -13307,16 +13307,12 @@ end
 function Plugin:_show_reader_comment_settings(back_callback)
     local return_to_comments=function() self:_show_reader_comment_settings(back_callback) end
     local function comment_preview_text()
-        return "这是一段评论文字，用来预览当前字体、字号和实际阅读效果。"
+        return "这是一段评论文字，用来预览当前字体、字号和 Emoji 😂 ❤️ 👍。"
     end
     ReaderTypographyDialog.show{
         title="评论显示",
         subtitle=function()
-            local comments_on=self:_thoughts_enabled()
-            local marks_on=self:_marks_enabled()
-            if not comments_on and not marks_on then return "阅读评论已关闭 · 划线已隐藏 · 数据仍保留" end
-            if not comments_on then return "阅读评论已关闭 · 划线与评论数据仍保留" end
-            if not marks_on then return "划线已隐藏 · 评论数据仍保留" end
+            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线已隐藏 · 数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
@@ -13399,19 +13395,15 @@ function Plugin:_show_reader_comment_center(back_callback)
                         self:_search_thought_favorites{reader_context=true,back_callback=reopen}
                     end},
             }
-            local mark_rows={}
-            if self:_current_book_supports_miuread_marks() then
-                mark_rows[#mark_rows+1]={icon="highlight",label="显示划线",value=self:_marks_enabled_label(),value_bold=true,keep_open=true,callback=function()
-                    self:_toggle_marks_enabled()
-                end}
-            end
             local display_rows={
+                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thoughts_enabled()
+                end},
                 {icon="settings",label="评论显示设置",
-                    value=self:_thoughts_enabled() and ("字号 "..self:_thought_font_size_label()) or "阅读评论已关闭",
+                    value="字号 "..self:_thought_font_size_label(),
                     arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
             }
             local sections={{title="评论内容",rows=content_rows}}
-            if #mark_rows>0 then sections[#sections+1]={title="正文标记",rows=mark_rows} end
             sections[#sections+1]={title="评论显示",rows=display_rows}
             return sections
         end,
@@ -24351,7 +24343,6 @@ function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="显示微信读书划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()

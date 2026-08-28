@@ -1,3 +1,15 @@
+## 5.4.0-beta.8
+
+- “阅读评论”改为评论与微信读书划线的唯一总开关：开启同时显示划线并允许查看评论，关闭同时隐藏划线和评论，但不删除任何数据。
+- 删除所有独立“显示划线 / 显示微信读书划线”设置入口；schema 120 一次性清理 beta.6/beta.7 遗留的 `show_marks` 状态，后续不再作为独立偏好使用。
+- 评论中心直接显示“阅读评论”状态，并继续保留原有 ReaderTypographyDialog 的实时字体、字号、跟随正文与预览交互。
+- 新增统一 DialogTransition：关闭旧窗口后先重绘旧区域，再延迟打开父/下一级窗口，并用 generation 丢弃过期导航回调，重点修复 E-Ink 大框切小框后的旧边框残留和连续操作叠框。
+- ReaderSettingsDialog、ReaderTypographyDialog 与 ReaderListDialog 统一接入新的关闭/重绘流程；评论字体菜单返回与评论中心返回均使用同一套过渡。
+- Release 构建阶段从 Google Fonts 固定 commit 自动加入黑白 Noto Emoji variable font 与 OFL-1.1 许可证；评论优先使用觅阅自带 Emoji 字体，不再依赖设备是否预装 Emoji。
+- 评论 Emoji 正常情况下直接显示真实字形；只有 Release 字体缺失且系统/用户字体也不可用时，才保留 `[笑哭]`、`[爱心]` 等文字作为故障降级。
+- 评论显示预览加入真实 Emoji 样例，方便在设备上直接确认字体、字号与 Emoji fallback 是否同时生效。
+- Wi-Fi、下载、精确进度、阅读时间上传、锁屏、本地书扫描、评论收藏数据库与 PR #67/#68 状态保持不变。
+
 ## 5.4.0-beta.7
 
 - 撤回 beta.5/beta.6 的评论显示单页实时控件重构；评论中心只保留收藏、划线和“评论显示设置”入口。

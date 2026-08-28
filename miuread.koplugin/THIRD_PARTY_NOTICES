@@ -13,6 +13,13 @@ Legacy upstream reference:
 KOReader APIs, names, and related project materials remain subject to KOReader's
 applicable licenses and policies.
 
+Bundled release asset:
+- Project: Google Noto Emoji (monochrome variable font)
+- Source: google/fonts, pinned by the release workflow to a fixed commit
+- License: SIL Open Font License 1.1 (OFL-1.1)
+- The full font license is staged into release packages as
+  miuread.koplugin/licenses/NotoEmoji-OFL.txt.
+
 MiuRead is distributed under GNU Affero General Public License version 3 only
 (AGPL-3.0-only). This notice preserves third-party attribution and does not add
 any non-commercial or no-sale restriction.
