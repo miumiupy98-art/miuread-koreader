@@ -623,10 +623,15 @@ function Api:_web_readreviews(id,chapter_uid,batch)
         local ok,value=pcall(self.http.post_json,self.http,
             "https://weread.qq.com/web/book/readReviews",payload,options)
         if ok and type(value)=="table" then
-            value._annotation_source="web"
-            return value
+            local has_reviews=type(value.reviews)=="table" or type(value.updated)=="table" or #value>0
+            if has_reviews then
+                value._annotation_source="web"
+                return value
+            end
+            last="web readReviews returned no review container"
+        else
+            last=ok and "web readReviews returned invalid data" or value
         end
-        last=ok and "web readReviews returned invalid data" or value
     end
     error(last or "web readReviews failed")
 end
@@ -634,7 +639,10 @@ end
 function Api:_agent_readreviews(id,chapter_uid,batch)
     local value=self:_chapter_call("/book/readreviews",id,chapter_uid,
         {reviews=sanitize(batch or {})},AGENT_ANNOTATION_REQUEST_OPTIONS)
-    if type(value)=="table" then value._annotation_source="agent" end
+    if type(value)~="table" or not (type(value.reviews)=="table" or type(value.updated)=="table" or #value>0) then
+        error("/book/readreviews: invalid response without review container")
+    end
+    value._annotation_source="agent"
     return value
 end
 

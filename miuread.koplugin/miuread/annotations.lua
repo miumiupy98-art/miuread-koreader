@@ -73,6 +73,35 @@ local function array_from(data, names)
     return {}
 end
 
+
+local function review_container(data)
+    if type(data)~="table" then return {},false end
+    for _,name in ipairs({"reviews","updated"}) do
+        if type(rawget(data,name))=="table" then return rawget(data,name),true end
+    end
+    if #data>0 then return data,true end
+    return {},false
+end
+
+local function next_page_request(group,request,page_no)
+    if type(group)~="table" or type(request)~="table" then return nil end
+    page_no=tonumber(page_no) or 0
+    if page_no>=20 then return nil end
+    local current=tonumber(request.maxIdx or 0) or 0
+    local count=math.max(1,tonumber(request.count or 30) or 30)
+    local total=tonumber(rawget(group,"totalCount") or rawget(group,"reviewCount") or rawget(group,"total"))
+    local explicit_more=rawget(group,"hasMore")==true or rawget(group,"hasNext")==true or rawget(group,"isEnd")==false
+        or (total and total>current+count)
+    if not explicit_more then return nil end
+    local next_idx=tonumber(rawget(group,"nextMaxIdx") or rawget(group,"maxIdx") or rawget(group,"maxIndex"))
+    if not next_idx or next_idx<=current then next_idx=current+count end
+    if total and next_idx>=total then return nil end
+    return {
+        range=tostring(request.range or ""),maxIdx=next_idx,count=count,
+        synckey=tonumber(rawget(group,"synckey") or rawget(group,"syncKey") or request.synckey or 0) or 0,
+    }
+end
+
 local function table_entries(data)
     local rows, invalid = {}, 0
     if type(data) ~= "table" then return rows, invalid end
@@ -218,15 +247,11 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     local batches=self.api:review_batches(target_ranges,30)
     local completed,pending={},{}
     local review_map={}
+    local review_seen_by_range={}
     local group_count,entry_count,invalid_review_count=0,0,0
+    local page_count_by_range={}
     for _,key in ipairs(target_ranges) do pending[tostring(key)]=true end
 
-    local function mark_batch_completed(batch)
-        for _,item in ipairs(batch or {}) do
-            local key=range_key(item)
-            if key~="" then pending[key]=nil; completed[key]=true end
-        end
-    end
     local active_batch_index=0
     local function merge_review_rows(rows)
         local new_invalid=0
@@ -239,9 +264,17 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
                 end)
                 new_invalid=new_invalid+invalid
                 if #texts>0 then
-                    if not review_map[key] then review_map[key]={}; group_count=group_count+1 end
-                    for _,item in ipairs(texts) do review_map[key][#review_map[key]+1]=item end
-                    entry_count=entry_count+#texts
+                    if not review_map[key] then review_map[key]={}; review_seen_by_range[key]={}; group_count=group_count+1 end
+                    local seen=review_seen_by_range[key]
+                    for _,item in ipairs(texts) do
+                        local item_key=tostring(item.review_id or "")
+                        if item_key=="" then item_key=tostring(item.content or "").."\0"..tostring(item.author or "") end
+                        if item_key~="" and not seen[item_key] then
+                            seen[item_key]=true
+                            review_map[key][#review_map[key]+1]=item
+                            entry_count=entry_count+1
+                        end
+                    end
                 end
             else
                 new_invalid=new_invalid+1
@@ -276,7 +309,14 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     end
 
     local function accept_response(batch,response,label)
-        local rows,invalid=table_entries(array_from(response,{"reviews","updated"}))
+        local container,valid_container=review_container(response)
+        if not valid_container then
+            result.error_kind=result.error_kind or "data"
+            result.errors[#result.errors+1]=tostring(label).." returned no review container"
+            save_checkpoint()
+            return nil,"invalid_container"
+        end
+        local rows,invalid=table_entries(container)
         local entry_invalid=merge_review_rows(rows)
         local skipped=invalid+entry_invalid
         if skipped>0 then
@@ -284,11 +324,25 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             result.errors[#result.errors+1]=tostring(label).." skipped malformed review entries"
             invalid_review_count=invalid_review_count+invalid
         end
-        -- A successful response is complete even when a malformed optional
-        -- review entry was skipped. Keeping the whole range pending caused
-        -- the same data to be fetched and normalized indefinitely.
-        mark_batch_completed(batch)
+
+        local request_by_range={}
+        for _,request in ipairs(batch or {}) do request_by_range[range_key(request)]=request end
+        local next_batch,next_seen={},{}
+        for _,group in ipairs(rows) do
+            local key=range_key(group)
+            local request=request_by_range[key]
+            if request then
+                page_count_by_range[key]=(tonumber(page_count_by_range[key]) or 0)+1
+                local next_request=next_page_request(group,request,page_count_by_range[key])
+                if next_request and not next_seen[key] then next_seen[key]=true; next_batch[#next_batch+1]=next_request end
+            end
+        end
+        for _,request in ipairs(batch or {}) do
+            local key=range_key(request)
+            if key~="" and not next_seen[key] then pending[key]=nil; completed[key]=true end
+        end
         save_checkpoint()
+        return next_batch
     end
 
     local function split_batch(batch)
@@ -308,7 +362,11 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             return self.api:readreviews(book_id,uid,batch)
         end)
         if good then
-            accept_response(batch,response,label)
+            local next_batch,accept_error=accept_response(batch,response,label)
+            if accept_error then return false,false end
+            if type(next_batch)=="table" and #next_batch>0 then
+                return fetch_adaptive(next_batch,label..".next",depth+1)
+            end
             return true,false
         end
 

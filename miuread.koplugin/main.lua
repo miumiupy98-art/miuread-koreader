@@ -6200,8 +6200,7 @@ function Plugin:reader_quick_panel_settings_menu()
             checked_func=function() return self:_reader_toolbar_enabled() end,keep_menu_open=true,callback=function()
                 self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
             end},
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
+        {text="评论设置",post_text="字号 "..self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
 
@@ -13151,14 +13150,21 @@ function Plugin:_set_thoughts_enabled(enabled)
     local changed=(p.thoughts.enabled~=false)~=enabled
     local legacy_marks=p.thoughts.show_marks~=nil
     p.thoughts.enabled=enabled
-    -- show_marks was a beta.6/beta.7 compatibility field. Keep it absent from
-    -- current preferences so "阅读评论" remains the only source of truth.
     p.thoughts.show_marks=nil
-    if changed or legacy_marks then self:_save_ui_preferences(p,"thoughts_enabled") end
+    if changed or legacy_marks then
+        -- The master comment switch is a behavioral state, not a cosmetic
+        -- preference. Persist it synchronously so a second menu rebuild, page
+        -- turn or KOReader exit can never observe the old value.
+        self:_mark_ui_preferences_flushed()
+        local saved,err=self.store:save_preferences(p)
+        if not saved then
+            logger.warn("[MiuRead][ThoughtDisplay] master switch save failed",tostring(err))
+            return false
+        end
+    end
 
-    -- WeRead marks and their comments are one presentation feature. Applying
-    -- the stylesheet here makes the underline visibility follow this switch
-    -- immediately without rewriting the EPUB or deleting any local data.
+    if self._thought_runtime_task then UIManager:unschedule(self._thought_runtime_task); self._thought_runtime_task=nil end
+    self._thought_runtime_generation=(tonumber(self._thought_runtime_generation) or 0)+1
     self:_apply_annotation_mark_style(enabled and "comments enabled" or "comments disabled")
 
     local current=self.sync and self.sync.current or nil
@@ -13172,15 +13178,17 @@ function Plugin:_set_thoughts_enabled(enabled)
     else
         if self.thought_runtime then self.thought_runtime:clear() end
         self:_close_active_thought_popup("comments disabled")
-        -- Keep the MiuRead internal-link guard installed. Hiding comments must
-        -- not hand #miuthought links back to KOReader as invalid external links.
         if annotation_book then self:_setup_thought_tap() end
         if changed then self:toast("阅读评论已关闭，划线和评论数据不会删除",2) end
     end
+    logger.info("[MiuRead][ThoughtDisplay] master switch","enabled=",tostring(enabled),"saved=",tostring(changed or legacy_marks))
     return true
 end
 
 function Plugin:_toggle_thoughts_enabled()
+    local now=monotonic_wall_time()
+    if now<(tonumber(self._thought_toggle_guard_until) or 0) then return self:_thoughts_enabled() end
+    self._thought_toggle_guard_until=now+.35
     return self:_set_thoughts_enabled(not self:_thoughts_enabled())
 end
 
@@ -13189,16 +13197,7 @@ function Plugin:_thoughts_enabled_label()
 end
 
 -- Downloaded annotation/thought books encode visible marks in EPUB CSS.
--- beta.8 deliberately derives mark visibility from the single comments switch;
--- these compatibility helpers no longer own or persist a second preference.
-function Plugin:_marks_enabled()
-    return self:_thoughts_enabled()
-end
-
-function Plugin:_marks_enabled_label()
-    return self:_thoughts_enabled_label()
-end
-
+-- Visibility is derived directly from the single comments switch.
 function Plugin:_annotation_mark_hide_css()
     local ANNOTATION_MARK_HIDE_CSS=[[/* MiuRead: hide annotation marks (reader preference) */
 .miu-inline-mark {
@@ -13210,7 +13209,7 @@ function Plugin:_annotation_mark_hide_css()
     padding-bottom: 2px !important;
 }
 ]]
-    if self:_marks_enabled() then return nil end
+    if self:_thoughts_enabled() then return nil end
     return ANNOTATION_MARK_HIDE_CSS
 end
 
@@ -13288,16 +13287,6 @@ function Plugin:_sync_reader_annotation_mark_style(reason)
     return self:_apply_annotation_mark_style(reason)
 end
 
-function Plugin:_set_marks_enabled(enabled)
-    -- Compatibility entry point for older callbacks. There is no independent
-    -- mark state from beta.8 onward.
-    return self:_set_thoughts_enabled(enabled)
-end
-
-function Plugin:_toggle_marks_enabled()
-    return self:_toggle_thoughts_enabled()
-end
-
 function Plugin:_thought_font_size_value(prefs)
     prefs=prefs or (self.store:preferences().thoughts or {})
     local numeric=tonumber(prefs.font_size)
@@ -13362,7 +13351,6 @@ function Plugin:_show_reader_comment_settings(back_callback)
             local prefs=self.store:preferences().thoughts or {}
             local follow=prefs.follow_body_font==true
             return {
-                {kind="select",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_toggle_thoughts_enabled() end},
                 {kind="select",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),close=true,callback=function()
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
@@ -13458,10 +13446,25 @@ end
 
 function Plugin:_thought_cache_status_label(scope)
     local status=self:_thought_cache_status(scope)
-    if status.known~=true then return "尚未获取" end
-    local suffix=tostring(tonumber(status.comments or 0) or 0).." 条"
-    if status.complete==true then return "已缓存 · "..suffix end
-    return "已缓存 · "..suffix.." · 待补全"
+    local comments=tonumber(status.comments or 0) or 0
+    local kind=tostring(status.status or "")
+    if kind=="error" then return comments>0 and ("获取失败 · 已保留 "..tostring(comments).." 条") or "获取失败" end
+    if kind=="suspicious_empty" then return "结果异常 · 已保留 "..tostring(comments).." 条" end
+    if status.known~=true then return "未获取" end
+    if kind=="empty" then return "已检查无评论" end
+    if status.complete==true then return "已完整 · "..tostring(comments).." 条" end
+    return "待补全 · "..tostring(comments).." 条"
+end
+
+function Plugin:_thought_book_status_label(status)
+    status=type(status)=="table" and status or {}
+    local cached=tonumber(status.cached or 0) or 0
+    local chapters=tonumber(status.chapters or 0) or 0
+    local comments=tonumber(status.comments or 0) or 0
+    local pending=(tonumber(status.partial or 0) or 0)+(tonumber(status.error or 0) or 0)+(tonumber(status.suspicious or 0) or 0)
+    local text=tostring(cached).." / "..tostring(chapters).." 章 · "..tostring(comments).." 条"
+    if pending>0 then text=text.." · 待处理 "..tostring(pending) end
+    return text
 end
 
 function Plugin:_schedule_runtime_thought_refresh(delay,reason)
@@ -13559,11 +13562,27 @@ function Plugin:_fetch_thought_chapter(scope,force,options)
         self._thought_prewarm_key=nil
         local value=result.value
         if options.quiet~=true then
-            self:toast((force and "本章评论已更新 · " or "本章评论已获取 · ")..tostring(value.comments or 0).." 条",2)
+            local status=tostring(value.status or "")
+            local comments=tonumber(value.comments or 0) or 0
+            if status=="suspicious_empty" then
+                self:toast("评论结果异常 · 已保留原有 "..tostring(comments).." 条",3)
+            elseif status=="empty" then
+                self:toast("本章已检查 · 暂无评论",2)
+            elseif value.complete~=true then
+                self:toast("本章评论已保存 "..tostring(comments).." 条 · 待补全",2.5)
+            else
+                self:toast((force and "本章评论已更新 · " or "本章评论已获取 · ")..tostring(comments).." 条",2)
+            end
+            logger.info("[MiuRead][ThoughtFetch] chapter verified","book=",book_id,"chapter=",chapter_uid,
+                "server=",tostring(value.server_comments or value.comments or 0),
+                "saved=",tostring(value.saved_comments or value.comments or 0),"status=",status)
         end
         self:_schedule_thought_prewarm()
         if self.thought_runtime then self.thought_runtime:clear(false) end
         self:_schedule_runtime_thought_refresh(.25,"chapter fetched")
+        if options.quiet~=true then
+            self:_schedule_thought_display_verification(book_id,chapter_uid,tonumber(value.saved_comments or value.comments or 0) or 0)
+        end
         if options.prefetch_next~=false then self:_schedule_next_thought_prefetch(1.5) end
         if options.done then options.done(true,value) end
     end,90)
@@ -13572,6 +13591,30 @@ function Plugin:_fetch_thought_chapter(scope,force,options)
         if options.quiet~=true then self:toast("无法开始评论获取："..tostring(err or "未知原因"),2.5) end
         return false
     end
+    return true
+end
+
+function Plugin:_schedule_thought_display_verification(book_id,chapter_uid,comments)
+    comments=tonumber(comments or 0) or 0
+    if comments<=0 or not self:_thoughts_enabled() or self:_current_book_supports_miuread_marks() then return false end
+    self._thought_display_verify_generation=(tonumber(self._thought_display_verify_generation) or 0)+1
+    local generation=self._thought_display_verify_generation
+    local function verify(attempt)
+        if generation~=self._thought_display_verify_generation or not self:_thoughts_enabled() then return end
+        local scope=self:_thought_current_scope()
+        if tostring(scope.book_id or "")~=tostring(book_id or "") or tostring(scope.chapter_uid or "")~=tostring(chapter_uid or "") then return end
+        if not self.thought_runtime or not self.thought_runtime:is_scope(book_id,chapter_uid) then
+            if attempt<2 then UIManager:scheduleIn(.45,function() verify(attempt+1) end) end
+            return
+        end
+        local mapped=#(self.thought_runtime.entries or {})
+        logger.info("[MiuRead][ThoughtFetch] display verified","book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+            "saved=",tostring(comments),"mapped=",tostring(mapped))
+        if mapped==0 then
+            self:toast("评论已保存 "..tostring(comments).." 条，但当前正文未匹配到评论位置",3.5)
+        end
+    end
+    UIManager:scheduleIn(.65,function() verify(0) end)
     return true
 end
 
@@ -13678,7 +13721,7 @@ function Plugin:_start_thought_batch(book_id,chapters,options)
             options.subtitle or "已有完整缓存章节会自动跳过",3)
     end
     local started,err=self.thought_fetch_async:run("thought-fetch-"..tostring(options.kind or "book"),function()
-        local summary={total=#targets,processed=0,fetched=0,skipped=0,partial=0,failed=0,comments=0,stopped_reason=""}
+        local summary={total=#targets,processed=0,fetched=0,empty=0,skipped=0,partial=0,suspicious=0,failed=0,comments=0,stopped_reason=""}
         local consecutive_failures=0
         for _,ch in ipairs(targets) do
             local state=service:chapter_status(book_id,ch.uid)
@@ -13690,10 +13733,12 @@ function Plugin:_start_thought_batch(book_id,chapters,options)
                 local error_kind=tostring((value and value.error_kind) or (detail and detail.error_kind) or "")
                 if value and value.complete==true then
                     summary.fetched=summary.fetched+1
+                    if tostring(value.status or "")=="empty" then summary.empty=summary.empty+1 end
                     summary.comments=summary.comments+(tonumber(value.comments) or 0)
                     consecutive_failures=0
                 elseif value then
                     summary.partial=summary.partial+1
+                    if tostring(value.status or "")=="suspicious_empty" then summary.suspicious=summary.suspicious+1 end
                     summary.comments=summary.comments+(tonumber(value.comments) or 0)
                     consecutive_failures=consecutive_failures+1
                 else
@@ -13735,13 +13780,16 @@ function Plugin:_start_thought_batch(book_id,chapters,options)
         if self.thought_runtime then self.thought_runtime:clear(false) end
         self:_schedule_runtime_thought_refresh(.3,"comment batch fetched")
         local stopped=tostring(v.stopped_reason or "")~=""
+        local unresolved=(tonumber(v.partial or 0) or 0)+(tonumber(v.failed or 0) or 0)
         if options.quiet~=true or options.completion_notice==true then
-            local prefix=stopped and tostring(options.paused_title or "评论获取已暂停")
-                or tostring(options.done_title or "评论获取完成")
-            local detail=prefix.." · 完成 "..tostring(v.fetched or 0).." 章 · 跳过 "..tostring(v.skipped or 0).." 章"
-            if tonumber(v.partial or 0)>0 or tonumber(v.failed or 0)>0 then
-                detail=detail.." · 待补 "..tostring((tonumber(v.partial or 0) or 0)+(tonumber(v.failed or 0) or 0)).." 章"
-            end
+            local prefix
+            if stopped then prefix=tostring(options.paused_title or "评论获取已暂停")
+            elseif unresolved>0 then prefix="评论获取结束"
+            else prefix=tostring(options.done_title or "评论获取完成") end
+            local detail=prefix.." · 完整 "..tostring(v.fetched or 0).." 章 · 跳过 "..tostring(v.skipped or 0).." 章"
+            if tonumber(v.empty or 0)>0 then detail=detail.." · 无评论 "..tostring(v.empty or 0).." 章" end
+            if unresolved>0 then detail=detail.." · 待处理 "..tostring(unresolved).." 章" end
+            if tonumber(v.suspicious or 0)>0 then detail=detail.." · 异常 "..tostring(v.suspicious).." 章" end
             self:toast(detail,3)
         end
         if options.done then options.done(true,v) end
@@ -13787,23 +13835,68 @@ function Plugin:show_book_thought_menu(book)
             or {cached=0,chapters=#ids,comments=0}
         local favorites=self:_thought_favorite_count({book_id=book_id})
         local items={
-            {text="获取／补全整本评论",post_text=tostring(status.cached or 0).." / "..tostring(status.chapters or #ids).." 章",callback=function()
+            {text="获取／补全整本评论",post_text=self:_thought_book_status_label(status),callback=function()
                 self:_fetch_book_thoughts_for(book,rows,function() self:show_book_thought_menu(book) end)
+            end},
+            {text="已下载评论",post_text=tostring(status.cached or 0).." 章 · "..tostring(status.comments or 0).." 条",enabled=(tonumber(status.cached or 0) or 0)>0,callback=function()
+                local title_map={}
+                for index,ch in ipairs(rows) do
+                    local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
+                    if uid~="" then title_map[uid]={title=U.trim(tostring(ch.title or ch.name or "")),index=index} end
+                end
+                self:_show_thought_cached_chapters(function() self:show_book_thought_menu(book) end,{},
+                    {book_id=book_id,title_map=title_map,on_home=nil})
             end},
             {text="本书评论收藏",post_text=tostring(favorites).." 条",callback=function()
                 self:show_thought_favorites{book_id=book_id,scope_label="本书评论收藏"}
             end},
         }
-        if tonumber(status.cached or 0)>0 then
-            items[#items+1]={text="删除本书评论缓存",post_text=tostring(status.comments or 0).." 条 · 收藏不会删除",callback=function()
-                UIManager:show(ConfirmBox:new{text="删除本书评论缓存？\n\n需要时可以重新获取；已收藏的评论不会删除。",
-                    ok_text="删除缓存",cancel_text="取消",ok_callback=function()
-                        self.thought_service:delete_book(book_id); Thoughts.clear_memory_cache(); self:toast("本书评论缓存已删除",2)
-                    end})
-            end}
-        end
         self:list("评论 · "..tostring(book.title or "当前书籍"),items)
     end,{context=context,status_text="正在读取章节目录…"})
+    return true
+end
+
+function Plugin:show_all_thought_cache_manager()
+    if not self.thought_service then self:toast("评论服务不可用",2); return false end
+    local books={}
+    local total_chapters,total_comments=0,0
+    for _,book in ipairs(self.store:all_books() or {}) do
+        local book_id=tostring(book.bookId or book.book_id or "")
+        if book_id~="" then
+            local cached=self.thought_service:cached_chapters(book_id) or {}
+            if #cached>0 then
+                local comments=0
+                for _,row in ipairs(cached) do comments=comments+(tonumber(row.comments or 0) or 0) end
+                books[#books+1]={book=book,book_id=book_id,chapters=#cached,comments=comments}
+                total_chapters=total_chapters+#cached; total_comments=total_comments+comments
+            end
+        end
+    end
+    table.sort(books,function(a,b)
+        if a.comments~=b.comments then return a.comments>b.comments end
+        return tostring(a.book.title or a.book.bookTitle or a.book_id)<tostring(b.book.title or b.book.bookTitle or b.book_id)
+    end)
+    local items={{text="缓存统计",post_text=tostring(#books).." 本 · "..tostring(total_chapters).." 章 · "..tostring(total_comments).." 条",enabled=false}}
+    for _,entry in ipairs(books) do
+        local book=entry.book
+        items[#items+1]={text=tostring(book.title or book.bookTitle or ("书籍 "..entry.book_id)),
+            post_text=tostring(entry.chapters).." 章 · "..tostring(entry.comments).." 条",callback=function()
+                self:show_book_thought_menu(book)
+            end}
+    end
+    if #books>0 then
+        items[#items+1]={separator=true}
+        items[#items+1]={text="删除全部评论缓存",post_text="收藏、划线和阅读数据不会删除",callback=function()
+            UIManager:show(ConfirmBox:new{text="删除全部书籍的评论缓存？\n\n评论收藏、划线、阅读进度和正文不会删除。",ok_text="删除全部缓存",cancel_text="取消",ok_callback=function()
+                for _,entry in ipairs(books) do self.thought_service:delete_book(entry.book_id) end
+                Thoughts.clear_memory_cache(); self._thought_prewarm_key=nil
+                if self.thought_runtime then self.thought_runtime:clear() end
+                self:toast("全部评论缓存已删除",2.5)
+                self:show_all_thought_cache_manager()
+            end})
+        end}
+    end
+    self:list("评论缓存",items,#books==0 and "暂无已下载评论" or nil)
     return true
 end
 
@@ -13821,14 +13914,12 @@ function Plugin:_schedule_post_download_thought_preload(book,rec,opt)
     self._thought_post_download_generation=(tonumber(self._thought_post_download_generation) or 0)+1
     local generation=self._thought_post_download_generation
     if self._thought_post_download_task then UIManager:unschedule(self._thought_post_download_task) end
-    local attempts=0
     local task
     task=function()
         if self._thought_post_download_task~=task or generation~=self._thought_post_download_generation then return end
         if self._miuread_suspended==true or HOME_SESSION.suspended==true or PowerState.state()~="NORMAL"
             or (self.download_task and self.download_task:busy()) or (self.thought_fetch_async and self.thought_fetch_async:busy()) then
-            attempts=attempts+1
-            if attempts<=12 then UIManager:scheduleIn(5,task) else self._thought_post_download_task=nil end
+            UIManager:scheduleIn(5,task)
             return
         end
         self._thought_post_download_task=nil
@@ -13844,32 +13935,151 @@ function Plugin:_schedule_post_download_thought_preload(book,rec,opt)
     return true
 end
 
+function Plugin:_thought_catalog_title_map()
+    local map={}
+    for index,ch in ipairs(self:_thought_current_catalog()) do
+        local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
+        if uid~="" then map[uid]={title=U.trim(tostring(ch.title or ch.name or "")),index=index} end
+    end
+    return map
+end
+
+function Plugin:_show_thought_cached_chapters(back_callback,selection,context)
+    context=type(context)=="table" and context or {}
+    local scope=self:_thought_current_scope()
+    local book_id=tostring(context.book_id or scope.book_id or "")
+    if not self.thought_service or book_id=="" then self:toast("当前书籍无法识别",2); return false end
+    selection=type(selection)=="table" and selection or {}
+    local title_map=type(context.title_map)=="table" and context.title_map or self:_thought_catalog_title_map()
+    local function rows_for(filter)
+        local cached=self.thought_service:cached_chapters(book_id) or {}
+        local rows={}
+        local selected_count=0
+        for _ in pairs(selection) do selected_count=selected_count+1 end
+        rows[#rows+1]={icon="delete",label="删除选中评论",value=tostring(selected_count).." 章",enabled=selected_count>0,callback=function()
+            local ids={}; for uid in pairs(selection) do ids[#ids+1]=uid end
+            table.sort(ids)
+            UIManager:show(ConfirmBox:new{text="删除选中的 "..tostring(#ids).." 章评论缓存？\n\n评论收藏、划线和阅读进度不会删除。",
+                ok_text="删除选中",cancel_text="取消",ok_callback=function()
+                    local ok,deleted=self.thought_service:delete_chapters(book_id,ids)
+                    if not ok then self:toast("删除失败："..tostring(deleted),3); return end
+                    for _,uid in ipairs(ids) do selection[uid]=nil end
+                    Thoughts.clear_memory_cache(); self._thought_prewarm_key=nil
+                    if self.thought_runtime then self.thought_runtime:clear() end
+                    self:toast("已删除 "..tostring(deleted or #ids).." 章评论缓存",2)
+                    self:_show_thought_cached_chapters(back_callback,selection,context)
+                end})
+        end}
+        rows[#rows+1]={icon="settings",label="全选当前列表",value="再次点击可取消",keep_open=true,callback=function()
+            local candidates={}
+            for _,item in ipairs(cached) do
+                local status=tostring(item.status or "")
+                local include=filter=="all" or (filter=="complete" and item.complete==true)
+                    or (filter=="partial" and (status=="partial" or (item.complete~=true and status~="error" and status~="suspicious_empty")))
+                    or (filter=="abnormal" and (status=="error" or status=="suspicious_empty"))
+                if include then candidates[#candidates+1]=item.chapter_uid end
+            end
+            local all_selected=#candidates>0
+            for _,uid in ipairs(candidates) do if not selection[uid] then all_selected=false; break end end
+            for _,uid in ipairs(candidates) do selection[uid]=all_selected and nil or true end
+        end}
+        for _,item in ipairs(cached) do
+            local status=tostring(item.status or "")
+            local include=filter=="all" or (filter=="complete" and item.complete==true)
+                or (filter=="partial" and (status=="partial" or (item.complete~=true and status~="error" and status~="suspicious_empty")))
+                or (filter=="abnormal" and (status=="error" or status=="suspicious_empty"))
+            if include then
+                local meta=title_map[item.chapter_uid] or {}
+                local label=tostring(meta.title or "")~="" and tostring(meta.title) or (meta.index and ("第 "..tostring(meta.index).." 章") or item.chapter_uid)
+                local state=item.complete and (status=="empty" and "无评论" or "完整")
+                    or (status=="suspicious_empty" and "异常" or (status=="error" and "失败" or "待补全"))
+                rows[#rows+1]={label=label,value=tostring(item.comments or 0).." 条 · "..state,
+                    checked=selection[item.chapter_uid]==true,keep_open=true,callback=function()
+                        selection[item.chapter_uid]=selection[item.chapter_uid] and nil or true
+                    end}
+            end
+        end
+        return rows
+    end
+    ReaderListDialog.show{
+        title="已下载评论",
+        categories={
+            {key="all",label="全部",items=function() return rows_for("all") end},
+            {key="complete",label="已完整",items=function() return rows_for("complete") end},
+            {key="partial",label="待补全",items=function() return rows_for("partial") end},
+            {key="abnormal",label="异常",items=function() return rows_for("abnormal") end},
+        },
+        page_size=7,
+        on_back=back_callback,
+        on_home=context.on_home or (self:_active_reader_ui() and function() return self:_reader_home_action("reader surface") end or nil),
+    }
+    return true
+end
+
 function Plugin:_show_thought_cache_manager(back_callback)
     local function reopen() self:_show_thought_cache_manager(back_callback) end
     ReaderSettingsDialog.show{
-        title="评论缓存",
-        subtitle="删除缓存不会删除已收藏的评论",
+        title="评论管理",
+        subtitle="按章节管理评论缓存；收藏、划线和阅读数据独立保留",
         on_back=back_callback,
         on_home=function() return self:_reader_home_action("reader surface") end,
         sections=function()
             local scope=self:_thought_current_scope(); local current=self:_thought_cache_status(scope)
             local chapters=self:_thought_current_catalog(); local ids={}
-            for _,ch in ipairs(chapters) do local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or ""); if uid~="" then ids[#ids+1]=uid end end
+            for _,ch in ipairs(chapters) do local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or ""); if uid~="" and ch.structural~=true then ids[#ids+1]=uid end end
             local book=self.thought_service and self.thought_service:book_status(scope.book_id,ids) or {cached=0,chapters=#ids,comments=0}
             return {{title="当前书籍",rows={
-                {label="本章评论缓存",value=current.known and (tostring(current.comments or 0).." 条") or "无缓存",enabled=current.known==true,callback=function()
+                {icon="settings",label="已下载评论",value=self:_thought_book_status_label(book),arrow=true,
+                    enabled=(tonumber(book.cached or 0) or 0)>0,callback=function() self:_show_thought_cached_chapters(reopen,{}) end},
+                {icon="delete",label="删除本章评论",value=current.known and (tostring(current.comments or 0).." 条") or "无缓存",
+                    enabled=current.known==true,callback=function()
                     UIManager:show(ConfirmBox:new{text="删除本章评论缓存？\n\n已收藏的评论不会删除。",ok_text="删除缓存",cancel_text="取消",ok_callback=function()
-                        self.thought_service:delete_chapter(scope.book_id,scope.chapter_uid); Thoughts.clear_memory_cache(); if self.thought_runtime then self.thought_runtime:clear() end; self:toast("本章评论缓存已删除",2); reopen()
+                        self.thought_service:delete_chapter(scope.book_id,scope.chapter_uid); Thoughts.clear_memory_cache();
+                        if self.thought_runtime then self.thought_runtime:clear() end; self:toast("本章评论缓存已删除",2); reopen()
                     end})
                 end},
-                {label="本书评论缓存",value=tostring(book.cached or 0).." / "..tostring(book.chapters or #ids).." 章 · "..tostring(book.comments or 0).." 条",enabled=scope.book_id~="",callback=function()
-                    UIManager:show(ConfirmBox:new{text="删除本书评论缓存？\n\n需要时可以重新获取；已收藏的评论不会删除。",ok_text="删除缓存",cancel_text="取消",ok_callback=function()
-                        self.thought_service:delete_book(scope.book_id); Thoughts.clear_memory_cache(); if self.thought_runtime then self.thought_runtime:clear() end; self:toast("本书评论缓存已删除",2); reopen()
+                {icon="delete",label="删除本书全部评论",value=tostring(book.comments or 0).." 条",
+                    enabled=(tonumber(book.cached or 0) or 0)>0,callback=function()
+                    UIManager:show(ConfirmBox:new{text="删除本书全部评论缓存？\n\n需要时可以重新获取；已收藏的评论不会删除。",ok_text="删除本书缓存",cancel_text="取消",ok_callback=function()
+                        self.thought_service:delete_book(scope.book_id); Thoughts.clear_memory_cache(); if self.thought_runtime then self.thought_runtime:clear() end;
+                        self:toast("本书评论缓存已删除",2); reopen()
                     end})
                 end},
             }}}
         end,
     }
+    return true
+end
+
+function Plugin:_show_reader_comment_fetch_center(back_callback)
+    local function reopen() self:_show_reader_comment_fetch_center(back_callback) end
+    ReaderSettingsDialog.show{
+        title="评论获取",
+        subtitle="只有已保存并通过检查的数据才会显示为完整",
+        on_back=back_callback,
+        on_home=function() return self:_reader_home_action("reader surface") end,
+        sections=function()
+            local scope=self:_thought_current_scope()
+            local status=self:_thought_cache_status(scope)
+            local chapters=self:_thought_current_catalog(); local ids={}
+            for _,ch in ipairs(chapters) do local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or ""); if uid~="" and ch.structural~=true then ids[#ids+1]=uid end end
+            local book=self.thought_service and self.thought_service:book_status(scope.book_id,ids) or {cached=0,chapters=#ids,comments=0}
+            local current_rows={
+                {label="当前章节状态",value=self:_thought_cache_status_label(scope),enabled=false},
+                {icon="comment",label=status.known and "更新本章评论" or "获取本章评论",value=status.known and "重新检查服务器" or "首次获取",
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",callback=function() self:_fetch_current_thoughts(status.known==true,reopen) end},
+            }
+            local book_rows={
+                {label="本书评论状态",value=self:_thought_book_status_label(book),enabled=false},
+                {icon="download",label="继续获取整本评论",value="完整章节自动跳过",enabled=scope.book_id~="" and #ids>0,callback=function() self:_fetch_book_thoughts(reopen) end},
+                {icon="download",label="阅读时预加载下一章",value=self:_thought_prefetch_next_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thought_prefetch_next(); if self:_thought_prefetch_next_enabled() then self:_schedule_next_thought_prefetch(1.0) end
+                end},
+            }
+            return {{title="当前章节",rows=current_rows},{title="当前书籍",rows=book_rows}}
+        end,
+    }
+    return true
 end
 
 function Plugin:_show_reader_comment_center(back_callback)
@@ -13877,10 +14087,8 @@ function Plugin:_show_reader_comment_center(back_callback)
     ReaderSettingsDialog.show{
         title="评论",
         subtitle=function()
-            local scope=self:_current_thought_favorite_scope()
-            local total=self:_thought_favorite_count()
-            local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
-            return "评论收藏 "..tostring(book_count).." / "..tostring(total).." · "..self:_thoughts_enabled_label()
+            local scope=self:_thought_current_scope(); local status=self:_thought_cache_status(scope)
+            return self:_thoughts_enabled_label().." · "..self:_thought_cache_status_label(scope)
         end,
         on_back=back_callback or function() self:show_reader_quick_panel() end,
         on_home=function() return self:_reader_home_action("reader surface") end,
@@ -13888,60 +14096,19 @@ function Plugin:_show_reader_comment_center(back_callback)
             local scope=self:_current_thought_favorite_scope()
             local total=self:_thought_favorite_count()
             local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
-            local chapter_count=(scope.book_id~="" and scope.chapter_uid~="")
-                and self:_thought_favorite_count({book_id=scope.book_id,chapter_uid=scope.chapter_uid}) or 0
-            local display_rows={
+            return {{title="评论",rows={
                 {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
                     self:_toggle_thoughts_enabled()
-                    self:_schedule_runtime_thought_refresh(.25,"comments toggled")
                 end},
-                {icon="settings",label="评论显示设置",value="字号 "..self:_thought_font_size_label(),
-                    arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
-            }
-            local status=self:_thought_cache_status(scope)
-            local fetch_rows={
-                {icon="comment",label=status.known and "更新本章评论" or "获取本章评论",
-                    value=scope.chapter_uid~="" and self:_thought_cache_status_label(scope) or "当前章节不可识别",
-                    enabled=scope.book_id~="" and scope.chapter_uid~="",callback=function()
-                        self:_fetch_current_thoughts(status.known==true,reopen)
-                    end},
-                {icon="download",label="下一章评论预加载",value=self:_thought_prefetch_next_label(),value_bold=true,keep_open=true,callback=function()
-                    self:_toggle_thought_prefetch_next()
-                    if self:_thought_prefetch_next_enabled() then self:_schedule_next_thought_prefetch(1.0) end
-                end},
-                {icon="download",label="获取整本评论",value="已有缓存章节自动跳过",enabled=scope.book_id~="",callback=function()
-                    self:_fetch_book_thoughts(reopen)
-                end},
-            }
-            local favorite_rows={
-                {icon="bookmark",label="本章评论收藏",value=scope.chapter_uid~="" and (tostring(chapter_count).." 条") or "当前章节不可识别",
-                    enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
-                        self:show_thought_favorites{book_id=scope.book_id,chapter_uid=scope.chapter_uid,scope_label="本章评论收藏",reader_context=true,back_callback=reopen}
-                    end},
-                {icon="current-book",label="本书评论收藏",value=scope.book_id~="" and (tostring(book_count).." 条") or "当前书籍不可识别",
-                    enabled=scope.book_id~="",arrow=true,callback=function()
-                        self:show_thought_favorites{book_id=scope.book_id,scope_label="本书评论收藏",reader_context=true,back_callback=reopen}
-                    end},
-                {icon="bookmark",label="全部评论收藏",value=tostring(total).." 条",enabled=total>0,arrow=true,callback=function()
-                    self:show_thought_favorites{reader_context=true,scope_label="全部评论收藏",back_callback=reopen}
-                end},
-                {icon="search",label="搜索收藏评论",value=total>0 and "评论、原文、作者、书名" or "暂无收藏",
-                    enabled=total>0,arrow=true,callback=function() self:_search_thought_favorites{reader_context=true,back_callback=reopen} end},
-            }
-            local chapters=self:_thought_current_catalog(); local ids={}
-            for _,ch in ipairs(chapters) do local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or ""); if uid~="" then ids[#ids+1]=uid end end
-            local book_status=(self.thought_service and scope.book_id~="") and self.thought_service:book_status(scope.book_id,ids) or {cached=0,chapters=#ids,comments=0}
-            local cache_rows={
-                {icon="settings",label="评论缓存管理",
-                    value=(#ids>0 and (tostring(book_status.cached or 0).." / "..tostring(#ids).." 章") or (status.known and "本章已有缓存" or "暂无缓存")),
-                    arrow=true,callback=function() self:_show_thought_cache_manager(reopen) end},
-            }
-            return {
-                {title="评论显示",rows=display_rows},
-                {title="评论获取",rows=fetch_rows},
-                {title="评论收藏",rows=favorite_rows},
-                {title="评论缓存",rows=cache_rows},
-            }
+                {icon="download",label="评论获取",value=self:_thought_cache_status_label(self:_thought_current_scope()),arrow=true,
+                    callback=function() self:_show_reader_comment_fetch_center(reopen) end},
+                {icon="settings",label="评论管理",value="按章节查看与删除",arrow=true,
+                    callback=function() self:_show_thought_cache_manager(reopen) end},
+                {icon="bookmark",label="评论收藏",value=tostring(book_count).." / "..tostring(total).." 条",arrow=true,
+                    callback=function() self:show_thought_favorites{reader_context=true,scope_label="评论收藏",back_callback=reopen} end},
+                {icon="settings",label="评论设置",value="字号 "..self:_thought_font_size_label(),arrow=true,
+                    callback=function() self:_show_reader_comment_settings(reopen) end},
+            }}}
         end,
     }
     return true
@@ -15852,9 +16019,6 @@ function Plugin:_show_reader_gesture_panel(back_callback)
                 {label="向上滑动",value="收起快捷面板",arrow=false},
                 {label="正文区域",value="保持翻页与选词手势",arrow=false},
             }
-            if self:_reader_session_is_weread() then
-                rows[#rows+1]={label="阅读评论",value=self:_thoughts_enabled_label(),keep_open=true,callback=function() self:_toggle_thoughts_enabled() end}
-            end
             return rows
         end,
     }
@@ -24978,7 +25142,6 @@ end
 function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()
@@ -26124,37 +26287,6 @@ function Plugin:_show_thought_favorite_books(options)
         menu_items[#menu_items+1]={text=item.text,post_text=item.post_text,close_before_action=true,callback=item.callback}
     end
     return self:_show_standalone_menu("按书籍查看",menu_items,{page_size=8,on_close=back})
-end
-
-function Plugin:_search_thought_favorites(options)
-    options=type(options)=="table" and U.copy(options) or {}
-    local dialog
-    dialog=InputDialog:new{
-        title="搜索评论收藏",
-        description="搜索评论、原文、作者、书名和章节",
-        input=tostring(self._thought_favorite_last_search or options.query or ""),
-        buttons={{
-            {text="取消",id="close",callback=function()
-                UIManager:close(dialog)
-                if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
-            end},
-            {text="搜索",is_enter_default=true,callback=function()
-                local query=U.trim(dialog:getInputText())
-                UIManager:close(dialog)
-                if query=="" then
-                    if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
-                    return
-                end
-                self._thought_favorite_last_search=query
-                options.query=query
-                options.scope_label="搜索评论收藏"
-                UIManager:scheduleIn(.05,function() self:show_thought_favorites(options) end)
-            end},
-        }},
-    }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
-    return true
 end
 
 function Plugin:show_thought_favorites(options)

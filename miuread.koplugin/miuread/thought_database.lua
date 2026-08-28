@@ -1,10 +1,11 @@
 local SQLiteStore = require("miuread.sqlite_store")
+local Json = require("miuread.json")
 local U = require("miuread.util")
 local lfs = require("libs/libkoreader-lfs")
 
 local ThoughtDatabase = {}
 
-ThoughtDatabase.SCHEMA_VERSION = 3
+ThoughtDatabase.SCHEMA_VERSION = 4
 ThoughtDatabase.FILE_NAME = "thoughts.sqlite3"
 
 local function chapter_key(value)
@@ -58,6 +59,11 @@ local function initialize(conn)
             fetched_at INTEGER NOT NULL DEFAULT 0,
             complete INTEGER NOT NULL DEFAULT 0,
             last_error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS thought_fetch_checkpoint (
+            chapter_uid TEXT PRIMARY KEY,
+            payload TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS thought_migration (
             source_path TEXT PRIMARY KEY,
@@ -428,7 +434,7 @@ end
 
 function ThoughtDatabase.book_status(store, book_id, chapter_uids)
     local ids=type(chapter_uids)=="table" and chapter_uids or {}
-    local result={chapters=#ids,cached=0,complete=0,comments=0,groups=0}
+    local result={chapters=#ids,cached=0,complete=0,empty=0,partial=0,error=0,suspicious=0,comments=0,groups=0}
     if #ids==0 or not ThoughtDatabase.exists(store,book_id) then return result end
     local wanted={}
     for _,uid in ipairs(ids) do
@@ -454,26 +460,46 @@ function ThoughtDatabase.book_status(store, book_id, chapter_uids)
             end
         end
         chapter_stmt:close()
-        local complete={}
+        local complete,state={} ,{}
         local state_stmt=conn:prepare([[
-            SELECT chapter_uid, complete FROM thought_fetch_state
+            SELECT chapter_uid, complete, status FROM thought_fetch_state
         ]])
         while true do
             local row=state_stmt:step()
             if not row then break end
             local key=tostring(row[1] or "")
-            if wanted[key] and tonumber(row[2] or 0)==1 then complete[key]=true end
+            if wanted[key] then
+                if tonumber(row[2] or 0)==1 then complete[key]=true end
+                state[key]=tostring(row[3] or "unknown")
+            end
         end
         state_stmt:close()
         conn:close()
-        return {rows=rows,complete=complete}
+        return {rows=rows,complete=complete,state=state}
     end)
     if not ok or type(value)~="table" then return result end
+    local counted={}
     for key,row in pairs(value.rows or {}) do
+        counted[key]=true
         result.cached=result.cached+1
         result.groups=result.groups+(tonumber(row.groups) or 0)
         result.comments=result.comments+(tonumber(row.comments) or 0)
         if value.complete and value.complete[key] then result.complete=result.complete+1 end
+        local state=value.state and tostring(value.state[key] or "") or ""
+        if state=="empty" then result.empty=result.empty+1
+        elseif state=="partial" then result.partial=result.partial+1
+        elseif state=="suspicious_empty" then result.suspicious=result.suspicious+1
+        elseif state=="error" then result.error=result.error+1 end
+    end
+    -- A failed first fetch can have state but no thought_chapters row yet. Keep
+    -- those failures visible in book-level status instead of reporting a clean book.
+    for key,state in pairs(value.state or {}) do
+        if not counted[key] then
+            state=tostring(state or "")
+            if state=="partial" then result.partial=result.partial+1
+            elseif state=="suspicious_empty" then result.suspicious=result.suspicious+1
+            elseif state=="error" then result.error=result.error+1 end
+        end
     end
     return result
 end
@@ -489,6 +515,7 @@ function ThoughtDatabase.delete_chapter(store, book_id, chapter_uid)
                 "DELETE FROM thought_groups WHERE chapter_uid = ?",
                 "DELETE FROM thought_chapters WHERE chapter_uid = ?",
                 "DELETE FROM thought_fetch_state WHERE chapter_uid = ?",
+                "DELETE FROM thought_fetch_checkpoint WHERE chapter_uid = ?",
             }) do
                 local st=conn:prepare(sql); st:bind(key):step(); st:close()
             end
@@ -497,6 +524,109 @@ function ThoughtDatabase.delete_chapter(store, book_id, chapter_uid)
     pcall(conn.close,conn)
     if not ok then return nil,tostring(err) end
     return true
+end
+
+
+function ThoughtDatabase.save_checkpoint(store, book_id, chapter_uid, snapshot)
+    local ok_encoded, payload = pcall(Json.encode, type(snapshot)=="table" and snapshot or {})
+    if not ok_encoded then return nil, tostring(payload) end
+    local conn=open(store,book_id,false)
+    local ok,err=pcall(function()
+        local statement=conn:prepare([[
+            INSERT OR REPLACE INTO thought_fetch_checkpoint(chapter_uid, payload, updated_at)
+            VALUES(?, ?, ?)
+        ]])
+        statement:bind(chapter_key(chapter_uid), tostring(payload or ""), os.time()):step()
+        statement:close()
+    end)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(err) end
+    return true
+end
+
+function ThoughtDatabase.load_checkpoint(store, book_id, chapter_uid)
+    if not ThoughtDatabase.exists(store,book_id) then return nil end
+    local ok,result=pcall(function()
+        local conn=open(store,book_id,true)
+        local statement=conn:prepare([[
+            SELECT payload FROM thought_fetch_checkpoint WHERE chapter_uid = ? LIMIT 1
+        ]])
+        local row=statement:bind(chapter_key(chapter_uid)):step()
+        statement:close(); conn:close()
+        if not row or tostring(row[1] or "")=="" then return nil end
+        local decoded_ok,value=pcall(Json.decode,tostring(row[1]))
+        return decoded_ok and type(value)=="table" and value or nil
+    end)
+    return ok and result or nil
+end
+
+function ThoughtDatabase.clear_checkpoint(store, book_id, chapter_uid)
+    if not ThoughtDatabase.exists(store,book_id) then return true end
+    local conn=open(store,book_id,false)
+    local ok,err=pcall(function()
+        local statement=conn:prepare("DELETE FROM thought_fetch_checkpoint WHERE chapter_uid = ?")
+        statement:bind(chapter_key(chapter_uid)):step(); statement:close()
+    end)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(err) end
+    return true
+end
+
+function ThoughtDatabase.cached_chapters(store, book_id)
+    if not ThoughtDatabase.exists(store,book_id) then return {} end
+    local ok,result=pcall(function()
+        local conn=open(store,book_id,false)
+        local rows={}
+        local statement=conn:prepare([[
+            SELECT c.chapter_uid, c.group_count, c.comment_count, c.updated_at,
+                   COALESCE(f.status, 'cached'), COALESCE(f.complete, 0),
+                   COALESCE(f.fetched_at, 0), COALESCE(f.last_error, '')
+              FROM thought_chapters c
+              LEFT JOIN thought_fetch_state f ON f.chapter_uid = c.chapter_uid
+             ORDER BY c.updated_at DESC, c.chapter_uid
+        ]])
+        while true do
+            local row=statement:step(); if not row then break end
+            rows[#rows+1]={
+                chapter_uid=tostring(row[1] or ""),groups=tonumber(row[2] or 0) or 0,
+                comments=tonumber(row[3] or 0) or 0,updated_at=tonumber(row[4] or 0) or 0,
+                status=tostring(row[5] or "cached"),complete=tonumber(row[6] or 0)==1,
+                fetched_at=tonumber(row[7] or 0) or 0,last_error=tostring(row[8] or ""),
+            }
+        end
+        statement:close(); conn:close(); return rows
+    end)
+    return ok and result or {}
+end
+
+function ThoughtDatabase.delete_chapters(store, book_id, chapter_uids)
+    local ids=type(chapter_uids)=="table" and chapter_uids or {}
+    if #ids==0 or not ThoughtDatabase.exists(store,book_id) then return true,0 end
+    local conn=open(store,book_id,false)
+    local deleted=0
+    local ok,err=xpcall(function()
+        SQLiteStore.transaction(conn,function()
+            local statements={}
+            for _,sql in ipairs({
+                "DELETE FROM thought_comments WHERE chapter_uid = ?",
+                "DELETE FROM thought_groups WHERE chapter_uid = ?",
+                "DELETE FROM thought_chapters WHERE chapter_uid = ?",
+                "DELETE FROM thought_fetch_state WHERE chapter_uid = ?",
+                "DELETE FROM thought_fetch_checkpoint WHERE chapter_uid = ?",
+            }) do statements[#statements+1]=conn:prepare(sql) end
+            for _,uid in ipairs(ids) do
+                local key=chapter_key(uid)
+                if key~="" then
+                    for _,st in ipairs(statements) do st:bind(key):step(); st:clearbind():reset() end
+                    deleted=deleted+1
+                end
+            end
+            for _,st in ipairs(statements) do st:close() end
+        end)
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(err) end
+    return true,deleted
 end
 
 function ThoughtDatabase.record_migration(store, book_id, source_path, source_signature, chapter_uid, counts)

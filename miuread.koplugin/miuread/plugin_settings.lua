@@ -66,10 +66,16 @@ end
 
 function M.comments(plugin)
     local rows={}
-    rows[#rows+1]={text="我的评论收藏",post_text=tostring(plugin:_thought_favorite_count()).." 条",callback=function() plugin:show_thought_favorites() end}
-    append(rows,plugin:thought_font_settings_menu())
-    rows[#rows+1]={text="本地划线与想法",post_text="显示与本地数据",enabled=false}
-    rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return M.comment_data(plugin) end}
+    rows[#rows+1]={text="阅读评论",post_text=plugin:_thoughts_enabled_label(),checked_func=function() return plugin:_thoughts_enabled() end,keep_menu_open=true,callback=function() plugin:_toggle_thoughts_enabled() end}
+    rows[#rows+1]={text="评论显示",post_text="字号 "..plugin:_thought_font_size_label(),sub_item_table_func=function() return plugin:thought_font_settings_menu() end}
+    rows[#rows+1]={text="评论收藏",post_text=tostring(plugin:_thought_favorite_count()).." 条",callback=function() plugin:show_thought_favorites() end}
+    rows[#rows+1]={text="评论缓存",post_text="按书籍和章节管理",callback=function() plugin:show_all_thought_cache_manager() end}
+    local current=plugin:_current_book_record()
+    if current then
+        rows[#rows+1]={text="当前书籍评论",post_text="获取与缓存管理",callback=function() plugin:show_book_thought_menu(current.book or current) end}
+    end
+    rows[#rows+1]={text="评论数据修复",post_text="旧数据迁移与维护",sub_item_table_func=function() return M.comment_data(plugin) end}
+    rows[#rows+1]={text="本地划线与想法",post_text="由 KOReader 管理",enabled=false}
     return rows
 end
 
