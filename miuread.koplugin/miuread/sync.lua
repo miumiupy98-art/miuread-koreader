@@ -3159,13 +3159,24 @@ function Sync:_import_daemon_status(force)
     local current_session=tostring(auth.login_session_id or "")
     local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local current_vid=tostring(account.vid or "")
+    local status_session=tostring(status.login_session_id or "")
+    local status_revision=math.max(0,tonumber(status.auth_revision or 0) or 0)
+    local status_vid=tostring(status.account_vid or "")
     if current_session=="" or current_vid==""
-        or tostring(status.login_session_id or "")~=current_session
-        or math.max(0,tonumber(status.auth_revision or 0) or 0)~=current_revision
-        or tostring(status.account_vid or "")~=current_vid then
-        logger.warn("[MiuRead][ReadReport] stale login status ignored",
-            "status_session=",tostring(status.login_session_id or ""),
-            "current_session=",current_session)
+        or status_session~=current_session
+        or status_revision~=current_revision
+        or status_vid~=current_vid then
+        local reasons={}
+        if current_session=="" then reasons[#reasons+1]="current_session_empty" end
+        if current_vid=="" then reasons[#reasons+1]="current_vid_empty" end
+        if status_session~=current_session then reasons[#reasons+1]="session" end
+        if status_revision~=current_revision then reasons[#reasons+1]="revision" end
+        if status_vid~=current_vid then reasons[#reasons+1]="vid" end
+        logger.info("[MiuRead][ReadReport] stale login status ignored",
+            "reason=",table.concat(reasons,","),
+            "status_session=",status_session,"current_session=",current_session,
+            "status_revision=",tostring(status_revision),"current_revision=",tostring(current_revision),
+            "status_vid=",status_vid,"current_vid=",current_vid)
         return
     end
 

@@ -139,24 +139,44 @@ function Dialog:_run_inline(callback)
     return true
 end
 
-function Dialog:_step_button(icon, width, height, callback)
-    local tap = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        enabled = type(callback) == "function",
-        callback = function() self:_run_inline(callback) end,
+function Dialog:_register_tap(x, y, w, h, callback, enabled)
+    if type(callback) ~= "function" or enabled == false then return end
+    self._tap_regions = self._tap_regions or {}
+    self._tap_regions[#self._tap_regions + 1] = {
+        dimen = Geom:new{x=x, y=y, w=math.max(1,w), h=math.max(1,h)},
+        callback = callback,
     }
-    tap[1] = Skin.frame(width, height, {
-        bordersize = Skin.line("thin"),
-        radius = math.floor(height / 2),
-        background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_DARK_GRAY,
-    }, Ui.icon(icon, width, height, Skin.dp(19, 16, 25), {
-        icon_key = icon, face = Skin.face("cfont", 18, 23, 15),
-    }))
-    return tap
 end
 
-function Dialog:_row_widget(row, width, height)
+function Dialog:_dispatch_tap(pos)
+    if not pos then return false end
+    for index = #(self._tap_regions or {}), 1, -1 do
+        local item = self._tap_regions[index]
+        local d = item and item.dimen
+        if d and pos.x >= d.x and pos.x <= d.x + d.w and pos.y >= d.y and pos.y <= d.y + d.h then
+            local ok, err = pcall(item.callback)
+            if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] tap action failed", tostring(err)) end
+            return true
+        end
+    end
+    return false
+end
+
+function Dialog:_step_button_visual(cell_w, height, icon, enabled)
+    local visual = math.min(height, Skin.dp(38, 33, 50))
+    local frame = Skin.frame(visual, visual, {
+        bordersize = Skin.line("thin"),
+        radius = math.floor(visual / 2),
+        background = Blitbuffer.COLOR_WHITE,
+        color = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_LIGHT_GRAY,
+    }, Ui.icon(icon, visual, visual, Skin.dp(19, 16, 25), {
+        icon_key = icon, face = Skin.face("cfont", 18, 23, 15),
+        fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+    }))
+    return CenterContainer:new{dimen = Geom:new{w = cell_w, h = height}, frame}
+end
+
+function Dialog:_row_widget(row, width, height, abs_x, abs_y)
     local enabled = row.enabled ~= false
     local pad = Skin.dp(8, 6, 11)
     local icon = tostring(row.icon or "")
@@ -166,30 +186,37 @@ function Dialog:_row_widget(row, width, height)
 
     if kind == "step" then
         local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
-        local button = math.min(inner_h, Skin.dp(38, 33, 50))
-        local label_w = math.max(Skin.dp(105, 88, 142), math.floor(width * .30))
-        local value_w = math.max(Skin.dp(50, 42, 68), math.floor(width * .10))
-        local consumed = pad * 2 + icon_w + label_w + button * 2 + value_w
-        local spacer_count = 4 + (icon_w > 0 and 1 or 0)
-        local step_gap = math.max(gap, math.floor(math.max(0, width - consumed) / spacer_count))
+        local touch_w = math.max(Skin.dp(52, 46, 66), inner_h)
+        local value_w = Skin.dp(56, 48, 72)
+        local controls_w = touch_w * 2 + value_w + gap * 2
+        local label_gap = icon_w > 0 and gap or 0
+        local label_w = math.max(Skin.dp(92, 78, 122), width - pad * 2 - icon_w - label_gap - controls_w)
+        local can_decrease = enabled and resolved(row.can_decrease, true) ~= false and type(row.on_decrease) == "function"
+        local can_increase = enabled and resolved(row.can_increase, true) ~= false and type(row.on_increase) == "function"
         local group = HorizontalGroup:new{align = "center"}
         if icon_w > 0 then
             group[#group + 1] = Ui.icon(icon, icon_w, inner_h, Skin.dp(20, 17, 27), {
                 icon_key = icon, face = Skin.face("cfont", 12.7, 17.2, 10.8),
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             })
-            group[#group + 1] = HorizontalSpan:new{width = step_gap}
+            group[#group + 1] = HorizontalSpan:new{width = gap}
         end
         group[#group + 1] = Ui.textbox(tostring(row.label or row.text or ""), label_w, inner_h,
             Skin.face("cfont", 10.9, 14.8, 9.4), {alignment = "left",
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY})
-        group[#group + 1] = HorizontalSpan:new{width = step_gap}
-        group[#group + 1] = self:_step_button("minus", button, button, enabled and row.on_decrease or nil)
-        group[#group + 1] = HorizontalSpan:new{width = step_gap}
+        group[#group + 1] = self:_step_button_visual(touch_w, inner_h, "minus", can_decrease)
+        group[#group + 1] = HorizontalSpan:new{width = gap}
         group[#group + 1] = Ui.textbox(tostring(resolved(row.value, "")), value_w, inner_h,
             Skin.face("cfont", 14.5, 19.0, 12.0), {alignment = "center", halign = "center", bold = true})
-        group[#group + 1] = HorizontalSpan:new{width = step_gap}
-        group[#group + 1] = self:_step_button("plus", button, button, enabled and row.on_increase or nil)
+        group[#group + 1] = HorizontalSpan:new{width = gap}
+        group[#group + 1] = self:_step_button_visual(touch_w, inner_h, "plus", can_increase)
+
+        local controls_x = abs_x + width - pad - controls_w
+        local touch_y = abs_y + pad
+        self:_register_tap(controls_x, touch_y, touch_w, inner_h,
+            function() self:_run_inline(row.on_decrease) end, can_decrease)
+        self:_register_tap(controls_x + touch_w + gap + value_w + gap, touch_y, touch_w, inner_h,
+            function() self:_run_inline(row.on_increase) end, can_increase)
         return CenterContainer:new{dimen = Geom:new{w = width, h = height}, group}
     end
 
@@ -216,8 +243,6 @@ function Dialog:_row_widget(row, width, height)
 
     local value = tostring(resolved(row.value or row.detail, "") or "")
     if row.checked == true then value = value ~= "" and (value .. "  ✓") or "✓" end
-    -- Reader settings stay visually flat by default. A chevron is shown only
-    -- when a caller explicitly requests one for a true child-page affordance.
     local arrow = row.arrow == true and row.callback ~= nil
     local icon_w = icon ~= "" and Skin.dp(28, 23, 38) or 0
     local arrow_w = arrow and Skin.dp(17, 14, 23) or 0
@@ -234,13 +259,11 @@ function Dialog:_row_widget(row, width, height)
         })
         row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
     end
-
     row_content[#row_content + 1] = Ui.textbox(tostring(row.label or row.text or ""), label_w, inner_h,
         Skin.face("cfont", 10.9, 14.8, 9.4), {
             bold = row.bold == true or row.checked == true, alignment = "left",
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         })
-
     if value_w > 0 then
         row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
         row_content[#row_content + 1] = Ui.textbox(value, value_w, inner_h,
@@ -249,7 +272,6 @@ function Dialog:_row_widget(row, width, height)
                 fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
             })
     end
-
     if arrow_w > 0 then
         row_content[#row_content + 1] = HorizontalSpan:new{width = gap}
         row_content[#row_content + 1] = Ui.icon("chevron-right", arrow_w, inner_h, Skin.dp(15, 13, 20), {
@@ -257,17 +279,11 @@ function Dialog:_row_widget(row, width, height)
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
         })
     end
-
-    local tap = TapBox:new{
-        dimen = Geom:new{w = width, h = height},
-        enabled = enabled,
-        callback = function() self:_run_row(row) end,
-    }
-    tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, row_content}
-    return tap
+    self:_register_tap(abs_x, abs_y, width, height, function() self:_run_row(row) end, enabled)
+    return CenterContainer:new{dimen = Geom:new{w = width, h = height}, row_content}
 end
 
-function Dialog:_section_widget(section, width, row_h)
+function Dialog:_section_widget(section, width, row_h, abs_x, abs_y)
     local rows = type(section.rows) == "table" and section.rows or {}
     local height = math.max(row_h, #rows * row_h)
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
@@ -283,7 +299,7 @@ function Dialog:_section_widget(section, width, row_h)
         layers[#layers + 1] = OffsetContainer:new{
             x_off = 0,
             y_off = (index - 1) * row_h,
-            self:_row_widget(row, width, row_h),
+            self:_row_widget(row, width, row_h, abs_x, abs_y + (index - 1) * row_h),
         }
     end
     if #rows == 0 then
@@ -298,54 +314,42 @@ function Dialog:_section_widget(section, width, row_h)
     return layers, height
 end
 
-function Dialog:_hero_widget(hero, width, height)
+function Dialog:_hero_widget(hero, width, height, abs_x, abs_y)
     local button_h = math.max(Skin.dp(46, 40, 61), math.min(height, Skin.dp(58, 48, 72)))
-    local button_w = button_h
-    local value_w = math.max(Skin.dp(86, 72, 120), width - button_w * 2 - math.floor(width * .18))
-    local gap = math.max(Skin.dp(8, 6, 12), math.floor((width - button_w * 2 - value_w) / 2))
+    local touch_w = math.max(button_h, Skin.dp(56, 48, 72))
+    local value_w = math.max(Skin.dp(86, 72, 120), width - touch_w * 2 - math.floor(width * .18))
+    local gap = math.max(Skin.dp(8, 6, 12), math.floor((width - touch_w * 2 - value_w) / 2))
+    local controls_w = touch_w * 2 + value_w + gap * 2
+    local start_x = abs_x + math.floor((width - controls_w) / 2)
+    local button_y = abs_y + math.floor((height - button_h) / 2)
 
-    local function step_button(label, callback)
-        local tap = TapBox:new{
-            dimen = Geom:new{w = button_w, h = button_h},
-            enabled = callback ~= nil,
-            callback = function()
-                if callback then
-                    local ok, err = pcall(callback)
-                    if not ok then logger.warn("[MiuRead][ReaderSettingsDialog] hero action failed", tostring(err)) end
-                    UIManager:scheduleIn(.04, function()
-                        if not self.closed then self:_rebuild() end
-                    end)
-                end
-            end,
-        }
-        tap[1] = Skin.frame(button_w, button_h, {
-            bordersize = Skin.line("thin"),
-            radius = math.floor(button_h / 2),
-            background = Blitbuffer.COLOR_WHITE,
-            color = Blitbuffer.COLOR_DARK_GRAY,
-        }, Ui.icon(label == "+" and "plus" or "minus",
-            button_w - Skin.dp(8, 6, 12), button_h - Skin.dp(4, 2, 6), Skin.dp(22, 19, 30), {
-                face = Skin.face("cfont", 20, 25, 17),
-            }))
-        return tap
+    local function visual(icon, enabled)
+        return self:_step_button_visual(touch_w, button_h, icon, enabled)
     end
+    local can_decrease = type(hero.on_decrease) == "function"
+    local can_increase = type(hero.on_increase) == "function"
+    self:_register_tap(start_x, button_y, touch_w, button_h,
+        function() self:_run_inline(hero.on_decrease) end, can_decrease)
+    self:_register_tap(start_x + touch_w + gap + value_w + gap, button_y, touch_w, button_h,
+        function() self:_run_inline(hero.on_increase) end, can_increase)
 
     return CenterContainer:new{
         dimen = Geom:new{w = width, h = height},
         HorizontalGroup:new{
             align = "center",
-            step_button("−", hero.on_decrease),
+            visual("minus", can_decrease),
             HorizontalSpan:new{width = gap},
             Ui.textbox(tostring(hero.value or ""), value_w, button_h, Skin.face("cfont", 27, 34, 22), {
                 bold = true, alignment = "center", halign = "center",
             }),
             HorizontalSpan:new{width = gap},
-            step_button("+", hero.on_increase),
+            visual("plus", can_increase),
         },
     }
 end
 
 function Dialog:_build_content()
+    self._tap_regions = {}
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
     local sections = self:_sections()
@@ -394,23 +398,17 @@ function Dialog:_build_content()
     local back_w = Skin.dp(44, 38, 58)
     local title_w = math.max(1, content_w - back_w * 2)
     local back_action = self.opts and self.opts.on_back or nil
-    local back_tap = TapBox:new{
-        dimen = Geom:new{w = back_w, h = header_h},
-        callback = function() self:_close(back_action) end,
-    }
-    back_tap[1] = Ui.icon("back", back_w, header_h, Skin.dp(21, 18, 28), {
+    local back_tap = Ui.icon("back", back_w, header_h, Skin.dp(21, 18, 28), {
         face = Skin.face("cfont", 21, 26, 18),
     })
     local home_action = self.opts and self.opts.on_home or nil
-    local home_tap = TapBox:new{
-        dimen = Geom:new{w = back_w, h = header_h},
-        enabled = type(home_action) == "function",
-        callback = function() self:_close(home_action) end,
-    }
-    home_tap[1] = Ui.icon("home", back_w, header_h, Skin.dp(21, 18, 28), {
+    local home_tap = Ui.icon("home", back_w, header_h, Skin.dp(21, 18, 28), {
         face = Skin.face("cfont", 15.8, 20.8, 13.2),
         fgcolor = type(home_action) == "function" and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
     })
+    self:_register_tap(outer_margin + pad, y, back_w, header_h, function() self:_close(back_action) end, true)
+    self:_register_tap(outer_margin + pad + back_w + title_w, y, back_w, header_h,
+        function() self:_close(home_action) end, type(home_action) == "function")
     local header = HorizontalGroup:new{
         align = "center",
         back_tap,
@@ -436,7 +434,8 @@ function Dialog:_build_content()
 
     if hero_h > 0 then
         y = y + gap
-        root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, self:_hero_widget(hero, content_w, hero_h)}
+        root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y,
+            self:_hero_widget(hero, content_w, hero_h, outer_margin + pad, y)}
         y = y + hero_h
     end
 
@@ -453,8 +452,9 @@ function Dialog:_build_content()
             }
             y = y + section_title_h
         end
-        local section_widget, section_h = self:_section_widget(section, content_w, row_h)
-        root[#root + 1] = OffsetContainer:new{x_off = outer_margin + pad, y_off = y, section_widget}
+        local section_x = outer_margin + pad
+        local section_widget, section_h = self:_section_widget(section, content_w, row_h, section_x, y)
+        root[#root + 1] = OffsetContainer:new{x_off = section_x, y_off = y, section_widget}
         y = y + section_h
         if section_index < #sections then y = y + gap end
     end
@@ -500,11 +500,13 @@ end
 
 function Dialog:onTapDismiss(_, ges)
     local pos = ges and ges.pos
+    if self:_dispatch_tap(pos) then return true end
     if pos and (pos.y < self.frame_dimen.y or pos.y > self.frame_dimen.y + self.frame_dimen.h
         or pos.x < self.frame_dimen.x or pos.x > self.frame_dimen.x + self.frame_dimen.w) then
         return self:_close(nil, true)
     end
-    return false
+    -- Consume taps inside the paper even when they hit a non-interactive preview.
+    return true
 end
 function Dialog:onSwipeDismiss(_, ges)
     if ges and ges.direction == "north" then return self:_close(nil, true) end

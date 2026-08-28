@@ -935,8 +935,12 @@ function Reader:catalog(book_id, request_options)
     if ok then return result end
     if is_auth_error(result) then
         local renewed, renew_error=self:_recover_login_session()
-        logger.warn("[MiuRead][Reader] catalog authentication recovery", "ok=", tostring(renewed),
-            "error=", renewed and "" or tostring(renew_error))
+        if renewed then
+            logger.info("[MiuRead][Reader] catalog authentication recovery", "ok=", "true")
+        else
+            logger.warn("[MiuRead][Reader] catalog authentication recovery", "ok=", "false",
+                "error=", tostring(renew_error))
+        end
         if renewed then
             local retry_ok, retry_result=pcall(load_catalog)
             if retry_ok then return retry_result end

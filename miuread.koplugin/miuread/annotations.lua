@@ -743,7 +743,7 @@ local function intervals(data, visible_count, index, coord_html)
     return clean, stats, unresolved
 end
 
-local function render_text_token(token, marks, data)
+local function render_text_token(token, marks, data, anchored)
     if token.skip or not token.units or #token.units == 0 then return token.raw end
     local out, pos = {}, token.start
     local active, thought_link_open = nil, false
@@ -771,7 +771,13 @@ local function render_text_token(token, marks, data)
                 end
                 local mark_class = Thoughts.mark_class(active.key)
                 local display_class = active.thought and "miu-thought-mark" or "miu-inline-mark"
-                out[#out + 1] = '<span class="' .. display_class .. ' ' .. mark_class .. '" data-miu-range="' .. active.key .. '">'
+                local id_attr = ""
+                if active.thought and not anchored[active.key] then
+                    anchored[active.key] = true
+                    id_attr = ' id="' .. Thoughts.anchor(data.book_id, data.chapter_uid, active.key) .. '"'
+                end
+                out[#out + 1] = '<span' .. id_attr .. ' class="' .. display_class .. ' ' .. mark_class
+                    .. '" data-miu-range="' .. active.key .. '">'
             end
         end
         out[#out + 1] = unit
@@ -789,8 +795,9 @@ local function inject(html, data, coord_html)
     local rendered = tostring(html or "")
     if #marks > 0 then
         local out = {}
+        local anchored = {}
         for _, token in ipairs(tokens) do
-            if token.kind == "text" then out[#out + 1] = render_text_token(token, marks, data)
+            if token.kind == "text" then out[#out + 1] = render_text_token(token, marks, data, anchored)
             else out[#out + 1] = token.raw end
         end
         rendered = table.concat(out)

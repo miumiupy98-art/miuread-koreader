@@ -752,6 +752,15 @@ function Plugin:init()
     else
         self:_set_navigation_state("native","file manager plugin initialized")
     end
+    -- Keep the annotation-mark preference in the first CRE stylesheet so a
+    -- hidden-mark book does not need a second full re-render after opening.
+    if self.ui and self.ui.styletweak
+        and type(self.ui.styletweak.getCssText)=="function" then
+        self:_install_marks_getCssText_wrapper(self.ui.styletweak)
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
+    end
+    -- Internal thought links must also work on keyboard-only/non-touch devices.
+    self:_install_thought_link_guard()
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._download_ui_yield_path="/tmp/miuread-download-ui-yield.until"
@@ -6191,6 +6200,7 @@ function Plugin:reader_quick_panel_settings_menu()
                 self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
             end},
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="显示微信读书划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
@@ -6956,18 +6966,24 @@ function Plugin:_wifi_schedule_reconcile(source,want_on)
         UIManager:scheduleIn(delay,function()
             if generation~=self._wifi_reconcile_generation then return end
             local state=self:_wifi_refresh_state(tostring(source or "toggle").."+"..tostring(delay))
-            local linked=state.connected==true or (state.connected==nil and state.online==true)
-            if (want_on==true and linked) or (want_on~=true and state.wifi_on==false) then
+            local linked=state.network_phase=="connected"
+                or (state.connected==true and state.online==true)
+            if want_on==true and linked then
+                require("miuread.network_health").note_success("wifi-reconcile")
+                self._wifi_reconcile_generation=generation+1
+            elseif want_on~=true and state.wifi_on==false then
                 self._wifi_reconcile_generation=generation+1
             end
         end)
     end
-    schedule(.8)
-    schedule(3)
-    schedule(6)
+    -- Kindle can take tens of seconds to re-associate after a real suspend.
+    -- Keep these sparse so recovery is visible without polling continuously.
+    for _,delay in ipairs({.8,3,6,12,24,40,52}) do schedule(delay) end
 end
 
 function Plugin:_wifi_start(NetworkMgr,source)
+    require("miuread.network_health").mark_recovering(tostring(source or "toggle")..":start")
+    HomeData.invalidate_device_state()
     local completed=false
     local function complete()
         if completed then return end
@@ -7030,6 +7046,7 @@ function Plugin:_wifi_stop(NetworkMgr,source)
         ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr,complete)
     end
     if ok then
+        require("miuread.network_health").clear()
         HomeData.invalidate_device_state()
         self:_wifi_schedule_reconcile(source,false)
     end
@@ -7118,13 +7135,18 @@ function Plugin:_reader_wifi_settings(back_callback)
 end
 
 function Plugin:_home_wifi_text()
-    local state=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
-    if state.wifi_on==false then return "已关闭" end
+    local state=HomeData.cached_device_state() or {}
+    local health=require("miuread.network_health").snapshot()
+    local phase=tostring(state.network_phase or "")
+    if state.wifi_on==false or phase=="off" then return "已关闭" end
+    if phase=="recovering" or (health.state=="recovering" and health.age<=50) then return "正在恢复" end
+    if phase=="unavailable" or (health.state=="down" and health.age<=20) then return "网络不可用" end
+    if phase=="connecting" then return "正在连接" end
     if state.wifi_on==true then
-        local linked=state.connected==true or (state.connected==nil and state.online==true)
+        local linked=state.connected==true and state.online==true
         local ssid=U.trim(tostring(state.wifi_name or ""))
         if linked and ssid~="" then return U.utf8_truncate(ssid,13,"…") end
-        return linked and "已连接" or "未连接"
+        return linked and "已连接" or "正在连接"
     end
     return "Wi-Fi"
 end
@@ -13117,6 +13139,125 @@ function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
 end
 
+-- Downloaded annotation/thought books encode visible marks in EPUB CSS.  This
+-- preference changes only their presentation; annotation and comment data stay
+-- intact and thought links remain interactive.
+function Plugin:_marks_enabled()
+    return (self.store:preferences().thoughts or {}).show_marks~=false
+end
+
+function Plugin:_marks_enabled_label()
+    return self:_marks_enabled() and "已开启" or "已关闭"
+end
+
+function Plugin:_annotation_mark_hide_css()
+    local ANNOTATION_MARK_HIDE_CSS=[[/* MiuRead: hide annotation marks (reader preference) */
+.miu-inline-mark {
+    text-decoration: none !important;
+}
+.miu-thought-mark, .miu-has-thought {
+    text-decoration: none !important;
+    border-bottom: 2px solid transparent !important;
+    padding-bottom: 2px !important;
+}
+]]
+    if self:_marks_enabled() then return nil end
+    return ANNOTATION_MARK_HIDE_CSS
+end
+
+function Plugin:_current_book_supports_miuread_marks()
+    local path=tostring(self:_current_document_path() or "")
+    if path:find("%[划线与想法版%]%.epub$") then return true end
+    local record=self.sync and self.sync:record() or nil
+    local variant=tostring(record and (record.variant or record.download_variant) or "")
+    return record and (record.annotation_requested==true or variant:find("notes",1,true)~=nil) or false
+end
+
+function Plugin:_install_marks_getCssText_wrapper(st)
+    if not (st and type(st.getCssText)=="function") then return false end
+    if rawget(st,"_miuread_marks_original_getCssText")~=nil then return true end
+    local original=st.getCssText
+    st._miuread_marks_original_getCssText=original
+    st.getCssText=function(instance)
+        local base=original(instance)
+        local extra=self:_annotation_mark_hide_css()
+        if extra==nil then return base end
+        if base==nil or base=="" then return extra end
+        return base.."\n"..extra
+    end
+    return true
+end
+
+function Plugin:_apply_annotation_mark_style(reason)
+    if self.ui and self.ui.document and not self:_current_book_supports_miuread_marks() then return false end
+    local doc=self.ui and self.ui.document or nil
+    if not doc or type(doc.setStyleSheet)~="function" then return false end
+    if not self:_reader_is_reflowable() then return false end
+    local hide_css=self:_annotation_mark_hide_css()
+    local want_hidden=hide_css~=nil
+    if (self._annotation_mark_style_hidden==true)==want_hidden then return false end
+    local ui=self.ui
+    local st=ui.styletweak or nil
+    local applied=false
+    if self:_install_marks_getCssText_wrapper(st) then
+        if type(ui.handleEvent)=="function" then
+            ui:handleEvent(Event:new("ApplyStyleSheet"))
+            applied=true
+        end
+    elseif hide_css~=nil or self._annotation_mark_style_direct==true then
+        local main_css=(ui.typeset and ui.typeset.css) or doc.default_css
+        local base=""
+        if st and type(st.css_text)=="string" then base=st.css_text end
+        local appended
+        if hide_css~=nil then
+            appended=(base~="" and base.."\n" or "")..hide_css
+        else
+            appended=base
+        end
+        local ok=pcall(doc.setStyleSheet,doc,main_css,appended)
+        if ok and type(ui.handleEvent)=="function" then
+            ui:handleEvent(Event:new("UpdatePos"))
+        end
+        self._annotation_mark_style_direct=ok
+        applied=ok
+    end
+    if applied then
+        self._annotation_mark_style_hidden=want_hidden
+        logger.info("[MiuRead][AnnotationStyle] mark display updated",
+            "reason=",tostring(reason or ""),"hidden=",tostring(want_hidden))
+    end
+    return applied
+end
+
+function Plugin:_sync_reader_annotation_mark_style(reason)
+    local st=self.ui and self.ui.styletweak or nil
+    if st~=nil and rawget(st,"_miuread_marks_original_getCssText")~=nil
+        and (self._annotation_mark_style_hidden==true)==(self:_annotation_mark_hide_css()~=nil) then
+        return false
+    end
+    self._annotation_mark_style_hidden=nil
+    return self:_apply_annotation_mark_style(reason)
+end
+
+function Plugin:_set_marks_enabled(enabled)
+    enabled=enabled~=false
+    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+    if (p.thoughts.show_marks~=false)==enabled then return true end
+    p.thoughts.show_marks=enabled
+    self:_save_ui_preferences(p,"marks_enabled")
+    self:_apply_annotation_mark_style(enabled and "marks enabled" or "marks disabled")
+    if enabled then
+        self:toast("划线显示已开启",1.5)
+    else
+        self:toast("划线已隐藏，划线和评论数据不会删除",2)
+    end
+    return true
+end
+
+function Plugin:_toggle_marks_enabled()
+    return self:_set_marks_enabled(not self:_marks_enabled())
+end
+
 function Plugin:_thought_font_size_value(prefs)
     prefs=prefs or (self.store:preferences().thoughts or {})
     local numeric=tonumber(prefs.font_size)
@@ -13263,6 +13404,12 @@ function Plugin:_show_reader_comment_center(back_callback)
                         self:_search_thought_favorites{reader_context=true,back_callback=reopen}
                     end},
             }
+            local mark_rows={}
+            if self:_current_book_supports_miuread_marks() then
+                mark_rows[#mark_rows+1]={icon="highlight",label="显示划线",value=self:_marks_enabled_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_marks_enabled()
+                end}
+            end
             local display_rows={
                 {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
                     self:_toggle_thoughts_enabled()
@@ -13271,6 +13418,8 @@ function Plugin:_show_reader_comment_center(back_callback)
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),reopen)
                 end},
                 {kind="step",icon="font",label="评论字号",value=function() return self:_thought_font_size_label() end,
+                    can_decrease=function() return self:_thought_font_size_value()>12 end,
+                    can_increase=function() return self:_thought_font_size_value()<48 end,
                     on_decrease=function() self:_adjust_thought_font_size(-1) end,
                     on_increase=function() self:_adjust_thought_font_size(1) end},
                 {icon="settings",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function()
@@ -13288,10 +13437,10 @@ function Plugin:_show_reader_comment_center(back_callback)
                     self:toast("评论显示已恢复默认",1.5)
                 end},
             }
-            return {
-                {title="评论内容",rows=content_rows},
-                {title="评论显示",rows=display_rows},
-            }
+            local sections={{title="评论内容",rows=content_rows}}
+            if #mark_rows>0 then sections[#sections+1]={title="正文标记",rows=mark_rows} end
+            sections[#sections+1]={title="评论显示",rows=display_rows}
+            return sections
         end,
     }
     return true
@@ -13339,13 +13488,18 @@ end
 
 function Plugin:_reader_wifi_summary()
     local state=HomeData.cached_device_state() or {}
-    if state.wifi_on==false then return "Wi-Fi关",false end
-    if state.wifi_on==nil then return "Wi-Fi",true end
-    local linked=state.connected==true or (state.connected==nil and state.online==true)
+    local health=require("miuread.network_health").snapshot()
+    local phase=tostring(state.network_phase or "")
+    if state.wifi_on==false or phase=="off" then return "Wi-Fi关",false end
+    if phase=="recovering" or (health.state=="recovering" and health.age<=50) then return "Wi-Fi恢复中",true end
+    if phase=="unavailable" or (health.state=="down" and health.age<=20) then return "网络不可用",true end
+    if phase=="connecting" then return "Wi-Fi连接中",true end
+    local linked=state.connected==true and state.online==true
     local ssid=U.trim(tostring(state.wifi_name or ""))
     if linked and ssid~="" then return ssid,false end
     if linked then return "已连接",false end
-    return "Wi-Fi!",true
+    if state.wifi_on==true then return "Wi-Fi连接中",true end
+    return "Wi-Fi",true
 end
 
 function Plugin:_reader_sync_summary()
@@ -24224,6 +24378,7 @@ function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="显示微信读书划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()
@@ -24852,6 +25007,21 @@ end
 function Plugin:_teardown_thought_tap()
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
+    if self._thought_link_guard and self.ui and self.ui.link then
+        local link_mod=self.ui.link
+        local original=rawget(link_mod,"_miuread_original_onGotoLink")
+        local wrapper=rawget(link_mod,"_miuread_wrapper_onGotoLink")
+        -- Restore only if MiuRead still owns the active hook. If another plugin
+        -- wrapped onGotoLink after us, leave its chain untouched.
+        if type(original)=="function" and wrapper~=nil and link_mod.onGotoLink==wrapper then
+            link_mod.onGotoLink=original
+        end
+        link_mod._miuread_original_onGotoLink=nil
+        link_mod._miuread_wrapper_onGotoLink=nil
+        self._thought_link_guard=nil
+        logger.info("[MiuRead][ThoughtPopup] link guard removed",
+            "owned=",tostring(wrapper~=nil and link_mod.onGotoLink==original))
+    end
 end
 function Plugin:_thought_font_size(value)
     -- The native comment popup uses this same final size for layout metrics and
@@ -24886,7 +25056,7 @@ function Plugin:_thought_font_name(prefs)
     if doc and type(doc.getFontFace)=="function" then
         local ok,value=pcall(doc.getFontFace,doc)
         if ok then
-            name=usable_font_name(value)
+            local name=usable_font_name(value)
             if name then return name end
         end
     end
@@ -25690,8 +25860,42 @@ function Plugin:_on_thought_tap(ges)
     if GestureBridge.dispatch(ges) then return true end
     return false
 end
+function Plugin:_install_thought_link_guard()
+    local ui=self.ui
+    local link_mod=ui and ui.link or nil
+    if not link_mod or type(link_mod.onGotoLink)~="function" then return false end
+    if rawget(link_mod,"_miuread_original_onGotoLink")~=nil then return true end
+    local original=link_mod.onGotoLink
+    link_mod._miuread_original_onGotoLink=original
+    local wrapper
+    wrapper=function(self2,link_obj,...)
+        if link_obj then
+            local href=extract_thought_href(link_obj,{},0)
+            if not href then
+                for _,v in pairs(link_obj) do
+                    if type(v)=="string" then
+                        local found=tostring(v):match("(#?miuthought%-[%x%.]+)")
+                        if found then href=found; break end
+                    end
+                end
+            end
+            if href and Thoughts.parse_href(href) then
+                return self:_show_thought_href(href)
+            end
+        end
+        return original(self2,link_obj,...)
+    end
+    link_mod._miuread_wrapper_onGotoLink=wrapper
+    link_mod.onGotoLink=wrapper
+    self._thought_link_guard=true
+    logger.info("[MiuRead][ThoughtPopup] link guard installed (keyboard/non-touch path)")
+    return true
+end
+
 function Plugin:_setup_thought_tap()
-    if self._thought_tap_setup or not self.ui or not self.ui.registerTouchZones then return end
+    if self._thought_tap_setup or not self.ui then return end
+    self:_install_thought_link_guard()
+    if not self.ui.registerTouchZones then return end
     local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
     self.ui:registerTouchZones({{id="miuread_thought_popup",ges="tap",screen_zone={ratio_x=0,ratio_y=0,ratio_w=1,ratio_h=1},overrides={"tap_link"},handler=function(ges) return self:_on_thought_tap(ges) end}})
     self._thought_tap_setup=true
@@ -25801,6 +26005,7 @@ function Plugin:on_sync_record_ready(current)
         local variant=tostring(current.variant or record.variant or "")
         if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
+            self:_sync_reader_annotation_mark_style("sync record ready")
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
@@ -26172,6 +26377,52 @@ function Plugin:_reader_rebuild_ready_state()
     return true,false
 end
 
+-- Install the mark visibility rule before CRE builds the first document
+-- stylesheet.  This avoids reopening a cached book and then forcing a second
+-- full layout pass merely to hide its annotation decoration.
+function Plugin:onDocSettingsLoad()
+    local st=self.ui and self.ui.styletweak or nil
+    if not (st and type(st.getCssText)=="function") then
+        self._annotation_mark_style_hidden=nil
+        return false
+    end
+    if self:_install_marks_getCssText_wrapper(st) then
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
+    else
+        self._annotation_mark_style_hidden=nil
+    end
+    return false
+end
+
+function Plugin:onReadSettings()
+    local st=self.ui and self.ui.styletweak or nil
+    if not (st and type(st.getCssText)=="function") then
+        self._annotation_mark_style_hidden=nil
+        return false
+    end
+    if rawget(st,"_miuread_marks_original_getCssText")~=nil then
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
+        return false
+    end
+    self:_install_marks_getCssText_wrapper(st)
+    local want_hidden=self:_annotation_mark_hide_css()~=nil
+    if want_hidden then
+        local typeset=self.ui.typeset or nil
+        local doc=self.ui and self.ui.document or nil
+        if typeset and doc and type(doc.setStyleSheet)=="function" and typeset.css then
+            local ok=pcall(doc.setStyleSheet,doc,typeset.css,st:getCssText())
+            if ok then
+                self._annotation_mark_style_hidden=true
+                return false
+            end
+        end
+        self._annotation_mark_style_hidden=nil
+        return false
+    end
+    self._annotation_mark_style_hidden=false
+    return false
+end
+
 function Plugin:onReaderReady()
     HOME_SESSION.home_restore_generation=(tonumber(HOME_SESSION.home_restore_generation) or 0)+1
     HOME_SESSION.home_restore_active=false
@@ -26287,6 +26538,7 @@ function Plugin:onReaderReady()
         end
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
+            self:_sync_reader_annotation_mark_style("reader ready")
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
         end
         local pending=HOME_SESSION.pending_annotation_jump
@@ -27665,6 +27917,17 @@ function Plugin:onResume()
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
+    -- Never reuse the pre-suspend Wi-Fi label. Kindle may keep the radio flag
+    -- while association/IP routing is still being restored for several seconds.
+    if self:_network_radio_hint()~=false then
+        require("miuread.network_health").mark_recovering("resume")
+        HomeData.invalidate_device_state()
+        ReaderToolbar.invalidate()
+        self:_wifi_schedule_reconcile("resume",true)
+    else
+        require("miuread.network_health").clear()
+        HomeData.invalidate_device_state()
+    end
     local close_pending=reader_close_active()
     local native_menu_pending=NATIVE_MENU_GUARD.active==true
     if close_pending then
