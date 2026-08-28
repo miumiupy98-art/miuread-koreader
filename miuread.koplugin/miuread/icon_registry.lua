@@ -60,7 +60,8 @@ local MAP = {
     wifi = "wifi", ["⌁"] = "wifi", ["Wi-Fi"] = "wifi",
     bluetooth = "bluetooth", bt = "bluetooth",
     ["⌫"] = "trash", trash = "trash", delete = "trash",
-    ["✎"] = "pencil", pencil = "pencil", edit = "pencil",
+    ["✎"] = "pencil", ["✏"] = "pencil", ["✐"] = "pencil",
+    pencil = "pencil", edit = "pencil",
     ["↔"] = "swap", swap = "swap",
     ["☁"] = "cloud", cloud = "cloud",
     ["◎"] = "newspaper", newspaper = "newspaper", mp = "newspaper",
@@ -88,12 +89,15 @@ function Registry.widget(value, size, opts)
     local path = opts.path or Registry.path(value)
     if path and path ~= "" and lfs.attributes(path, "mode") == "file" then
         local image
+        -- Do not pass scale_factor=0: that keeps the SVG's aspect ratio and
+        -- letterboxes optically-small glyphs. Nil stretches to the square slot,
+        -- matching KOReader IconWidget. Stroke/fill live on each shape so
+        -- NanoSVG does not depend on parent inheritance.
         local ok = pcall(function()
             image = ImageWidget:new{
                 file = path,
                 width = size,
                 height = size,
-                scale_factor = 0,
                 file_do_cache = true,
                 is_icon = true,
             }

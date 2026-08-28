@@ -9297,7 +9297,7 @@ function Plugin:_show_home_settings_popup(anchor)
         {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function()
             self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor})
         end},
-        {icon="✎",label="评论与批注",detail="评论 划线与想法",callback=function()
+        {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function()
             self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor})
         end},
         {icon="◷",label="时间与时区",detail="时间来源与地区显示",callback=function()
@@ -9465,7 +9465,7 @@ function Plugin:_home_action_function_actions(key,anchor)
     if key=="miuread_settings" then return {
         {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
         {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor}) end},
-        {icon="✎",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
+        {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
         {icon="⇅",label="同步",detail="进度 时间与批注同步",callback=function() self:_show_standalone_menu("同步",self:sync_settings_menu(),{anchor=anchor}) end},
         {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor}) end},
         {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor}) end},

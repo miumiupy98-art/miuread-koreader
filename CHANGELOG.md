@@ -7,6 +7,8 @@
 - 新增 10 个图标并写入登记表：删除 `trash`、编辑 `pencil`、对调 `swap`、云 `cloud`、公众号 `newspaper`、关机 `power-off`、缓存 `cache`、勾选 `check`、分类 `library`、圆点 `dot`。KOReader 的 K 标和行距没有现成 Lucide 图形，按同一套 24/2 线框重画。
 - Wi-Fi 三态改为 Lucide：已连接满格 `wifi`、未连接一格 `wifi-low`、关闭划掉 `wifi-off`。
 - 「我的分类」改用 `library`；阅读下滑栏「更多」补上省略号图标；去掉划线/评论等为迁就旧画幅而设的 `icon_scale` / `icon_nudge_y`。截图倒计时的 `5` / `10` / `15` 仍用数字，不改成图标。
+- 同级图标光学对齐：每个 path/circle/rect 自带 `fill="none"` 与 `stroke-width="2"`，避免 KOReader NanoSVG 不继承父级描边时有的实心、有的空心；偏小的字形（字体、加号、返回箭头等）收紧 viewBox，不再依赖会把画幅 letterbox 的 `scale_factor=0`。
+- 「评论与批注」改为直接使用 `pencil.svg`，不再写 `✎` 字符（NanoSVG 对铅笔路径里的 `.5` 简写也做了展开）。
 - 在 `THIRD_PARTY_NOTICES` 记录 Lucide / Feather 版权。不修改阅读时间、进度、批注、下载模型、评论缓存、锁屏、评论中心或 `SCHEMA`。
 
 ## 5.4.0-beta.10
