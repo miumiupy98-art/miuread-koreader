@@ -24876,6 +24876,20 @@ function Plugin:_close_active_thought_popup(reason)
     end
 end
 
+-- Likes are the only web annotation feature without a Skill Gateway fallback, so
+-- a timed-out session shows up as a heart that silently does nothing while the
+-- bookshelf and comments still work. Say why. The notice is throttled, always
+-- optional and fully contained: it can never turn into a second failure path for
+-- the like itself, and it uses the plugin's own transient toast, which the reader
+-- return watcher ignores and which never closes the thought popup.
+function Plugin:_notify_online_like_auth_expired()
+    local now=monotonic_wall_time()
+    local last=tonumber(self._online_like_auth_notice_at)
+    if last and now-last<6 then return end
+    self._online_like_auth_notice_at=now
+    pcall(function() self:toast("微信读书登录已失效，请重新扫码登录后再点赞",3) end)
+end
+
 function Plugin:_toggle_online_review_like(request,callback)
     request=type(request)=="table" and request or {}
     local review_id=U.trim(tostring(request.review_id or ""))
@@ -24888,6 +24902,19 @@ function Plugin:_toggle_online_review_like(request,callback)
     end
     if self.interactive_network_async and self.interactive_network_async:busy() then
         finish(nil,"busy")
+        return false
+    end
+
+    -- Every like runs in a fresh child process, so the Api-level annotation
+    -- circuit cannot survive between taps. Remember a confirmed session timeout
+    -- against the credential revision that produced it; otherwise each tap
+    -- spends a full request timeout plus a login renewal already known to fail,
+    -- and the heart looks unresponsive for tens of seconds. Any real credential
+    -- change bumps the revision, so a fresh login clears this on its own.
+    local revision=self.store:auth_revision()
+    if self._online_like_auth_dead==revision then
+        self:_notify_online_like_auth_expired()
+        finish(nil,"auth_expired")
         return false
     end
 
@@ -24942,11 +24969,25 @@ function Plugin:_toggle_online_review_like(request,callback)
             self:_apply_interactive_auth{auth=payload.auth,changed=true}
         end
         if not payload or payload.request_ok~=true then
+            local reason=tostring(payload and payload.error
+                or (result and result.error) or "network task failed")
+            -- Only the confirmed web-session timeout opens the circuit. Other
+            -- failures may be transient and must stay retryable.
+            if tonumber(Http.auth_error_code(reason))==-2012 then
+                local dead_revision=self.store:auth_revision()
+                if self._online_like_auth_dead~=dead_revision then
+                    logger.warn("[MiuRead][ThoughtLike] likes paused; login session timed out",
+                        "revision=",tostring(dead_revision))
+                end
+                self._online_like_auth_dead=dead_revision
+                self:_notify_online_like_auth_expired()
+            end
             logger.warn("[MiuRead][ThoughtLike] request failed","review=",review_id,
-                "error=",tostring(payload and payload.error or (result and result.error) or "network task failed"))
+                "error=",reason)
             finish(nil,payload and payload.error or "request failed")
             return
         end
+        self._online_like_auth_dead=nil
         logger.info("[MiuRead][ThoughtLike] updated","review=",review_id,
             "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes))
         finish({is_liked=payload.is_liked==true,likes=tonumber(payload.likes) or cached_likes})
