@@ -376,7 +376,15 @@ function Dialog:init()
     self[1] = self:_build_content()
 end
 
+function Dialog:onShow()
+    if self.frame_dimen then
+        UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.frame_dimen) end)
+    end
+    return true
+end
+
 function Dialog:onCloseWidget()
+    local old_region=self.frame_dimen and Skin.expand_region(self.frame_dimen) or nil
     if live_dialog == self then live_dialog = nil end
     if self.rebuild_task then
         UIManager:unschedule(self.rebuild_task)
@@ -384,7 +392,17 @@ function Dialog:onCloseWidget()
     end
     local action = self.pending_action
     self.pending_action = nil
-    if action then UIManager:nextTick(action) end
+    -- CloseWidget is dispatched before UIManager actually removes this dialog
+    -- from the window stack. Reopen the parent (when requested) and repaint the
+    -- newly uncovered area on the next tick so Kindle/E-Ink does not keep the
+    -- old typography page as ghost pixels.
+    UIManager:nextTick(function()
+        if action then
+            local ok,err=pcall(action)
+            if not ok then logger.warn("[MiuRead][TypographyDialog] close action failed",tostring(err)) end
+        end
+        if old_region then UIManager:setDirty("all", "ui", old_region) end
+    end)
     return true
 end
 

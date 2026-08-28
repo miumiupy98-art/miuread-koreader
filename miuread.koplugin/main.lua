@@ -13312,7 +13312,11 @@ function Plugin:_show_reader_comment_settings(back_callback)
     ReaderTypographyDialog.show{
         title="评论显示",
         subtitle=function()
-            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线与评论数据仍保留" end
+            local comments_on=self:_thoughts_enabled()
+            local marks_on=self:_marks_enabled()
+            if not comments_on and not marks_on then return "阅读评论已关闭 · 划线已隐藏 · 数据仍保留" end
+            if not comments_on then return "阅读评论已关闭 · 划线与评论数据仍保留" end
+            if not marks_on then return "划线已隐藏 · 评论数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
@@ -13327,10 +13331,10 @@ function Plugin:_show_reader_comment_settings(back_callback)
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
                 {kind="step",label="字号",value=function() return self:_thought_font_size_label() end,
-                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
-                    on_increase=function() self:_adjust_thought_font_size(1) end,
-                    on_decrease_hold=function() self:_adjust_thought_font_size(-3) end,
-                    on_increase_hold=function() self:_adjust_thought_font_size(3) end},
+                    on_decrease=self:_thought_font_size_value()>12 and function() self:_adjust_thought_font_size(-1) end or nil,
+                    on_increase=self:_thought_font_size_value()<48 and function() self:_adjust_thought_font_size(1) end or nil,
+                    on_decrease_hold=self:_thought_font_size_value()>12 and function() self:_adjust_thought_font_size(-3) end or nil,
+                    on_increase_hold=self:_thought_font_size_value()<48 and function() self:_adjust_thought_font_size(3) end or nil},
                 {kind="select",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,callback=function() self:_toggle_thought_follow_body_font() end},
             }
         end,
@@ -13347,13 +13351,6 @@ function Plugin:_show_reader_comment_settings(back_callback)
                     self:_save_ui_preferences(p,"thought_font_reset")
                     self:_refresh_thought_display(p.thoughts)
                     self:toast("评论显示已恢复默认",1.5)
-                end},
-                {label="应用到全部评论",primary=true,callback=function()
-                    -- 评论显示偏好本身就是觅阅全局偏好；这里显式保存并
-                    -- 给用户一个明确的“应用到全部”操作，而不再另造一份状态。
-                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                    self:_save_ui_preferences(p,"thought_font_global")
-                    self:toast("已应用到全部评论",1.5)
                 end},
             }
         end,
@@ -13379,8 +13376,6 @@ function Plugin:_show_reader_comment_center(back_callback)
             local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
             local chapter_count=(scope.book_id~="" and scope.chapter_uid~="")
                 and self:_thought_favorite_count({book_id=scope.book_id,chapter_uid=scope.chapter_uid}) or 0
-            local prefs=self.store:preferences().thoughts or {}
-            local follow=prefs.follow_body_font==true
             local content_rows={
                 {icon="bookmark",label="本章评论收藏",value=scope.chapter_uid~="" and (tostring(chapter_count).." 条") or "当前章节不可识别",
                     enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
@@ -13411,31 +13406,9 @@ function Plugin:_show_reader_comment_center(back_callback)
                 end}
             end
             local display_rows={
-                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
-                    self:_toggle_thoughts_enabled()
-                end},
-                {icon="font",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),arrow=true,callback=function()
-                    self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),reopen)
-                end},
-                {kind="step",icon="font",label="评论字号",value=function() return self:_thought_font_size_label() end,
-                    can_decrease=function() return self:_thought_font_size_value()>12 end,
-                    can_increase=function() return self:_thought_font_size_value()<48 end,
-                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
-                    on_increase=function() self:_adjust_thought_font_size(1) end},
-                {icon="settings",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function()
-                    self:_toggle_thought_follow_body_font()
-                end},
-                {kind="preview",label="评论预览",
-                    text="这是一段评论文字，用来预览当前字体与字号。",
-                    font=function() return self:_thought_font_name(self.store:preferences().thoughts or {}) end,
-                    size=function() return self:_thought_font_size_value() end},
-                {icon="undo",label="恢复默认",value="字体、字号与跟随设置",keep_open=true,callback=function()
-                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                    p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
-                    self:_save_ui_preferences(p,"thought_font_reset")
-                    self:_refresh_thought_display(p.thoughts)
-                    self:toast("评论显示已恢复默认",1.5)
-                end},
+                {icon="settings",label="评论显示设置",
+                    value=self:_thoughts_enabled() and ("字号 "..self:_thought_font_size_label()) or "阅读评论已关闭",
+                    arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
             }
             local sections={{title="评论内容",rows=content_rows}}
             if #mark_rows>0 then sections[#sections+1]={title="正文标记",rows=mark_rows} end
