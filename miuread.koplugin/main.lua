@@ -9326,7 +9326,7 @@ function Plugin:_show_home_file_manager_popup(anchor)
         title="文件管理",subtitle="本地文件入口",
         actions={
             {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
-            {icon="▦",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+            {icon="library",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         },
     }
 end
@@ -9480,7 +9480,7 @@ function Plugin:_home_action_function_actions(key,anchor)
     } end
     if key=="file_manager" then return {
         {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
-        {icon="▦",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+        {icon="library",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
     } end
     if key=="screenshot" then return {
         {icon="▣",label="开始截图",detail="进入截图模式",callback=function() ScreenshotMode.start(self,anchor) end},
@@ -9589,7 +9589,7 @@ function Plugin:_show_home_local_book_more(book,anchor)
         title=tostring(book.title or "本地书籍"),subtitle="KOReader 管理",
         actions={
             {icon="▤",label="在文件管理中查看",detail="由 KOReader 管理文件",callback=function() self:_home_open_koreader_filemanager(book and book.file,true) end},
-            {icon="▦",label="我的分类",detail="打开 KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+            {icon="library",label="我的分类",detail="打开 KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         },
         footer_action={label="返回书籍操作",callback=function() self:_home_hold_book(book,anchor) end},
     }
@@ -16008,21 +16008,21 @@ function Plugin:_reader_quick_definitions()
     return {
         toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
         progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
-        search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
+        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
         -- Keep the legacy key so existing customized quick-panel layouts do not
         -- lose this slot after OTA; its action is now the requested Home action.
-        back={key="back",icon="home",label=self:_home_enabled() and "主页" or "书架",icon_scale=.98,callback=function() self:_reader_home_action("reader quick panel") end},
+        back={key="back",icon="home",label=self:_home_enabled() and "主页" or "书架",callback=function() self:_reader_home_action("reader quick panel") end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-        comments={key="comments",icon="comment",label="评论",icon_scale=1.16,icon_nudge_y=-1,active=self:_thoughts_enabled(),callback=function()
+        comments={key="comments",icon="comment",label="评论",active=self:_thoughts_enabled(),callback=function()
             self:_show_reader_comment_center(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        annotations={key="annotations",icon="highlight",label="批注",icon_scale=1.28,icon_nudge_y=-2,callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
-        edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",icon_scale=1.02,active=edge_enabled,callback=function()
+        annotations={key="annotations",icon="highlight",label="批注",callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
+        edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",active=edge_enabled,callback=function()
             self:_show_reader_edge_guard_panel(function() self:show_reader_quick_panel() end)
         end},
         sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},

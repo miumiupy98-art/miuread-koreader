@@ -23,3 +23,12 @@ Bundled release asset:
 MiuRead is distributed under GNU Affero General Public License version 3 only
 (AGPL-3.0-only). This notice preserves third-party attribution and does not add
 any non-commercial or no-sale restriction.
+
+UI outline icons:
+- Project: Lucide (lucide-static 1.34.0)
+- Source: https://lucide.dev
+- Copyright (c) 2026 Lucide Icons and Contributors (ISC)
+- Feather-derived icons: Copyright (c) 2013-present Cole Bemis (MIT)
+- Local copies live in miuread.koplugin/resources/icons/miuread/ and
+  miuread.koplugin/resources/wifi-*.svg, with currentColor replaced by
+  black so KOReader's SVG renderer can paint them on e-ink.

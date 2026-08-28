@@ -1,3 +1,14 @@
+## Unreleased
+
+- 全面检查界面 SVG 图标：原有 57 个 `resources/icons/miuread` 图标虽都是 24×24 线框，但线宽不齐（1.5–2.0）、填充/描边混用，同步/刷新/重启、休眠/夜间等语义也容易撞形。
+- 代码侧约 240 处 `icon` / `icon_key` 引用中，删除 `⌫`、编辑 `✎`、云同步 `☁`、公众号 `◎`、关机 `■`、预读取缓存 `⇥`、对调 `↔` 没有登记，动作表只能掉回字符；「我的分类」与「全部书籍」共用格子图标；阅读下滑栏「更多」只有文字。
+- 全套改用 Lucide 1.34.0 线框（ISC；Feather 衍生图标仍为 MIT）：统一 `viewBox="0 0 24 24"`、`stroke="#000"`、`stroke-width="2"`、圆角端点，并把 `currentColor` 换成纯黑，方便 KOReader 在墨水屏上渲染。
+- 既有文件按语义替换为 Lucide 图形（本地文件名不变）：返回 `chevron-left`、主页 `house`、关闭 `x`、目录 `list`、进度 `circle-gauge`、字体 `type`、前光 `sun`、同步 `arrow-up-down`、格子 `layout-grid`、刷新 `refresh-cw`、搜索 `search`、下载/上传 `download`/`upload`、设置 `settings`、历史 `history`、文件管理 `folder-open`、截图 `camera`、当前书 `book-open`、评论 `message-square-text`、划线 `highlighter`、想法 `lightbulb`、防误触 `shield`/`shield-off`、休眠 `moon`、夜间 `moon-star`、诊断 `activity`、修复 `wrench`、电源 `power`、重启 `rotate-ccw`、旋转 `rotate-cw`、方向锁 `lock`/`unlock`、色温 `thermometer-sun`、电量 `battery-full`、全屏刷新 `rotate-cw-square`、返回 KO `corner-down-left`、显示 `monitor`、设备 `tablet`。
+- 新增 10 个图标并写入登记表：删除 `trash`、编辑 `pencil`、对调 `swap`、云 `cloud`、公众号 `newspaper`、关机 `power-off`、缓存 `cache`、勾选 `check`、分类 `library`、圆点 `dot`。KOReader 的 K 标和行距没有现成 Lucide 图形，按同一套 24/2 线框重画。
+- Wi-Fi 三态改为 Lucide：已连接满格 `wifi`、未连接一格 `wifi-low`、关闭划掉 `wifi-off`。
+- 「我的分类」改用 `library`；阅读下滑栏「更多」补上省略号图标；去掉划线/评论等为迁就旧画幅而设的 `icon_scale` / `icon_nudge_y`。截图倒计时的 `5` / `10` / `15` 仍用数字，不改成图标。
+- 在 `THIRD_PARTY_NOTICES` 记录 Lucide / Feather 版权。不修改阅读时间、进度、批注、下载模型、评论缓存、锁屏、评论中心或 `SCHEMA`。
+
 ## 5.4.0-beta.10
 
 - 新下载正式切换为“唯一正文 + 独立评论缓存”模型：主页、书架二级菜单、整本下载、单章下载和章节范围下载不再提供“纯净版 / 划线与想法版”二选一；评论不会再决定生成第二份 EPUB。
