@@ -25136,8 +25136,23 @@ function Plugin:_toggle_online_review_like(request,callback)
         if not write_ok then
             return {request_ok=false,error=tostring(write_result),auth=child_auth,auth_changed=auth_changed}
         end
+        -- The Web reader only flips its own state once the response reports succ,
+        -- and it prefers the likesCount the response carries over a local guess.
+        -- A zero errCode alone does not mean the like was accepted, so a rejected
+        -- write must not be reported as a successful one. Both fields are treated
+        -- as optional: when the endpoint omits them the previous behaviour stands.
+        local response=type(write_result)=="table" and write_result or nil
+        local succ=response and rawget(response,"succ")
+        if succ~=nil and not (succ==true or tonumber(succ)==1 or tostring(succ):lower()=="true") then
+            return {request_ok=false,error="微信读书未接受本次点赞",
+                auth=child_auth,auth_changed=auth_changed}
+        end
+        local server_likes=response and tonumber(rawget(response,"likesCount")) or nil
+        if server_likes and server_likes<0 then server_likes=nil end
         return {request_ok=true,is_liked=not is_liked,
-            likes=math.max(0,likes+(is_liked and -1 or 1)),
+            likes=server_likes and math.max(0,math.floor(server_likes))
+                or math.max(0,likes+(is_liked and -1 or 1)),
+            server_count=server_likes~=nil,
             auth=child_auth,auth_changed=auth_changed}
     end,function(result)
         local payload=result and result.ok==true and type(result.value)=="table" and result.value or nil
@@ -25166,7 +25181,8 @@ function Plugin:_toggle_online_review_like(request,callback)
         self._online_like_auth_dead=nil
         logger.info("[MiuRead][ThoughtLike] updated","review=",review_id,
             "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes),
-            "synced_only=",tostring(payload.synced_only==true))
+            "synced_only=",tostring(payload.synced_only==true),
+            "server_count=",tostring(payload.server_count==true))
         finish({is_liked=payload.is_liked==true,likes=tonumber(payload.likes) or cached_likes})
     end,{silent=true,timeout=35})
     if not started then finish(nil,err) end
