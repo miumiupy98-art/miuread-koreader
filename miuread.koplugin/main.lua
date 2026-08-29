@@ -24952,6 +24952,16 @@ function Plugin:_toggle_online_review_like(request,callback)
             is_liked=flag==true or tonumber(flag)==1 or tostring(flag):lower()=="true"
             likes=math.max(0,math.floor(tonumber(rawget(state,"likesCount")
                 or rawget(nested,"likesCount") or likes) or 0))
+            -- The popup has no stored like state, so a reopened comment always
+            -- draws the empty heart and the first tap can only mean "like". When
+            -- the review turns out to be liked already, just report the official
+            -- state: dropping a like the reader gave earlier is far worse than
+            -- doing nothing, and the heart still ends up filled either way.
+            if is_liked==true then
+                local child_auth,auth_changed=child_store:snapshot()
+                return {request_ok=true,is_liked=true,likes=likes,synced_only=true,
+                    auth=child_auth,auth_changed=auth_changed}
+            end
         end
         local write_ok,write_result=pcall(
             child_api.like_review,child_api,review_id,is_liked,wire_context
@@ -24989,7 +24999,8 @@ function Plugin:_toggle_online_review_like(request,callback)
         end
         self._online_like_auth_dead=nil
         logger.info("[MiuRead][ThoughtLike] updated","review=",review_id,
-            "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes))
+            "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes),
+            "synced_only=",tostring(payload.synced_only==true))
         finish({is_liked=payload.is_liked==true,likes=tonumber(payload.likes) or cached_likes})
     end,{silent=true,timeout=35})
     if not started then finish(nil,err) end

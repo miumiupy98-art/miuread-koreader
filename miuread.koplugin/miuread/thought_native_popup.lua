@@ -299,6 +299,7 @@ local NativePopup = InputContainer:extend{
     page_refresh_count = 0,
     like_buttons = nil,
     _like_inflight = nil,
+    _like_session = 0,
     _measurement_cache = nil,
 }
 
@@ -1066,7 +1067,12 @@ function NativePopup:_request_like(piece)
     self._like_inflight = self._like_inflight or {}
     if self._like_inflight[comment_index] then return true end
     self._like_inflight[comment_index] = true
+    -- The popup is pooled. A response can arrive after it was reopened with a
+    -- different comment set, and comment_index would then point at an unrelated
+    -- comment, so a stale reply must be dropped instead of applied.
+    local session = self._like_session
     local function done(result)
+        if self._like_session ~= session then return end
         if self._like_inflight then self._like_inflight[comment_index] = nil end
         if type(result) == "table" then self:_apply_like_result(comment_index, result) end
     end
@@ -1696,6 +1702,7 @@ function NativePopup:_reopen(opts)
     self.page_refresh_count = 0
     self.like_buttons = nil
     self._like_inflight = nil
+    self._like_session = (tonumber(self._like_session) or 0) + 1
     self._measurement_cache = nil
     self:init()
 end
