@@ -13339,8 +13339,9 @@ function Plugin:_thought_cache_status_label(scope)
     local kind=tostring(status.status or "")
     if kind=="error" then return comments>0 and ("获取失败 · 已保留 "..tostring(comments).." 条") or "获取失败" end
     if kind=="suspicious_empty" then return "结果异常 · 已保留 "..tostring(comments).." 条" end
-    if status.known~=true then return "未获取" end
-    if kind=="empty" then return "已检查无评论" end
+    if status.known~=true or (kind=="missing" and comments==0) then return "未获取" end
+    if kind=="verified_empty" then return "已检查无评论" end
+    if kind=="stale_empty" then return "待重新确认" end
     if status.complete==true then return "已完整 · "..tostring(comments).." 条" end
     return "待补全 · "..tostring(comments).." 条"
 end
@@ -13368,14 +13369,11 @@ function Plugin:_schedule_runtime_thought_refresh(delay,reason)
             if self.thought_runtime then self.thought_runtime:clear() end
             return
         end
-        if self:_current_book_supports_miuread_marks() then
-            if self.thought_runtime then self.thought_runtime:clear(false) end
-            return
-        end
-        -- Pure EPUBs have no embedded #miuthought links, so their runtime
-        -- underline layer also needs the shared full-screen tap dispatcher.
-        -- ReaderReady deliberately tears this dispatcher down before cloud
-        -- identity settles; reinstalling here makes late sync and rebuilds safe.
+        local has_embedded_marks=self:_current_book_supports_miuread_marks()
+        -- The runtime layer is now only a compatibility/fresh-range renderer.
+        -- New canonical EPUB marks are rendered by EPUB CSS; locators discovered
+        -- after that EPUB was generated (embedded=false) are rendered here.
+        -- This guarantees one renderer per range and avoids solid/double lines.
         self:_setup_thought_tap()
         if RuntimePressure.active() or (tonumber(self._reader_busy_until) or 0)>os.time() then
             self:_schedule_runtime_thought_refresh(1.2,"reader busy")
@@ -13386,9 +13384,32 @@ function Plugin:_schedule_runtime_thought_refresh(delay,reason)
         -- XPointer mappings remain valid while paging within the same chapter.
         -- Avoid reopening SQLite and re-running fulltext searches on every page.
         if self.thought_runtime and self.thought_runtime:is_scope(scope.book_id,scope.chapter_uid) then return end
-        local groups=select(1,Thoughts.load(self.store,scope.book_id,scope.chapter_uid))
-        if type(groups)~="table" or #groups==0 then
-            if self.thought_runtime then self.thought_runtime:clear() end
+        local cached_groups=select(1,Thoughts.load(self.store,scope.book_id,scope.chapter_uid))
+        if type(cached_groups)~="table" then cached_groups={} end
+        local by_range={}
+        for _,group in ipairs(cached_groups) do
+            local key=tostring(group and group.range or ""); if key~="" then by_range[key]=group end
+        end
+        local locators=self.thought_service and self.thought_service:locators(scope.book_id,scope.chapter_uid) or {}
+        local groups={}
+        if type(locators)=="table" and #locators>0 then
+            for _,locator in ipairs(locators) do
+                local include=not has_embedded_marks or locator.embedded~=true
+                local key=tostring(locator.range or "")
+                if include and key~="" then
+                    local group=by_range[key]
+                    if group then
+                        groups[#groups+1]=group
+                    elseif U.trim(tostring(locator.source_text or ""))~="" then
+                        groups[#groups+1]={range=key,texts={{abstract=tostring(locator.source_text),content=tostring(locator.source_text)}}}
+                    end
+                end
+            end
+        elseif not has_embedded_marks then
+            groups=cached_groups
+        end
+        if #groups==0 then
+            if self.thought_runtime then self.thought_runtime:clear(false) end
             return
         end
         local ok,result=pcall(self.thought_runtime.map_current,self.thought_runtime,
@@ -13455,7 +13476,7 @@ function Plugin:_fetch_thought_chapter(scope,force,options)
             local comments=tonumber(value.comments or 0) or 0
             if status=="suspicious_empty" then
                 self:toast("评论结果异常 · 已保留原有 "..tostring(comments).." 条",3)
-            elseif status=="empty" then
+            elseif status=="verified_empty" then
                 self:toast("本章已检查 · 暂无评论",2)
             elseif value.complete~=true then
                 self:toast("本章评论已保存 "..tostring(comments).." 条 · 待补全",2.5)
@@ -13514,17 +13535,17 @@ end
 function Plugin:_next_thought_scope()
     local scope=self:_thought_current_scope()
     if scope.book_id=="" or scope.chapter_uid=="" then return nil end
-    local chapters=self:_thought_current_catalog()
+    local chapters=self:_thought_body_targets(scope.book_id,self:_thought_current_catalog())
     local current_index
     for index,ch in ipairs(chapters) do
         local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
         if uid==scope.chapter_uid then current_index=index; break end
     end
     if not current_index then return nil end
-    for index=current_index+1,#chapters do
-        local ch=chapters[index]
+    local ch=chapters[current_index+1]
+    if ch then
         local uid=tostring(ch.uid or ch.chapterUid or ch.chapter_uid or "")
-        if uid~="" and ch.structural~=true then
+        if uid~="" then
             return {book_id=scope.book_id,book_title=scope.book_title,chapter_uid=uid,
                 chapter_title=U.trim(tostring(ch.title or ch.name or ""))}
         end
@@ -13571,6 +13592,136 @@ function Plugin:_thought_targets(chapters,limit)
         end
     end
     return targets
+end
+
+
+function Plugin:_thought_body_targets(book_id,chapters)
+    local catalog=self:_thought_targets(chapters,nil)
+    if not self.thought_service or tostring(book_id or "")=="" then return catalog end
+    local state=self:_book_local_content_state(book_id)
+    local full_body=state and state.primary_kind~=nil
+    local downloaded_set={}
+    if not full_body and type(self._chapter_content_rows)=="function" then
+        for _,row in ipairs(self:_chapter_content_rows(book_id,"downloaded") or {}) do
+            downloaded_set[tostring(row.uid or "")]=true
+        end
+    end
+    local locator_rows=self.thought_service:locator_chapters(book_id) or {}
+    if #locator_rows==0 then
+        -- Legacy full EPUBs predate the locator database. Their first comment
+        -- request may bootstrap locators. Chapter-only books are restricted to
+        -- chapter files that actually exist locally.
+        if full_body then return catalog end
+        local out={}
+        for _,ch in ipairs(catalog) do if downloaded_set[ch.uid] then out[#out+1]=ch end end
+        return out
+    end
+    local available={}
+    for _,row in ipairs(locator_rows) do
+        local uid=tostring(row.chapter_uid or "")
+        if (tonumber(row.locators or 0) or 0)>0 and (full_body or downloaded_set[uid]) then available[uid]=true end
+    end
+    local out={}
+    for _,ch in ipairs(catalog) do if available[ch.uid] then out[#out+1]=ch end end
+    return out
+end
+
+function Plugin:_thought_targets_from_current(book_id,chapters,current_uid,count)
+    local available=self:_thought_body_targets(book_id,chapters)
+    local start=nil
+    for index,ch in ipairs(available) do if tostring(ch.uid)==tostring(current_uid or "") then start=index; break end end
+    if not start then return {} end
+    local out={}
+    local wanted=math.max(1,tonumber(count) or 1)
+    for index=start,math.min(#available,start+wanted-1) do out[#out+1]=available[index] end
+    return out
+end
+
+function Plugin:_fetch_thought_targets(book_id,targets,title,reopen,force)
+    return self:_start_thought_batch(book_id,targets,{
+        kind="range",title=tostring(title or "正在获取评论"),subtitle="正文不会重新下载或生成",
+        user_initiated=true,force_refresh=force==true,done_title="评论获取完成",paused_title="评论获取已暂停",
+        done=function() if reopen then reopen() end end,
+    })
+end
+
+function Plugin:_show_thought_chapter_selector(book,chapters,back_callback,selection)
+    book=type(book)=="table" and book or {}
+    local book_id=tostring(book.bookId or book.book_id or "")
+    selection=type(selection)=="table" and selection or {}
+    local available=self:_thought_body_targets(book_id,chapters)
+    local function rows()
+        local out={}; local selected=0
+        for _ in pairs(selection) do selected=selected+1 end
+        out[#out+1]={label="获取选中评论",value=tostring(selected).." 章",enabled=selected>0,callback=function()
+            local picked={}
+            for _,ch in ipairs(available) do if selection[ch.uid] then picked[#picked+1]=ch end end
+            self:_fetch_thought_targets(book_id,picked,"正在获取选中章节评论",back_callback,false)
+        end}
+        out[#out+1]={icon="settings",label="全选当前列表",value="再次点击可取消",keep_open=true,callback=function()
+            local all=#available>0
+            for _,ch in ipairs(available) do if not selection[ch.uid] then all=false; break end end
+            for _,ch in ipairs(available) do selection[ch.uid]=all and nil or true end
+        end}
+        for index,ch in ipairs(available) do
+            local state=self.thought_service and self.thought_service:chapter_status(book_id,ch.uid) or {}
+            local suffix=(tonumber(state.comments or 0) or 0)>0 and (tostring(state.comments).." 条")
+                or (state.complete==true and tostring(state.status)=="verified_empty" and "无评论" or "未完整")
+            out[#out+1]={label=U.trim(tostring(ch.title or ""))~="" and ch.title or ("第 "..tostring(index).." 章"),
+                value=suffix,checked=selection[ch.uid]==true,keep_open=true,
+                callback=function() selection[ch.uid]=selection[ch.uid] and nil or true end}
+        end
+        if #available==0 then out[#out+1]={label="暂无已建立正文定位的章节",enabled=false} end
+        return out
+    end
+    ReaderListDialog.show{title="选择评论章节",categories={{key="all",label="已有正文",items=rows}},page_size=7,on_back=back_callback}
+    return true
+end
+
+function Plugin:_show_reader_thought_range_menu(back_callback)
+    local scope=self:_thought_current_scope(); local chapters=self:_thought_current_catalog()
+    local book_id=tostring(scope.book_id or "")
+    local available=self:_thought_body_targets(book_id,chapters)
+    local function fetch_current(n,label)
+        local targets=self:_thought_targets_from_current(book_id,chapters,scope.chapter_uid,n)
+        return self:_fetch_thought_targets(book_id,targets,label,back_callback,false)
+    end
+    self:list("获取评论",{
+        {text="本章",post_text=self:_thought_cache_status_label(scope),callback=function() fetch_current(1,"正在获取本章评论") end},
+        {text="从本章开始 5 章",callback=function() fetch_current(5,"正在获取后续 5 章评论") end},
+        {text="从本章开始 10 章",callback=function() fetch_current(10,"正在获取后续 10 章评论") end},
+        {text="选择章节",post_text=tostring(#available).." 章已有正文",callback=function()
+            self:_show_thought_chapter_selector({bookId=book_id,title=scope.book_title},chapters,back_callback,{})
+        end},
+        {text="全部已有正文",post_text=tostring(#available).." 章",enabled=#available>0,callback=function()
+            self:_fetch_thought_targets(book_id,available,"正在获取全部已有正文章节评论",back_callback,false)
+        end},
+        {text="整本",post_text=(#available==#self:_thought_targets(chapters,nil) and "完整正文" or "需要完整正文"),
+            enabled=#available>0 and #available==#self:_thought_targets(chapters,nil),callback=function()
+            self:_fetch_thought_targets(book_id,available,"正在获取整本评论",back_callback,false)
+        end},
+    })
+    return true
+end
+
+function Plugin:_show_book_thought_range_menu(book,chapters,back_callback)
+    local book_id=tostring(book and (book.bookId or book.book_id) or "")
+    local available=self:_thought_body_targets(book_id,chapters)
+    self:list("获取评论 · "..tostring(book and book.title or "当前书籍"),{
+        {text="前 5 章",callback=function() self:_fetch_thought_targets(book_id,self:_thought_targets(available,5),"正在获取前 5 章评论",back_callback,false) end},
+        {text="前 10 章",callback=function() self:_fetch_thought_targets(book_id,self:_thought_targets(available,10),"正在获取前 10 章评论",back_callback,false) end},
+        {text="选择章节",post_text=tostring(#available).." 章已有正文",callback=function()
+            self:_show_thought_chapter_selector(book,chapters,back_callback,{})
+        end},
+        {text="全部已有正文",post_text=tostring(#available).." 章",enabled=#available>0,callback=function()
+            self:_fetch_thought_targets(book_id,available,"正在获取全部已有正文章节评论",back_callback,false)
+        end},
+        {text="整本",post_text=(#available==#self:_thought_targets(chapters,nil) and "完整正文" or "需要完整正文"),
+            enabled=#available>0 and #available==#self:_thought_targets(chapters,nil),callback=function()
+            self:_fetch_thought_targets(book_id,available,"正在获取整本评论",back_callback,false)
+        end},
+    })
+    return true
 end
 
 function Plugin:_start_thought_batch(book_id,chapters,options)
@@ -13622,7 +13773,7 @@ function Plugin:_start_thought_batch(book_id,chapters,options)
                 local error_kind=tostring((value and value.error_kind) or (detail and detail.error_kind) or "")
                 if value and value.complete==true then
                     summary.fetched=summary.fetched+1
-                    if tostring(value.status or "")=="empty" then summary.empty=summary.empty+1 end
+                    if tostring(value.status or "")=="verified_empty" then summary.empty=summary.empty+1 end
                     summary.comments=summary.comments+(tonumber(value.comments) or 0)
                     consecutive_failures=0
                 elseif value then
@@ -13724,8 +13875,8 @@ function Plugin:show_book_thought_menu(book)
             or {cached=0,chapters=#ids,comments=0}
         local favorites=self:_thought_favorite_count({book_id=book_id})
         local items={
-            {text="获取／补全整本评论",post_text=self:_thought_book_status_label(status),callback=function()
-                self:_fetch_book_thoughts_for(book,rows,function() self:show_book_thought_menu(book) end)
+            {text="获取评论",post_text=self:_thought_book_status_label(status),callback=function()
+                self:_show_book_thought_range_menu(book,rows,function() self:show_book_thought_menu(book) end)
             end},
             {text="已下载评论",post_text=tostring(status.cached or 0).." 章 · "..tostring(status.comments or 0).." 条",enabled=(tonumber(status.cached or 0) or 0)>0,callback=function()
                 local title_map={}
@@ -13880,7 +14031,7 @@ function Plugin:_show_thought_cached_chapters(back_callback,selection,context)
             if include then
                 local meta=title_map[item.chapter_uid] or {}
                 local label=tostring(meta.title or "")~="" and tostring(meta.title) or (meta.index and ("第 "..tostring(meta.index).." 章") or item.chapter_uid)
-                local state=item.complete and (status=="empty" and "无评论" or "完整")
+                local state=item.complete and (status=="verified_empty" and "无评论" or "完整")
                     or (status=="suspicious_empty" and "异常" or (status=="error" and "失败" or "待补全"))
                 rows[#rows+1]={label=label,value=tostring(item.comments or 0).." 条 · "..state,
                     checked=selection[item.chapter_uid]==true,keep_open=true,callback=function()
@@ -13955,12 +14106,13 @@ function Plugin:_show_reader_comment_fetch_center(back_callback)
             local book=self.thought_service and self.thought_service:book_status(scope.book_id,ids) or {cached=0,chapters=#ids,comments=0}
             local current_rows={
                 {label="当前章节状态",value=self:_thought_cache_status_label(scope),enabled=false},
-                {icon="comment",label=status.known and "更新本章评论" or "获取本章评论",value=status.known and "重新检查服务器" or "首次获取",
-                    enabled=scope.book_id~="" and scope.chapter_uid~="",callback=function() self:_fetch_current_thoughts(status.known==true,reopen) end},
+                {icon="download",label="选择获取范围",value="本章 / 后续 / 自选 / 已有正文 / 整本",arrow=true,
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",callback=function() self:_show_reader_thought_range_menu(reopen) end},
+                {icon="comment",label="强制刷新本章",value="重新检查划线与评论",
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",callback=function() self:_fetch_current_thoughts(true,reopen) end},
             }
             local book_rows={
                 {label="本书评论状态",value=self:_thought_book_status_label(book),enabled=false},
-                {icon="download",label="继续获取整本评论",value="完整章节自动跳过",enabled=scope.book_id~="" and #ids>0,callback=function() self:_fetch_book_thoughts(reopen) end},
                 {icon="download",label="阅读时预加载下一章",value=self:_thought_prefetch_next_label(),value_bold=true,keep_open=true,callback=function()
                     self:_toggle_thought_prefetch_next(); if self:_thought_prefetch_next_enabled() then self:_schedule_next_thought_prefetch(1.0) end
                 end},
@@ -18892,6 +19044,13 @@ function Plugin:_finish_download_comment_power_hold(reason)
 end
 
 function Plugin:_finalize_download_after_comment_stage(b,opt,rec,done,open_after,was_background)
+    -- When comment preload was selected the body reaching 100% is only the end
+    -- of stage one. Keep the original download surface/runtime until comments
+    -- finish, then retire it here so “下载完成” once again means the requested
+    -- body + comment scope has actually finished.
+    self:_close_download_dialog("finished")
+    if self.download_task then self.download_task:set_backgrounded(false) end
+    self._download_runtime=nil
     self:_refresh_local_files()
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
     local annotation_pending=DownloadResult.annotation_pending(rec)
@@ -18962,6 +19121,11 @@ function Plugin:_run_download_comment_stage(b,rec,opt,done)
         comment_total=#targets,comment_pending=#targets,started_at=os.time(),
     },true)
     self:_update_open_shelf_download_status(b.bookId,"正文已完成 · 正在获取评论 0/"..tostring(#targets))
+    local runtime=self._download_runtime
+    if runtime and self:_download_dialog_is_shown(runtime) then
+        runtime.dialog:set_state({stage="thoughts",current=0,total=#targets,percent=0,
+            chapter="",message="正文已完成 · 正在获取评论"})
+    end
     self:status_toast("正文已完成","正在获取评论 · 0/"..tostring(#targets).." 章",3)
     local started,err=self:_start_thought_batch(tostring(b.bookId or b.book_id or ""),targets,{
         kind="download-preload",
@@ -18995,9 +19159,14 @@ function Plugin:_finish_download_runtime(runtime,result)
     local done=runtime.done
     local open_after=runtime.open_after==true
     local was_background=runtime.background==true
-    self:_close_download_dialog("finished")
-    if self.download_task then self.download_task:set_backgrounded(false) end
-    self._download_runtime=nil
+    local preload=tonumber(opt.thought_preload_count or 0) or 0
+    local keep_for_comments=result and result.ok==true and opt.prefetch~=true
+        and opt.annotations~=true and preload~=0
+    if not keep_for_comments then
+        self:_close_download_dialog("finished")
+        if self.download_task then self.download_task:set_backgrounded(false) end
+        self._download_runtime=nil
+    end
     if not result or result.ok~=true then
         local err=result and result.error or "未知下载错误"
         if opt.prefetch==true then
@@ -19144,7 +19313,6 @@ function Plugin:_finish_download_runtime(runtime,result)
         self:_start_next_queued_download()
         return
     end
-    local preload=tonumber(opt.thought_preload_count or 0) or 0
     if opt.annotations~=true and preload~=0 then
         self:_run_download_comment_stage(b,rec,opt,function(_comment_ok,comment_result)
             opt._comment_stage_result=type(comment_result)=="table" and comment_result or nil
@@ -26690,6 +26858,32 @@ function Plugin:_close_active_thought_popup(reason)
     end
 end
 
+function Plugin:_prompt_missing_thought(info)
+    info=type(info)=="table" and info or {}
+    local status=self.thought_service and self.thought_service:chapter_status(info.book_id,info.chapter_uid) or {}
+    if tostring(status.status or "")=="verified_empty" then
+        self:info("该划线暂无评论")
+        return true
+    end
+    local label=(tostring(status.status or "")=="partial" or tostring(status.status or "")=="suspicious_empty"
+        or tostring(status.status or "")=="error") and "继续补全" or "获取本章评论"
+    local dialog
+    dialog=ConfirmBox:new{
+        text=(label=="继续补全" and "本章评论尚未完整获取。" or "本章评论尚未获取。")
+            .."\n\n正文定位已经保留，获取评论不会重新下载或生成正文。",
+        ok_text=label,cancel_text="取消",ok_callback=function()
+            if dialog then UIManager:close(dialog) end
+            self:_fetch_thought_chapter({book_id=tostring(info.book_id or ""),chapter_uid=tostring(info.chapter_uid or ""),chapter_title="当前章节"},false,{
+                prefetch_next=false,done=function(ok)
+                    if ok then self:toast("评论已更新，可再次点击该虚线查看",2) end
+                end,
+            })
+        end,
+    }
+    UIManager:show(dialog)
+    return true
+end
+
 function Plugin:_open_thought_info(info,generation)
     if generation~=self._thought_popup_generation or not (self.ui and self.ui.document) then
         self:_finish_thought_popup(generation)
@@ -26704,7 +26898,7 @@ function Plugin:_open_thought_info(info,generation)
         local lookup_started=monotonic_wall_time()
         local group,err,token=Thoughts.find(self.store,info.book_id,info.chapter_uid,info.range)
         local lookup_ms=math.floor((monotonic_wall_time()-lookup_started)*1000+.5)
-        if not group then notice=tostring(err or "没有想法内容"); return end
+        if not group then notice="__miu_missing_comment__"; return end
         local prefs=self.store:preferences().thoughts or {}
         local function on_close() self:_finish_thought_popup(generation) end
         local parts_started=monotonic_wall_time()
@@ -26762,7 +26956,8 @@ function Plugin:_open_thought_info(info,generation)
         self:info("评论暂时无法显示。当前阅读批注已先保存，请稍后重试。")
     elseif not popup then
         self:_finish_thought_popup(generation)
-        if notice then self:info(notice) end
+        if notice=="__miu_missing_comment__" then self:_prompt_missing_thought(info)
+        elseif notice then self:info(notice) end
     end
 end
 

@@ -5,7 +5,7 @@ local lfs = require("libs/libkoreader-lfs")
 
 local ThoughtDatabase = {}
 
-ThoughtDatabase.SCHEMA_VERSION = 4
+ThoughtDatabase.SCHEMA_VERSION = 5
 ThoughtDatabase.FILE_NAME = "thoughts.sqlite3"
 
 local function chapter_key(value)
@@ -65,6 +65,18 @@ local function initialize(conn)
             payload TEXT NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS thought_locators (
+            chapter_uid TEXT NOT NULL,
+            range_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL DEFAULT 0,
+            source_text TEXT NOT NULL DEFAULT '',
+            embedded INTEGER NOT NULL DEFAULT 0,
+            body_fingerprint TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chapter_uid, range_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_thought_locator_chapter
+            ON thought_locators(chapter_uid, ordinal);
         CREATE TABLE IF NOT EXISTS thought_migration (
             source_path TEXT PRIMARY KEY,
             source_signature TEXT NOT NULL,
@@ -84,6 +96,12 @@ local function initialize(conn)
         SELECT chapter_uid, MAX(group_count), MAX(comment_count), MAX(migrated_at)
           FROM thought_migration
          GROUP BY chapter_uid;
+        -- beta.10-beta.12 could persist a false successful empty result.
+        -- beta.13 never trusts those legacy empty states: comments may be
+        -- re-fetched from the persisted locator ranges without touching正文.
+        UPDATE thought_fetch_state
+           SET status = 'stale_empty', complete = 0
+         WHERE status = 'empty' AND complete = 1;
     ]])
     SQLiteStore.set_text(conn, "thought_schema_version", tostring(ThoughtDatabase.SCHEMA_VERSION))
 end
@@ -388,6 +406,136 @@ function ThoughtDatabase.chapter_counts(store, book_id, chapter_uid)
     return ok and result or {groups=0, comments=0}
 end
 
+local function compact_locator(row, fallback_ordinal, fallback_fingerprint)
+    if type(row) ~= "table" then return nil end
+    local range=tostring(row.range or row.range_key or "")
+    if range=="" then return nil end
+    return {
+        range=range,
+        ordinal=tonumber(row.ordinal or fallback_ordinal or 0) or 0,
+        source_text=tostring(row.source_text or row.text or row.markText or row.abstract or ""),
+        embedded=row.embedded==true,
+        body_fingerprint=tostring(row.body_fingerprint or fallback_fingerprint or ""),
+    }
+end
+
+function ThoughtDatabase.save_locators(store, book_id, chapter_uid, rows, body_fingerprint, replace_existing)
+    local conn=open(store,book_id,false)
+    local ok,result=xpcall(function()
+        return SQLiteStore.transaction(conn,function()
+            local key=chapter_key(chapter_uid)
+            if key=="" then error("章节标识为空") end
+            if replace_existing==true then
+                local st=conn:prepare("DELETE FROM thought_locators WHERE chapter_uid = ?")
+                st:bind(key):step(); st:close()
+            end
+            local existing={}
+            if replace_existing~=true then
+                local st=conn:prepare([[SELECT range_key, embedded, body_fingerprint FROM thought_locators WHERE chapter_uid = ?]])
+                st:bind(key)
+                while true do
+                    local row=st:step(); if not row then break end
+                    existing[tostring(row[1] or "")]={embedded=tonumber(row[2] or 0)==1,fingerprint=tostring(row[3] or "")}
+                end
+                st:close()
+            end
+            local statement=conn:prepare([[
+                INSERT OR REPLACE INTO thought_locators(
+                    chapter_uid, range_key, ordinal, source_text, embedded, body_fingerprint, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            ]])
+            local saved=0
+            for index,row in ipairs(type(rows)=="table" and rows or {}) do
+                local item=compact_locator(row,index,body_fingerprint)
+                if item then
+                    local old=existing[item.range]
+                    if old then
+                        -- A later underlines refresh must not downgrade a locator
+                        -- that is already embedded in the canonical EPUB.
+                        if old.embedded then item.embedded=true end
+                        if item.body_fingerprint=="" then item.body_fingerprint=old.fingerprint end
+                    end
+                    statement:bind(key,item.range,item.ordinal,item.source_text,item.embedded and 1 or 0,
+                        item.body_fingerprint,os.time()):step()
+                    statement:clearbind():reset()
+                    saved=saved+1
+                end
+            end
+            statement:close()
+            return saved
+        end)
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(result) end
+    return true,result
+end
+
+function ThoughtDatabase.load_locators(store, book_id, chapter_uid)
+    if not ThoughtDatabase.exists(store,book_id) then return {} end
+    local ok,result=pcall(function()
+        local conn=open(store,book_id,true)
+        local rows={}
+        local statement=conn:prepare([[
+            SELECT range_key, ordinal, source_text, embedded, body_fingerprint, updated_at
+              FROM thought_locators WHERE chapter_uid = ? ORDER BY ordinal, range_key
+        ]])
+        statement:bind(chapter_key(chapter_uid))
+        while true do
+            local row=statement:step(); if not row then break end
+            rows[#rows+1]={
+                range=tostring(row[1] or ""),ordinal=tonumber(row[2] or 0) or 0,
+                source_text=tostring(row[3] or ""),embedded=tonumber(row[4] or 0)==1,
+                body_fingerprint=tostring(row[5] or ""),updated_at=tonumber(row[6] or 0) or 0,
+            }
+        end
+        statement:close(); conn:close(); return rows
+    end)
+    return ok and result or {}
+end
+
+function ThoughtDatabase.locator_chapters(store, book_id)
+    if not ThoughtDatabase.exists(store,book_id) then return {} end
+    local ok,result=pcall(function()
+        local conn=open(store,book_id,true)
+        local rows={}
+        local statement=conn:prepare([[
+            SELECT chapter_uid, COUNT(*), SUM(CASE WHEN embedded = 1 THEN 1 ELSE 0 END), MAX(updated_at)
+              FROM thought_locators GROUP BY chapter_uid ORDER BY MAX(updated_at) DESC, chapter_uid
+        ]])
+        while true do
+            local row=statement:step(); if not row then break end
+            rows[#rows+1]={chapter_uid=tostring(row[1] or ""),locators=tonumber(row[2] or 0) or 0,
+                embedded=tonumber(row[3] or 0) or 0,updated_at=tonumber(row[4] or 0) or 0}
+        end
+        statement:close(); conn:close(); return rows
+    end)
+    return ok and result or {}
+end
+
+function ThoughtDatabase.locator_count(store, book_id, chapter_uid)
+    local rows=ThoughtDatabase.load_locators(store,book_id,chapter_uid)
+    return #rows
+end
+
+function ThoughtDatabase.delete_book_comments(store, book_id)
+    if not ThoughtDatabase.exists(store,book_id) then return true end
+    local conn=open(store,book_id,false)
+    local ok,err=xpcall(function()
+        SQLiteStore.transaction(conn,function()
+            for _,sql in ipairs({
+                "DELETE FROM thought_comments",
+                "DELETE FROM thought_groups",
+                "DELETE FROM thought_chapters",
+                "DELETE FROM thought_fetch_state",
+                "DELETE FROM thought_fetch_checkpoint",
+            }) do conn:exec(sql) end
+        end)
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(err) end
+    return true
+end
+
 function ThoughtDatabase.set_fetch_state(store, book_id, chapter_uid, status, complete, last_error)
     local conn = open(store, book_id, false)
     local ok, err = pcall(function()
@@ -423,10 +571,12 @@ function ThoughtDatabase.chapter_status(store, book_id, chapter_uid)
         local known=known_statement:bind(key):step()~=nil
         known_statement:close()
         conn:close()
+        local locator_count=ThoughtDatabase.locator_count(store,book_id,chapter_uid)
         return {
-            known=known,status=tostring(row and row[1] or (known and "cached" or "missing")),
+            known=known or locator_count>0,status=tostring(row and row[1] or (known and "cached" or "missing")),
             fetched_at=tonumber(row and row[2] or 0) or 0,complete=tonumber(row and row[3] or 0)==1,
             last_error=tostring(row and row[4] or ""),groups=counts.groups,comments=counts.comments,
+            locators=locator_count,
         }
     end)
     return ok and result or {known=false,status="error",groups=0,comments=0,complete=false,fetched_at=0}
@@ -486,8 +636,8 @@ function ThoughtDatabase.book_status(store, book_id, chapter_uids)
         result.comments=result.comments+(tonumber(row.comments) or 0)
         if value.complete and value.complete[key] then result.complete=result.complete+1 end
         local state=value.state and tostring(value.state[key] or "") or ""
-        if state=="empty" then result.empty=result.empty+1
-        elseif state=="partial" then result.partial=result.partial+1
+        if state=="verified_empty" then result.empty=result.empty+1
+        elseif state=="partial" or state=="stale_empty" then result.partial=result.partial+1
         elseif state=="suspicious_empty" then result.suspicious=result.suspicious+1
         elseif state=="error" then result.error=result.error+1 end
     end
@@ -496,7 +646,7 @@ function ThoughtDatabase.book_status(store, book_id, chapter_uids)
     for key,state in pairs(value.state or {}) do
         if not counted[key] then
             state=tostring(state or "")
-            if state=="partial" then result.partial=result.partial+1
+            if state=="partial" or state=="stale_empty" then result.partial=result.partial+1
             elseif state=="suspicious_empty" then result.suspicious=result.suspicious+1
             elseif state=="error" then result.error=result.error+1 end
         end

@@ -124,7 +124,7 @@ end
 
 local function review_texts(group,yield_check)
     local rows, seen, invalid = {}, {}, 0
-    local pages, skipped = table_entries(array_from(group, {"pageReviews", "reviews", "updated"}))
+    local pages, skipped = table_entries(array_from(group, {"pageReviews", "reviews", "updated", "reviewList", "items", "list"}))
     invalid = invalid + skipped
     for page_index, page in ipairs(pages) do
         if yield_check and page_index%64==0 then yield_check() end
@@ -170,9 +170,10 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     local previous=type(options.previous)=="table" and options.previous or nil
     local checkpoint=type(options.checkpoint)=="function" and options.checkpoint or nil
     local fetch_reviews=options.fetch_reviews~=false
+    local supplied_underlines=type(options.underlines)=="table" and options.underlines or nil
     progress=progress or function() end
 
-    if previous and previous.complete==true and options.force_refresh~=true then
+    if previous and previous.complete==true and options.force_refresh~=true and not supplied_underlines then
         previous.cached=true
         return previous
     end
@@ -184,10 +185,17 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     local reuse_pending=previous and previous.underline_request_ok==true
         and previous.underlines_partial~=true and #(previous.underlines or {})>0
         and #(previous.pending_ranges or {})>0
-    if reuse_pending then
+    if supplied_underlines then
+        result.underlines=supplied_underlines
+        result.underline_count=#result.underlines
+        result.underline_request_ok=true
+        result.locator_source="local"
+        progress("underlines",result.underline_count,result.underline_count,"使用已保存正文定位")
+    elseif reuse_pending then
         result.underlines=previous.underlines
         result.underline_count=#result.underlines
         result.underline_request_ok=true
+        result.locator_source="checkpoint"
         progress("underlines",result.underline_count,result.underline_count,"继续未完成的想法")
     else
         local ok,data,network_down,error_kind=call_with_retry("underlines",function()
@@ -206,6 +214,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         end
 
         result.underline_request_ok=true
+        result.locator_source="remote"
         local invalid_underlines
         result.underlines,invalid_underlines=table_entries(array_from(data,{"underlines","updated","bookmarks"}))
         result.underline_count=#result.underlines
@@ -224,9 +233,11 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         local key=range_key(row)
         if key~="" and not active_seen[key] then active_seen[key]=true; active_ranges[#active_ranges+1]=key end
     end
+    result.locator_complete=result.underline_request_ok and result.underlines_partial~=true
+    result.locator_range_count=#active_ranges
     if #active_ranges==0 then
-        result.review_complete=true
-        result.complete=result.underline_request_ok and result.underlines_partial~=true
+        result.review_complete=fetch_reviews and true or false
+        result.complete=result.locator_complete
         return result
     end
 
@@ -241,8 +252,8 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         result.review_skipped=true
         result.completed_ranges={}
         result.pending_ranges={}
-        result.review_complete=true
-        result.complete=result.underline_request_ok and result.underlines_partial~=true
+        result.review_complete=false
+        result.complete=result.locator_complete
         return result
     end
 
@@ -263,6 +274,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
 
     local batches=self.api:review_batches(target_ranges,30)
     local completed,pending={},{}
+    local verified_empty_completed={}
     local review_map={}
     local review_seen_by_range={}
     local group_count,entry_count,invalid_review_count=0,0,0
@@ -272,6 +284,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     local active_batch_index=0
     local function merge_review_rows(rows)
         local new_invalid=0
+        local content_seen={}
         for group_index,group in ipairs(rows or {}) do
             if group_index%8==0 then progress("thoughts",active_batch_index,#batches,"整理想法") end
             local key=range_key(group)
@@ -281,6 +294,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
                 end)
                 new_invalid=new_invalid+invalid
                 if #texts>0 then
+                    content_seen[key]=true
                     if not review_map[key] then review_map[key]={}; review_seen_by_range[key]={}; group_count=group_count+1 end
                     local seen=review_seen_by_range[key]
                     for _,item in ipairs(texts) do
@@ -298,7 +312,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             end
         end
         invalid_review_count=invalid_review_count+new_invalid
-        return new_invalid
+        return new_invalid,content_seen
     end
     local function rebuild_state()
         result.review_map=review_map
@@ -314,7 +328,12 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         table.sort(result.completed_ranges)
         table.sort(result.pending_ranges)
         result.review_complete=#result.pending_ranges==0
-        result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
+        result.complete=result.locator_complete and result.review_complete
+        local verified_empty_count=0
+        for _ in pairs(verified_empty_completed) do verified_empty_count=verified_empty_count+1 end
+        result.verified_empty_count=verified_empty_count
+        result.verified_empty=result.review_complete and result.thought_entry_count==0
+            and verified_empty_count>=#target_ranges and #target_ranges>0
         if result.thought_entry_count>0 then
             result.suspicious_empty=false
         elseif result.suspicious_candidate==true and #result.pending_ranges>0 then
@@ -339,7 +358,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             return nil,"invalid_container"
         end
         local rows,invalid=table_entries(container)
-        local entry_invalid=merge_review_rows(rows)
+        local entry_invalid,content_seen=merge_review_rows(rows)
         local skipped=invalid+entry_invalid
         if skipped>0 then
             result.error_kind=result.error_kind or "data"
@@ -347,6 +366,15 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             invalid_review_count=invalid_review_count+invalid
         end
 
+        local function list_set(values)
+            local out={}
+            for _,value in ipairs(type(values)=="table" and values or {}) do
+                local key=tostring(value or ""); if key~="" then out[key]=true end
+            end
+            return out
+        end
+        local verified_empty=list_set(response and response._annotation_verified_empty_ranges)
+        local unverified_empty=list_set(response and response._annotation_unverified_empty_ranges)
         local request_by_range={}
         for _,request in ipairs(batch or {}) do request_by_range[range_key(request)]=request end
         local next_batch,next_seen,returned_seen={},{},{}
@@ -368,7 +396,17 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
             -- empty result, which turned hundreds of real comment ranges into
             -- pending=0 / comments=0 false successes.
             if key~="" and returned_seen[key] then
-                if not next_seen[key] then pending[key]=nil; completed[key]=true end
+                if not next_seen[key] then
+                    local has_content=content_seen[key]==true or (type(review_map[key])=="table" and #review_map[key]>0)
+                    if has_content then
+                        pending[key]=nil; completed[key]=true; verified_empty_completed[key]=nil
+                    elseif verified_empty[key] then
+                        pending[key]=nil; completed[key]=true; verified_empty_completed[key]=true
+                    else
+                        missing[#missing+1]=key
+                        unverified_empty[key]=true
+                    end
+                end
             elseif key~="" then
                 missing[#missing+1]=key
             end
@@ -376,18 +414,21 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         if #missing>0 then
             result.missing_range_count=(tonumber(result.missing_range_count) or 0)+#missing
             local all_missing=#rows==0 and #missing==#(batch or {})
-            if all_missing then
+            local semantic_empty=false
+            for _,key in ipairs(missing) do if unverified_empty[key] then semantic_empty=true; break end end
+            if all_missing or semantic_empty then
                 result.suspicious_candidate=true
                 result.suspicious_empty=true
                 result.error_kind=result.error_kind or "suspicious_empty"
             else
                 result.error_kind=result.error_kind or "incomplete"
             end
-            result.errors[#result.errors+1]=tostring(label).." omitted "..tostring(#missing).." requested ranges"
-            logger.warn("[MiuRead][Annotations] review response omitted requested ranges",
+            result.errors[#result.errors+1]=tostring(label).." left "..tostring(#missing).." requested ranges unverified"
+            logger.warn("[MiuRead][Annotations] review response left requested ranges unverified",
                 "book=",result.book_id,"chapter=",result.chapter_uid,
                 "requested=",tostring(#(batch or {})),"returned=",tostring(#rows),
                 "missing=",tostring(#missing),"all_missing=",tostring(all_missing),
+                "semantic_empty=",tostring(semantic_empty),
                 "source=",tostring(response and response._annotation_source or "unknown"))
         end
         save_checkpoint()
@@ -462,7 +503,8 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     end
     logger.info("[MiuRead][Annotations] chapter fetched","book=",result.book_id,"chapter=",result.chapter_uid,
         "underlines=",result.underline_count,"thought_groups=",result.thought_count,
-        "thought_entries=",result.thought_entry_count,"pending_ranges=",#result.pending_ranges)
+        "thought_entries=",result.thought_entry_count,"pending_ranges=",#result.pending_ranges,
+        "verified_empty=",tostring(result.verified_empty==true),"locator_source=",tostring(result.locator_source or "unknown"))
     return result
 end
 
@@ -828,8 +870,10 @@ local function intervals(data, visible_count, index, coord_html)
         end
 
         if a and b and b > a then
+            local quotes=quote_candidates(row,data)
             out[#out + 1] = {
                 a=a, b=b, key=key, row=row,
+                source_text=tostring((official_meta and official_meta.text) or quotes[1] or ""),
                 thought=#(data.review_map[key] or {}) > 0,
             }
         elseif official_reason ~= "point_range" then
@@ -898,7 +942,7 @@ end
 local function inject(html, data, coord_html)
     local tokens, visible_count = tokenize(html)
     local index = build_text_index(tokens)
-    local marks, stats = intervals(data, visible_count, index, coord_html)
+    local marks, stats, unresolved = intervals(data, visible_count, index, coord_html)
     local rendered = tostring(html or "")
     if #marks > 0 then
         local out = {}
@@ -909,15 +953,25 @@ local function inject(html, data, coord_html)
         end
         rendered = table.concat(out)
     end
-    -- Unlocated marks remain in the annotation cache and diagnostic counters.
-    -- They are deliberately omitted from the EPUB instead of being appended to
-    -- the chapter, so generated books contain only content placed in context.
-    return rendered, stats
+    local locators={}
+    for index,mark in ipairs(marks or {}) do
+        if tostring(mark.key or "")~="" then
+            locators[#locators+1]={range=tostring(mark.key),ordinal=index,source_text=tostring(mark.source_text or ""),embedded=true}
+        end
+    end
+    for _,item in ipairs(unresolved or {}) do
+        if tostring(item.key or "")~="" then
+            locators[#locators+1]={range=tostring(item.key),ordinal=#locators+1,source_text=tostring(item.quote or ""),embedded=false}
+        end
+    end
+    -- Unlocated marks remain in the locator index so a later comment refresh can
+    -- still attach them at runtime without regenerating the EPUB.
+    return rendered, stats, locators
 end
 
 function Annotations:apply(html, data, coord_html)
-    if not data or data.underline_count == 0 then return html, "", {underlines=0,thoughts=0} end
-    local rendered, alignment = inject(html, data, coord_html)
+    if not data or data.underline_count == 0 then return html, "", {underlines=0,thoughts=0,locators={}} end
+    local rendered, alignment, locators = inject(html, data, coord_html)
     logger.info("[MiuRead][Annotations] alignment",
         "book=", tostring(data.book_id or ""), "chapter=", tostring(data.chapter_uid or ""),
         "official=", tostring(alignment and alignment.official or 0),
@@ -938,6 +992,7 @@ function Annotations:apply(html, data, coord_html)
         quote_aligned=alignment and alignment.quote_aligned or 0,
         dropped=alignment and alignment.dropped or 0,
         fallback=alignment and alignment.fallback or 0,
+        locators=locators or {},
     }
 end
 
@@ -971,6 +1026,24 @@ local function cached_groups(groups)
     return out
 end
 
+function Annotations:locator_rows(data, embedded)
+    data=type(data)=="table" and data or {}
+    local rows,seen={},{}
+    for index,row in ipairs(data.underlines or {}) do
+        local key=range_key(row)
+        if key~="" and not seen[key] then
+            seen[key]=true
+            local source=""
+            for _,name in ipairs({"markText","bookmarkText","rangeText","abstract","text","content"}) do
+                local value=scalar_str(rawget(row,name))
+                if value~="" then source=value; break end
+            end
+            rows[#rows+1]={range=key,ordinal=index,source_text=source,embedded=embedded==true}
+        end
+    end
+    return rows
+end
+
 function Annotations:to_cache(data)
     data=type(data)=="table" and data or {}
     local underlines={}
@@ -980,8 +1053,9 @@ function Annotations:to_cache(data)
         review_groups=cached_groups(data.review_groups),completed_ranges=data.completed_ranges or {},
         pending_ranges=data.pending_ranges or {},underline_request_ok=data.underline_request_ok==true,
         underlines_partial=data.underlines_partial==true,review_complete=data.review_complete==true,
-        complete=data.complete==true,error_kind=data.error_kind,
-        suspicious_empty=data.suspicious_empty==true,review_skipped=data.review_skipped==true,
+        complete=data.complete==true,error_kind=data.error_kind,locator_complete=data.locator_complete==true,
+        suspicious_empty=data.suspicious_empty==true,verified_empty=data.verified_empty==true,
+        review_skipped=data.review_skipped==true,locator_source=data.locator_source,
     }
 end
 
@@ -1000,9 +1074,9 @@ function Annotations:from_cache(value)
         thought_entry_count=entry_count,errors={},completed_ranges=value.completed_ranges or {},
         pending_ranges=value.pending_ranges or {},underline_request_ok=value.underline_request_ok==true,
         underlines_partial=value.underlines_partial==true,review_complete=value.review_complete==true,
-        complete=value.complete==true,error_kind=value.error_kind,
-        suspicious_empty=value.suspicious_empty==true,review_skipped=value.review_skipped==true,
-        cached=true}
+        complete=value.complete==true,error_kind=value.error_kind,locator_complete=value.locator_complete==true,
+        suspicious_empty=value.suspicious_empty==true,verified_empty=value.verified_empty==true,
+        review_skipped=value.review_skipped==true,locator_source=value.locator_source,cached=true}
 end
 
 local function merge_review_lists(old_rows,new_rows)
@@ -1099,7 +1173,9 @@ function Annotations:merge(previous,current)
     end
     current.underline_count=#(current.underlines or {})
     current.review_complete=#(current.pending_ranges or {})==0
-    current.complete=current.underline_request_ok and current.underlines_partial~=true and current.review_complete
+    current.locator_complete=current.underline_request_ok and current.underlines_partial~=true
+    current.complete=current.locator_complete and current.review_complete
+    if current.thought_entry_count>0 then current.verified_empty=false end
     -- A later retry that actually obtains comment groups must be allowed to
     -- recover from a previous suspicious-empty checkpoint. Keep the flag only
     -- while the chapter is still unresolved and still contains no comment data.

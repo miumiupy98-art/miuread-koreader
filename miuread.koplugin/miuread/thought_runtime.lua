@@ -24,7 +24,13 @@ function Overlay:paintTo(bb,x,y)
                 if bx and by and bw and bh and bw>0 and bh>0 then
                     local sx,sy=x+bx,y+by
                     local ly=sy+bh-thickness
-                    bb:paintRect(sx,ly,bw,thickness,Blitbuffer.COLOR_BLACK)
+                    local dash=math.max(3,thickness*4)
+                    local gap=math.max(2,thickness*3)
+                    local dx=0
+                    while dx<bw do
+                        bb:paintRect(sx+dx,ly,math.min(dash,bw-dx),thickness,Blitbuffer.COLOR_BLACK)
+                        dx=dx+dash+gap
+                    end
                     -- Hit testing uses the exact screen coordinates we paint.
                     hits[#hits+1]={x=sx,y=sy,w=bw,h=bh,info=entry.info}
                 end
@@ -36,7 +42,7 @@ end
 
 function Runtime:new(host)
     return setmetatable({host=host,ui=nil,overlay=nil,entries={},hit_boxes={},enabled=false,
-        key="",scope_key="",generation=0,line_width=2},self)
+        key="",scope_key="",generation=0,line_width=1},self)
 end
 
 function Runtime:install(ui)

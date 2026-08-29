@@ -1,26 +1,26 @@
 local M = {}
 
-M.MARKER_BEGIN = "/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */"
-M.MARKER_END = "/* MIUREAD_ANNOTATION_STYLE_V2_END */"
+M.MARKER_BEGIN = "/* MIUREAD_ANNOTATION_STYLE_V3_BEGIN */"
+M.MARKER_END = "/* MIUREAD_ANNOTATION_STYLE_V3_END */"
 
 -- Keep this intentionally close to the proven weread implementation.
--- The thought text uses its own class, so it can never inherit the solid
--- underline rule used by ordinary WeRead marks.
+-- All WeRead ranges use the same Kindle-safe dashed border. Comment state is
+-- deliberately independent from the visual style.
 M.CSS = [[
-/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */
-.miu-inline-mark {
-    text-decoration: underline;
+/* MIUREAD_ANNOTATION_STYLE_V3_BEGIN */
+.miu-inline-mark,
+.miu-thought-mark {
+    text-decoration: none;
+    border-bottom: 1px dashed #000;
+    padding-bottom: 1px;
 }
 .miu-thought-link {
     text-decoration: none;
     color: inherit;
 }
-.miu-thought-link .miu-thought-mark {
+.miu-thought-link .miu-thought-mark,
+.miu-thought-link .miu-inline-mark {
     color: inherit;
-}
-.miu-thought-mark {
-    border-bottom: 2px dashed #ff6b35;
-    padding-bottom: 2px;
 }
 .miu-thought-star {
     font-size: 0;
@@ -29,7 +29,7 @@ M.CSS = [[
     padding: 0;
     color: transparent;
 }
-/* MIUREAD_ANNOTATION_STYLE_V2_END */
+/* MIUREAD_ANNOTATION_STYLE_V3_END */
 ]]
 
 M.INLINE_STYLE_ID = "miuread-annotation-style"
@@ -42,6 +42,7 @@ end
 
 local OLD_MARKERS = {
     {"/* MIUREAD_ANNOTATION_STYLE_REPAIR_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_REPAIR_END */"},
+    {"/* MIUREAD_ANNOTATION_STYLE_V2_BEGIN */", "/* MIUREAD_ANNOTATION_STYLE_V2_END */"},
     {M.MARKER_BEGIN, M.MARKER_END},
 }
 

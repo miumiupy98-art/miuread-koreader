@@ -6,6 +6,8 @@ local Footnotes = require("miuread.footnotes")
 local ResourceRefs = require("miuread.resource_refs")
 local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
+local ThoughtDatabase = require("miuread.thought_database")
+local Digests = require("miuread.digests")
 local Epub = require("miuread.epub")
 local Http = require("miuread.http")
 local DownloadPlan = require("miuread.download_plan")
@@ -1892,17 +1894,18 @@ function Downloader:book(input, opt, progress)
             annotation=fetch_annotation(chapter,function(stage,current_index,total)
                 progress(stage,index,expected,chapter.title,{batch=current_index,batches=total})
             end,requested_annotations)
-            local pending=annotation.complete~=true
-            entry.annotation_locator_done=not pending
-            entry.annotation_locator_pending=pending or nil
+            local locator_pending=annotation.locator_complete~=true
+            local review_pending=requested_annotations and annotation.review_complete~=true or false
+            entry.annotation_locator_done=not locator_pending
+            entry.annotation_locator_pending=locator_pending or nil
             entry.annotation_account_key=annotation_account_key
             entry.annotation_run_id=opt.download_run_id
             if requested_annotations then
-                entry.annotation_done=not pending
-                entry.annotation_pending=pending or nil
-                entry.annotation_error_kind=pending and (annotation.error_kind or "incomplete") or nil
-                entry.annotation_error=pending and table.concat(annotation.errors or {},"; ") or nil
-                if pending then
+                entry.annotation_done=not review_pending
+                entry.annotation_pending=review_pending or nil
+                entry.annotation_error_kind=review_pending and (annotation.error_kind or "incomplete") or nil
+                entry.annotation_error=review_pending and table.concat(annotation.errors or {},"; ") or nil
+                if review_pending then
                     record_annotation_error(chapter,annotation)
                     logger.warn("[MiuRead][Download] annotations preserved with pending items",
                         "book=",tostring(book.bookId),"chapter=",uid,
@@ -1910,7 +1913,7 @@ function Downloader:book(input, opt, progress)
                 else
                     annotation_error_map[uid]=nil
                 end
-            elseif pending then
+            elseif locator_pending then
                 logger.warn("[MiuRead][Download] range locators incomplete;正文继续",
                     "book=",tostring(book.bookId),"chapter=",uid,
                     "kind=",tostring(annotation.error_kind or "incomplete"))
@@ -1918,7 +1921,24 @@ function Downloader:book(input, opt, progress)
             local extra_css,apply_stats
             respect_reader_priority("annotation_apply")
             progress("annotation_apply",index,expected,chapter.title,{message="正在定位微信划线"})
+            local locator_fingerprint=Digests.md5(tostring(coord_body or body or "")):lower()
             body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
+            if annotation.underline_request_ok==true and annotation.underlines_partial~=true then
+                local locator_rows=type(apply_stats)=="table" and apply_stats.locators or nil
+                if type(locator_rows)~="table" then locator_rows=self.annotations:locator_rows(annotation,true) end
+                local saved_locator,locator_error=ThoughtDatabase.save_locators(self.store,book.bookId,uid,
+                    locator_rows,locator_fingerprint,true)
+                if saved_locator then
+                    local embedded=0
+                    for _,locator in ipairs(locator_rows or {}) do if locator.embedded==true then embedded=embedded+1 end end
+                    logger.info("[MiuRead][ThoughtLocator] body index saved",
+                        "book=",tostring(book.bookId),"chapter=",uid,"ranges=",tostring(#(locator_rows or {})),
+                        "embedded=",tostring(embedded),"fingerprint=",tostring(locator_fingerprint):sub(1,8))
+                else
+                    logger.warn("[MiuRead][ThoughtLocator] body index save failed",
+                        "book=",tostring(book.bookId),"chapter=",uid,"error=",tostring(locator_error))
+                end
+            end
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
             entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
             entry.annotation_official_verified=tonumber(apply_stats and apply_stats.official_verified or 0) or 0
