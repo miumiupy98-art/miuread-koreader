@@ -1855,6 +1855,53 @@ function Store:forget_book_local_state(id)
     end
     return true
 end
+function Store:forget_book_download_content(id)
+    local key=tostring(id or "")
+    if key=="" then return false end
+    -- beta.12: remove only reproducible local download state. Reading sessions,
+    -- per-book preferences, favorites and other user data deliberately remain.
+    local all=self:library(); all[key]=nil; self:set("library",all)
+    local prefetch=self:get("prefetch_cache",{}); prefetch[key]=nil; self:set("prefetch_cache",prefetch)
+    U.remove_tree(self:prefetch_book_path(key))
+    local covers=self:get("cover_index",{}); covers[key]=nil; self:set("cover_index",covers)
+
+    local queue_out={}
+    for _,job in ipairs(self:download_queue()) do
+        local job_id=tostring((job.book and (job.book.bookId or job.book.book_id)) or job.book_id or "")
+        if job_id~=key then queue_out[#queue_out+1]=job end
+    end
+    self:save_download_queue(queue_out)
+
+    local pending_out={}
+    for _,row in ipairs(self:pending_installs()) do
+        if tostring(row.book_id or "")~=key then pending_out[#pending_out+1]=row end
+    end
+    self:save_pending_installs(pending_out)
+
+    local repair=self:get("book_repair_state",{}); repair[key]=nil; self:set("book_repair_state",repair)
+    local history_out={}
+    for _,row in ipairs(self:get("book_repair_history",{})) do
+        if tostring(row.book_id or "")~=key then history_out[#history_out+1]=row end
+    end
+    self:set("book_repair_history",history_out)
+
+    local shelf=self:shelf_cache()
+    local shelf_changed=false
+    for _,group in ipairs({shelf.books or {},shelf.mp or {}}) do
+        for _,row in ipairs(group) do
+            if tostring(row.bookId or row.book_id or "")==key and row.cover_path~=nil then
+                row.cover_path=nil; shelf_changed=true
+            end
+        end
+    end
+    if shelf_changed then self:save_shelf_cache(shelf) end
+
+    local state=self:download_state()
+    if tostring(state.book_id or (state.book and (state.book.bookId or state.book.book_id)) or "")==key then
+        self:clear_download_state()
+    end
+    return true
+end
 function Store:forget_all_books() self:set("library",{}) end
 function Store:prune_missing_files()
     local all=self:library(); local changed=false

@@ -169,6 +169,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     options=type(options)=="table" and options or {}
     local previous=type(options.previous)=="table" and options.previous or nil
     local checkpoint=type(options.checkpoint)=="function" and options.checkpoint or nil
+    local fetch_reviews=options.fetch_reviews~=false
     progress=progress or function() end
 
     if previous and previous.complete==true and options.force_refresh~=true then
@@ -224,6 +225,22 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         if key~="" and not active_seen[key] then active_seen[key]=true; active_ranges[#active_ranges+1]=key end
     end
     if #active_ranges==0 then
+        result.review_complete=true
+        result.complete=result.underline_request_ok and result.underlines_partial~=true
+        return result
+    end
+
+    -- The single-EPUB model always resolves WeRead ranges while the chapter
+    -- source is available, even when the user chose not to preload comments.
+    -- In locator-only mode we stop after underlines: no empty review result can
+    -- be mistaken for a verified "no comments" state, and no comment cache is
+    -- written. The range markers are still precise enough for later comment
+    -- downloads to attach to the same text without regenerating the EPUB.
+    if not fetch_reviews then
+        result.locator_only=true
+        result.review_skipped=true
+        result.completed_ranges={}
+        result.pending_ranges={}
         result.review_complete=true
         result.complete=result.underline_request_ok and result.underlines_partial~=true
         return result
@@ -298,6 +315,11 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         table.sort(result.pending_ranges)
         result.review_complete=#result.pending_ranges==0
         result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
+        if result.thought_entry_count>0 then
+            result.suspicious_empty=false
+        elseif result.suspicious_candidate==true and #result.pending_ranges>0 then
+            result.suspicious_empty=true
+        end
         result.invalid_review_count=invalid_review_count
     end
     local function save_checkpoint()
@@ -327,19 +349,46 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
 
         local request_by_range={}
         for _,request in ipairs(batch or {}) do request_by_range[range_key(request)]=request end
-        local next_batch,next_seen={},{}
+        local next_batch,next_seen,returned_seen={},{},{}
         for _,group in ipairs(rows) do
             local key=range_key(group)
             local request=request_by_range[key]
             if request then
+                returned_seen[key]=true
                 page_count_by_range[key]=(tonumber(page_count_by_range[key]) or 0)+1
                 local next_request=next_page_request(group,request,page_count_by_range[key])
                 if next_request and not next_seen[key] then next_seen[key]=true; next_batch[#next_batch+1]=next_request end
             end
         end
+        local missing={}
         for _,request in ipairs(batch or {}) do
             local key=range_key(request)
-            if key~="" and not next_seen[key] then pending[key]=nil; completed[key]=true end
+            -- A requested range is complete only when the server explicitly
+            -- returned that range. beta.11 treated a missing range as a valid
+            -- empty result, which turned hundreds of real comment ranges into
+            -- pending=0 / comments=0 false successes.
+            if key~="" and returned_seen[key] then
+                if not next_seen[key] then pending[key]=nil; completed[key]=true end
+            elseif key~="" then
+                missing[#missing+1]=key
+            end
+        end
+        if #missing>0 then
+            result.missing_range_count=(tonumber(result.missing_range_count) or 0)+#missing
+            local all_missing=#rows==0 and #missing==#(batch or {})
+            if all_missing then
+                result.suspicious_candidate=true
+                result.suspicious_empty=true
+                result.error_kind=result.error_kind or "suspicious_empty"
+            else
+                result.error_kind=result.error_kind or "incomplete"
+            end
+            result.errors[#result.errors+1]=tostring(label).." omitted "..tostring(#missing).." requested ranges"
+            logger.warn("[MiuRead][Annotations] review response omitted requested ranges",
+                "book=",result.book_id,"chapter=",result.chapter_uid,
+                "requested=",tostring(#(batch or {})),"returned=",tostring(#rows),
+                "missing=",tostring(#missing),"all_missing=",tostring(all_missing),
+                "source=",tostring(response and response._annotation_source or "unknown"))
         end
         save_checkpoint()
         return next_batch
@@ -822,7 +871,7 @@ local function render_text_token(token, marks, data, anchored)
                 -- HTML does not allow links inside links. When an underline overlaps
                 -- an existing footnote/noteref link, preserve the underline style but
                 -- leave the original link as the only clickable target.
-                if active.thought and not token.inside_anchor then
+                if active.key~="" and not token.inside_anchor then
                     local href = Thoughts.href(data.book_id, data.chapter_uid, active.key)
                     out[#out + 1] = '<a class="miu-thought-link" href="' .. href .. '">'
                     thought_link_open = true
@@ -830,7 +879,7 @@ local function render_text_token(token, marks, data, anchored)
                 local mark_class = Thoughts.mark_class(active.key)
                 local display_class = active.thought and "miu-thought-mark" or "miu-inline-mark"
                 local id_attr = ""
-                if active.thought and not anchored[active.key] then
+                if active.key~="" and not anchored[active.key] then
                     anchored[active.key] = true
                     id_attr = ' id="' .. Thoughts.anchor(data.book_id, data.chapter_uid, active.key) .. '"'
                 end
@@ -932,6 +981,7 @@ function Annotations:to_cache(data)
         pending_ranges=data.pending_ranges or {},underline_request_ok=data.underline_request_ok==true,
         underlines_partial=data.underlines_partial==true,review_complete=data.review_complete==true,
         complete=data.complete==true,error_kind=data.error_kind,
+        suspicious_empty=data.suspicious_empty==true,review_skipped=data.review_skipped==true,
     }
 end
 
@@ -951,6 +1001,7 @@ function Annotations:from_cache(value)
         pending_ranges=value.pending_ranges or {},underline_request_ok=value.underline_request_ok==true,
         underlines_partial=value.underlines_partial==true,review_complete=value.review_complete==true,
         complete=value.complete==true,error_kind=value.error_kind,
+        suspicious_empty=value.suspicious_empty==true,review_skipped=value.review_skipped==true,
         cached=true}
 end
 
@@ -1049,6 +1100,12 @@ function Annotations:merge(previous,current)
     current.underline_count=#(current.underlines or {})
     current.review_complete=#(current.pending_ranges or {})==0
     current.complete=current.underline_request_ok and current.underlines_partial~=true and current.review_complete
+    -- A later retry that actually obtains comment groups must be allowed to
+    -- recover from a previous suspicious-empty checkpoint. Keep the flag only
+    -- while the chapter is still unresolved and still contains no comment data.
+    current.suspicious_empty=current.suspicious_empty==true
+        or (current.complete~=true and current.thought_entry_count==0
+            and previous and previous.suspicious_empty==true) or false
     return current
 end
 

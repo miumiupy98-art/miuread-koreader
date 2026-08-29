@@ -646,6 +646,36 @@ function Api:_agent_readreviews(id,chapter_uid,batch)
     return value
 end
 
+local function review_range_key(row)
+    if type(row)~="table" then return tostring(scalar(row) or row or "") end
+    local value=rawget(row,"range") or rawget(row,"reviewRange") or rawget(row,"rangeKey")
+        or rawget(row,"rangeValue")
+    local resolved=scalar(value) or value
+    return tostring(resolved or "")
+end
+
+local function review_container(value)
+    if type(value)~="table" then return nil,nil end
+    if type(value.reviews)=="table" then return value.reviews,"reviews" end
+    if type(value.updated)=="table" then return value.updated,"updated" end
+    if #value>0 then return value,false end
+    return {},type(value.reviews)=="table" and "reviews" or (type(value.updated)=="table" and "updated" or false)
+end
+
+local function missing_review_requests(batch,rows)
+    local returned={}
+    for _,row in ipairs(type(rows)=="table" and rows or {}) do
+        local key=review_range_key(row)
+        if key~="" then returned[key]=true end
+    end
+    local missing={}
+    for _,request in ipairs(type(batch)=="table" and batch or {}) do
+        local key=review_range_key(request)
+        if key~="" and not returned[key] then missing[#missing+1]=request end
+    end
+    return missing,returned
+end
+
 function Api:readreviews(id, chapter_uid, batch)
     if self.web_annotation_auth_dead==true then
         logger.dbg("[MiuRead][API] web readReviews skipped; annotation circuit open",
@@ -653,7 +683,58 @@ function Api:readreviews(id, chapter_uid, batch)
         return self:_agent_readreviews(id,chapter_uid,batch)
     end
     local ok,value=pcall(self._web_readreviews,self,id,chapter_uid,batch)
-    if ok then self.web_annotation_auth_dead=false; return value end
+    if ok then
+        self.web_annotation_auth_dead=false
+        local rows,container_key=review_container(value)
+        local missing=missing_review_requests(batch,rows)
+        if #missing>0 then
+            -- beta.12: the server omitting a requested range is not equivalent to
+            -- an explicit empty result. Verify only the missing ranges through
+            -- the older gateway path and merge recovered groups into the web result.
+            local agent_ok,agent_value=pcall(self._agent_readreviews,self,id,chapter_uid,missing)
+            if agent_ok and type(agent_value)=="table" then
+                local agent_rows=select(1,review_container(agent_value)) or {}
+                if #agent_rows>0 then
+                    if container_key=="reviews" then
+                        value.reviews=value.reviews or {}
+                        for _,row in ipairs(agent_rows) do value.reviews[#value.reviews+1]=row end
+                    elseif container_key=="updated" then
+                        value.updated=value.updated or {}
+                        for _,row in ipairs(agent_rows) do value.updated[#value.updated+1]=row end
+                    else
+                        for _,row in ipairs(agent_rows) do value[#value+1]=row end
+                    end
+                    logger.info("[MiuRead][API] missing readReviews ranges recovered by Skill Gateway",
+                        "book=",tostring(id),"chapter=",tostring(chapter_uid),
+                        "requested=",tostring(#(batch or {})),"missing=",tostring(#missing),
+                        "recovered_groups=",tostring(#agent_rows))
+                end
+                local merged_rows=select(1,review_container(value)) or {}
+                local still_missing=missing_review_requests(batch,merged_rows)
+                if #still_missing>0 then
+                    value._annotation_missing_ranges={}
+                    for _,request in ipairs(still_missing) do
+                        value._annotation_missing_ranges[#value._annotation_missing_ranges+1]=review_range_key(request)
+                    end
+                    value._annotation_agent_empty=(#agent_rows==0) or nil
+                    logger.warn("[MiuRead][API] readReviews still omitted requested ranges",
+                        "book=",tostring(id),"chapter=",tostring(chapter_uid),
+                        "missing=",tostring(#still_missing),"web_groups=",tostring(#rows),
+                        "agent_groups=",tostring(#agent_rows))
+                end
+            else
+                value._annotation_agent_error=tostring(agent_value)
+                value._annotation_missing_ranges={}
+                for _,request in ipairs(missing) do
+                    value._annotation_missing_ranges[#value._annotation_missing_ranges+1]=review_range_key(request)
+                end
+                logger.warn("[MiuRead][API] readReviews missing-range verification failed",
+                    "book=",tostring(id),"chapter=",tostring(chapter_uid),
+                    "missing=",tostring(#missing),"error=",tostring(agent_value))
+            end
+        end
+        return value
+    end
     self:_note_web_annotation_failure(value)
     -- Batch-shape failures must go back to the adaptive splitter. Falling
     -- through to the Skill Gateway would repeat the same rejected payload and

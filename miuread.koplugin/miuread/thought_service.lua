@@ -97,6 +97,23 @@ function ThoughtService:fetch_chapter(book_id, chapter_uid, options)
 
     local incoming_comments=tonumber(merged.thought_entry_count or 0) or 0
     local previous_comments=tonumber(previous_state.comments or 0) or 0
+    if merged.suspicious_empty==true then
+        local combined=merged_groups(previous_groups,groups)
+        local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,combined)
+        if not saved then return fail(tostring(save_err or "评论缓存写入失败"),"save failed",result) end
+        local counts=ThoughtDatabase.chapter_counts(self.store,book_id,chapter_uid)
+        ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,"suspicious_empty",false,
+            table.concat(merged.errors or {}," | "))
+        ThoughtDatabase.save_checkpoint(self.store,book_id,chapter_uid,self.annotations:to_cache(merged))
+        return {
+            book_id=tostring(book_id or ""),chapter_uid=tostring(chapter_uid or ""),
+            groups=tonumber(counts.groups or 0) or 0,comments=tonumber(counts.comments or 0) or 0,
+            server_comments=incoming_comments,saved_comments=tonumber(counts.comments or 0) or 0,
+            complete=false,status="suspicious_empty",protected=previous_comments>0,
+            error_kind="suspicious_empty",underlines=tonumber(merged.underline_count or 0) or 0,
+            pending_ranges=#(merged.pending_ranges or {}),
+        }
+    end
     if merged.complete==true and incoming_comments==0 and previous_comments>0 then
         -- A chapter that used to contain valid comments must never be erased by
         -- a transient empty readReviews response. Keep the old cache and make
