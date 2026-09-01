@@ -6,8 +6,6 @@ local Footnotes = require("miuread.footnotes")
 local ResourceRefs = require("miuread.resource_refs")
 local InternalLinks = require("miuread.internal_links")
 local Thoughts = require("miuread.thoughts")
-local ThoughtDatabase = require("miuread.thought_database")
-local Digests = require("miuread.digests")
 local Epub = require("miuread.epub")
 local Http = require("miuread.http")
 local DownloadPlan = require("miuread.download_plan")
@@ -31,7 +29,7 @@ local FOOTNOTE_TRANSFORM_VERSION = 2
 local LEGACY_TITLE_TRANSFORM_VERSION = 1
 local TITLE_TRANSFORM_VERSION = 2
 local LEGACY_ANNOTATION_TRANSFORM_VERSION = 1
-local ANNOTATION_TRANSFORM_VERSION = 6
+local ANNOTATION_TRANSFORM_VERSION = 5
 local IMAGE_TRANSFORM_VERSION = 2
 local LEGACY_CONTENT_TRANSFORM_VERSION = 1
 local CONTENT_TRANSFORM_VERSION = 2
@@ -824,7 +822,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     end
     if #chapters<=0 then error("EPUB 至少需要一个说明页面") end
 
-    local suffix = kind == "notes" and "划线与想法版" or ""
+    local suffix = kind == "notes" and "划线与想法版" or "纯净版"
     local standalone = opt.chapter_uid ~= nil
     local hidden_prefetch = standalone and opt.prefetch_hidden == true
     local dir = hidden_prefetch and self.store:prefetch_root(book.bookId) or self.store:epub_root()
@@ -846,8 +844,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         elseif preview_mode=="partial" then preview_name="【试读版·部分内容】"
         else preview_name="【试读版】" end
     end
-    local variant_suffix=suffix~="" and (" ["..suffix.."]") or ""
-    local formal_filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name..variant_suffix..".epub"
+    local formal_filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name.." ["..suffix.."].epub"
     local filename=hidden_prefetch and (U.id_name(opt.chapter_uid).."-"..storage_kind..".epub") or formal_filename
     local path=hidden_prefetch and self.store:hidden_prefetch_path(book.bookId,opt.chapter_uid,storage_kind) or self.store:epub_path(filename)
     -- Keep the exact path of an existing variant. KOReader sidecar notes are
@@ -998,9 +995,6 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         failed_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         annotation_requested=opt.annotation_requested==true or opt.annotations==true,
-        annotation_locators=opt.annotation_locators==true or nil,
-        unified_body=(not standalone and not partial_range and access_scope=="full" and kind=="clean") or nil,
-        annotation_locator_pending=opt.annotation_locator_pending==true or nil,
         annotation_pending=opt.annotation_pending==true or nil,
         annotation_fallback=opt.annotation_fallback==true or nil,
         annotation_error_kind=opt.annotation_error_kind,
@@ -1098,13 +1092,11 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         pending_install=defer_install or nil,
         pending_file=pending_path,
         annotation_requested=opt.annotation_requested==true or opt.annotations==true,
-        annotation_locators=opt.annotation_locators==true or nil,
-        annotation_locator_pending=opt.annotation_locator_pending==true or nil,
         annotation_pending=opt.annotation_pending==true or nil,
         annotation_fallback=opt.annotation_fallback==true or nil,
         annotation_error_kind=opt.annotation_error_kind,
         annotation_errors=U.copy(opt.annotation_errors or {}),
-        annotation_account_key=opt.annotation_account_key,
+        annotation_account_key=opt.annotations and annotation_account_key or nil,
         core_map_hash=core_map_hash,
         image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
@@ -1389,7 +1381,6 @@ function Downloader:book(input, opt, progress)
     local failure_map, restricted_map = {}, {}
     local network_failure_streak=0
     local requested_annotations=opt.annotations==true
-    local requested_locators=opt.annotation_locators==true or requested_annotations
     opt.download_run_id=tostring(opt.download_run_id or (os.time().."-"..math.random(100000,999999)))
     local annotation_account_key=DownloadDatabase.account_key(self.store)
     local annotation_suspended=false
@@ -1408,7 +1399,7 @@ function Downloader:book(input, opt, progress)
         annotation_error_kind=annotation_error_kind or (annotation and annotation.error_kind) or "incomplete"
     end
 
-    local function fetch_annotation(chapter,report_progress,fetch_reviews)
+    local function fetch_annotation(chapter,report_progress)
         local uid=chapter_uid(chapter)
         local previous=DownloadDatabase.load_annotation_data(cache.root,uid,annotation_account_key,self.annotations)
         if annotation_suspended then
@@ -1447,7 +1438,7 @@ function Downloader:book(input, opt, progress)
                     respect_reader_priority("annotation_batch")
                     if report_progress then report_progress(stage,current_index,total) end
                 end,
-                {previous=previous,checkpoint=persist_checkpoint,fetch_reviews=fetch_reviews~=false})
+                {previous=previous,checkpoint=persist_checkpoint})
         end
 
         local ok,current=pcall(fetch_once)
@@ -1528,7 +1519,7 @@ function Downloader:book(input, opt, progress)
             annotation_error_kind=current.error_kind or "incomplete"
         end
 
-        if fetch_reviews~=false and type(merged.review_groups)=="table" then
+        if type(merged.review_groups)=="table" then
             Thoughts.save(self.store,book.bookId,chapter.chapterUid or chapter.uid,merged.review_groups)
         end
         return merged
@@ -1734,15 +1725,6 @@ function Downloader:book(input, opt, progress)
         -- legacy malformed XHTML would preserve a truncated EPUB, so those entries
         -- are refreshed above before any completed checkpoint can be reused.
 
-        if entry and entry.complete and requested_locators
-            and tonumber(entry.annotation_transform_version or 0)<ANNOTATION_TRANSFORM_VERSION then
-            logger.info("[MiuRead][Download] refreshing chapter for unified comment locators",
-                "chapter=",uid,"old_version=",tostring(entry.annotation_transform_version or 0),
-                "new_version=",tostring(ANNOTATION_TRANSFORM_VERSION))
-            cache_reset_entry(cache,uid)
-            entry=nil
-        end
-
         if entry and entry.complete then
             local migrated=false
             if tonumber(entry.title_transform_version or 0)<=0 then
@@ -1750,11 +1732,11 @@ function Downloader:book(input, opt, progress)
                     or LEGACY_TITLE_TRANSFORM_VERSION
                 migrated=true
             end
-            if requested_locators and tonumber(entry.annotation_transform_version or 0)<=0 then
+            if requested_annotations and tonumber(entry.annotation_transform_version or 0)<=0 then
                 entry.annotation_transform_version=LEGACY_ANNOTATION_TRANSFORM_VERSION
                 migrated=true
             end
-            if requested_locators and tostring(entry.annotation_account_key or "")=="" then
+            if requested_annotations and tostring(entry.annotation_account_key or "")=="" then
                 -- Older caches did not record the account. Preserve their final
                 -- XHTML and bind it to the current account instead of rebuilding
                 -- every chapter during the upgrade.
@@ -1768,7 +1750,7 @@ function Downloader:book(input, opt, progress)
         -- re-injecting every annotation on every update changes EPUB text nodes
         -- and invalidates KOReader local-note positions. Only pending, changed,
         -- new, or account-mismatched chapters are rebuilt.
-        local annotation_current=not requested_locators or (
+        local annotation_current=not requested_annotations or (
             entry and entry.annotation_pending~=true
             and tostring(entry.annotation_account_key or "")==tostring(annotation_account_key))
         if entry and entry.complete and annotation_current then
@@ -1885,66 +1867,35 @@ function Downloader:book(input, opt, progress)
         end
 
         local annotation
-        if requested_locators then
+        if requested_annotations then
             progress("underlines",index,expected,chapter.title)
-            -- New single-body downloads resolve only stable WeRead ranges here.
-            -- Comment bodies are fetched by the selected preload stage before the
-            -- overall download is declared complete. Legacy notes jobs may still
-            -- request full reviews for compatibility.
             annotation=fetch_annotation(chapter,function(stage,current_index,total)
                 progress(stage,index,expected,chapter.title,{batch=current_index,batches=total})
-            end,requested_annotations)
-            local locator_pending=annotation.locator_complete~=true
-            local review_pending=requested_annotations and annotation.review_complete~=true or false
-            entry.annotation_locator_done=not locator_pending
-            entry.annotation_locator_pending=locator_pending or nil
+            end)
+            local pending=annotation.complete~=true
+            entry.annotation_done=not pending
+            entry.annotation_pending=pending or nil
+            entry.annotation_error_kind=pending and (annotation.error_kind or "incomplete") or nil
+            entry.annotation_error=pending and table.concat(annotation.errors or {},"; ") or nil
             entry.annotation_account_key=annotation_account_key
             entry.annotation_run_id=opt.download_run_id
-            if requested_annotations then
-                entry.annotation_done=not review_pending
-                entry.annotation_pending=review_pending or nil
-                entry.annotation_error_kind=review_pending and (annotation.error_kind or "incomplete") or nil
-                entry.annotation_error=review_pending and table.concat(annotation.errors or {},"; ") or nil
-                if review_pending then
-                    record_annotation_error(chapter,annotation)
-                    logger.warn("[MiuRead][Download] annotations preserved with pending items",
-                        "book=",tostring(book.bookId),"chapter=",uid,
-                        "kind=",tostring(annotation.error_kind or "incomplete"))
-                else
-                    annotation_error_map[uid]=nil
-                end
-            elseif locator_pending then
-                logger.warn("[MiuRead][Download] range locators incomplete;正文继续",
+            if pending then
+                record_annotation_error(chapter,annotation)
+                logger.warn("[MiuRead][Download] annotations preserved with pending items",
                     "book=",tostring(book.bookId),"chapter=",uid,
                     "kind=",tostring(annotation.error_kind or "incomplete"))
+            else
+                annotation_error_map[uid]=nil
             end
             local extra_css,apply_stats
             respect_reader_priority("annotation_apply")
-            progress("annotation_apply",index,expected,chapter.title,{message="正在定位微信划线"})
-            local locator_fingerprint=Digests.md5(tostring(coord_body or body or "")):lower()
+            progress("annotation_apply",index,expected,chapter.title,{message="正在定位划线与想法"})
             body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body)
-            if annotation.underline_request_ok==true and annotation.underlines_partial~=true then
-                local locator_rows=type(apply_stats)=="table" and apply_stats.locators or nil
-                if type(locator_rows)~="table" then locator_rows=self.annotations:locator_rows(annotation,true) end
-                local saved_locator,locator_error=ThoughtDatabase.save_locators(self.store,book.bookId,uid,
-                    locator_rows,locator_fingerprint,true)
-                if saved_locator then
-                    local embedded=0
-                    for _,locator in ipairs(locator_rows or {}) do if locator.embedded==true then embedded=embedded+1 end end
-                    logger.info("[MiuRead][ThoughtLocator] body index saved",
-                        "book=",tostring(book.bookId),"chapter=",uid,"ranges=",tostring(#(locator_rows or {})),
-                        "embedded=",tostring(embedded),"fingerprint=",tostring(locator_fingerprint):sub(1,8))
-                else
-                    logger.warn("[MiuRead][ThoughtLocator] body index save failed",
-                        "book=",tostring(book.bookId),"chapter=",uid,"error=",tostring(locator_error))
-                end
-            end
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
             entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
             entry.annotation_official_verified=tonumber(apply_stats and apply_stats.official_verified or 0) or 0
             entry.annotation_official_roundtrip=tonumber(apply_stats and apply_stats.official_roundtrip or 0) or 0
             entry.annotation_official_failed=tonumber(apply_stats and apply_stats.official_failed or 0) or 0
-            entry.annotation_locator_count=tonumber(apply_stats and apply_stats.underlines or 0) or 0
             style=tostring(style or "").."\n"..tostring(extra_css or "")
             cache_save(cache)
         end
@@ -2008,7 +1959,7 @@ function Downloader:book(input, opt, progress)
                 }) do
                     rebuilt_images[key]=rebuilt_images[key]+(tonumber(chapter_images[key]) or 0)
                 end
-                if requested_locators then
+                if opt.annotations then
                     rebuilt_annotations.chapters_ok = rebuilt_annotations.chapters_ok + 1
                     rebuilt_annotations.underlines = rebuilt_annotations.underlines + (tonumber(entry.underlines) or 0)
                     rebuilt_annotations.thoughts = rebuilt_annotations.thoughts + (tonumber(entry.thoughts) or 0)
@@ -2162,18 +2113,7 @@ function Downloader:book(input, opt, progress)
     annotation_summary.pending=#annotation_errors>0
     annotation_summary.error_kind=annotation_error_kind
     annotation_summary.errors=U.copy(annotation_errors)
-    local locator_pending_count=0
-    if requested_locators then
-        for _,chapter in ipairs(selected) do
-            local uid=tostring(chapter.chapterUid or chapter.uid)
-            local entry=cache.manifest.chapters[uid]
-            if entry and entry.annotation_locator_pending==true then locator_pending_count=locator_pending_count+1 end
-        end
-    end
     opt.annotation_requested=requested_annotations
-    opt.annotation_locators=requested_locators
-    opt.annotation_account_key=requested_locators and annotation_account_key or nil
-    opt.annotation_locator_pending=locator_pending_count>0
     opt.annotation_pending=#annotation_errors>0
     opt.annotation_fallback=tonumber(annotation_summary.fallbacks or 0)>0
     opt.annotation_error_kind=annotation_error_kind

@@ -221,7 +221,7 @@ function M.partial_repairs(store,book_id)
                 end
                 out[#out+1]={
                     root=root,manifest=manifest,options=options,option_error=option_error,
-                    kind=kind,label=(kind=="notes" and "旧划线与想法版" or "正文").." · 未完成缓存",
+                    kind=kind,label=(kind=="notes" and "划线与想法版" or "纯净版").." · 未完成缓存",
                     complete=complete,failed=failed,total=total,updated_at=tonumber(manifest.updated_at or 0) or 0,
                 }
             end

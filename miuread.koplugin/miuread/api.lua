@@ -623,15 +623,10 @@ function Api:_web_readreviews(id,chapter_uid,batch)
         local ok,value=pcall(self.http.post_json,self.http,
             "https://weread.qq.com/web/book/readReviews",payload,options)
         if ok and type(value)=="table" then
-            local has_reviews=type(value.reviews)=="table" or type(value.updated)=="table" or #value>0
-            if has_reviews then
-                value._annotation_source="web"
-                return value
-            end
-            last="web readReviews returned no review container"
-        else
-            last=ok and "web readReviews returned invalid data" or value
+            value._annotation_source="web"
+            return value
         end
+        last=ok and "web readReviews returned invalid data" or value
     end
     error(last or "web readReviews failed")
 end
@@ -639,211 +634,27 @@ end
 function Api:_agent_readreviews(id,chapter_uid,batch)
     local value=self:_chapter_call("/book/readreviews",id,chapter_uid,
         {reviews=sanitize(batch or {})},AGENT_ANNOTATION_REQUEST_OPTIONS)
-    if type(value)~="table" or not (type(value.reviews)=="table" or type(value.updated)=="table" or #value>0) then
-        error("/book/readreviews: invalid response without review container")
-    end
-    value._annotation_source="agent"
+    if type(value)=="table" then value._annotation_source="agent" end
     return value
 end
 
-local function review_range_key(row)
-    if type(row)~="table" then return tostring(scalar(row) or row or "") end
-    local value=rawget(row,"range") or rawget(row,"reviewRange") or rawget(row,"rangeKey")
-        or rawget(row,"rangeValue")
-    local resolved=scalar(value) or value
-    return tostring(resolved or "")
-end
-
-local function review_container(value)
-    if type(value)~="table" then return nil,nil end
-    if type(value.reviews)=="table" then return value.reviews,"reviews" end
-    if type(value.updated)=="table" then return value.updated,"updated" end
-    if #value>0 then return value,false end
-    return {},type(value.reviews)=="table" and "reviews" or (type(value.updated)=="table" and "updated" or false)
-end
-
-local function review_nested_rows(group)
-    if type(group)~="table" then return {} end
-    for _,name in ipairs({"pageReviews","reviews","updated","reviewList","items","list"}) do
-        local value=rawget(group,name)
-        if type(value)=="table" then return value end
-    end
-    return {}
-end
-
-local function review_comment_count(group)
-    local count=0
-    for _,entry in ipairs(review_nested_rows(group)) do
-        if type(entry)=="table" then
-            local nested=rawget(entry,"review")
-            local row=type(nested)=="table" and nested or entry
-            if type(row)=="table" then
-                local content=scalar(rawget(row,"content") or rawget(row,"review") or rawget(row,"text"))
-                if tostring(content or "")~="" then count=count+1 end
-            end
-        end
-    end
-    return count
-end
-
-local function classify_review_requests(batch,rows)
-    local returned,content_counts={},{}
-    for _,row in ipairs(type(rows)=="table" and rows or {}) do
-        local key=review_range_key(row)
-        if key~="" then
-            returned[key]=true
-            content_counts[key]=(content_counts[key] or 0)+review_comment_count(row)
-        end
-    end
-    local missing,empty,content={},{},{}
-    for _,request in ipairs(type(batch)=="table" and batch or {}) do
-        local key=review_range_key(request)
-        if key~="" then
-            if not returned[key] then missing[#missing+1]=request
-            elseif (content_counts[key] or 0)>0 then content[#content+1]=request
-            else empty[#empty+1]=request end
-        end
-    end
-    local comments=0
-    for _,n in pairs(content_counts) do comments=comments+(tonumber(n) or 0) end
-    return {missing=missing,empty=empty,content=content,returned=returned,content_counts=content_counts,comments=comments}
-end
-
-local function append_review_rows(value,container_key,rows)
-    if type(rows)~="table" or #rows==0 then return end
-    if container_key=="reviews" then
-        value.reviews=value.reviews or {}
-        for _,row in ipairs(rows) do value.reviews[#value.reviews+1]=row end
-    elseif container_key=="updated" then
-        value.updated=value.updated or {}
-        for _,row in ipairs(rows) do value.updated[#value.updated+1]=row end
-    else
-        for _,row in ipairs(rows) do value[#value+1]=row end
-    end
-end
-
-local function range_keys(requests)
-    local out={}
-    for _,request in ipairs(type(requests)=="table" and requests or {}) do
-        local key=review_range_key(request)
-        if key~="" then out[#out+1]=key end
-    end
-    return out
-end
-
-local function annotate_agent_result(value,batch)
-    local rows=select(1,review_container(value)) or {}
-    local state=classify_review_requests(batch,rows)
-    value._annotation_verified_empty_ranges=range_keys(state.empty)
-    value._annotation_missing_ranges=range_keys(state.missing)
-    value._annotation_unverified_empty_ranges=range_keys(state.missing)
-    value._annotation_diagnostic={source="agent",requested=#(batch or {}),groups=#rows,
-        content_ranges=#state.content,comments=state.comments,empty_ranges=#state.empty,missing_ranges=#state.missing}
-    return value,state
-end
-
 function Api:readreviews(id, chapter_uid, batch)
-    batch=type(batch)=="table" and batch or {}
     if self.web_annotation_auth_dead==true then
         logger.dbg("[MiuRead][API] web readReviews skipped; annotation circuit open",
-            "book=",tostring(id),"chapter=",tostring(chapter_uid),"ranges=",tostring(#batch))
-        local value=self:_agent_readreviews(id,chapter_uid,batch)
-        local annotated,state=annotate_agent_result(value,batch)
-        logger.info("[MiuRead][ThoughtAPI] readReviews",
-            "book=",tostring(id),"chapter=",tostring(chapter_uid),"source=agent",
-            "requested=",tostring(#batch),"groups=",tostring(#(select(1,review_container(value)) or {})),
-            "content_ranges=",tostring(#state.content),"comments=",tostring(state.comments),
-            "empty_ranges=",tostring(#state.empty),"missing_ranges=",tostring(#state.missing))
-        return annotated
+            "book=",tostring(id),"chapter=",tostring(chapter_uid),"ranges=",tostring(#(batch or {})))
+        return self:_agent_readreviews(id,chapter_uid,batch)
     end
     local ok,value=pcall(self._web_readreviews,self,id,chapter_uid,batch)
-    if ok then
-        self.web_annotation_auth_dead=false
-        local rows,container_key=review_container(value)
-        rows=rows or {}
-        local web_state=classify_review_requests(batch,rows)
-        local verify={}
-        for _,request in ipairs(web_state.missing) do verify[#verify+1]=request end
-        for _,request in ipairs(web_state.empty) do verify[#verify+1]=request end
-        local verified_empty,unverified={},{}
-        local agent_groups,agent_comments,agent_content_ranges=0,0,0
-        if #verify>0 then
-            -- A returned range without real comment content is only a semantic
-            -- empty result, not proof that the range has no comments. Verify it
-            -- through the older gateway path just like an omitted range.
-            local agent_ok,agent_value=pcall(self._agent_readreviews,self,id,chapter_uid,verify)
-            if agent_ok and type(agent_value)=="table" then
-                local agent_rows=select(1,review_container(agent_value)) or {}
-                local agent_state=classify_review_requests(verify,agent_rows)
-                agent_groups=#agent_rows
-                agent_comments=agent_state.comments
-                agent_content_ranges=#agent_state.content
-                if #agent_rows>0 then append_review_rows(value,container_key,agent_rows) end
-                for _,request in ipairs(agent_state.empty) do
-                    local key=review_range_key(request); if key~="" then verified_empty[#verified_empty+1]=key end
-                end
-                for _,request in ipairs(agent_state.missing) do
-                    local key=review_range_key(request); if key~="" then unverified[#unverified+1]=key end
-                end
-            else
-                value._annotation_agent_error=tostring(agent_value)
-                unverified=range_keys(verify)
-            end
-        end
-        -- Reclassify after merging recovered Agent rows. Any web semantic-empty
-        -- range recovered by Agent now contains real content and no longer needs
-        -- empty verification metadata.
-        local merged_rows=select(1,review_container(value)) or {}
-        local merged_state=classify_review_requests(batch,merged_rows)
-        local content_keys={}
-        for _,request in ipairs(merged_state.content) do content_keys[review_range_key(request)]=true end
-        local verified_filtered={}
-        for _,key in ipairs(verified_empty) do if not content_keys[key] then verified_filtered[#verified_filtered+1]=key end end
-        local unverified_map={}
-        for _,key in ipairs(unverified) do if key~="" and not content_keys[key] then unverified_map[key]=true end end
-        for _,request in ipairs(merged_state.missing) do
-            local key=review_range_key(request); if key~="" then unverified_map[key]=true end
-        end
-        for _,request in ipairs(merged_state.empty) do
-            local key=review_range_key(request)
-            local verified=false
-            for _,v in ipairs(verified_filtered) do if v==key then verified=true; break end end
-            if key~="" and not verified then unverified_map[key]=true end
-        end
-        local unverified_filtered={}
-        for key in pairs(unverified_map) do unverified_filtered[#unverified_filtered+1]=key end
-        table.sort(unverified_filtered)
-        value._annotation_verified_empty_ranges=verified_filtered
-        value._annotation_unverified_empty_ranges=unverified_filtered
-        value._annotation_missing_ranges=range_keys(merged_state.missing)
-        value._annotation_diagnostic={source=(#verify>0 and "web+agent" or "web"),requested=#batch,
-            web_groups=#rows,web_content_ranges=#web_state.content,web_comments=web_state.comments,
-            verify_ranges=#verify,agent_groups=agent_groups,agent_content_ranges=agent_content_ranges,
-            agent_comments=agent_comments,final_content_ranges=#merged_state.content,
-            final_comments=merged_state.comments,verified_empty=#verified_filtered,unverified=#unverified_filtered}
-        logger.info("[MiuRead][ThoughtAPI] readReviews",
-            "book=",tostring(id),"chapter=",tostring(chapter_uid),
-            "source=",tostring(value._annotation_diagnostic.source),
-            "requested=",tostring(#batch),"web_groups=",tostring(#rows),
-            "web_content_ranges=",tostring(#web_state.content),"web_comments=",tostring(web_state.comments),
-            "verify=",tostring(#verify),"agent_groups=",tostring(agent_groups),
-            "agent_content_ranges=",tostring(agent_content_ranges),"agent_comments=",tostring(agent_comments),
-            "verified_empty=",tostring(#verified_filtered),"unverified=",tostring(#unverified_filtered))
-        return value
-    end
+    if ok then self.web_annotation_auth_dead=false; return value end
     self:_note_web_annotation_failure(value)
+    -- Batch-shape failures must go back to the adaptive splitter. Falling
+    -- through to the Skill Gateway would repeat the same rejected payload and
+    -- spend the tighter Agent request budget without improving the result.
     if annotation_batch_error(value) then error(value) end
     logger.warn("[MiuRead][API] web readReviews unavailable; using Skill Gateway",
         "book=",tostring(id),"chapter=",tostring(chapter_uid),
-        "ranges=",tostring(#batch),"error=",tostring(value))
-    local agent=self:_agent_readreviews(id,chapter_uid,batch)
-    local annotated,state=annotate_agent_result(agent,batch)
-    logger.info("[MiuRead][ThoughtAPI] readReviews",
-        "book=",tostring(id),"chapter=",tostring(chapter_uid),"source=agent_fallback",
-        "requested=",tostring(#batch),"content_ranges=",tostring(#state.content),
-        "comments=",tostring(state.comments),"empty_ranges=",tostring(#state.empty),
-        "missing_ranges=",tostring(#state.missing))
-    return annotated
+        "ranges=",tostring(#(batch or {})),"error=",tostring(value))
+    return self:_agent_readreviews(id,chapter_uid,batch)
 end
 
 Api._scalar = scalar
