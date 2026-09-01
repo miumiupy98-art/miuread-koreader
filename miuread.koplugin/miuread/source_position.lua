@@ -116,6 +116,27 @@ local function fetch_coord_html(reader, record, anchor, options)
     return coord_html, false
 end
 
+function M.chapterSource(reader, book_id, uid, version, options)
+    options = type(options) == "table" and options or {}
+    local record = {
+        book = {
+            book_id = tostring(book_id or ""),
+            bookId = tostring(book_id or ""),
+            version = tonumber(version) or 0,
+            bookVersion = tonumber(version) or 0,
+            title = tostring(options.book_title or ""),
+            author = tostring(options.book_author or ""),
+        },
+    }
+    local anchor = {
+        chapter_uid = tostring(uid or ""),
+        chapter_index = tonumber(options.chapter_index) or 0,
+        chapter_title = tostring(options.chapter_title or ""),
+        book_version = tonumber(version) or 0,
+    }
+    return fetch_coord_html(reader, record, anchor, {cache_only = options.cache_only == true})
+end
+
 function M.cacheChapter(reader, book_id, uid, version, coord_html)
     coord_html = tostring(coord_html or "")
     if coord_html == "" then return false, "coord_html_missing" end

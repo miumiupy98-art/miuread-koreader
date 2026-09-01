@@ -862,6 +862,8 @@ function Plugin:init()
     self.api=Api:new(self.http,self.store,self.reader)
     self.mp=MP:new(self.reader,self.http,self.store,self.api)
     self.annotations=Annotations:new(self.api)
+    self.public_annotation_service=require("miuread.public_annotation_service"):new(self.annotations,self.reader,self.store)
+    self.public_annotation_runtime=require("miuread.public_annotation_runtime"):new(self)
     self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
     do
         self:_annotation_sync_preferences()
@@ -897,6 +899,16 @@ function Plugin:init()
     -- Current-chapter thought prewarming is read-only and optional. Keep it on
     -- its own worker so SQLite cold opens never compete with taps or sync.
     self.thought_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
+    -- Public WeRead marks/comments are optional read-only decoration. Fetch them
+    -- on their own worker so a slow Web/Skill response can never block page turns
+    -- or the already-stable personal annotation sync path.
+    self.public_annotation_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
+    self._public_annotation_task=nil
+    self._public_annotation_generation=0
+    self._public_annotation_fetch_generation=0
+    self._public_annotation_fetch_key=nil
+    self._public_annotation_scope_key=nil
+    self._public_annotation_next_check_at=0
     self._thought_prewarm_task=nil
     self._thought_prewarm_generation=0
     self._thought_prewarm_key=nil
@@ -13128,12 +13140,20 @@ function Plugin:_set_thoughts_enabled(enabled)
     local variant=tostring(current and (current.variant or record.variant) or "")
     local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
-        if annotation_book then self:_setup_thought_tap() end
+        if annotation_book then
+            self:_setup_thought_tap()
+        else
+            -- Clean EPUBs receive public WeRead marks at runtime. The existing
+            -- personal annotation/comment system is intentionally untouched.
+            self:_setup_thought_tap()
+            self:_schedule_public_annotation_refresh(.25,"comments enabled")
+        end
         if changed then self:toast("阅读评论已开启",1.5) end
     else
         self:_close_active_thought_popup("comments disabled")
-        -- Keep the MiuRead internal-link guard installed. Hiding comments must
-        -- not hand #miuthought links back to KOReader as invalid external links.
+        if self.public_annotation_runtime then self.public_annotation_runtime:clear() end
+        self:_cancel_public_annotation_work("comments disabled")
+        -- Keep the MiuRead internal-link guard installed for legacy notes EPUBs.
         if annotation_book then self:_setup_thought_tap() end
         if changed then self:toast("阅读评论已关闭，划线和评论数据不会删除",2) end
     end
@@ -13180,6 +13200,181 @@ function Plugin:_current_book_supports_miuread_marks()
     local record=self.sync and self.sync:record() or nil
     local variant=tostring(record and (record.variant or record.download_variant) or "")
     return record and (record.annotation_requested==true or variant:find("notes",1,true)~=nil) or false
+end
+
+function Plugin:_public_annotation_scope()
+    if not self:_thoughts_enabled() or not self:_reader_session_is_weread()
+        or self:_current_book_supports_miuread_marks() then return nil end
+    local current=self:_current_book_record()
+    if not (current and current.book) then return nil end
+    local book=current.book or {}; local record=current.record or {}
+    local variant=tostring(current.variant or record.variant or record.download_variant or "")
+    if record.annotation_requested==true or variant:find("notes",1,true) then return nil end
+    if not self:_reader_is_reflowable() then return nil end
+    local scope=self:_current_thought_favorite_scope()
+    if tostring(scope.book_id or "")=="" or tostring(scope.chapter_uid or "")=="" then return nil end
+    scope.book_version=tonumber(book.version or book.bookVersion or record.book_version or record.bookVersion) or 0
+    scope.book_author=U.trim(tostring(book.author or ""))
+    local function fill(rows)
+        for index,ch in ipairs(type(rows)=="table" and rows or {}) do
+            local uid=tostring(type(ch)=="table" and (ch.uid or ch.chapterUid or ch.chapter_uid) or "")
+            if uid==scope.chapter_uid then
+                scope.chapter_index=tonumber(ch.chapterIdx or ch.chapter_idx or ch.index) or index
+                if scope.chapter_title=="" then scope.chapter_title=U.trim(tostring(ch.title or ch.name or "")) end
+                return true
+            end
+        end
+    end
+    if not fill(record.chapter_map) then fill(book.catalog) end
+    scope.chapter_index=tonumber(scope.chapter_index) or 0
+    return scope
+end
+
+function Plugin:_cancel_public_annotation_work(reason)
+    self._public_annotation_generation=(tonumber(self._public_annotation_generation) or 0)+1
+    self._public_annotation_fetch_generation=(tonumber(self._public_annotation_fetch_generation) or 0)+1
+    if self._public_annotation_task then
+        UIManager:unschedule(self._public_annotation_task)
+        self._public_annotation_task=nil
+    end
+    if self.public_annotation_async and self.public_annotation_async:busy() then
+        self.public_annotation_async:cancel(reason or "public annotation cancelled")
+    end
+    self._public_annotation_fetch_key=nil
+    self._public_annotation_next_check_at=0
+end
+
+function Plugin:_public_annotation_due(meta,force)
+    if force==true then return true end
+    meta=type(meta)=="table" and meta or {}
+    if meta.known~=true then return true end
+    local age=math.max(0,os.time()-(tonumber(meta.updated_at) or 0))
+    if tostring(meta.status or "")=="ready" and meta.reviews_complete==true then
+        return age>=math.max(1800,tonumber(Config.PUBLIC_ANNOTATION_TTL) or 12*60*60)
+    end
+    return age>=math.max(120,tonumber(Config.PUBLIC_ANNOTATION_RETRY_TTL) or 10*60)
+end
+
+function Plugin:_map_public_annotation_cache(scope,reason)
+    if not (scope and self.public_annotation_service and self.public_annotation_runtime) then return nil end
+    local ok,marks,meta,err=pcall(self.public_annotation_service.chapter,self.public_annotation_service,scope)
+    if not ok then
+        logger.warn("[MiuRead][PublicAnnotations] cache read failed",tostring(marks))
+        return nil
+    end
+    if type(marks)~="table" then
+        logger.warn("[MiuRead][PublicAnnotations] cache unavailable",tostring(err or "unknown"))
+        return meta
+    end
+    -- A dashed runtime mark is clickable only when its comment group still
+    -- exists in the established Thoughts cache. Repair/cleanup may remove that
+    -- cache independently; in that case keep the public underline but degrade it
+    -- to an ordinary solid mark until the next public refresh repopulates comments.
+    local groups=select(1,Thoughts.load(self.store,scope.book_id,scope.chapter_uid))
+    local thought_ranges={}
+    for _,group in ipairs(type(groups)=="table" and groups or {}) do
+        local range=tostring(type(group)=="table" and group.range or "")
+        if range~="" then thought_ranges[range]=true end
+    end
+    for _,mark in ipairs(marks) do
+        if tonumber(mark.thought_state)==1 and thought_ranges[tostring(mark.range or "")]~=true then
+            mark.thought_state=0
+        end
+    end
+    local mapped,map_err=self.public_annotation_runtime:map_current(scope.book_id,scope.chapter_uid,marks,{
+        max_marks=Config.PUBLIC_ANNOTATION_MAX_MARKS,
+    })
+    if not mapped then
+        logger.warn("[MiuRead][PublicAnnotations] map failed",tostring(map_err or "unknown"))
+    else
+        logger.info("[MiuRead][PublicAnnotations] cache mapped","reason=",tostring(reason or "idle"),
+            "book=",scope.book_id,"chapter=",scope.chapter_uid,
+            "mapped=",tostring(mapped.mapped or 0),"total=",tostring(mapped.total or #marks))
+    end
+    if type(meta)=="table" and meta.known==true then
+        local ttl=(tostring(meta.status or "")=="ready" and meta.reviews_complete==true)
+            and (tonumber(Config.PUBLIC_ANNOTATION_TTL) or 12*60*60)
+            or (tonumber(Config.PUBLIC_ANNOTATION_RETRY_TTL) or 10*60)
+        self._public_annotation_next_check_at=(tonumber(meta.updated_at) or os.time())+math.max(120,ttl)
+    else
+        self._public_annotation_next_check_at=0
+    end
+    return meta
+end
+
+function Plugin:_schedule_public_annotation_refresh(delay,reason,force)
+    -- Page-turn callers only enqueue a delayed check. Book/chapter discovery can
+    -- touch Store/Sync state, so it deliberately stays off the immediate flip path.
+    self._public_annotation_generation=(tonumber(self._public_annotation_generation) or 0)+1
+    local generation=self._public_annotation_generation
+    if self._public_annotation_task then UIManager:unschedule(self._public_annotation_task) end
+    local task
+    task=function()
+        if self._public_annotation_task~=task or generation~=self._public_annotation_generation then return end
+        self._public_annotation_task=nil
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true or PowerState.state()~="NORMAL"
+            or reader_close_active() or RuntimePressure.active() then return end
+        if not self:_thoughts_enabled() or not self:_active_reader_ui() or not self:_reader_session_is_weread()
+            or self:_current_book_supports_miuread_marks() then
+            if self.public_annotation_runtime then self.public_annotation_runtime:clear(false) end
+            return
+        end
+        local live=self:_public_annotation_scope()
+        if not live then
+            if self.public_annotation_runtime then self.public_annotation_runtime:clear(false) end
+            return
+        end
+        local live_key=tostring(live.book_id).."|"..tostring(live.chapter_uid)
+        if force~=true and self._public_annotation_scope_key==live_key
+            and self.public_annotation_runtime and self.public_annotation_runtime:is_scope(live.book_id,live.chapter_uid)
+            and os.time()<(tonumber(self._public_annotation_next_check_at) or 0) then
+            return
+        end
+        self:_setup_thought_tap()
+        local meta=self:_map_public_annotation_cache(live,reason)
+        self._public_annotation_scope_key=live_key
+        if not self:_public_annotation_due(meta,force) or not self:logged_in() then return end
+        if not self.public_annotation_async or not self.public_annotation_async:available()
+            or self.public_annotation_async:busy() then return end
+        if self.download_task and self.download_task:busy() then return end
+        self._public_annotation_fetch_key=live_key
+        self._public_annotation_fetch_generation=(tonumber(self._public_annotation_fetch_generation) or 0)+1
+        local fetch_generation=self._public_annotation_fetch_generation
+        local service=self.public_annotation_service
+        local request_scope=U.copy(live)
+        local started,worker_err=self.public_annotation_async:run("public-annotations",function()
+            local value,fetch_err,detail=service:fetch_chapter(request_scope,{
+                force_refresh=force==true,allow_source_fetch=true,
+            })
+            if not value then error(tostring(fetch_err or (detail and detail.error_kind) or "public_annotation_fetch_failed")) end
+            return value
+        end,function(result)
+            if fetch_generation~=self._public_annotation_fetch_generation then return end
+            self._public_annotation_fetch_key=nil
+            if not result or result.ok~=true then
+                self._public_annotation_next_check_at=os.time()+math.max(120,tonumber(Config.PUBLIC_ANNOTATION_RETRY_TTL) or 10*60)
+                logger.warn("[MiuRead][PublicAnnotations] fetch failed","book=",request_scope.book_id,
+                    "chapter=",request_scope.chapter_uid,"error=",tostring(result and result.error or "unknown"))
+                return
+            end
+            Thoughts.clear_memory_cache()
+            self._thought_prewarm_key=nil
+            if not self:_active_reader_ui() or self._miuread_suspended==true then return end
+            local now_scope=self:_public_annotation_scope()
+            if not now_scope or tostring(now_scope.book_id).."|"..tostring(now_scope.chapter_uid)~=live_key then return end
+            if self.public_annotation_runtime then self.public_annotation_runtime:clear(false) end
+            self._public_annotation_scope_key=nil
+            self:_schedule_public_annotation_refresh(.12,"public data updated")
+            self:_schedule_thought_prewarm()
+        end,90)
+        if not started then
+            self._public_annotation_fetch_key=nil
+            logger.warn("[MiuRead][PublicAnnotations] worker unavailable",tostring(worker_err or "unknown"))
+        end
+    end
+    self._public_annotation_task=task
+    UIManager:scheduleIn(math.max(.15,tonumber(delay) or tonumber(Config.PUBLIC_ANNOTATION_OPEN_DELAY) or 1.4),task)
+    return true
 end
 
 function Plugin:_install_marks_getCssText_wrapper(st)
@@ -25816,10 +26011,21 @@ function Plugin:_on_thought_tap(ges)
             if self:_thought_edge_page_turn(ges) then return true end
             return self:_show_thought_href(href)
         end
+        -- A real EPUB link/footnote always outranks the optional public-comment layer.
+        return false
     end
     if self:_reader_top_menu_tap(ges) then
         logger.info("[MiuRead][ReaderToolbar] opened by top tap through thought layer")
         return self:show_reader_quick_panel()
+    end
+    if self.public_annotation_runtime and self.public_annotation_runtime:native_hit_test(ges and ges.pos) then
+        -- KOReader's own highlight/note always owns an overlapping tap.
+        return false
+    end
+    local runtime_info=self.public_annotation_runtime and self.public_annotation_runtime:hit_test(ges and ges.pos) or nil
+    if runtime_info then
+        if self:_thought_edge_page_turn(ges) then return true end
+        return self:_show_thought_href(Thoughts.href(runtime_info.book_id,runtime_info.chapter_uid,runtime_info.range))
     end
     if GestureBridge.dispatch(ges) then return true end
     return false
@@ -25970,6 +26176,11 @@ function Plugin:on_sync_record_ready(current)
         if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("sync record ready")
+            if self.public_annotation_runtime then self.public_annotation_runtime:clear(false) end
+        elseif self:_thoughts_enabled() then
+            self:_setup_thought_tap()
+            self._public_annotation_scope_key=nil
+            self:_schedule_public_annotation_refresh(.55,"sync record ready")
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
@@ -26119,6 +26330,9 @@ function Plugin:_prepare_reader_disappearance(reason)
         if self.annotation_async then self.annotation_async:cancel(reason or "reader disappeared") end
     end
     self._repair_prompt_open=false
+    self:_cancel_public_annotation_work(reason or "reader disappeared")
+    if self.public_annotation_runtime then self.public_annotation_runtime:clear(false) end
+    self._public_annotation_scope_key=nil
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
@@ -26503,7 +26717,12 @@ function Plugin:onReaderReady()
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("reader ready")
+            if self.public_annotation_runtime then self.public_annotation_runtime:clear(false) end
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
+        elseif record and self:_thoughts_enabled() and self:_reader_session_is_weread() then
+            self:_setup_thought_tap()
+            self._public_annotation_scope_key=nil
+            self:_schedule_public_annotation_refresh(1.25,"reader ready")
         end
         local pending=HOME_SESSION.pending_annotation_jump
         if type(pending)=="table" then
@@ -26715,6 +26934,9 @@ function Plugin:onPageUpdate(page)
     if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
+        if self:_thoughts_enabled() and not self:_current_book_supports_miuread_marks() then
+            self:_schedule_public_annotation_refresh(.85,"page update")
+        end
     end
 end
 function Plugin:_annotation_sync_preferences()
@@ -27750,6 +27972,7 @@ function Plugin:onSuspend()
     StatusToast.set_blocked(true)
     StatusToast.close()
     self:_cancel_thought_prewarm("suspend")
+    self:_cancel_public_annotation_work("suspend")
     self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)
@@ -28025,6 +28248,8 @@ function Plugin:onResume()
         UIManager:scheduleIn(.12,repaint_task)
         self:_schedule_download_resume_after_wake(3.5)
         self:_schedule_hibernated_download_resume("resume into reader")
+        self._public_annotation_scope_key=nil
+        self:_schedule_public_annotation_refresh(2.0,"resume")
     end
     if not close_pending and not native_menu_pending and not reader_active and HomeView.is_shown() then
         self:_set_foreground("home")

@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.4.0-beta.8",
+    VERSION = "5.6.0-beta.1",
     SCHEMA = 120,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -52,6 +52,14 @@ local C = {
     -- without moving large comment layouts into the foreground.
     THOUGHT_PREWARM_DELAY = 2.8,
     THOUGHT_PREWARM_GROUPS = 6,
+
+    -- 5.6: public WeRead marks/comments are fetched only for the current
+    -- chapter of a clean EPUB. Cached data paints immediately; network refresh
+    -- stays behind the reader-idle gate and never runs on every page turn.
+    PUBLIC_ANNOTATION_OPEN_DELAY = 1.4,
+    PUBLIC_ANNOTATION_TTL = 12 * 60 * 60,
+    PUBLIC_ANNOTATION_RETRY_TTL = 10 * 60,
+    PUBLIC_ANNOTATION_MAX_MARKS = 120,
 
     -- Single-chapter reading may prepare exactly one following chapter after
     -- the reader has been stable for a while. It never wakes a sleeping device
