@@ -772,6 +772,13 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
     return xhtml, assets, summary, localized_css
 end
 
+local function response_header(headers, name)
+    local target = tostring(name or ""):lower()
+    for key, value in pairs(headers or {}) do
+        if tostring(key):lower() == target then return value end
+    end
+end
+
 function Reader:new(http, store)
     return setmetatable({http=http, store=store, _renewing_session=false, _transient_image_roots={}}, self)
 end
@@ -782,9 +789,10 @@ function Reader:cleanup_transient_images()
 end
 
 function Reader:renew()
-    local data, _, meta = self.http:post_json(BASE .. "/web/login/renewal", {rq="%2Fweb%2Fbook%2Fread", ql=false},
-        {headers={Origin=BASE, Referer=BASE .. "/", Accept="application/json, text/plain, */*"}, retries=2})
-    return data, meta
+    local data, headers, meta = self.http:post_json(BASE .. "/web/login/renewal", {rq="%2Fweb%2Fbook%2Fread", ql=false},
+        {headers={Origin=BASE, Referer=BASE .. "/", Accept="application/json, text/plain, */*"},
+            retries=2,defer_auth_persist=true})
+    return data, headers, meta
 end
 
 function Reader:_recover_login_session()
@@ -793,13 +801,35 @@ function Reader:_recover_login_session()
 
     local before = self.store:auth()
     local before_login_session_id=tostring(before.login_session_id or "")
+    local before_auth_revision=math.max(0,tonumber(before.auth_revision or 0) or 0)
     local before_vid = tostring((before.account or {}).vid or (before.cookies or {}).wr_vid or "")
     local ok, result = pcall(function()
-        local renewed, meta = self:renew()
+        local renewed, renewal_headers, meta = self:renew()
         if type(renewed) ~= "table" then error("续期接口返回无效数据") end
         if renewed.succ == false or tostring(renewed.succ or "") == "0" then
             error("微信读书未接受本次登录续期")
         end
+
+        -- A failed/ambiguous renewal response must never mutate the durable
+        -- login. Only now, after succ has been accepted, merge its Set-Cookie
+        -- and public-account headers into the exact credential revision that
+        -- started this renewal.
+        local candidate=Util.copy(before)
+        candidate.cookies=Cookies.absorb(candidate.cookies or {},response_header(renewal_headers,"set-cookie"),{protect_core=true})
+        candidate.cookies=Cookies.sanitize(candidate.cookies)
+        local renewed_ticket=response_header(renewal_headers,"x-wr-ticket")
+        local renewed_wrpa=response_header(renewal_headers,"x-wrpa-0")
+        if renewed_ticket~=nil and tostring(renewed_ticket)~="" then candidate.wr_ticket=tostring(renewed_ticket) end
+        if renewed_wrpa~=nil and tostring(renewed_wrpa)~="" then candidate.wr_wrpa=tostring(renewed_wrpa) end
+        if (renewed_ticket~=nil and tostring(renewed_ticket)~="") or (renewed_wrpa~=nil and tostring(renewed_wrpa)~="") then
+            candidate.ticket_updated_at=os.time()
+        end
+        local candidate_vid=tostring(((candidate.account or {}).vid) or (candidate.cookies or {}).wr_vid or "")
+        if before_vid~="" and candidate_vid~="" and before_vid~=candidate_vid then
+            error("续期返回了不同账户，已保留原账户凭据")
+        end
+        local committed,commit_error=self.store:save_auth(candidate,{expected_revision=before_auth_revision})
+        if committed~=true then error(commit_error or "登录续期结果已过期") end
 
         -- Ordinary book reading and downloads only need the renewed Web
         -- session. Refreshing the Skills API key is useful for other features,
@@ -821,11 +851,10 @@ function Reader:_recover_login_session()
             error("续期后仍缺少正文下载所需的登录凭据")
         end
         if before_vid ~= "" and after_vid ~= "" and before_vid ~= after_vid then
-            local current=self.store:auth()
-            if tostring(current.login_session_id or "")==before_login_session_id then self.store:save_auth(before) end
-            error("续期返回了不同账户，已保留原账户凭据")
+            error("续期后的账户身份异常")
         end
-        return {meta=meta, verified=true, skills_verified=skills_ok, vid=after_vid}
+        return {meta=meta, verified=true, skills_verified=skills_ok, vid=after_vid,
+            auth_revision=tonumber(after.auth_revision or 0) or 0}
     end)
 
     self._renewing_session = false
@@ -906,8 +935,12 @@ function Reader:catalog(book_id, request_options)
     if ok then return result end
     if is_auth_error(result) then
         local renewed, renew_error=self:_recover_login_session()
-        logger.warn("[MiuRead][Reader] catalog authentication recovery", "ok=", tostring(renewed),
-            "error=", renewed and "" or tostring(renew_error))
+        if renewed then
+            logger.info("[MiuRead][Reader] catalog authentication recovery", "ok=", "true")
+        else
+            logger.warn("[MiuRead][Reader] catalog authentication recovery", "ok=", "false",
+                "error=", tostring(renew_error))
+        end
         if renewed then
             local retry_ok, retry_result=pcall(load_catalog)
             if retry_ok then return retry_result end
@@ -1191,19 +1224,13 @@ function Reader:mp_content(review_id, book_id, options)
     return html
 end
 
-local function response_header(headers, name)
-    local target = tostring(name or ""):lower()
-    for key, value in pairs(headers or {}) do
-        if tostring(key):lower() == target then return value end
-    end
-end
-
 -- Repair QR-login web cookies using the authenticated follow-up flow from
 -- the compatibility reporting path. Only stable wr_ / ptcz / RK / pgv_pvid cookies
 -- are retained; browser-session cookies are deliberately discarded.
 function Reader:repair_login_session()
     local auth = self.store:auth()
     local login_session_id=tostring(auth.login_session_id or "")
+    local auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local jar = Util.copy(auth.cookies or {})
     local account = auth.account or {}
     local vid = tostring(jar.wr_vid or account.vid or account.user_vid or "")
@@ -1259,7 +1286,8 @@ function Reader:repair_login_session()
     if login_session_id=="" or tostring(current.login_session_id or "")~=login_session_id then
         error("登录状态已变化，已忽略旧修复结果")
     end
-    self.store:save_auth(auth)
+    local saved,save_error=self.store:save_auth(auth,{expected_revision=auth_revision})
+    if saved~=true then error(save_error or "登录凭据已变化，已忽略旧修复结果") end
     return {repaired=true, cookie_count=(function()
         local n=0; for _ in pairs(jar) do n=n+1 end; return n
     end)()}

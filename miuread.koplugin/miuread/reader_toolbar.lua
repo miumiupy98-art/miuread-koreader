@@ -161,7 +161,7 @@ function SliderBar:_set_from_position(ges, force)
     local target = math.floor(self.min + ratio * (self.max - self.min) + .5)
     local actual = target
     if self.on_change then
-        local ok, result = pcall(self.on_change, target)
+        local ok, result = pcall(self.on_change, target, force and "commit" or "drag")
         if not ok then
             logger.warn("[MiuRead][ReaderToolbar] slider action failed", tostring(result))
             return true
@@ -411,56 +411,58 @@ end
 function Toolbar:_top_status_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
     local has_bluetooth = header.bluetooth_visible == true
-    local entries, callbacks, holds, ref_keys, weights
+    local entries, callbacks, holds, ref_keys
     if has_bluetooth then
-        weights = {29, 13, 21, 11, 13, 13}
         entries = {
             {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
             {icon = "bluetooth", label = header.bluetooth_label or "蓝牙", enabled = type(header.bluetooth_callback) == "function", bold = true},
             {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
+            {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
             {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
             {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
         }
         callbacks = {
             function() self:_activate(header.wifi_callback, "Wi-Fi") end,
             function() self:_activate(header.bluetooth_callback, "蓝牙") end,
             function() self:_activate(header.sync_callback, "同步") end,
-            nil,
+            nil,nil,
             function() self:_activate(header.home_callback, "首页") end,
             function() self:_activate(header.more_callback, "更多") end,
         }
         holds = {
             type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
             type(header.bluetooth_hold_callback) == "function" and function() self:_activate_hold(header.bluetooth_hold_callback, "蓝牙设备") end or nil,
-            nil,nil,nil,nil,
+            nil,nil,nil,nil,nil,
         }
-        ref_keys = {"wifi","bluetooth","sync","battery","home","more"}
+        ref_keys = {"wifi","bluetooth","sync","time","battery","home","more"}
     else
-        weights = {33, 23, 14, 15, 15}
         entries = {
             {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
             {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
+            {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
             {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
             {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
         }
         callbacks = {
             function() self:_activate(header.wifi_callback, "Wi-Fi") end,
             function() self:_activate(header.sync_callback, "同步") end,
-            nil,
+            nil,nil,
             function() self:_activate(header.home_callback, "首页") end,
             function() self:_activate(header.more_callback, "更多") end,
         }
         holds = {
             type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-            nil,nil,nil,nil,
+            nil,nil,nil,nil,nil,
         }
-        ref_keys = {"wifi","sync","battery","home","more"}
+        ref_keys = {"wifi","sync","time","battery","home","more"}
     end
+    local count = #entries
+    local cell_w = math.floor(width / count)
     local used = 0
     for index, entry in ipairs(entries) do
-        local w = index == #entries and (width - used) or math.floor(width * weights[index] / 100)
+        local w = index == count and (width - used) or cell_w
         root[#root + 1] = OffsetContainer:new{
             x_off = x + used, y_off = y,
             status_item(entry, w, height, callbacks[index], holds[index], self, ref_keys[index]),
@@ -485,17 +487,26 @@ end
 
 function Toolbar:_chapter_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
-    local left_w = math.floor(width * .66)
-    local right_w = width - left_w
+    local left_w = math.floor(width * .20)
+    local middle_w = math.floor(width * .55)
+    local right_w = width - left_w - middle_w
+
     local chapter = TapBox:new{
         dimen = Geom:new{w = left_w, h = height},
         enabled = type(header.chapter_callback) == "function",
-        callback = function() self:_activate(header.chapter_callback, "章节") end,
+        callback = function() self:_activate(header.chapter_callback, "目录") end,
     }
-    local chapter_box=Ui.textbox(tostring(header.chapter_label or "当前章节"), left_w, height,
-        Skin.face("cfont", 10.5, 13.8, 8.9), {alignment = "left", halign = "left", bold = true})
+    local chapter_box=Ui.textbox(tostring(header.chapter_label or "☰ 目录"), left_w, height,
+        Skin.face("cfont", 10.5, 13.8, 8.9), {alignment = "center", halign = "center", bold = true})
     if chapter_box and chapter_box[1] then self._text_refs.chapter=chapter_box[1] end
     chapter[1] = chapter_box
+
+    local location_box=Ui.textbox(tostring(header.location_label or "当前阅读位置"), middle_w, height,
+        Skin.face("cfont", 10.1, 13.3, 8.6), {alignment = "center", halign = "center", bold = false})
+    if location_box and location_box[1] then self._text_refs.location=location_box[1] end
+    local location = TapBox:new{dimen = Geom:new{w = middle_w, h = height}, enabled = false}
+    location[1] = location_box
+
     local progress = TapBox:new{
         dimen = Geom:new{w = right_w, h = height},
         enabled = type(header.progress_callback) == "function",
@@ -506,7 +517,7 @@ function Toolbar:_chapter_row(root, header, x, y, width, height)
         Skin.face("cfont", 10.3, 13.6, 8.7), {alignment = "right", halign = "right", bold = true})
     if progress_box and progress_box[1] then self._text_refs.progress=progress_box[1] end
     progress[1] = progress_box
-    root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, HorizontalGroup:new{align = "center", chapter, progress}}
+    root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y, HorizontalGroup:new{align = "center", chapter, location, progress}}
 end
 
 function Toolbar:_content_row(root, entries, x, y, width, height)
@@ -621,9 +632,9 @@ function Toolbar:_light_row(root, setting, x, y, width, height)
         value = tonumber(setting.value) or 0,
         owner = self,
         value_widget = value_widget,
-        on_change = function(target)
+        on_change = function(target, interaction)
             if type(setting.on_set) ~= "function" then return target end
-            local result = setting.on_set(target)
+            local result = setting.on_set(target, interaction)
             if result == false then return false end
             return tonumber(result) or target
         end,
@@ -790,6 +801,25 @@ local function set_ref(ref,value,formatter)
     ref:setText(text)
 end
 
+function Toolbar:refreshFrontlightState()
+    local changed=false
+    for _,key in ipairs({"frontlight","warmth"}) do
+        local setting=type(self.opts[key])=="table" and self.opts[key] or nil
+        local slider=self._sliders and self._sliders[key] or nil
+        if setting and slider and type(setting.get_value)=="function" then
+            local ok,value=pcall(setting.get_value)
+            if ok and tonumber(value) then
+                slider:setValue(tonumber(value),false)
+                changed=true
+            end
+        end
+    end
+    if changed and self.panel_dimen then
+        UIManager:setDirty(self,function() return "ui",Skin.expand_region(self.panel_dimen,Skin.dp(2,2,3)) end)
+    end
+    return changed
+end
+
 function Toolbar:updateFromOptions(opts)
     opts=type(opts)=="table" and opts or {}
     if self:_signature(opts)~=self._layout_signature then return false end
@@ -803,11 +833,13 @@ function Toolbar:updateFromOptions(opts)
     set_ref(self._text_refs.wifi,header.wifi_label or "Wi-Fi",self._text_formatters.wifi)
     set_ref(self._text_refs.bluetooth,header.bluetooth_label or "蓝牙",self._text_formatters.bluetooth)
     set_ref(self._text_refs.sync,header.sync_label or "同步",self._text_formatters.sync)
+    set_ref(self._text_refs.time,header.time_label or "")
     set_ref(self._text_refs.battery,header.battery_label or "")
     set_ref(self._text_refs.home,header.home_label or "首页")
     set_ref(self._text_refs.more,header.more_label or "更多")
     set_ref(self._text_refs.title,header.title or "正在阅读")
-    set_ref(self._text_refs.chapter,header.chapter_label or "当前章节")
+    set_ref(self._text_refs.chapter,header.chapter_label or "☰ 目录")
+    set_ref(self._text_refs.location,header.location_label or "当前阅读位置")
     local progress=tostring(header.progress_label or "")
     if progress~="" then progress=progress.."  ›" end
     set_ref(self._text_refs.progress,progress)
@@ -885,6 +917,12 @@ local M = {}
 function M.close()
     if live_toolbar and not live_toolbar.closed then live_toolbar:_close(nil, true) end
     live_toolbar = nil
+end
+function M.refreshFrontlight()
+    if live_toolbar and not live_toolbar.closed and type(live_toolbar.refreshFrontlightState)=="function" then
+        return live_toolbar:refreshFrontlightState()
+    end
+    return false
 end
 function M.invalidate()
     M.close()

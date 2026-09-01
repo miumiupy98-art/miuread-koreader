@@ -164,9 +164,9 @@ function WeRead.make_read_payload(opts)
         ps = opts.psvts or opts.ps or "",
         pc = opts.pclts or opts.pc or WeRead.e(now),
     }
-    -- 4.6.0-beta.2: reading-time-only reports deliberately omit all position
-    -- fields. This keeps the default 60-second timer from changing cloud
-    -- progress or forcing a chapter-position calculation while the user reads.
+    -- Pure time-only reports omit position fields. Automatic reading-time sync
+    -- uses the explicit reading_time_compat mode instead, which deliberately
+    -- calls this builder as a normal full Web Reader report after refresh_context.
     if opts.time_only ~= true then
         params.c = WeRead.e(opts.chapter_uid or 0)
         params.ci = opts.chapter_idx or 0

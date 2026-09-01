@@ -130,9 +130,9 @@ function Bridge.handle(base, widget, event)
     if event and event.handler == "onGesture" then
         local ges = event.args and event.args[1]
         local gesture = ges and ges.ges
-        local pointer_action = gesture == "tap" or gesture == "hold"
-            or gesture == "hold_release" or gesture == "double_tap"
-            or gesture == "two_finger_tap"
+        local pointer_action = gesture == "tap" or gesture == "touch"
+            or gesture == "hold" or gesture == "hold_release"
+            or gesture == "double_tap" or gesture == "two_finger_tap"
         -- Buttons, cards and title-bar controls on the visible MiuRead surface
         -- always get pointer input first. Temporarily disable the fullscreen
         -- propagation fence while asking the widget tree whether it actually

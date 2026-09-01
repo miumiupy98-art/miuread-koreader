@@ -66,6 +66,7 @@ end
 
 function M.comments(plugin)
     local rows={}
+    rows[#rows+1]={text="我的评论收藏",post_text=tostring(plugin:_thought_favorite_count()).." 条",callback=function() plugin:show_thought_favorites() end}
     append(rows,plugin:thought_font_settings_menu())
     rows[#rows+1]={text="本地划线与想法",post_text="显示与本地数据",enabled=false}
     rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return M.comment_data(plugin) end}
@@ -112,6 +113,7 @@ function M.menu(plugin)
         {text="下载与存储",post_text=plugin:_download_settings_summary(),sub_item_table_func=function() return plugin:download_settings_menu() end},
         {text="评论与批注",post_text=plugin:_thought_display_label(),sub_item_table_func=function() return M.comments(plugin) end},
         {text="公众号阅读",sub_item_table_func=function() return plugin:mp_settings_menu() end},
+        {text="阅读界面",post_text=plugin:_reader_toolbar_setting_summary(),sub_item_table_func=function() return plugin:reader_quick_panel_settings_menu() end},
         {text="性能与兼容性",post_text=plugin:_performance_mode_label(),sub_item_table_func=function() return M.performance(plugin) end},
         {text="更新与关于",sub_item_table_func=function() return M.update_about(plugin) end},
         {text="运行模式",post_text=plugin:_home_mode_label(),sub_item_table_func=function() return plugin:home_mode_menu() end},

@@ -100,6 +100,56 @@ function Api:_note_web_annotation_failure(value)
     return false
 end
 
+local function recovery_detail(called,ok,value)
+    if not called then return tostring(ok or "recovery call failed") end
+    if ok==true then return "ok" end
+    return tostring(value or "recovery failed")
+end
+
+function Api:_recover_web_once(channel,request_once,allow_recovery)
+    local ok,a,b,c=pcall(request_once)
+    if ok then return a,b,c end
+    local first_error=a
+    if allow_recovery==false or not Http.is_auth_error(first_error)
+        or not self.reader or type(self.reader._recover_login_session)~="function" then
+        error(first_error)
+    end
+    local called,recovered,detail=pcall(self.reader._recover_login_session,self.reader)
+    logger.warn("[MiuRead][API] web authentication recovery",
+        "channel=",tostring(channel or "web"),"ok=",tostring(called and recovered==true),
+        "detail=",U.first_line(recovery_detail(called,recovered,detail),160))
+    if called and recovered==true then
+        local ok2,d,e,f=pcall(request_once)
+        if ok2 then return d,e,f end
+        error(d)
+    end
+    error(first_error)
+end
+
+function Api:_recover_agent_once(name)
+    if not self.reader then return false,"automatic recovery unavailable" end
+    local repair_error
+    if type(self.reader.repair_login_session)=="function" then
+        local called,value=pcall(self.reader.repair_login_session,self.reader)
+        if called then
+            logger.info("[MiuRead][API] Skills credential refresh succeeded","api=",tostring(name))
+            return true,"skills_refreshed"
+        end
+        repair_error=value
+        logger.warn("[MiuRead][API] Skills credential refresh failed",
+            "api=",tostring(name),"error=",U.first_line(value,160))
+    end
+    if type(self.reader._recover_login_session)=="function" then
+        local called,recovered,detail=pcall(self.reader._recover_login_session,self.reader)
+        if called and recovered==true then
+            logger.info("[MiuRead][API] full login recovery succeeded","api=",tostring(name))
+            return true,"web_and_skills_refreshed"
+        end
+        return false,recovery_detail(called,recovered,detail or repair_error)
+    end
+    return false,tostring(repair_error or "automatic recovery unavailable")
+end
+
 function Api:call(name, params, request_options)
     local payload = sanitize(U.copy(params or {}))
     payload.api_name = tostring(name)
@@ -109,6 +159,7 @@ function Api:call(name, params, request_options)
         local auth = self.store:auth()
         if tostring(auth.api_key or "") == "" then error("API key is not configured") end
         local options = U.copy(request_options or {})
+        options.no_auth_recovery = nil
         options.auth = false
         options.headers = options.headers or {}
         options.headers.Authorization = "Bearer " .. tostring(auth.api_key)
@@ -118,15 +169,40 @@ function Api:call(name, params, request_options)
 
     local ok, data = pcall(request_once)
     local annotation_endpoint=tostring(name)=="/book/underlines" or tostring(name)=="/book/readreviews"
-    if not ok and not annotation_endpoint and Http.is_auth_error(data) and self.reader then
-        local recovered, recover_error = self.reader:_recover_login_session()
+    local allow_auth_recovery = not (type(request_options)=="table" and request_options.no_auth_recovery==true)
+    if not ok and not annotation_endpoint and allow_auth_recovery and Http.is_auth_error(data) and self.reader then
+        local recovered,recovery_mode=self:_recover_agent_once(name)
         logger.warn("[MiuRead][API] authentication recovery",
-            "api=", tostring(name), "ok=", tostring(recovered),
-            "error=", recovered and "" or tostring(recover_error))
-        if recovered then ok, data = pcall(request_once) end
+            "api=",tostring(name),"ok=",tostring(recovered),
+            "detail=",recovered and tostring(recovery_mode or "ok") or U.first_line(recovery_mode,160))
+        if recovered then ok,data=pcall(request_once) end
+        if not ok and Http.is_auth_error(data) and recovery_mode=="skills_refreshed"
+            and type(self.reader._recover_login_session)=="function" then
+            local called,renewed,detail=pcall(self.reader._recover_login_session,self.reader)
+            logger.warn("[MiuRead][API] authentication recovery second stage",
+                "api=",tostring(name),"ok=",tostring(called and renewed==true),
+                "detail=",U.first_line(recovery_detail(called,renewed,detail),160))
+            if called and renewed==true then ok,data=pcall(request_once) end
+        end
     end
     if not ok then error(tostring(name) .. ": " .. tostring(data)) end
     return unwrap(data)
+end
+
+function Api:reading_stats(mode, base_time, options)
+    options=options or {}
+    mode=tostring(mode or "monthly")
+    if mode~="weekly" and mode~="monthly" and mode~="annually" and mode~="overall" then
+        error("invalid reading statistics mode: "..mode)
+    end
+    return self:call("/readdata/detail", {
+        mode=mode,
+        baseTime=tonumber(base_time) or 0,
+    }, {
+        retries=options.retries==nil and 0 or options.retries,
+        timeout=options.timeout or {6,12},
+        no_auth_recovery=options.no_auth_recovery~=false,
+    })
 end
 
 function Api:shelf(options)
@@ -177,12 +253,15 @@ function Api:web_shelf_index(options)
     local vid=tostring(account.vid or cookies.wr_vid or "")
     local url="https://weread.qq.com/web/shelf/sync?onlyBookid=1&cbcount=1"
     if vid~="" then url=url.."&userVid="..Protocol.escape(vid) end
-    local data=self.http:get_json(url,{
+    local request_options={
         auth=true,
         retries=options.retries==nil and 0 or options.retries,
         timeout=options.timeout or {7,12},
         headers={Accept="application/json, text/plain, */*",Referer="https://weread.qq.com/web/shelf"},
-    })
+    }
+    local data=self:_recover_web_once("shelf_index",function()
+        return self.http:get_json(url,request_options)
+    end,options.no_auth_recovery~=true)
     local ids=shelf_index_ids(data)
     if #ids==0 then error("web shelf index returned no book ids") end
     return data,ids
@@ -197,7 +276,7 @@ function Api:web_shelf_sync_books(book_ids,options)
         if id~="" and not seen[id] then seen[id]=true; ids[#ids+1]=id end
     end
     if #ids==0 then return {books={}} end
-    return self.http:post_json("https://weread.qq.com/web/shelf/syncBook",{bookIds=ids},{
+    local request_options={
         auth=true,
         retries=options.retries==nil and 0 or options.retries,
         timeout=options.timeout or {8,15},
@@ -209,7 +288,10 @@ function Api:web_shelf_sync_books(book_ids,options)
             Origin="https://weread.qq.com",
             Referer="https://weread.qq.com/web/shelf",
         },
-    })
+    }
+    return self:_recover_web_once("shelf_batch",function()
+        return self.http:post_json("https://weread.qq.com/web/shelf/syncBook",{bookIds=ids},request_options)
+    end,options.no_auth_recovery~=true)
 end
 
 function Api:shelf_stream(options)
@@ -219,7 +301,14 @@ function Api:shelf_stream(options)
         retries=0,timeout=options.index_timeout or {7,12},
     })
     if not ok_index then
-        logger.warn("[MiuRead][ShelfStream] index unavailable; falling back to full shelf",tostring(index))
+        local auth_failure=Http.is_auth_error(index)
+        if options.allow_full_fallback==false and not auth_failure then
+            logger.info("[MiuRead][ShelfStream] index unavailable; cached shelf retained",
+                U.first_line(index,160))
+            return {_miuread_stream={enabled=false,keep_cache=true,reason="index_unavailable",error=tostring(index)}}
+        end
+        logger.warn("[MiuRead][ShelfStream] index unavailable; falling back to Agent shelf",
+            "auth_failure=",tostring(auth_failure),"error=",U.first_line(index,160))
         local full=self:shelf(options)
         if type(full)=="table" then full._miuread_stream={enabled=false,fallback=true,reason="index_failed"} end
         return full
@@ -229,7 +318,14 @@ function Api:shelf_stream(options)
     for i=1,math.min(first_count,#ids) do batch_ids[#batch_ids+1]=ids[i] end
     local ok_batch,batch=pcall(self.web_shelf_sync_books,self,batch_ids,{retries=0,timeout={8,15}})
     if not ok_batch or type(batch)~="table" then
-        logger.warn("[MiuRead][ShelfStream] first batch unavailable; falling back to full shelf",tostring(batch))
+        local auth_failure=not ok_batch and Http.is_auth_error(batch)
+        if options.allow_full_fallback==false and not auth_failure then
+            logger.info("[MiuRead][ShelfStream] first batch unavailable; cached shelf retained",
+                U.first_line(batch or "first shelf batch unavailable",160))
+            return {_miuread_stream={enabled=false,keep_cache=true,reason="batch_unavailable",error=tostring(batch or "")}}
+        end
+        logger.warn("[MiuRead][ShelfStream] first batch unavailable; falling back to Agent shelf",
+            "auth_failure=",tostring(auth_failure),"error=",U.first_line(batch,160))
         local full=self:shelf(options)
         if type(full)=="table" then full._miuread_stream={enabled=false,fallback=true,reason="batch_failed"} end
         return full
@@ -276,7 +372,7 @@ function Api:web_progress(id)
     if id=="" then error("invalid book id") end
     local url="https://weread.qq.com/web/book/getProgress?bookId="
         ..Protocol.escape(id).."&_="..tostring(os.time())..tostring(math.random(1000,9999))
-    local data=self.http:get_json(url,{
+    local request_options={
         auth=true,retries=0,timeout={8,15},
         headers={
             Accept="application/json, text/plain, */*",
@@ -284,7 +380,10 @@ function Api:web_progress(id)
             ["Cache-Control"]="no-cache, no-store, max-age=0",
             Pragma="no-cache",
         },
-    })
+    }
+    local data=self:_recover_web_once("progress",function()
+        return self.http:get_json(url,request_options)
+    end,true)
     if type(data)=="table" then
         data._progress_source="web_cookie"
         data._progress_fetched_at=os.time()

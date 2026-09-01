@@ -21,7 +21,6 @@ local Assets = require("miuread.book_excerpt_card.assets")
 local Runes = require("miuread.book_excerpt_card.runes")
 local BlitBuffer = require("ffi/blitbuffer")
 local DataStorage = require("datastorage")
-local RenderImage = require("ui/renderimage")
 local RenderText = require("ui/rendertext")
 local ffiutil = require("ffi/util")
 local logger = require("logger")
@@ -47,7 +46,7 @@ local drawOrnateDivider = Draw.drawOrnateDivider
 local verticalTitleHeight = Vertical.verticalTitleHeight
 local renderVerticalTitle = Vertical.renderVerticalTitle
 local drawLineImage = Assets.drawLineImage
-local backgroundImagePath = Assets.backgroundImagePath
+local getStillnessHeadBB = Assets.getStillnessHeadBB
 
 -- 正式保存的自增序号（防同秒覆盖；预览固定文件名不走此路径）
 local save_seq = 0
@@ -445,78 +444,22 @@ local function renderBB(opts)
     -- 静影模板为「头部背景图 + 正文浅色区」双背景(cover 等比缩放)。
     if template.id == "stillness" then
         local head_h = ds(340)
-        local bg_blitted = false
-        -- 诊断日志:资产 bg_*.jpg 实际是 WebP 伪装(RIFF/VP8,不是 JPEG),
-        -- 老版本 KOReader 无 libwebp 时 RenderImage 解码失败,这里每步失败
-        -- 都打日志,便于 Kindle 等设备上定位回退纯色的原因。
-        local function sniffImageFormat(path)
-            local f = io.open(path, "rb")
-            if not f then return "unreadable" end
-            local head = f:read(12) or ""
-            f:close()
-            local b1, b2, b3, b4 = head:byte(1), head:byte(2), head:byte(3), head:byte(4)
-            if b1 == 0xFF and b2 == 0xD8 then return "JPEG" end
-            if b1 == 0x52 and b2 == 0x49 and b3 == 0x46 and b4 == 0x46 then
-                local tag = head:sub(9, 12)
-                return tag ~= "" and ("WebP/RIFF(" .. tag .. ")") or "WebP/RIFF"
-            end
-            if b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then return "PNG" end
-            return string.format("unknown(%02X %02X %02X %02X)",
-                b1 or 0, b2 or 0, b3 or 0, b4 or 0)
-        end
-        -- 渲染一张背景图铺满头部区(cover:等比缩放居中裁剪)。
-        -- @return true 绘制成功;false 失败(调用方回退纯色)
+        -- 背景图经 assets.getStillnessHeadBB 缓存:首次解码 + cover 裁剪成
+        -- W×head_h 的 RGB32 bb,后续命中只做一次 blitFrom(预览切换配色零解码)。
+        -- 资产缺失 / WebP 解码失败(老 KOReader 无 libwebp)时返回 nil,
+        -- 逐级回退 bg_1 → 纯背景色(与改动前等价)。
         local function blitBgImage(idx)
-            local path = backgroundImagePath(idx)
-            if not path then
-                logger.warn("miuread: stillness head image missing: idx=" .. tostring(idx))
+            local head = getStillnessHeadBB(idx, W, head_h)
+            if not head then return false end
+            local ok, err = pcall(bb.blitFrom, bb, head, 0, 0, 0, 0, W, head_h)
+            if not ok then
+                logger.warn("miuread: stillness head image blit error: idx=" .. tostring(idx)
+                    .. " err=" .. tostring(err))
                 return false
             end
-            logger.info("miuread: stillness head image: idx=" .. tostring(idx)
-                .. " path=" .. path .. " format=" .. sniffImageFormat(path))
-            local ok_img, img = pcall(RenderImage.renderImageFile, RenderImage, path, false)
-            if not ok_img then
-                logger.warn("miuread: stillness head image render error: idx=" .. tostring(idx)
-                    .. " path=" .. path .. " err=" .. tostring(img))
-                return false
-            end
-            if not img then
-                logger.warn("miuread: stillness head image render returned nil: idx="
-                    .. tostring(idx) .. " path=" .. path)
-                return false
-            end
-            local iw, ih = img:getWidth(), img:getHeight()
-            if not (iw and ih and iw > 0 and ih > 0) then
-                logger.warn("miuread: stillness head image invalid size: idx=" .. tostring(idx)
-                    .. " iw=" .. tostring(iw) .. " ih=" .. tostring(ih))
-                img:free()
-                return false
-            end
-            -- 解码出的位图类型(灰度屏 Kindle 上 Pic.color=false,JPEG 会解码成 BB8)
-            local type_map = {
-                [BlitBuffer.TYPE_BB8] = "BB8",
-                [BlitBuffer.TYPE_BBRGB32] = "RGB32",
-            }
-            local bb_type = type_map[img:getType()] or ("type#" .. tostring(img:getType()))
-            local ratio = math.max(W / iw, head_h / ih)
-            local sw, sh = math.floor(iw * ratio), math.floor(ih * ratio)
-            -- scale/blit 之前未受 pcall 保护,失败会直接抛错;包一层便于落日志并回退
-            local ok_scaled, scale_err = pcall(function()
-                local scaled = img:scale(sw, sh)
-                bb:blitFrom(scaled, 0, 0,
-                    math.floor((sw - W) / 2), math.floor((sh - head_h) / 2), W, head_h)
-                scaled:free()
-            end)
-            img:free()
-            if not ok_scaled then
-                logger.warn("miuread: stillness head image scale/blit error: idx=" .. tostring(idx)
-                    .. " err=" .. tostring(scale_err))
-                return false
-            end
-            logger.info("miuread: stillness head image OK: idx=" .. tostring(idx)
-                .. " " .. bb_type .. " " .. iw .. "x" .. ih .. " -> " .. sw .. "x" .. sh)
             return true
         end
+        local bg_blitted = false
         if not opts.background_idx then
             logger.info("miuread: stillness no background_idx set, try default bg_1")
         end

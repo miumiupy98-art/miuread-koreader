@@ -531,60 +531,80 @@ function LocalAnnotationDatabase.hold_local(store, book_id, local_id)
     return changed > 0
 end
 
-function LocalAnnotationDatabase.summary(store, book_id)
-    if not LocalAnnotationDatabase.exists(store, book_id) then
-        return {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
-            delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
-            unknown=0, action_required=0, held_local=0, legacy_synced=0}
-    end
-    local conn = open(store, book_id, false)
-    local ok, result = xpcall(function()
-        local out = {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
-            delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
-            unknown=0, action_required=0, held_local=0, legacy_synced=0}
-        local statement = conn:prepare([[
-            SELECT kind, sync_state, COUNT(*) FROM local_annotations
-             WHERE book_id = ? AND (present = 1 OR sync_state IN ('delete_pending','delete_unknown'))
-             GROUP BY kind, sync_state
-        ]])
-        statement:bind(tostring(book_id or ""))
-        while true do
-            local row = statement:step()
-            if not row then break end
-            local kind = tostring(row[1] or "")
-            local state = tostring(row[2] or "")
-            local count = tonumber(row[3] or 0) or 0
-            out.total = out.total + count
-            if out[kind] ~= nil then out[kind] = out[kind] + count end
-            if state == "synced" then out.synced = out.synced + count
-            elseif state == "delete_pending" or state == "delete_unknown" then
-                out.delete_pending = out.delete_pending + count
-            elseif state == "locate_failed" then
-                out.locate_failed = out.locate_failed + count; out.action_required = out.action_required + count
-            elseif state == "metadata_failed" then
-                out.metadata_failed = out.metadata_failed + count; out.action_required = out.action_required + count
-            elseif state == "coord_failed" then
-                out.coord_failed = out.coord_failed + count; out.action_required = out.action_required + count
-            elseif state == "unknown" then
-                out.unknown = out.unknown + count; out.pending = out.pending + count
-            elseif state == "held_local" then
-                out.held_local = out.held_local + count
-            else
-                out.pending = out.pending + count
-            end
+local function empty_summary()
+    return {total=0, bookmark=0, highlight=0, thought=0, pending=0, synced=0,
+        delete_pending=0, locate_failed=0, metadata_failed=0, coord_failed=0,
+        unknown=0, action_required=0, held_local=0, legacy_synced=0}
+end
+
+local function read_summary(conn, book_id)
+    local out = empty_summary()
+    local statement = conn:prepare([[
+        SELECT kind, sync_state, COUNT(*) FROM local_annotations
+         WHERE book_id = ? AND (present = 1 OR sync_state IN ('delete_pending','delete_unknown'))
+         GROUP BY kind, sync_state
+    ]])
+    statement:bind(tostring(book_id or ""))
+    while true do
+        local row = statement:step()
+        if not row then break end
+        local kind = tostring(row[1] or "")
+        local state = tostring(row[2] or "")
+        local count = tonumber(row[3] or 0) or 0
+        out.total = out.total + count
+        if out[kind] ~= nil then out[kind] = out[kind] + count end
+        if state == "synced" then out.synced = out.synced + count
+        elseif state == "delete_pending" or state == "delete_unknown" then
+            out.delete_pending = out.delete_pending + count
+        elseif state == "locate_failed" then
+            out.locate_failed = out.locate_failed + count; out.action_required = out.action_required + count
+        elseif state == "metadata_failed" then
+            out.metadata_failed = out.metadata_failed + count; out.action_required = out.action_required + count
+        elseif state == "coord_failed" then
+            out.coord_failed = out.coord_failed + count; out.action_required = out.action_required + count
+        elseif state == "unknown" then
+            out.unknown = out.unknown + count; out.pending = out.pending + count
+        elseif state == "held_local" then
+            out.held_local = out.held_local + count
+        else
+            out.pending = out.pending + count
         end
-        statement:close()
-        local legacy = conn:prepare([[
-            SELECT COUNT(*) FROM local_annotations
-             WHERE book_id = ? AND present = 1 AND sync_state = 'synced'
-               AND COALESCE(coord_version, 0) < 2
-        ]])
-        legacy:bind(tostring(book_id or ""))
-        local legacy_row = legacy:step()
-        out.legacy_synced = legacy_row and (tonumber(legacy_row[1] or 0) or 0) or 0
-        legacy:close()
-        return out
-    end, debug.traceback)
+    end
+    statement:close()
+    local legacy = conn:prepare([[
+        SELECT COUNT(*) FROM local_annotations
+         WHERE book_id = ? AND present = 1 AND sync_state = 'synced'
+           AND COALESCE(coord_version, 0) < 2
+    ]])
+    legacy:bind(tostring(book_id or ""))
+    local legacy_row = legacy:step()
+    out.legacy_synced = legacy_row and (tonumber(legacy_row[1] or 0) or 0) or 0
+    legacy:close()
+    return out
+end
+
+function LocalAnnotationDatabase.summary(store, book_id)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return empty_summary() end
+    local conn = open(store, book_id, false)
+    local ok, result = xpcall(function() return read_summary(conn, book_id) end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(result) end
+    return result
+end
+
+-- Lifecycle-safe summary used by close/suspend. It never initializes/migrates
+-- schema and caps SQLite lock waiting to a tiny interval. If an old/busy DB
+-- cannot be read immediately, callers defer the authoritative check to the
+-- background worker instead of making the user wait.
+function LocalAnnotationDatabase.summary_fast(store, book_id)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return empty_summary() end
+    local conn
+    local opened, open_err = pcall(function()
+        conn = open(store, book_id, true)
+        pcall(conn.exec, conn, "PRAGMA busy_timeout=80;")
+    end)
+    if not opened or not conn then return nil, tostring(open_err or "annotation database unavailable") end
+    local ok, result = xpcall(function() return read_summary(conn, book_id) end, debug.traceback)
     pcall(conn.close, conn)
     if not ok then return nil, tostring(result) end
     return result

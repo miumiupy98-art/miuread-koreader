@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "4.9.0-beta.6",
-    SCHEMA = 114,
+    VERSION = "5.4.0-beta.8",
+    SCHEMA = 120,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
@@ -53,11 +53,22 @@ local C = {
     THOUGHT_PREWARM_DELAY = 2.8,
     THOUGHT_PREWARM_GROUPS = 6,
 
+    -- Single-chapter reading may prepare exactly one following chapter after
+    -- the reader has been stable for a while. It never wakes a sleeping device
+    -- just to prefetch, and any explicit user download takes priority.
+    CHAPTER_PREFETCH_DELAY = 30,
+    -- Hidden next-chapter EPUBs are cache, not formal downloads. Keep them
+    -- long enough for a short reading break but prune stale unused entries.
+    CHAPTER_PREFETCH_TTL = 24 * 60 * 60,
     -- Failed automatic cover fetches must not restart on every home gesture.
     -- A manual refresh bypasses the runtime backoff once.
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
     READ_INTERVAL = 60,
+    -- First confirmed reading-time report is intentionally earlier than the
+    -- steady 60 s cadence so the user can verify sync without waiting a minute.
+    -- This is an internal strategy, not another user-facing setting.
+    READ_FIRST_DELAY = 15,
     -- beta.24 never replays historical/suspend reading-time debt. Normal
     -- reports stay on the established one-minute cadence and every request is
     -- independently capped, avoiding burst uploads after reconnect/resume.

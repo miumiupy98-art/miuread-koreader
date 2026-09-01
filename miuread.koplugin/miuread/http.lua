@@ -7,6 +7,7 @@ local ok_lfs, lfs = pcall(require, "lfs")
 local Json = require("miuread.json")
 local Config = require("miuread.config")
 local NetworkPolicy = require("miuread.network_policy")
+local NetworkHealth = require("miuread.network_health")
 local Cookies = require("miuread.cookies")
 local Protocol = require("miuread.protocol")
 local Util = require("miuread.util")
@@ -435,56 +436,69 @@ function Http:_jar()
     return jar
 end
 
-function Http:_save_jar(jar, expected_login_session_id)
-    local auth = self.store:auth()
+function Http:_save_response_auth(headers, set_cookie, expected_login_session_id, expected_auth_revision)
+    local ticket=hget(headers,"x-wr-ticket")
+    local wrpa=hget(headers,"x-wrpa-0")
+    local auth=self.store:auth()
     if tostring(expected_login_session_id or "")~=""
         and tostring(auth.login_session_id or "")~=tostring(expected_login_session_id or "") then
-        logger.warn("[MiuRead][HTTP] stale cookie response ignored")
+        logger.warn("[MiuRead][HTTP] stale authentication response ignored","reason=login_session_changed")
         return false
     end
-    local cleaned = Cookies.sanitize(jar or {})
-    if not Cookies.same(auth.cookies or {}, cleaned) then
-        auth.cookies = cleaned
-        local saved,save_error=self.store:save_auth(auth)
-        if saved~=true then
-            logger.warn("[MiuRead][HTTP] refreshed cookies not persisted",Util.first_line(save_error or "unknown",160))
-            return false,save_error
-        end
+    local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    if expected_auth_revision~=nil and current_revision~=tonumber(expected_auth_revision) then
+        logger.warn("[MiuRead][HTTP] stale authentication response ignored","reason=credential_revision_changed")
+        return false
     end
+    local candidate=Util.copy(auth)
+    local changed=false
+    if set_cookie~=nil then
+        local merged=Cookies.absorb(candidate.cookies or {},set_cookie,{protect_core=true})
+        merged=Cookies.sanitize(merged)
+        if not Cookies.same(candidate.cookies or {},merged) then candidate.cookies=merged; changed=true end
+    end
+    if ticket~=nil and tostring(ticket)~="" and tostring(candidate.wr_ticket or "")~=tostring(ticket) then
+        candidate.wr_ticket=tostring(ticket); changed=true
+    end
+    if wrpa~=nil and tostring(wrpa)~="" and tostring(candidate.wr_wrpa or "")~=tostring(wrpa) then
+        candidate.wr_wrpa=tostring(wrpa); changed=true
+    end
+    if not changed then return false end
+    if (ticket~=nil and tostring(ticket)~="") or (wrpa~=nil and tostring(wrpa)~="") then
+        candidate.ticket_updated_at=os.time()
+    end
+    local saved,save_error=self.store:save_auth(candidate,{expected_revision=current_revision})
+    if saved~=true then
+        logger.warn("[MiuRead][HTTP] response credentials not persisted",Util.first_line(save_error or "unknown",160))
+        return false
+    end
+    logger.info("[MiuRead][HTTP] response credentials merged",
+        "cookies=",tostring(set_cookie~=nil),"ticket=",tostring(ticket~=nil and tostring(ticket)~=""),
+        "wrpa=",tostring(wrpa~=nil and tostring(wrpa)~=""))
     return true
 end
 
-function Http:_save_response_auth_headers(headers, expected_login_session_id)
-    local ticket = hget(headers, "x-wr-ticket")
-    local wrpa = hget(headers, "x-wrpa-0")
-    if (ticket == nil or tostring(ticket) == "") and (wrpa == nil or tostring(wrpa) == "") then return false end
-    local auth = self.store:auth()
-    if tostring(expected_login_session_id or "")~=""
-        and tostring(auth.login_session_id or "")~=tostring(expected_login_session_id or "") then
-        logger.warn("[MiuRead][HTTP] stale credential response ignored")
-        return false
+local function response_allows_auth_persist(code,text)
+    code=tonumber(code)
+    if not code or code<200 or code>=300 then return false end
+    text=tostring(text or "")
+    if #text==0 or #text>65536 then return true end
+    local first=text:match("^%s*(.)")
+    if first~="{" and first~="[" then return true end
+    local ok,value=pcall(Json.decode,text)
+    if not ok or type(value)~="table" then return true end
+    local err=value.errCode or value.errcode or value.errorCode or value.error_code
+    if err~=nil then
+        local n=tonumber(err)
+        if (n and n~=0) or (not n and tostring(err)~="" and tostring(err)~="0") then return false end
     end
-    local changed = false
-    if ticket ~= nil and tostring(ticket) ~= "" and tostring(auth.wr_ticket or "") ~= tostring(ticket) then
-        auth.wr_ticket = tostring(ticket)
-        auth.ticket_updated_at = os.time()
-        changed = true
+    local service_code=value.code
+    if service_code~=nil then
+        local n=tonumber(service_code)
+        if n and n<0 then return false end
     end
-    if wrpa ~= nil and tostring(wrpa) ~= "" and tostring(auth.wr_wrpa or "") ~= tostring(wrpa) then
-        auth.wr_wrpa = tostring(wrpa)
-        auth.ticket_updated_at = os.time()
-        changed = true
-    end
-    if changed then
-        local saved,save_error=self.store:save_auth(auth)
-        if saved~=true then
-            logger.warn("[MiuRead][HTTP] public-account credential not persisted",Util.first_line(save_error or "unknown",160))
-            return false
-        end
-        logger.info("[MiuRead][HTTP] public-account credential refreshed",
-            "ticket=", tostring(auth.wr_ticket ~= ""), "wrpa=", tostring(auth.wr_wrpa ~= ""))
-    end
-    return changed
+    if value.succ==false or tostring(value.succ or "")=="0" then return false end
+    return true
 end
 
 function Http:_request_once(opt)
@@ -495,6 +509,7 @@ function Http:_request_once(opt)
     local body = opt.body
     local auth_snapshot=self.store:auth()
     local request_login_session_id=tostring(auth_snapshot.login_session_id or "")
+    local request_auth_revision=math.max(0,tonumber(auth_snapshot.auth_revision or 0) or 0)
     local jar = self:_jar()
     local headers = {}
     for k, v in pairs(opt.headers or {}) do headers[k] = v end
@@ -607,13 +622,18 @@ function Http:_request_once(opt)
 
         local set_cookie = hget(resp_headers, "set-cookie")
         if set_cookie and opt.auth ~= false then
-            local before = Cookies.sanitize(jar)
             jar = Cookies.absorb(jar, set_cookie, {protect_core=true})
-            if not Cookies.same(before, jar) then self:_save_jar(jar,request_login_session_id) end
             headers["Cookie"] = Cookies.header(jar)
         end
-        if opt.auth ~= false and is_weread_url(current) then
-            self:_save_response_auth_headers(resp_headers,request_login_session_id)
+        if opt.auth ~= false and is_weread_url(current) and opt.defer_auth_persist~=true
+            and response_allows_auth_persist(code,text) then
+            local persisted=self:_save_response_auth(resp_headers,set_cookie,request_login_session_id,request_auth_revision)
+            -- Only this exact request may advance its redirect-chain revision.
+            -- If another request won the race, keep the old revision so every
+            -- later response from this chain remains stale and cannot write back.
+            if persisted==true then
+                request_auth_revision=math.max(0,tonumber(self.store:auth().auth_revision or request_auth_revision) or request_auth_revision)
+            end
         end
 
         local location = hget(resp_headers, "location")
@@ -667,6 +687,15 @@ function Http:request(opt)
         for attempt = 1, retries + 1 do
             local text, code, headers, url, err = self:_request_once(opt)
             last_text, last_code, last_headers, last_url, last_error = text, code, headers, url, err
+            -- Keep UI Wi-Fi state honest across worker processes. Any HTTP status
+            -- proves transport is usable; only a no-status socket failure marks
+            -- the link degraded. This file lives in /tmp and is intentionally
+            -- independent from authentication/rate-limit semantics.
+            if code then
+                NetworkHealth.note_success("http:" .. tostring(code))
+            elseif err then
+                NetworkHealth.note_failure(err)
+            end
             limited_code = (tonumber(code) == 429 or tonumber(code) == 499)
                 and tostring(code) or body_rate_limit(text)
             if limited_code then break end
@@ -721,7 +750,7 @@ local RATE_LIMIT_MARKER = "[MiuReadRateLimit]"
 
 local function auth_error_message(code, message)
     local suffix = tostring(message or ""):gsub("[%c]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-    local out = "登录状态已失效 " .. AUTH_ERROR_MARKER .. " error_code=" .. tostring(code or "unknown")
+    local out = "登录凭证需要更新 " .. AUTH_ERROR_MARKER .. " error_code=" .. tostring(code or "unknown")
     if suffix ~= "" then out = out .. ": " .. suffix end
     return out
 end

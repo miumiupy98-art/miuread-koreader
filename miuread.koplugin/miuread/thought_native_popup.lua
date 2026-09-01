@@ -1,4 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
@@ -287,7 +288,7 @@ local NativePopup = InputContainer:extend{
 function NativePopup:handleEvent(event)
     if not self.closing and event and event.handler == "onGesture" then
         local ges = event.args and event.args[1]
-        if ges and self.on_interact_callback and (ges.ges == "tap" or ges.ges == "swipe") then
+        if ges and self.on_interact_callback and (ges.ges == "tap" or ges.ges == "swipe" or ges.ges == "hold") then
             pcall(self.on_interact_callback)
         end
     end
@@ -316,6 +317,7 @@ end
 
 function NativePopup:_close()
     if self.closing then return true end
+    self:_close_action_dialog()
     self.closing = true
     UIManager:close(self)
     return true
@@ -456,7 +458,7 @@ end
 
 function NativePopup:_piece_widget(piece, width, metrics)
     local group = VerticalGroup:new{align = "left"}
-    local author = clean(piece.author)
+    local author = ThoughtFaceFactory:displayText(clean(piece.author))
     if author == "" then author = "微信读书用户" end
     local likes = tonumber(piece.likes or 0) or 0
     local meta
@@ -467,7 +469,7 @@ function NativePopup:_piece_widget(piece, width, metrics)
     else
         meta = author
     end
-    local content = clean_body(piece.content)
+    local content = ThoughtFaceFactory:displayText(clean_body(piece.content))
     if content == "" then content = " " end
 
     -- Let KOReader measure the author row with the same face it will paint.
@@ -824,7 +826,7 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
 end
 
 function NativePopup:_build_source(width, metrics, close_size)
-    local source = clean(self.source_text)
+    local source = ThoughtFaceFactory:displayText(clean(self.source_text))
     if source == "" then
         local empty = VerticalGroup:new{align = "left"}
         empty[#empty + 1] = Widget:new{dimen = Geom:new{w = width, h = close_size}}
@@ -856,25 +858,42 @@ end
 function NativePopup:_build_comment_page(width, metrics, target_height)
     local page = (self.pages and self.pages[self.page_index]) or {}
     local group = VerticalGroup:new{align = "left"}
+    local hit_targets = {}
+    local cursor_y = 0
     if #page == 0 then
         local empty_h = math.max(metrics.body_size * 2, Screen:scaleBySize(38))
-        group[#group + 1] = VerticalSpan:new{height = math.max(6, Screen:scaleBySize(5))}
+        local top_gap = math.max(6, Screen:scaleBySize(5))
+        group[#group + 1] = VerticalSpan:new{height = top_gap}
+        cursor_y = cursor_y + top_gap
         group[#group + 1] = self:_text_box("没有评论内容", metrics.meta_face, width, {
             height = empty_h,
             alignment = "center",
             line_height = 0.08,
             fgcolor = Blitbuffer.COLOR_DARK_GRAY,
         })
+        cursor_y = cursor_y + empty_h
     else
         for index, piece in ipairs(page) do
             if index > 1 and needs_comment_separator(page[index - 1], piece) then
                 group[#group + 1] = self:_separator_widget(width, metrics, true, false)
+                cursor_y = cursor_y + metrics.comment_separator_height
             end
-            local widget = self:_piece_widget(piece, width, metrics)
+            local widget, piece_h = self:_piece_widget(piece, width, metrics)
+            piece_h = math.max(1, tonumber(piece_h) or widget:getSize().h)
             group[#group + 1] = widget
+            local comment_index = tonumber(piece.comment_index)
+            if comment_index then
+                hit_targets[#hit_targets + 1] = {
+                    y = cursor_y,
+                    h = piece_h,
+                    comment_index = comment_index,
+                }
+            end
+            cursor_y = cursor_y + piece_h
         end
     end
 
+    self.comment_hit_targets = hit_targets
     if group.resetLayout then group:resetLayout() end
     local natural_h = math.max(1, group:getSize().h)
     local final_h = natural_h
@@ -942,6 +961,97 @@ function NativePopup:_build_page_indicator(width, metrics, height)
         CenterContainer:new{dimen = Geom:new{w = side_w, h = indicator_h}, right},
     }
     return container, indicator_h, label
+end
+
+function NativePopup:_current_comment()
+    local page=(self.pages and self.pages[self.page_index]) or {}
+    local index
+    for _,piece in ipairs(page) do
+        local candidate=tonumber(piece.comment_index)
+        if candidate then index=candidate; break end
+    end
+    if not index and type(self.comments)=="table" and #self.comments==1 then index=1 end
+    return index and self.comments and self.comments[index] or nil,index
+end
+
+function NativePopup:_comment_at_position(pos)
+    if not pos or not self.comments_dimen then return nil,nil end
+    local py=tonumber(pos.y)
+    if not py then return nil,nil end
+    local relative_y=py-tonumber(self.comments_dimen.y or 0)
+    for _,target in ipairs(self.comment_hit_targets or {}) do
+        local top=tonumber(target.y) or 0
+        local height=math.max(1,tonumber(target.h) or 0)
+        if relative_y>=top and relative_y<top+height then
+            local index=tonumber(target.comment_index)
+            return index and self.comments and self.comments[index] or nil,index
+        end
+    end
+    return nil,nil
+end
+
+function NativePopup:_is_current_favorite(comment)
+    comment=comment or self:_current_comment()
+    if not comment or type(self.is_favorite_callback)~="function" then return false end
+    local ok,value=pcall(self.is_favorite_callback,comment,self.source_text)
+    return ok and value==true
+end
+
+function NativePopup:_action_texts(comment)
+    return {"复制评论","复制原文+评论",self:_is_current_favorite(comment) and "取消收藏" or "收藏"}
+end
+
+function NativePopup:_handle_action(index,comment)
+    comment=comment or self:_current_comment()
+    if not comment then return true end
+    if self.on_interact_callback then pcall(self.on_interact_callback) end
+    if index==1 or index==2 then
+        if type(self.copy_callback)=="function" then
+            pcall(self.copy_callback,comment,self.source_text,index==2)
+        end
+        return true
+    end
+    if index==3 and type(self.toggle_favorite_callback)=="function" then
+        pcall(self.toggle_favorite_callback,comment,self.source_text)
+        return true
+    end
+    return true
+end
+
+function NativePopup:_close_action_dialog()
+    local dialog=self.action_dialog
+    self.action_dialog=nil
+    if dialog then pcall(UIManager.close,UIManager,dialog) end
+end
+
+function NativePopup:_show_action_menu(comment)
+    comment=comment or self:_current_comment()
+    if not comment or self.closing then return true end
+    self:_close_action_dialog()
+    local texts=self:_action_texts(comment)
+    local dialog
+    local function run(index)
+        if dialog then
+            pcall(UIManager.close,UIManager,dialog)
+            if self.action_dialog==dialog then self.action_dialog=nil end
+        end
+        return self:_handle_action(index,comment)
+    end
+    dialog=ButtonDialog:new{
+        title="评论操作",
+        title_align="center",
+        buttons={
+            {{text=texts[1],callback=function() return run(1) end}},
+            {{text=texts[2],callback=function() return run(2) end}},
+            {{text=texts[3],callback=function() return run(3) end}},
+        },
+        close_callback=function()
+            if self.action_dialog==dialog then self.action_dialog=nil end
+        end,
+    }
+    self.action_dialog=dialog
+    UIManager:show(dialog,"ui")
+    return true
 end
 
 function NativePopup:_build(reset_pages, anchor_comment)
@@ -1088,9 +1198,9 @@ function NativePopup:_build(reset_pages, anchor_comment)
     else
         self.page_indicator_dimen = nil
     end
-    local refresh_bottom = self.page_indicator_dimen
-        and (self.page_indicator_dimen.y + self.page_indicator_dimen.h)
-        or (self.comments_dimen.y + self.comments_dimen.h)
+    local refresh_bottom=self.page_indicator_dimen
+        and (self.page_indicator_dimen.y+self.page_indicator_dimen.h)
+        or (self.comments_dimen.y+self.comments_dimen.h)
     self.content_refresh_dimen = Geom:new{
         x = popup_x + inset,
         y = self.comments_dimen.y,
@@ -1299,6 +1409,7 @@ function NativePopup:init()
         self.ges_events = {
             TapPage = {GestureRange:new{ges = "tap", range = self.dimen}},
             SwipePage = {GestureRange:new{ges = "swipe", range = self.dimen}},
+            HoldComment = {GestureRange:new{ges = "hold", range = self.dimen}},
         }
     end
     if Device:hasKeys() and Device.input and Device.input.group then
@@ -1328,6 +1439,16 @@ function NativePopup:onTapPage(_, ges)
     return self:_change_page(1)
 end
 
+function NativePopup:onHoldComment(_, ges)
+    local pos=ges and ges.pos
+    if not pos or not self.comments_dimen or pos:notIntersectWith(self.comments_dimen) then
+        return false
+    end
+    local comment=self:_comment_at_position(pos)
+    if not comment then return true end
+    return self:_show_action_menu(comment)
+end
+
 function NativePopup:onSwipePage(_, ges)
     local pos = ges and ges.pos
     if pos and self.popup_dimen and pos:notIntersectWith(self.popup_dimen) then
@@ -1354,6 +1475,7 @@ function NativePopup:onClose() return self:_close() end
 
 function NativePopup:onCloseWidget()
     local region = self.popup_dimen and self.popup_dimen:copy() or nil
+    self:_close_action_dialog()
     self.closing = true
     if live_popup == self then live_popup = nil end
     self.page_changing = false
@@ -1367,6 +1489,7 @@ end
 
 function NativePopup:_reopen(opts)
     opts = opts or {}
+    self:_close_action_dialog()
     self.source_text = opts.source_text
     self.comments = opts.comments
     self.cache_key = opts.cache_key
@@ -1377,6 +1500,9 @@ function NativePopup:_reopen(opts)
     self.on_close_callback = opts.on_close
     self.on_interact_callback = opts.on_interact
     self.on_error_callback = opts.on_error
+    self.is_favorite_callback = opts.is_favorite_callback
+    self.toggle_favorite_callback = opts.toggle_favorite_callback
+    self.copy_callback = opts.copy_callback
     self.closing = false
     self.paint_failed = false
     self.page_changing = false
@@ -1410,6 +1536,9 @@ function M.show(opts)
             on_close_callback = opts.on_close,
             on_interact_callback = opts.on_interact,
             on_error_callback = opts.on_error,
+            is_favorite_callback = opts.is_favorite_callback,
+            toggle_favorite_callback = opts.toggle_favorite_callback,
+            copy_callback = opts.copy_callback,
         }
         pooled_popup = popup
     end

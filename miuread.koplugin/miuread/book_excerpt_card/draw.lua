@@ -6,6 +6,7 @@
 
 local Config = require("miuread.book_excerpt_card.config")
 local BlitBuffer = require("ffi/blitbuffer")
+local ffi = require("ffi")
 local logger = require("logger")
 
 local ds = Config.ds
@@ -35,25 +36,54 @@ local function mixColor(fg_hex, bg_hex, ratio)
 end
 
 --- 垂直渐变填充(逐行插值，RGB32)。
+-- 性能:把整块渐变写进一条 RGB32 字节缓冲,BlitBuffer.fromstring 后单次 blitFrom,
+-- 取代原先逐行 paintRectRGB32(H 次 FFI 调用 → 1 次 blit)。
+-- 像素值与改动前逐字一致:math.floor(r1 + (r2-r1)*t), t=i/(h-1), alpha=0xFF。
 local function drawVGradient(bb, x, y, w, h, c1, c2)
     if h <= 0 or w <= 0 then return end
-    if h == 1 then
-        bb:paintRectRGB32(x, y, w, 1, c1)
-        return
-    end
     local r1, g1, b1 = c1.r, c1.g, c1.b
     local r2, g2, b2 = c2.r, c2.g, c2.b
-    for i = 0, h - 1 do
-        local t = i / (h - 1)
-        bb:paintRectRGB32(x, y + i, w, 1, BlitBuffer.ColorRGB32(
-            math.floor(r1 + (r2 - r1) * t),
-            math.floor(g1 + (g2 - g1) * t),
-            math.floor(b1 + (b2 - b1) * t), 0xFF))
+    local dr, dg, db = r2 - r1, g2 - g1, b2 - b1
+    if not BlitBuffer.fromstring then
+        -- 回退(fromstring 不可用):逐行 paintRectRGB32(老路径)
+        if h == 1 then
+            bb:paintRectRGB32(x, y, w, 1, c1)
+            return
+        end
+        for i = 0, h - 1 do
+            local t = i / (h - 1)
+            bb:paintRectRGB32(x, y + i, w, 1, BlitBuffer.ColorRGB32(
+                math.floor(r1 + dr * t),
+                math.floor(g1 + dg * t),
+                math.floor(b1 + db * t), 0xFF))
+        end
+        return
     end
+    -- 每行同色:row = 4 字节像素 × w,逐行 string.rep,table.concat 成整块。
+    local rows = {}
+    if h == 1 then
+        rows[1] = string.rep(string.char(
+            math.floor(r1), math.floor(g1), math.floor(b1), 0xFF), w)
+    else
+        for i = 0, h - 1 do
+            local t = i / (h - 1)
+            rows[i + 1] = string.rep(string.char(
+                math.floor(r1 + dr * t),
+                math.floor(g1 + dg * t),
+                math.floor(b1 + db * t), 0xFF), w)
+        end
+    end
+    local tmp = BlitBuffer.fromstring(w, h, BlitBuffer.TYPE_BBRGB32, table.concat(rows))
+    bb:blitFrom(tmp, x, y, 0, 0, w, h)
+    tmp:free()
 end
 
 --- 对角线渐变填充(start{0,0}→end{1,1}):
 --- t = (px*w + py*h)/(w²+h²) — 线性渐变像素投影。
+--- 性能:用 ffi 缓冲一次性写完全部像素,再 fromstring + 单次 blitFrom,
+--- 取代原先逐像素 paintRectRGB32(W*H 次 FFI 调用 → 1 次 blit)。
+--- 像素值与改动前逐字一致:t0=py*h/denom,rstep=dr*w/denom,
+--- math.floor(r0 + rstep*px + 0.5), alpha=0xFF。
 --- 注意:在高卡片(375×~890)上投影主要沿 y(垂直),水平分量很弱;
 --- 之前的 (px/w+py/h)/2 归一化公式水平分量过强,导致左右偏色。
 local function drawVGradientDiag(bb, x, y, w, h, c1, c2)
@@ -67,18 +97,39 @@ local function drawVGradientDiag(bb, x, y, w, h, c1, c2)
     local dr, dg, db = r2 - r1, g2 - g1, b2 - b1
     local denom = w * w + h * h
     local inv_denom = 1 / denom
+    if not (BlitBuffer.fromstring and ffi) then
+        -- 回退(fromstring/ffi 不可用):逐像素 paintRectRGB32(老路径)
+        for py = 0, h - 1 do
+            local t0 = py * h * inv_denom
+            local r0, g0, b0 = r1 + dr * t0, g1 + dg * t0, b1 + db * t0
+            local rstep, gstep, bstep = dr * w * inv_denom, dg * w * inv_denom, db * w * inv_denom
+            for px = 0, w - 1 do
+                bb:paintRectRGB32(x + px, y + py, 1, 1, BlitBuffer.ColorRGB32(
+                    math.floor(r0 + rstep * px + 0.5),
+                    math.floor(g0 + gstep * px + 0.5),
+                    math.floor(b0 + bstep * px + 0.5), 0xFF))
+            end
+        end
+        return
+    end
+    local stride = w * 4
+    local buf = ffi.new("uint8_t[?]", h * stride)
     for py = 0, h - 1 do
-        -- 行内水平渐变:左端 t = py*h/denom,右端 t = (w² + py*h)/denom
         local t0 = py * h * inv_denom
         local r0, g0, b0 = r1 + dr * t0, g1 + dg * t0, b1 + db * t0
         local rstep, gstep, bstep = dr * w * inv_denom, dg * w * inv_denom, db * w * inv_denom
+        local rowoff = py * stride
         for px = 0, w - 1 do
-            bb:paintRectRGB32(x + px, y + py, 1, 1, BlitBuffer.ColorRGB32(
-                math.floor(r0 + rstep * px + 0.5),
-                math.floor(g0 + gstep * px + 0.5),
-                math.floor(b0 + bstep * px + 0.5), 0xFF))
+            local o = rowoff + px * 4
+            buf[o] = math.floor(r0 + rstep * px + 0.5)
+            buf[o + 1] = math.floor(g0 + gstep * px + 0.5)
+            buf[o + 2] = math.floor(b0 + bstep * px + 0.5)
+            buf[o + 3] = 0xFF
         end
     end
+    local tmp = BlitBuffer.fromstring(w, h, BlitBuffer.TYPE_BBRGB32, ffi.string(buf, h * stride))
+    bb:blitFrom(tmp, x, y, 0, 0, w, h)
+    tmp:free()
 end
 
 -- ---------------------------------------------------------------------------

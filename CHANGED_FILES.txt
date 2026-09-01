@@ -1,7 +1,0 @@
-CHANGED_FILES.txt
-miuread.koplugin/_meta.lua
-miuread.koplugin/main.lua
-miuread.koplugin/miuread/book_excerpt_card/render.lua
-miuread.koplugin/miuread/book_excerpt_dialog.lua
-miuread.koplugin/miuread/book_excerpt_transfer.lua
-miuread.koplugin/miuread/config.lua

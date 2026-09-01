@@ -38,7 +38,7 @@ function Auth:new(http,store,host)
     return setmetatable({
         http=http, store=store, host=host, generation=0, jar={}, dialog=nil,
         retry_dialog=nil, started=0, active=false, closing=false, poll_failures=0,
-        refresh_count=0, pending_auth=nil, pending_name="",
+        refresh_count=0, pending_auth=nil, pending_name="", pending_expected_revision=nil,
     },self)
 end
 local function merge_auth_headers(jar,vid,key)
@@ -74,6 +74,7 @@ function Auth:cancel()
     self.refresh_count=0
     self.pending_auth=nil
     self.pending_name=""
+    self.pending_expected_revision=nil
 end
 function Auth:_uid()
     local _,code,h=self.http:request{url=BASE.."/r/weread-skills",method="GET",auth=false,headers={Referer=BASE.."/"}}
@@ -116,8 +117,8 @@ function Auth:_persisted_auth_matches(expected)
     return true
 end
 
-function Auth:_commit_auth(auth)
-    local saved,save_error=self.store:save_auth(auth)
+function Auth:_commit_auth(auth,expected_revision)
+    local saved,save_error=self.store:save_auth(auth,{expected_revision=expected_revision,replace_login=true})
     if saved~=true then return false,save_error or "settings write failed" end
     local verified,verify_error=self:_persisted_auth_matches(auth)
     if verified~=true then
@@ -141,6 +142,7 @@ end
 function Auth:_abandon_pending_commit()
     self.pending_auth=nil
     self.pending_name=""
+    self.pending_expected_revision=nil
     if self.host.on_auth_commit_failed then pcall(self.host.on_auth_commit_failed,self.host) end
 end
 
@@ -171,17 +173,23 @@ function Auth:_show_commit_retry(detail)
                 self.closing=false
                 local pending=Util.copy(self.pending_auth)
                 local pending_name=tostring(self.pending_name or "")
+                local pending_expected_revision=self.pending_expected_revision
                 if type(pending)~="table" then
                     self:_abandon_pending_commit()
                     self:_begin(0)
                     return
                 end
                 UIManager:scheduleIn(.05,function()
-                    local saved,save_error=self:_commit_auth(pending)
+                    local old_auth=self.store:auth()
+                    local saved,save_error=self:_commit_auth(pending,pending_expected_revision)
                     if saved==true then
                         logger.info("[MiuRead][Auth] pending login state saved after retry")
                         self.pending_auth=nil
                         self.pending_name=""
+                        self.pending_expected_revision=nil
+                        if self.host.on_auth_replaced then
+                            pcall(self.host.on_auth_replaced,self.host,old_auth,self.store:auth())
+                        end
                         self:_complete_login(pending_name)
                     else
                         logger.warn("[MiuRead][Auth] pending login save retry failed",Util.first_line(save_error or "unknown",160))
@@ -284,17 +292,19 @@ function Auth:_finish(data)
         },
     }
     local old_auth=self.store:auth()
-    if self.host.on_auth_replacing then
-        local replaced,replace_error=pcall(self.host.on_auth_replacing,self.host,old_auth,new_auth)
-        if not replaced then logger.warn("[MiuRead][Auth] pre-commit reset failed",tostring(replace_error)) end
-    end
-    local committed,commit_error=self:_commit_auth(new_auth)
+    local old_revision=math.max(0,tonumber(old_auth.auth_revision or 0) or 0)
+    local committed,commit_error=self:_commit_auth(new_auth,old_revision)
     local display_name=account_name~="" and account_name or vid
     if committed~=true then
         self.pending_auth=Util.copy(new_auth)
         self.pending_name=display_name
+        self.pending_expected_revision=old_revision
         logger.warn("[MiuRead][Auth] QR login confirmed but local commit failed",Util.first_line(commit_error or "unknown",160))
         return nil,commit_error
+    end
+    if self.host.on_auth_replaced then
+        local replaced,replace_error=pcall(self.host.on_auth_replaced,self.host,old_auth,self.store:auth())
+        if not replaced then logger.warn("[MiuRead][Auth] post-commit transition failed",tostring(replace_error)) end
     end
     logger.info("[MiuRead][Auth] QR session finalized",
         "session_cookies=",tostring(cookie_count(session)),

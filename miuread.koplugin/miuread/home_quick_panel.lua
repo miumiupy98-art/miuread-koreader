@@ -169,7 +169,7 @@ function ControlSlider:_set_from_position(ges,force)
     local target=math.floor(self.min+ratio*(self.max-self.min)+.5)
     local actual=target
     if self.on_change then
-        local ok,result=pcall(self.on_change,target)
+        local ok,result=pcall(self.on_change,target,force and "commit" or "drag")
         if not ok then logger.warn("[MiuRead][QuickPanel] frontlight slider failed",tostring(result)); return true end
         if result==false then return true end
         if tonumber(result) then actual=tonumber(result) end
@@ -699,6 +699,14 @@ local QuickPanel = {}
 function QuickPanel.close()
     if live_panel and not live_panel._closed then live_panel:_close(nil, true) end
     live_panel = nil
+end
+
+function QuickPanel.refreshFrontlight()
+    if live_panel and not live_panel._closed and type(live_panel._refresh_frontlight_state)=="function" then
+        live_panel:_refresh_frontlight_state()
+        return true
+    end
+    return false
 end
 function QuickPanel.invalidate()
     QuickPanel.close()

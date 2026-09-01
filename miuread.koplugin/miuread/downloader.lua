@@ -12,6 +12,7 @@ local DownloadPlan = require("miuread.download_plan")
 local DownloadDatabase = require("miuread.download_database")
 local EpubInstaller = require("miuread.epub_installer")
 local BookIntegrity = require("miuread.book_integrity")
+local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
@@ -293,25 +294,6 @@ local function preview_information_chapter(book, mode, catalog_count, readable_c
     end
     lines[#lines + 1] = '<p>生成时间：' .. U.xml(os.date("%Y-%m-%d %H:%M:%S")) .. '</p></section>'
     return table.concat(lines, "\n"), title
-end
-
-local function localize(http, html, assets, enabled)
-    if not enabled then return html end
-    local cache = {}
-    local function replace(prefix, quote, url)
-        local clean = tostring(url):gsub("&amp;", "&")
-        if cache[clean] then return prefix .. quote .. cache[clean] .. quote end
-        local ok, data = pcall(http.download, http, clean, {auth=false, retries=3})
-        if not ok or not data or #data == 0 then return prefix .. quote .. url .. quote end
-        local ext, mime = Codec.media(data)
-        local href = "images/remote-" .. tostring(#assets + 1) .. ext
-        assets[#assets + 1] = {href=href, data=data, mime=mime}
-        cache[clean] = "../" .. href
-        return prefix .. quote .. cache[clean] .. quote
-    end
-    html = html:gsub("(data%-src=)([\"'])(https?://[^\"']+)%2", replace)
-    html = html:gsub("(src=)([\"'])(https?://[^\"']+)%2", replace)
-    return html
 end
 
 local function failure_message(failures, expected, actual, checkpointed)
@@ -841,14 +823,17 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     if #chapters<=0 then error("EPUB 至少需要一个说明页面") end
 
     local suffix = kind == "notes" and "划线与想法版" or "纯净版"
-    local dir = self.store:epub_root()
     local standalone = opt.chapter_uid ~= nil
+    local hidden_prefetch = standalone and opt.prefetch_hidden == true
+    local dir = hidden_prefetch and self.store:prefetch_root(book.bookId) or self.store:epub_root()
     local partial_range = not standalone and opt.range_start_index ~= nil and opt.range_end_index ~= nil
     local access_scope=tostring(opt.access_scope or "full")
     local storage_kind=partial_range and ("range_"..kind)
         or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind)
     local existing_record
-    if standalone then existing_record=self.store:chapter_variant(book.bookId,opt.chapter_uid,storage_kind)
+    if standalone then
+        existing_record=hidden_prefetch and self.store:hidden_prefetch_record(book.bookId,opt.chapter_uid,storage_kind)
+            or self.store:chapter_variant(book.bookId,opt.chapter_uid,storage_kind)
     else existing_record=self.store:variant(book.bookId,storage_kind) end
 
     local chapter_name = standalone and (" - " .. U.safe_name(chapters[1] and chapters[1].title or "章节")) or ""
@@ -859,8 +844,9 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         elseif preview_mode=="partial" then preview_name="【试读版·部分内容】"
         else preview_name="【试读版】" end
     end
-    local filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name.." ["..suffix.."].epub"
-    local path=self.store:epub_path(filename)
+    local formal_filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name.." ["..suffix.."].epub"
+    local filename=hidden_prefetch and (U.id_name(opt.chapter_uid).."-"..storage_kind..".epub") or formal_filename
+    local path=hidden_prefetch and self.store:hidden_prefetch_path(book.bookId,opt.chapter_uid,storage_kind) or self.store:epub_path(filename)
     -- Keep the exact path of an existing variant. KOReader sidecar notes are
     -- associated with the document path, so a title or filename change must not
     -- silently create a second EPUB and leave the old .sdr behind.
@@ -869,7 +855,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         path=recorded_path
         filename=recorded_path:match("([^/]+)$") or filename
     end
-    if U.file_exists(path) then
+    if U.file_exists(path) and not hidden_prefetch then
         local identity=type(self.store.epub_identity)=="function" and self.store:epub_identity(path) or nil
         local same_identity=type(identity)=="table"
             and tostring(identity.book_id or "")==tostring(book.bookId)
@@ -997,10 +983,12 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
         range_end_title=opt.range_end_title,content_type="book",
-        sync_enabled=not partial_range,read_report_enabled=not partial_range,
+        sync_enabled=true,progress_sync_enabled=true,read_report_enabled=not partial_range,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
         title_transform_version=tonumber(opt.title_transform_version) or TITLE_TRANSFORM_VERSION,
-        access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or 0,
+        catalog_complete=opt.catalog_complete==true,
+        local_chapter_count=tonumber(opt.local_chapter_count) or #chapters,
         readable_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_count=tonumber(opt.restricted_chapter_count) or 0,
         preview_mode=access_scope=="preview" and preview_mode or nil,
@@ -1080,13 +1068,16 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         file=path, directory=dir, variant=storage_kind, base_variant=kind, downloaded_at=now,
         content_type="book",
-        sync_enabled=not partial_range,
+        sync_enabled=true,
+        progress_sync_enabled=true,
         read_report_enabled=not partial_range,
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
         range_end_title=opt.range_end_title,
         chapter_count=#chapters, expected_chapter_count=expected_chapter_count,
-        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or expected_chapter_count,
+        local_chapter_count=tonumber(opt.local_chapter_count) or #chapters,
+        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or 0,
+        catalog_complete=opt.catalog_complete==true,
         readable_chapter_count=tonumber(opt.readable_chapter_count) or #chapters,
         restricted_chapter_count=tonumber(opt.restricted_chapter_count) or 0,
         failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
@@ -1110,17 +1101,30 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
         image_transform_version=IMAGE_TRANSFORM_VERSION,
         content_transform_version=CONTENT_TRANSFORM_VERSION,
+        prefetch_hidden=hidden_prefetch or nil,
+        prefetch_origin=hidden_prefetch and "auto_next" or nil,
+        prefetch_at=hidden_prefetch and now or nil,
+        prefetch_source_uid=hidden_prefetch and tostring(opt.prefetch_source_uid or "") or nil,
+        prefetch_target_title=hidden_prefetch and tostring(opt.prefetch_target_title or chapters[1] and chapters[1].title or "") or nil,
+        promote_target=hidden_prefetch and self.store:epub_path(formal_filename) or nil,
+        promote_filename=hidden_prefetch and formal_filename or nil,
     }
     if standalone then
         record.chapter_uid = tostring(opt.chapter_uid)
-        self.store:save_chapter_variant(book.bookId, opt.chapter_uid, storage_kind, record)
+        if hidden_prefetch then
+            self.store:save_hidden_prefetch(book.bookId,opt.chapter_uid,storage_kind,record)
+        else
+            self.store:save_chapter_variant(book.bookId, opt.chapter_uid, storage_kind, record)
+        end
     else
         self.store:save_variant(book.bookId, storage_kind, record)
     end
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         version=tonumber(book.version),
-        directory=dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
+        directory=hidden_prefetch and self.store:epub_root() or dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
+        catalog_chapter_count=tonumber(opt.catalog_chapter_count) or 0,
+        catalog_complete=opt.catalog_complete==true,
         core_catalog_hash=BookIntegrity.core_map_hash(book.bookId,
             type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,{}),
         content_type="book",
@@ -1488,7 +1492,7 @@ function Downloader:book(input, opt, progress)
 
         if current.auth_required==true then
             error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
-                or "登录状态已失效 [MiuReadAuth]")
+                or "登录凭证仍不可用 [MiuReadAuth]")
         end
         if current.rate_limited==true then
             annotation_suspended=true
@@ -1837,6 +1841,12 @@ function Downloader:book(input, opt, progress)
             -- ranges are interpreted only against this immutable chapter body.
             coord_body = type(state) == "table" and tostring(state.coord_html or "") or ""
             if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
+            local cached_source, cache_error = SourcePosition.cacheChapter(
+                self.reader, book.bookId, uid, book.version or 0, coord_body)
+            if not cached_source then
+                logger.warn("[MiuRead][ProgressSource] download cache seed failed",
+                    "book=",tostring(book.bookId),"chapter=",uid,"reason=",tostring(cache_error or "unknown"))
+            end
             local body_count
             body,body_count = Codec.body_fragment(downloaded)
             local body_valid,body_error=validate_body_fragment(body)
@@ -2146,7 +2156,14 @@ function Downloader:book(input, opt, progress)
             or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
     })
     opt.expected_chapter_count = accessible_expected
-    opt.catalog_chapter_count = expected
+    -- beta.18: `expected` is the number of chapters selected for this local
+    -- EPUB, not the size of the whole WeRead catalog. Keep these two counts
+    -- separate; otherwise a standalone chapter can make a one-row catalog look
+    -- complete and its chapter percentage gets misreported as whole-book progress.
+    local full_catalog_count = type(opt.full_catalog_map)=="table" and #opt.full_catalog_map or 0
+    opt.catalog_chapter_count = full_catalog_count
+    opt.catalog_complete = full_catalog_count > 0
+    opt.local_chapter_count = readable_count
     opt.readable_chapter_count = readable_count
     opt.restricted_chapter_count = restricted_count
     opt.failed_chapter_count = #failures

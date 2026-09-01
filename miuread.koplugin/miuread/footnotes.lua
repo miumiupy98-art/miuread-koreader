@@ -252,33 +252,33 @@ local function split_href(href)
     return file or "", anchor
 end
 
-local function extract_anchor_text(html, anchor)
+--- 从 id/name 锚点提取脚注正文（优先取 enclosing block 全文）。
+-- @string html 全文章节 XHTML
+-- @string anchor 锚点 id
+-- @string|nil enclosing_block 锚点所在注块原文；由 index_anchors 一次性收集，
+--   传入时直接取块内文本，避免对整篇文档逐标签 gmatch 重复扫描。
+local function extract_anchor_text(html, anchor, enclosing_block)
     if type(html) ~= "string" or anchor == nil or anchor == "" then return nil end
-    local tags = { "aside", "li", "p", "div", "section", "blockquote", "dd", "td" }
-    for _, tag in ipairs(tags) do
-        local pattern = "<" .. tag .. "([^>]*)>(.-)</" .. tag .. "%s*>"
-        for attrs, inner in html:gmatch(pattern) do
-            if get_attr(attrs, "id") == anchor or get_attr(attrs, "name") == anchor then
-                local content=note_content(inner)
-                content.text=cleanup_footnote_text(content.text)
-                if content.text~="" and not is_trivial_footnote_text(content) then return content end
-            end
-        end
-        local upper = tag:upper()
-        if upper ~= tag then
-            local upattern = "<" .. upper .. "([^>]*)>(.-)</" .. upper .. "%s*>"
-            for attrs, inner in html:gmatch(upattern) do
-                if get_attr(attrs, "id") == anchor or get_attr(attrs, "name") == anchor then
-                    local content=note_content(inner)
-                    content.text=cleanup_footnote_text(content.text)
-                    if content.text~="" and not is_trivial_footnote_text(content) then return content end
-                end
-            end
-        end
+
+    if type(enclosing_block) == "string" and enclosing_block ~= "" then
+        local content=note_content(enclosing_block)
+        content.text=cleanup_footnote_text(content.text)
+        if content.text~="" and not is_trivial_footnote_text(content) then return content end
     end
 
     -- Some books place an empty named anchor immediately before the note paragraph.
+    -- 注块总是紧邻锚点（同元素内，或紧随其后的兄弟块），故只在锚点周围的
+    -- 窗口子串内做模式匹配：window:match 把 .- 回溯与模式搜索都限制在窗口内，
+    -- 避免锚点不在注块时 .- 一路回溯到文档尾（脚注密集章节放大到每章数十秒）。
+    -- 窗口足够覆盖紧邻兄弟块；命中结果与全文档匹配一致。
     local escaped = escape_pattern(anchor)
+    local id_pos = html:find('id="' .. anchor .. '"', 1, true)
+        or html:find('name="' .. anchor .. '"', 1, true)
+        or html:find("id='" .. anchor .. "'", 1, true)
+        or html:find("name='" .. anchor .. "'", 1, true)
+    local from = id_pos and math.max(1, id_pos - 4096) or 1
+    local to = id_pos and math.min(#html, id_pos + 4096) or #html
+    local window = html:sub(from, to)
     local patterns = {
         '<[aA][^>]-id="' .. escaped .. '"[^>]*>%s*</[aA]>%s*<[pP][^>]*>(.-)</[pP]>',
         "<[aA][^>]-id='" .. escaped .. "'[^>]*>%s*</[aA]>%s*<[pP][^>]*>(.-)</[pP]>",
@@ -294,7 +294,7 @@ local function extract_anchor_text(html, anchor)
         "<[aA][^>]-name='" .. escaped .. "'[^>]*>(.-)</[aA]>",
     }
     for _, pattern in ipairs(patterns) do
-        local block = html:match(pattern)
+        local block = window:match(pattern)
         if block then
             local content=note_content(block)
             content.text=cleanup_footnote_text(content.text)
@@ -330,11 +330,33 @@ end
 function Footnotes.index_anchors(html)
     local map, seen = {}, {}
     if type(html) ~= "string" or html == "" then return map end
+
+    -- 一次性 O(n) 收集注块 id -> 块原文（aside/li/p/div/.../td 任一容器标签）。
+    -- 原实现逐 anchor 对整篇文档重复 gmatch：脚注锚点数 × 文档长度，在脚注
+    -- 密集章节会放大到每章数秒~数十秒。预收集后每个锚点 O(1) 命中所属注块。
+    local block_of_id = {}
+    local tags = { "aside", "li", "p", "div", "section", "blockquote", "dd", "td" }
+    for _, tag in ipairs(tags) do
+        local pattern = "<" .. tag .. "([^>]*)>(.-)</" .. tag .. "%s*>"
+        for attrs, inner in html:gmatch(pattern) do
+            local id = get_attr(attrs, "id") or get_attr(attrs, "name")
+            if id and id ~= "" and not block_of_id[id] then block_of_id[id] = inner end
+        end
+        local upper = tag:upper()
+        if upper ~= tag then
+            local upattern = "<" .. upper .. "([^>]*)>(.-)</" .. upper .. "%s*>"
+            for attrs, inner in html:gmatch(upattern) do
+                local id = get_attr(attrs, "id") or get_attr(attrs, "name")
+                if id and id ~= "" and not block_of_id[id] then block_of_id[id] = inner end
+            end
+        end
+    end
+
     for tag in html:gmatch("<[%a][^>]*>") do
         local anchor = get_attr(tag, "id") or get_attr(tag, "name")
         if anchor and anchor ~= "" and not seen[anchor] then
             seen[anchor] = true
-            local text = extract_anchor_text(html, anchor)
+            local text = extract_anchor_text(html, anchor, block_of_id[anchor])
             if text and text ~= "" then map[anchor] = text end
         end
     end

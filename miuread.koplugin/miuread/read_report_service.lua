@@ -155,6 +155,7 @@ function Service.run(job)
     local consecutive_unconfirmed = 0
     local blocked = false
     local carry_remaining = 0
+    local progress_fence_seq = 0
 
     local function reader_busy_until()
         if reader_busy_path == "" then return 0 end
@@ -168,6 +169,7 @@ function Service.run(job)
         if value.generation==nil then value.generation=generation end
         if value.controller_token==nil then value.controller_token=tostring(source_job.controller_token or "") end
         if value.login_session_id==nil then value.login_session_id=tostring(source_job.login_session_id or "") end
+        if value.auth_revision==nil then value.auth_revision=math.max(0,tonumber(source_job.auth_revision or 0) or 0) end
         if value.account_vid==nil then value.account_vid=tostring(source_job.account_vid or "") end
         if value.book_id==nil then value.book_id=tostring(source_job.book_id or "") end
         if value.core_map_hash==nil then value.core_map_hash=tostring(source_job.core_map_hash or "") end
@@ -181,6 +183,7 @@ function Service.run(job)
             generation=generation,
             controller_token=tostring(current_job.controller_token or ""),
             login_session_id=tostring(current_job.login_session_id or ""),
+            auth_revision=math.max(0,tonumber(current_job.auth_revision or 0) or 0),
             account_vid=tostring(current_job.account_vid or ""),
             book_id=tostring(current_job.book_id or ""),
             core_map_hash=tostring(current_job.core_map_hash or ""),
@@ -197,6 +200,7 @@ function Service.run(job)
         -- flag for compatibility with older job files, but never make periodic
         -- reporting depend on foreground position calculation.
         local time_only=current_job.time_only==true or control.time_only==true
+        local report_mode=tostring(current_job.report_mode or (time_only and "reading_time_compat" or "progress"))
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
             or tonumber(control.record_generation or -1)~=tonumber(current_job.record_generation or 0)
@@ -244,6 +248,15 @@ function Service.run(job)
             core_map_hash=tostring(current_job.core_map_hash or ""),
             progress_ratio = time_only and nil or (tonumber(control.progress_ratio) or 0),
             time_only = time_only,
+            report_mode = report_mode,
+            cloud_anchor = time_only and {
+                chapter_uid=control.cloud_anchor_chapter_uid,
+                chapter_idx=control.cloud_anchor_chapter_idx,
+                chapter_offset=control.cloud_anchor_chapter_offset,
+                protocol_progress=control.cloud_anchor_progress,
+                raw_progress=control.cloud_anchor_raw_progress,
+                source=control.cloud_anchor_source,
+            } or nil,
             elapsed_seconds = elapsed,
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
@@ -260,12 +273,15 @@ function Service.run(job)
         write_service_status({
             generation=generation,seq=sequence,state="reporting",accepted=nil,
             attempted_at=attempted_at,elapsed_seconds=elapsed,final_flush=final_flush==true,
-            flush_reason=reason,time_only=time_only,next_due=0,
+            flush_reason=reason,time_only=time_only,report_mode=report_mode,next_due=0,
             writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
         })
         local ok, result = pcall(Adapter.run, report_job)
         local completed_at = os.time()
-        last_report_at = completed_at
+        -- The elapsed segment ends when the request is dispatched, not when
+        -- the HTTP response returns. Reading continues while the request is in
+        -- flight, so that network time belongs to the next fresh segment.
+        last_report_at = attempted_at
 
         if ok and type(result) == "table" then
             -- A candidate context only becomes authoritative after WeRead
@@ -282,6 +298,7 @@ function Service.run(job)
 
             local out = public_result(result)
             out.time_only=time_only
+            out.report_mode=report_mode
             out.writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
@@ -327,7 +344,16 @@ function Service.run(job)
                 delay=math.min(delay,10)
             end
             out.retry_delay = delay
-            out.next_due = final_flush and 0 or (completed_at + delay)
+            if final_flush then
+                out.next_due=0
+            elseif result.accepted or uncertain then
+                -- Keep the 60 s cadence anchored to the segment boundary. A
+                -- slow HTTP response must not silently erase several seconds
+                -- from every reading interval.
+                out.next_due=math.max(completed_at,attempted_at+delay)
+            else
+                out.next_due=completed_at+delay
+            end
             out.book_id = tostring(current_job.book_id or "")
             out.core_map_hash=tostring(current_job.core_map_hash or "")
             out.record_generation=tonumber(current_job.record_generation or 0) or 0
@@ -361,6 +387,7 @@ function Service.run(job)
             recovery_probe = false,
             final_flush = final_flush == true,
             flush_reason = reason,
+            report_mode = report_mode,
             next_due = due,
             book_id = tostring(current_job.book_id or ""),
             core_map_hash=tostring(current_job.core_map_hash or ""),
@@ -388,12 +415,25 @@ function Service.run(job)
             if loaded and tonumber(loaded.generation or 0) == requested
                 and tostring(control.controller_token or "")==tostring(loaded.controller_token or "")
                 and tostring(control.login_session_id or "")==tostring(loaded.login_session_id or "")
+                and math.max(0,tonumber(control.auth_revision or 0) or 0)==math.max(0,tonumber(loaded.auth_revision or 0) or 0)
                 and tostring(control.account_vid or "")==tostring(loaded.account_vid or "")
                 and (tostring(loaded.action or "")=="reset_auth" or (
                     tostring(control.book_id or "")==tostring(loaded.book_id or "")
                     and tostring(control.core_map_hash or "")~=""
                     and tostring(control.core_map_hash or "")==tostring(loaded.core_map_hash or "")
                     and tonumber(control.record_generation or -1)==tonumber(loaded.record_generation or 0))) then
+                local previous_job=current_job
+                local previous_next_due=next_due
+                local previous_last_report_at=last_report_at
+                local preserve_clock=previous_job~=nil
+                    and tostring(loaded.action or "")~="reset_auth"
+                    and tostring(loaded.reading_time_session_id or "")~=""
+                    and tostring(loaded.reading_time_session_id or "")==tostring(previous_job.reading_time_session_id or "")
+                    and tostring(loaded.reading_time_segment_id or "")~=""
+                    and tostring(loaded.reading_time_segment_id or "")==tostring(previous_job.reading_time_segment_id or "")
+                    and tostring(loaded.book_id or "")==tostring(previous_job.book_id or "")
+                    and tostring(loaded.book_path or "")==tostring(previous_job.book_path or "")
+                    and tostring(loaded.core_map_hash or "")==tostring(previous_job.core_map_hash or "")
                 generation = requested
                 current_job = loaded
                 last_flush_seq = 0
@@ -418,10 +458,20 @@ function Service.run(job)
                     local interval = math.max(10, tonumber(loaded.interval) or tonumber(Config.READ_INTERVAL) or 60)
                     local first_delay = math.max(5, math.min(interval, tonumber(loaded.first_delay) or interval))
                     local now = os.time()
-                    -- Historical suspend debt is intentionally not replayed.
                     carry_remaining=0
-                    next_due = now + first_delay
-                    last_report_at = now
+                    if preserve_clock then
+                        -- Authentication/session metadata can refresh while the
+                        -- same reading segment is active. Replace credentials,
+                        -- but never restart the 15/60 s clock.
+                        last_report_at=previous_last_report_at>0 and previous_last_report_at or now
+                        next_due=previous_next_due>0 and previous_next_due or (now+first_delay)
+                    else
+                        -- A real new reading segment (new book or resume after
+                        -- suspend) starts a fresh clock; suspended time is never
+                        -- counted or replayed.
+                        next_due = now + first_delay
+                        last_report_at = now
+                    end
                     write_context()
                     write_service_status({
                         generation = generation,
@@ -429,6 +479,9 @@ function Service.run(job)
                         state = "waiting",
                         next_due = next_due,
                         first_delay = first_delay,
+                        clock_preserved = preserve_clock or nil,
+                        reading_time_session_id=tostring(loaded.reading_time_session_id or ""),
+                        reading_time_segment_id=tostring(loaded.reading_time_segment_id or ""),
                         carry_elapsed = 0,
                         carry_consumed = false,
                         carry_remaining = carry_remaining,
@@ -441,6 +494,7 @@ function Service.run(job)
         if current_job and control and tonumber(control.generation or 0) == generation
             and tostring(control.controller_token or "") == tostring(current_job.controller_token or "")
             and tostring(control.login_session_id or "") == tostring(current_job.login_session_id or "")
+            and math.max(0,tonumber(control.auth_revision or 0) or 0)==math.max(0,tonumber(current_job.auth_revision or 0) or 0)
             and tostring(control.account_vid or "") == tostring(current_job.account_vid or "")
             and tostring(control.book_id or "") == tostring(current_job.book_id or "")
             and tostring(control.core_map_hash or "") ~= ""
@@ -475,10 +529,31 @@ function Service.run(job)
                 end
             end
 
-            if pending_flush then
+            local requested_fence_seq=tonumber(control.writer_barrier_seq or 0) or 0
+            if control.progress_fence==true then
+                -- Progress writes and reading-time writes share /web/book/read.
+                -- A fence is acknowledged only after any in-flight report has
+                -- returned to this loop, so foreground progress can safely write.
+                if progress_fence_seq~=requested_fence_seq then
+                    progress_fence_seq=requested_fence_seq
+                    write_service_status({
+                        generation=generation,seq=sequence,state="progress_fenced",
+                        book_id=tostring(current_job.book_id or ""),next_due=next_due,
+                        writer_barrier_seq=requested_fence_seq,
+                        writer_barrier_reason=tostring(control.writer_barrier_reason or "progress_write_fence"),
+                    })
+                end
+            elseif pending_flush then
+                progress_fence_seq=0
                 last_flush_seq = flush_seq
                 local now = os.time()
-                local elapsed = math.floor(tonumber(control.flush_elapsed) or math.max(0, now - last_report_at))
+                local elapsed
+                if control.flush_auto==true then
+                    elapsed=math.max(0,now-last_report_at)
+                else
+                    elapsed=tonumber(control.flush_elapsed) or math.max(0,now-last_report_at)
+                end
+                elapsed=math.floor(math.max(0,elapsed))
                 if elapsed >= MIN_FINAL_SECONDS then
                     next_due = run_report(control, elapsed, true, tostring(control.flush_reason or "stop"))
                 else
@@ -498,6 +573,7 @@ function Service.run(job)
                     })
                 end
             elseif active and not blocked then
+                progress_fence_seq=0
                 local now = os.time()
                 local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
                 local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
@@ -505,11 +581,9 @@ function Service.run(job)
                 local idle = now - last_activity
 
                 if now >= next_due then
-                    local busy_until = reader_busy_until()
+                    local time_only=current_job.time_only==true or control.time_only==true
+                    local busy_until=time_only and 0 or reader_busy_until()
                     if busy_until > now then
-                        -- Never start a normal interval upload while the user is
-                        -- actively paging or opening a reader panel. Final
-                        -- suspend/close flushes above are intentionally exempt.
                         next_due = math.max(next_due, busy_until + 1)
                     elseif idle <= idle_timeout then
                         local elapsed = math.max(1, now - last_report_at)

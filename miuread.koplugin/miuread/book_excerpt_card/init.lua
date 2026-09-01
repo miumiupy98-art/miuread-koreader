@@ -70,5 +70,7 @@ BookExcerptCard.renderBB = Render.renderBB
 -- 暴露给调用方/测试的辅助
 BookExcerptCard.footerBrandText = Device.footerBrandText
 BookExcerptCard.backgroundImagePath = Assets.backgroundImagePath
+BookExcerptCard.getStillnessHeadBB = Assets.getStillnessHeadBB
+BookExcerptCard.clearStillnessHeadCache = Assets.clearStillnessHeadCache
 
 return BookExcerptCard

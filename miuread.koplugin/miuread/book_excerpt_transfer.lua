@@ -6,6 +6,7 @@
 保活，不参与下载/同步任务；调用 stop() 后监听地址立即失效。
 --]]--
 
+local Device = require("device")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local U = require("miuread.util")
@@ -25,6 +26,65 @@ end
 
 local function close_socket(sock)
     if sock then pcall(sock.close, sock) end
+end
+
+local function is_kindle()
+    local fn = Device and Device.isKindle
+    if type(fn) ~= "function" then return false end
+    local ok, yes = pcall(fn, Device)
+    return ok and yes == true
+end
+
+local function shell_ok(command)
+    local ok, a, _, code = pcall(os.execute, command)
+    if not ok then return false, tostring(a or "execute failed") end
+    if a == true then return code == nil or tonumber(code) == 0, tostring(code or "") end
+    if type(a) == "number" then return a == 0, tostring(a) end
+    return false, tostring(a or "unknown")
+end
+
+local function kindle_firewall_rule(action, direction, port)
+    port = tonumber(port)
+    if not port or port < 1 or port > 65535 then return false, "invalid port" end
+    local command
+    if direction == "INPUT" then
+        command = string.format(
+            "iptables -%s INPUT -p tcp --dport %d -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT",
+            action, port)
+    else
+        command = string.format(
+            "iptables -%s OUTPUT -p tcp --sport %d -m conntrack --ctstate ESTABLISHED -j ACCEPT",
+            action, port)
+    end
+    return shell_ok(command)
+end
+
+local function open_kindle_firewall(port)
+    if not is_kindle() then return true, false end
+    local input_ok, input_err = kindle_firewall_rule("A", "INPUT", port)
+    if not input_ok then
+        logger.warn("[MiuRead][BookExcerpt] Kindle firewall open failed",
+            "direction=INPUT", "port=", tostring(port), "error=", tostring(input_err or ""))
+        return false, "INPUT"
+    end
+    local output_ok, output_err = kindle_firewall_rule("A", "OUTPUT", port)
+    if not output_ok then
+        kindle_firewall_rule("D", "INPUT", port)
+        logger.warn("[MiuRead][BookExcerpt] Kindle firewall open failed",
+            "direction=OUTPUT", "port=", tostring(port), "error=", tostring(output_err or ""))
+        return false, "OUTPUT"
+    end
+    logger.info("[MiuRead][BookExcerpt] Kindle firewall opened", "port=", tostring(port))
+    return true, true
+end
+
+local function close_kindle_firewall(port, opened)
+    if not opened or not is_kindle() then return true end
+    local input_ok = kindle_firewall_rule("D", "INPUT", port)
+    local output_ok = kindle_firewall_rule("D", "OUTPUT", port)
+    logger.info("[MiuRead][BookExcerpt] Kindle firewall closed",
+        "port=", tostring(port), "input=", tostring(input_ok), "output=", tostring(output_ok))
+    return input_ok and output_ok
 end
 
 local function read_file(path)
@@ -192,6 +252,8 @@ local function parse_request(state, client)
     path = tostring(path or ""):match("^[^?]+") or ""
     local base = "/" .. state.token
     if path == base or path == base .. "/" then
+        logger.info("[MiuRead][BookExcerpt] phone request", "resource=page",
+            "peer=", tostring(client.peer_ip or "unknown"))
         local body = state.html
         if head_only then
             client.chunks = {response_header("200 OK", "text/html; charset=utf-8", #body)}
@@ -202,6 +264,8 @@ local function parse_request(state, client)
         return
     end
     if path == base .. "/card.png" then
+        logger.info("[MiuRead][BookExcerpt] phone request", "resource=card",
+            "peer=", tostring(client.peer_ip or "unknown"), "method=", tostring(method or ""))
         if head_only then
             client.chunks = {response_header("200 OK", "image/png", #state.image, {
                 'Content-Disposition: inline; filename="book-excerpt.png"',
@@ -216,6 +280,8 @@ local function parse_request(state, client)
         client.card_fetch = true
         return
     end
+    logger.info("[MiuRead][BookExcerpt] phone request", "resource=not_found",
+        "peer=", tostring(client.peer_ip or "unknown"))
     queue_response(client, "404 Not Found", "text/plain; charset=utf-8", "Not found")
 end
 
@@ -247,7 +313,8 @@ local function send_response(state, client)
         if not chunk then
             if client.card_fetch and not state.download_seen then
                 state.download_seen = true
-                logger.info("[MiuRead][BookExcerpt] phone fetched card")
+                logger.info("[MiuRead][BookExcerpt] phone fetched card",
+                    "peer=", tostring(client.peer_ip or "unknown"), "bytes=", tostring(#state.image))
                 if type(state.on_download) == "function" then pcall(state.on_download) end
             end
             client.closed = true
@@ -294,20 +361,31 @@ local function poll(state, expected_generation)
         local client_sock = state.server:accept()
         if not client_sock then break end
         client_sock:settimeout(0)
+        local peer_ip, peer_port
+        local peer_ok, a, b = pcall(client_sock.getpeername, client_sock)
+        if peer_ok then peer_ip, peer_port = a, b end
+        logger.info("[MiuRead][BookExcerpt] phone connected",
+            "peer=", tostring(peer_ip or "unknown"), "port=", tostring(peer_port or ""))
         state.clients[#state.clients + 1] = {
             sock = client_sock,
             inbuf = "",
             chunks = nil,
             chunk_index = 1,
             chunk_pos = 1,
-            deadline = now() + 12,
+            deadline = now() + 30,
+            peer_ip = peer_ip,
+            peer_port = peer_port,
             closed = false,
         }
     end
 
     for index = #state.clients, 1, -1 do
         local client = state.clients[index]
-        if now() > client.deadline then client.closed = true end
+        if now() > client.deadline then
+            logger.warn("[MiuRead][BookExcerpt] phone connection timed out",
+                "peer=", tostring(client.peer_ip or "unknown"))
+            client.closed = true
+        end
         if not client.closed then receive_request(state, client) end
         if not client.closed then send_response(state, client) end
         if client.closed then drop_client(state, index) end
@@ -327,7 +405,9 @@ function M.stop(reason)
     if state.poll_task then pcall(UIManager.unschedule, UIManager, state.poll_task) end
     for index = #state.clients, 1, -1 do drop_client(state, index) end
     close_socket(state.server)
-    logger.info("[MiuRead][BookExcerpt] local transfer stopped", tostring(reason or "closed"))
+    close_kindle_firewall(state.port, state.kindle_firewall_open == true)
+    logger.info("[MiuRead][BookExcerpt] local transfer stopped", tostring(reason or "closed"),
+        "download_seen=", tostring(state.download_seen == true))
     return true
 end
 
@@ -363,6 +443,12 @@ function M.start(opts)
         return nil, "无法取得临时传输端口"
     end
 
+    local firewall_ok, firewall_open = open_kindle_firewall(port)
+    if not firewall_ok then
+        close_socket(server)
+        return nil, "Kindle 无法临时开放手机访问端口，请保留日志后重试"
+    end
+
     generation = generation + 1
     local token = random_token(26)
     local state = {
@@ -375,6 +461,7 @@ function M.start(opts)
         title = U.trim(tostring(opts.title or "")),
         on_download = opts.on_download,
         download_seen = false,
+        kindle_firewall_open = firewall_open == true,
     }
     state.url = string.format("http://%s:%d/%s", ip, port, token)
     state.html = html_page(state)

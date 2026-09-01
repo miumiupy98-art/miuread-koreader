@@ -142,7 +142,7 @@ function SliderBox:_set_from_position(ges, force)
     local accepted = true
     local actual = target
     if self.on_change then
-        local ok, result = pcall(self.on_change, target)
+        local ok, result = pcall(self.on_change, target, force and "commit" or "drag")
         if not ok then
             logger.warn("[MiuRead][ReaderFrontlightDialog] slider action failed", tostring(result))
             accepted = false

@@ -1,6 +1,5 @@
 local Device = require("device")
 local logger = require("logger")
-local lfs = require("libs/libkoreader-lfs")
 
 local M = {}
 
@@ -21,10 +20,6 @@ if type(cache) ~= "table" then
 end
 
 local KINDLE_SERVICE = "com.lab126.btfd"
-
-local function is_file(path)
-    return lfs.attributes(path, "mode") == "file"
-end
 
 local function shell_quote(value)
     value = tostring(value or "")

@@ -220,7 +220,7 @@ local function placeholder(width, height, title, author)
             face = face("smallinfofont", 7.8, 10.8),
             width = math.max(1, content_w - UiScale.dp(4, 3, 7)), height = author_h,
             height_adjust = false, height_overflow_show_ellipsis = true, alignment = "center",
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = Blitbuffer.COLOR_BLACK,
         }
     end
     return fixed_frame(width, height, {
@@ -300,97 +300,174 @@ local function notice_strip(item, width, height)
     }, row), item.on_tap)
 end
 
-local function hero_card(book, width, height, callback, compact, hold_callback)
-    -- Draw the border inside the card's refresh rectangle. A line exactly on
-    -- the outer edge is clipped on a few Kindle/Kobo framebuffer paths.
-    local frame_inset = math.max(1, UiScale.dp(2, 2, 3))
+local function home_card_outer_inset()
+    return math.max(1, UiScale.dp(2, 2, 3))
+end
+
+local function hero_card(book, width, height, callback, compact, hold_callback, shelf_cover_w, shelf_cover_h)
+    local frame_inset = home_card_outer_inset()
     local frame_w = math.max(1, width - frame_inset * 2)
     local frame_h = math.max(1, height - frame_inset * 2)
-    local pad = math.max(UiScale.dp(7, 6, 12), math.min(UiScale.dp(12, 10, 18), math.floor(math.min(frame_w, frame_h) * .030)))
+    local mini = width < Screen:getWidth() * .62
+    local pad = math.max(UiScale.dp(7, 6, 12), math.min(UiScale.dp(11, 9, 16), math.floor(math.min(frame_w, frame_h) * .027)))
     local inner_w = math.max(1, frame_w - pad * 2)
     local inner_h = math.max(1, frame_h - pad * 2)
-    local cover_w = math.max(UiScale.dp(76, 64, 110), math.min(
-        math.floor(inner_w * (compact and .24 or .27)),
-        math.floor(inner_h * .82)
-    ))
-    local cover_h = math.max(UiScale.dp(108, 92, 155), math.min(inner_h, math.floor(cover_w / .68)))
-    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05) or placeholder(cover_w, cover_h, book.title, book.author)
-    local gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
-    local text_w = math.max(1, inner_w - cover_w - gap)
-    local heading_h = UiScale.dp(22, 20, 30)
-    local refresh_w = book.on_refresh_metadata and math.max(UiScale.dp(28, 25, 40), heading_h) or 0
-    local heading_text_w = math.max(1, text_w - (refresh_w > 0 and refresh_w + UiScale.dp(3, 2, 5) or 0))
-    local title_h = UiScale.dp(compact and 44 or 54, compact and 40 or 48, compact and 64 or 76)
-    local line_h = UiScale.dp(27, 23, 36)
-    local description_h = math.max(UiScale.dp(52, 44, 78), inner_h - heading_h - title_h - line_h * 3)
-    local progress_value = math.max(0, math.min(100, tonumber(book.progress) or 0))
-    local progress_text = progress_value > 0
-        and ("阅读至 " .. tostring(math.floor(progress_value + .5)) .. "%")
-        or "尚未开始"
-    if book.last_read_text and tostring(book.last_read_text) ~= "" then
-        progress_text = progress_text .. " · " .. tostring(book.last_read_text)
+
+    -- beta.24: the title owns a real two-line slot and the recent-reading
+    -- cover uses the visible shelf cover as its minimum target.  This avoids
+    -- the old situation where the hero cover could still look smaller than a
+    -- normal bookshelf cover on some Kindle geometries.
+    local section_gap = UiScale.dp(4, 3, 6)
+    local title_face = face("cfont", mini and 13.0 or (compact and 13.8 or 14.6),
+        mini and 17.4 or (compact and 18.6 or 19.6), mini and 11.2 or 12.2)
+    local title_line_h = UiScale.dp(22, 19, 30)
+    if title_face and title_face.ftsize and type(title_face.ftsize.getHeightAndAscender) == "function" then
+        local ok, fh = pcall(title_face.ftsize.getHeightAndAscender, title_face.ftsize)
+        if ok and tonumber(fh) and tonumber(fh) > 0 then title_line_h = math.floor(tonumber(fh) + .5) end
     end
+    local title_h = math.max(UiScale.dp(38, 34, 52), title_line_h * 2 + UiScale.dp(2, 1, 3))
+    local progress_h = math.max(UiScale.dp(29, 26, 40), math.min(UiScale.dp(38, 33, 48), math.floor(inner_h * .11)))
+    local body_h = math.max(1, inner_h - title_h - progress_h - section_gap * 2)
+
+    local baseline_h = math.max(0, tonumber(shelf_cover_h) or 0)
+    local baseline_w = math.max(0, tonumber(shelf_cover_w) or 0)
+    local minimum_h = UiScale.dp(mini and 126 or 136, mini and 108 or 116, mini and 184 or 198)
+    local desired_h = math.max(minimum_h, baseline_h)
+    local cover_h = math.min(body_h, desired_h)
+    local width_cap = math.max(1, math.floor(inner_w * (mini and .50 or .46)))
+    local desired_w = math.max(baseline_w, math.floor(cover_h * .715))
+    local cover_w = math.min(width_cap, desired_w)
+    -- Keep the same cover-box aspect rule as the shelf.  If width is the
+    -- limiting factor, shrink height rather than squeezing the artwork.
+    if cover_w < math.floor(cover_h * .715) then
+        cover_h = math.min(body_h, math.max(1, math.floor(cover_w / .715)))
+    else
+        cover_w = math.min(width_cap, math.max(1, math.floor(cover_h * .715)))
+    end
+    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05)
+        or placeholder(cover_w, cover_h, book.title, book.author)
+    local gap = math.max(UiScale.dp(8, 6, 13), math.floor(width * .018))
+    local text_w = math.max(1, inner_w - cover_w - gap)
+    local history_h = UiScale.dp(22, 20, 30)
+    local history_w = book.on_history and math.max(UiScale.dp(52, 46, 72), math.floor(text_w * .31)) or 0
+
     local author = U.trim(tostring(book.author or ""))
-    local source = U.trim(tostring(book.source_text or ""))
     local category = U.trim(tostring(book.category or ""))
     local publisher = U.trim(tostring(book.publisher or ""))
-    local published_date = U.trim(tostring(book.published_date or book.publish_date or ""))
-    published_date = published_date:match("^(%d%d%d%d)") or published_date
-    local meta = {}
-    for _, value in ipairs({author, category}) do
-        if value ~= "" then meta[#meta + 1] = value end
+    local published_date = U.trim(tostring(book.published_date or book.publishTime or ""))
+    local published_number = tonumber(published_date)
+    if published_number and published_number > 1000000000 then
+        if published_number > 100000000000 then published_number = published_number / 1000 end
+        local ok, year = pcall(os.date, "%Y", published_number)
+        published_date = ok and tostring(year or "") or ""
+    elseif published_date ~= "" then
+        published_date = U.utf8_truncate(published_date, 16, "…")
     end
-    local source_meta = {}
-    for _, value in ipairs({source, publisher, published_date}) do
-        if value ~= "" then source_meta[#source_meta + 1] = value end
-    end
-    local description = U.trim(tostring(book.description or book.intro or book.summary or ""))
-    if description == "" then
-        local substitutes = {}
-        for _, value in ipairs({book.translator, book.series, book.language}) do
-            value = U.trim(tostring(value or ""))
-            if value ~= "" then substitutes[#substitutes + 1] = value end
-        end
-        description = #substitutes > 0 and table.concat(substitutes, " · ") or "点击查看详情或继续阅读"
+    local format = U.trim(tostring(book.format or "")):upper()
+    local edition = U.trim(tostring(book.edition_text or ""))
+    local recent_line = U.trim(tostring(book.last_read_text or ""))
+
+    local source_line
+    if book.source == "local" or book.local_file == true then
+        source_line = "本地阅读"
+    elseif tostring(book.source or "") == "mp" then
+        source_line = "公众号"
+    else
+        source_line = "微信书架"
     end
 
-    local text = VerticalGroup:new{align = "left"}
-    table.insert(text, TextBoxWidget:new{
-        text = tostring(book.heading or "最近阅读"),
-        face = face("smallinfofont", 10.5, 15), bold = true,
-        width = heading_text_w, height = heading_h, height_adjust = false,
-        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    })
-    table.insert(text, TextBoxWidget:new{
+    local info_lines = {}
+    local function add_info(label, value)
+        value = U.trim(tostring(value or ""))
+        if value ~= "" then info_lines[#info_lines + 1] = tostring(label or "") .. value end
+    end
+    add_info("作者  ", author)
+    add_info("来源  ", source_line)
+    add_info("分类  ", category)
+    if publisher ~= "" then
+        local pub = publisher
+        if published_date ~= "" then pub = pub .. " · " .. published_date end
+        add_info("出版  ", pub)
+    elseif published_date ~= "" then
+        add_info("出版  ", published_date)
+    end
+    if edition ~= "" then
+        add_info("版本  ", edition)
+    elseif (book.source == "local" or book.local_file == true) and format ~= "" then
+        add_info("格式  ", format)
+    end
+    add_info("最近  ", recent_line)
+
+    -- History only owns the top-right corner.  It no longer wastes a whole
+    -- metadata row.  The first information line simply shortens around it;
+    -- every following line uses the full information width.
+    local info_h = body_h
+    local min_line_h = math.max(UiScale.dp(18, 16, 25), math.floor(body_h * .105))
+    local max_lines = math.max(1, math.floor(info_h / math.max(1, min_line_h)))
+    while #info_lines > max_lines do table.remove(info_lines, #info_lines - 1) end
+    local line_count = math.max(1, #info_lines)
+    local line_h = math.max(1, math.floor(info_h / line_count))
+    local info = OverlapGroup:new{dimen = Geom:new{w = text_w, h = info_h}, allow_mirroring = false}
+    if #info_lines == 0 then
+        info[#info + 1] = Widget:new{dimen = Geom:new{w = text_w, h = info_h}}
+    else
+        for index, value in ipairs(info_lines) do
+            local line_w = text_w
+            if index == 1 and history_w > 0 then
+                line_w = math.max(1, text_w - history_w - UiScale.dp(5, 4, 8))
+            end
+            info[#info + 1] = OffsetContainer:new{x_off = 0, y_off = (index - 1) * line_h, TextBoxWidget:new{
+                text = value,
+                face = face("smallinfofont", mini and 9.2 or 9.8, mini and 12.6 or 13.4, mini and 7.8 or 8.2),
+                bold = true,
+                width = line_w, height = line_h, height_adjust = false,
+                height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
+            }}
+        end
+    end
+
+    local title = TextBoxWidget:new{
         text = tostring(book.title or "未命名"),
-        face = face("cfont", compact and 17 or 19, compact and 22 or 25), bold = true,
-        width = text_w, height = title_h, height_adjust = false,
-        height_overflow_show_ellipsis = true,
-    })
-    table.insert(text, TextBoxWidget:new{
-        text = table.concat(meta, " · "),
-        face = face("smallinfofont", 10.5, 15),
-        width = text_w, height = line_h, height_adjust = false,
+        face = title_face,
+        bold = true,
+        width = inner_w, height = title_h, height_adjust = false,
         height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    })
-    table.insert(text, TextBoxWidget:new{
-        text = progress_text,
-        face = face("smallinfofont", 10.5, 15), bold = true,
-        width = text_w, height = line_h, height_adjust = false,
-        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    })
-    table.insert(text, TextBoxWidget:new{
-        text = table.concat(source_meta, " · "),
-        face = face("smallinfofont", 10, 14),
-        width = text_w, height = line_h, height_adjust = false,
-        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    })
-    table.insert(text, TextBoxWidget:new{
-        text = description,
-        face = face("smallinfofont", 11.5, 17),
-        width = text_w, height = description_h, height_adjust = false,
-        height_overflow_show_ellipsis = true, fgcolor = Blitbuffer.COLOR_BLACK,
-    })
+    }
+
+    local progress_value = math.max(0, math.min(100, tonumber(book.progress) or 0))
+    local progress_number = string.format("%.1f", progress_value):gsub("%.0$", "")
+    local progress_label = "阅读进度 " .. progress_number .. "%"
+    local progress_label_h = math.max(UiScale.dp(18, 16, 25), math.floor(progress_h * .52))
+    local progress_slot_h = math.max(1, progress_h - progress_label_h)
+    local progress_track_h = math.max(UiScale.line("thick"), UiScale.dp(3, 2, 5))
+    local progress_fill = math.max(0, math.min(inner_w, math.floor(inner_w * progress_value / 100 + .5)))
+    local progress_layers = OverlapGroup:new{dimen = Geom:new{w = inner_w, h = progress_slot_h}, allow_mirroring = false}
+    local bar_y = math.floor((progress_slot_h - progress_track_h) / 2)
+    progress_layers[#progress_layers + 1] = OffsetContainer:new{x_off = 0, y_off = bar_y, LineWidget:new{
+        background = Blitbuffer.COLOR_LIGHT_GRAY, dimen = Geom:new{w = inner_w, h = progress_track_h},
+    }}
+    if progress_fill > 0 then
+        progress_layers[#progress_layers + 1] = OffsetContainer:new{x_off = 0, y_off = bar_y, LineWidget:new{
+            background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = progress_fill, h = progress_track_h},
+        }}
+    end
+
+    local body = OverlapGroup:new{dimen = Geom:new{w = inner_w, h = inner_h}, allow_mirroring = false}
+    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = 0, HorizontalGroup:new{
+        align = "center",
+        CenterContainer:new{dimen = Geom:new{w = cover_w, h = body_h}, cover},
+        HorizontalSpan:new{width = gap},
+        CenterContainer:new{dimen = Geom:new{w = text_w, h = body_h}, info},
+    }}
+    local title_y = body_h + section_gap
+    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = title_y, title}
+    local progress_y = title_y + title_h + section_gap
+    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = progress_y, VerticalGroup:new{
+        align = "left",
+        Ui.textbox(progress_label, inner_w, progress_label_h,
+            face("smallinfofont", 9.6, 13.2, 8.2), {bold = true, alignment = "left", fgcolor = Blitbuffer.COLOR_BLACK}),
+        progress_layers,
+    }}
 
     local content = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
     content[#content + 1] = OffsetContainer:new{
@@ -402,29 +479,18 @@ local function hero_card(book, width, height, callback, compact, hold_callback)
             padding = pad,
             background = Blitbuffer.COLOR_WHITE,
             color = Blitbuffer.COLOR_DARK_GRAY,
-        }, HorizontalGroup:new{
-            align = "center",
-            cover,
-            HorizontalSpan:new{width = gap},
-            text,
-        }),
+        }, body),
     }
+
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
-    -- Paint the card once, then place small transparent input zones over it.
-    -- The refresh zone is registered before the full-card zone so tapping the
-    -- icon cannot accidentally open the book underneath.
     layers[#layers + 1] = content
-    if refresh_w > 0 then
-        local refresh_x = frame_inset + pad + cover_w + gap + math.max(0, text_w - refresh_w)
-        local refresh_y = frame_inset + pad
+    if history_w > 0 then
         layers[#layers + 1] = OffsetContainer:new{
-            x_off = refresh_x, y_off = refresh_y,
-            tappable(refresh_w, heading_h, Ui.icon("refresh", refresh_w, heading_h,
-                math.max(UiScale.dp(17, 15, 24), math.floor(heading_h * .72)), {
-                    face = UiScale.iconFace("cfont", 14, 19, 11),
-                }), function()
-                if book.on_refresh_metadata then book.on_refresh_metadata() end
-            end),
+            x_off = frame_inset + pad + cover_w + gap + math.max(0, text_w - history_w),
+            y_off = frame_inset + pad,
+            tappable(history_w, history_h,
+                Ui.text("历史 ›", history_w, history_h, face("smallinfofont", 9.8, 13.5), {bold = true, fgcolor = Blitbuffer.COLOR_BLACK}),
+                function() if book.on_history then book.on_history() end end),
         }
     end
     layers[#layers + 1] = tappable(width, height, Widget:new{dimen = Geom:new{w = width, h = height}}, callback, function(anchor)
@@ -457,33 +523,39 @@ local function welcome_card(width, height, callback)
 end
 
 local function shelf_folder_card(folder, width, height, callback)
-    local inner_w = math.max(1, width - UiScale.dp(8, 6, 12))
-    local icon_h = math.max(UiScale.dp(52, 44, 72), math.floor(height * .48))
-    local title_h = math.max(UiScale.dp(30, 26, 42), math.floor(height * .24))
-    local detail_h = math.max(UiScale.dp(20, 17, 28), height - icon_h - title_h - UiScale.dp(10, 8, 15))
+    -- A folder occupies exactly one normal book slot.  Its visual body uses the
+    -- same cover geometry as a book, so mixed folders/books stay on one grid.
+    local pad = math.max(UiScale.dp(1, 0, 2), math.floor(width * .004))
+    local inner_w = math.max(1, width - pad * 2)
+    local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))
+    local vgap = UiScale.dp(2, 2, 4)
+    local cover_h = math.max(UiScale.dp(78, 64, 108), height - title_h - vgap)
+    local cover_w = math.max(UiScale.dp(54, 46, 78), math.min(math.floor(inner_w * .995), math.floor(cover_h * .715)))
     local icon_key = folder.local_parent==true and "back" or "folder"
+    local icon_size = math.max(UiScale.dp(36, 31, 52), math.min(math.floor(cover_w * .58), math.floor(cover_h * .35)))
+    local cover_inset = UiScale.line("thin") + UiScale.dp(2, 1, 4)
+    local icon_area_w = math.max(1, cover_w - cover_inset * 2)
+    local icon_area_h = math.max(1, cover_h - cover_inset * 2)
+    local cover = fixed_frame(cover_w, cover_h, {
+        bordersize = UiScale.line("thin"),
+        radius = UiScale.radius(7, 5, 12),
+        padding = UiScale.dp(2, 1, 4),
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_GRAY,
+    }, Ui.icon(icon_key, icon_area_w, icon_area_h, icon_size, {
+        face = UiScale.iconFace("cfont", 28, 40),
+    }))
     local body = VerticalGroup:new{
         align = "center",
-        Ui.icon(icon_key, inner_w, icon_h, UiScale.dp(34, 29, 48), {
-            face = UiScale.iconFace("cfont", 24, 34),
-        }),
+        cover,
+        VerticalSpan:new{height = vgap},
         TextBoxWidget:new{
             text = tostring(folder.title or "文件夹"), face = face("cfont", 11.8, 16.5), bold = true,
             width = inner_w, height = title_h, height_adjust = false,
             height_overflow_show_ellipsis = true, alignment = "center",
         },
-        TextBoxWidget:new{
-            text = tostring(folder.status_text or "文件夹"), face = face("smallinfofont", 8.7, 12),
-            width = inner_w, height = detail_h, height_adjust = false,
-            height_overflow_show_ellipsis = true, alignment = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-        },
     }
-    local card = fixed_frame(width, height, {
-        bordersize = UiScale.line("thin"), padding = UiScale.dp(4, 3, 7),
-        radius = UiScale.radius(8, 6, 13), background = Blitbuffer.COLOR_WHITE,
-        color = Blitbuffer.COLOR_GRAY,
-    }, body)
-    return tappable(width, height, card, function(anchor)
+    return tappable(width, height, CenterContainer:new{dimen = Geom:new{w = width, h = height}, body}, function(anchor)
         if callback then callback(folder, anchor) end
     end)
 end
@@ -873,128 +945,103 @@ function HomeWidget:onHomeShelfSwipe(_,ges)
 end
 
 function HomeWidget:_build_header(children, m)
-    -- Independent compact groups: account | Wi-Fi/SSID | sync | time | battery.
-    -- Keep direct references to the text widgets so minute/device updates can
-    -- repaint only the changed header field instead of rebuilding the home.
-    local gap = math.max(UiScale.dp(2, 2, 4), math.floor(m.content_w * .003))
-    local title_w = math.max(UiScale.dp(66, 58, 86), math.floor(m.content_w * .10))
-    local account_w = math.max(UiScale.dp(112, 98, 145), math.floor(m.content_w * .15))
-    local sync_w = math.max(UiScale.dp(94, 82, 124), math.floor(m.content_w * .13))
-    local time_w = math.max(UiScale.dp(57, 51, 74), math.floor(m.content_w * .075))
-    local battery_w = math.max(UiScale.dp(78, 69, 102), math.floor(m.content_w * .10))
-    local menu_w = math.max(UiScale.dp(62, 55, 82), math.floor(m.content_w * .085))
-    local wifi_w = math.max(UiScale.dp(132, 116, 176),
-        m.content_w - title_w - account_w - sync_w - time_w - battery_w - menu_w - gap * 6)
-    local used = title_w + account_w + wifi_w + sync_w + time_w + battery_w + menu_w + gap * 6
-    if used > m.content_w then
-        wifi_w = math.max(UiScale.dp(92, 82, 122), wifi_w - (used - m.content_w))
-    end
+    -- Match the reader toolbar: only render capabilities that really exist,
+    -- and keep a visible safe inset on both ends of the status strip.
+    local edge_pad=math.max(UiScale.dp(7,6,12),math.floor(m.content_w*.010))
+    local header_x=m.margin+edge_pad
+    local header_w=math.max(1,m.content_w-edge_pad*2)
+    local gap=math.max(UiScale.dp(2,2,4),math.floor(header_w*.004))
+    local has_bluetooth=self.opts.bluetooth_visible==true
+    local status_count=has_bluetooth and 5 or 4 -- wifi, [bt], sync, battery, more
+    local title_w=math.max(UiScale.dp(62,54,82),math.floor(header_w*.085))
+    local account_w=math.max(UiScale.dp(112,96,150),math.floor(header_w*.205))
+    local available=math.max(1,header_w-title_w-account_w-gap*(status_count+1))
+    local status_w=math.max(1,math.floor(available/status_count))
+    local last_w=math.max(1,available-status_w*(status_count-1))
+
     local account_text=tostring(self.opts.account_name or "")
     if account_text=="" then account_text="未登录" end
     local wifi_text=tostring(self.opts.wifi_text or "")
     if wifi_text=="" then wifi_text="Wi-Fi" end
+    local bluetooth_text=tostring(self.opts.bluetooth_text or "")
+    if bluetooth_text=="" then bluetooth_text="蓝牙" end
     local sync_text=tostring(self.opts.sync_text or "已同步")
 
-    local account_cell=Ui.textbox(account_text,
-        account_w, m.header_h, face("smallinfofont", 10.8, 14.8), {
-            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis = true,
-        })
-    local wifi_value_cell=Ui.textbox(wifi_text,math.max(1,wifi_w-UiScale.dp(24,21,33)),m.header_h,
-        face("smallinfofont",10.5,14.5),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis=true,
-        })
-    local sync_value_cell=Ui.textbox(sync_text,math.max(1,sync_w-UiScale.dp(22,19,30)),m.header_h,
-        face("smallinfofont",10.1,14),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-            height_overflow_show_ellipsis=true,
-        })
-    local time_cell=Ui.textbox(tostring(self.opts.time_text or "--:--"),time_w,m.header_h,
-        face("smallinfofont",10.6,14.6),{
-            bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,
-        })
-    local battery_value_cell=Ui.textbox(tostring(self.opts.battery_text or "--%"),math.max(1,battery_w-UiScale.dp(24,21,33)),m.header_h,
-        face("smallinfofont",10.6,14.6),{
-            bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,
-        })
+    local account_cell=Ui.textbox(account_text,account_w,m.header_h,face("smallinfofont",10.8,14.8),{
+        bold=true,alignment="center",halign="center",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
+    })
+    local function status_text(text,width,icon_space,size)
+        return Ui.textbox(text,math.max(1,width-UiScale.dp(icon_space or 22,19,31)),m.header_h,
+            face("smallinfofont",size or 10.1,(size or 10.1)+4),{
+                bold=true,alignment="left",halign="left",fgcolor=Blitbuffer.COLOR_BLACK,height_overflow_show_ellipsis=true,
+            })
+    end
+    local wifi_value_cell=status_text(wifi_text,status_w,24,10.2)
+    local bluetooth_value_cell=has_bluetooth and status_text(bluetooth_text,status_w,22,9.8) or nil
+    local sync_value_cell=status_text(sync_text,status_w,22,10.0)
+    local battery_target_w=has_bluetooth and status_w or status_w
+    local battery_value_cell=status_text(tostring(self.opts.battery_text or "--%"),battery_target_w,24,10.5)
 
-    local header = HorizontalGroup:new{
-        align = "center",
-        LeftContainer:new{dimen = Geom:new{w = title_w, h = m.header_h}, TextWidget:new{
-            text = self.opts.title or "觅阅",
-            face = face("cfont", 16.8, 21),
-            bold = true,
-        }},
-        HorizontalSpan:new{width = gap},
-        tappable(account_w, m.header_h, account_cell, self.opts.on_account),
-        HorizontalSpan:new{width = gap},
-        tappable(wifi_w, m.header_h, LeftContainer:new{
-            dimen=Geom:new{w=wifi_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
-                HorizontalSpan:new{width=UiScale.dp(2,2,4)},
-                wifi_value_cell,
-            },
-        }, self.opts.on_quick_panel),
-        HorizontalSpan:new{width = gap},
-        tappable(sync_w, m.header_h, LeftContainer:new{
-            dimen=Geom:new{w=sync_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
-                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                sync_value_cell,
-            },
-        }, self.opts.on_quick_panel),
-        HorizontalSpan:new{width = gap},
-        time_cell,
-        HorizontalSpan:new{width = gap},
-        CenterContainer:new{
-            dimen=Geom:new{w=battery_w,h=m.header_h},
-            HorizontalGroup:new{
-                align="center",
-                Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
-                HorizontalSpan:new{width=UiScale.dp(2,1,3)},
-                battery_value_cell,
-            },
-        },
-        HorizontalSpan:new{width = gap},
-        tappable(menu_w, m.header_h,
-            fixed_frame(menu_w, m.header_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
-                Ui.text("更多", menu_w, m.header_h, face("smallinfofont", 10.8, 14.8), {bold = true})), function()
-            logger.info("[MiuRead][Home] more menu tapped")
-            if self.opts and self.opts.on_menu then self.opts.on_menu()
-            elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
-        end),
-    }
+    local header=HorizontalGroup:new{align="center"}
+    header[#header+1]=LeftContainer:new{dimen=Geom:new{w=title_w,h=m.header_h},TextWidget:new{
+        text=self.opts.title or "觅阅",face=face("cfont",16.8,21),bold=true,
+    }}
+    header[#header+1]=HorizontalSpan:new{width=gap}
+    header[#header+1]=tappable(account_w,m.header_h,account_cell,self.opts.on_account)
+    header[#header+1]=HorizontalSpan:new{width=gap}
+
+    local field_x=header_x+title_w+gap+account_w+gap
+    self._header_field_dimens={account=Geom:new{x=header_x+title_w+gap,y=m.margin,w=account_w,h=m.header_h}}
+
+    local function add_status(key,width,child,callback)
+        header[#header+1]=tappable(width,m.header_h,child,callback)
+        self._header_field_dimens[key]=Geom:new{x=field_x,y=m.margin,w=width,h=m.header_h}
+        field_x=field_x+width
+        header[#header+1]=HorizontalSpan:new{width=gap}
+        field_x=field_x+gap
+    end
+
+    add_status("wifi",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+        align="center",Ui.icon("wifi",UiScale.dp(22,19,29),m.header_h,UiScale.dp(18,16,24),{icon_key="wifi"}),
+        HorizontalSpan:new{width=UiScale.dp(2,2,4)},wifi_value_cell,
+    }},self.opts.on_quick_panel)
+
+    if has_bluetooth then
+        add_status("bluetooth",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+            align="center",Ui.icon("bluetooth",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="bluetooth"}),
+            HorizontalSpan:new{width=UiScale.dp(2,1,3)},bluetooth_value_cell,
+        }},self.opts.on_bluetooth or self.opts.on_quick_panel)
+    end
+
+    add_status("sync",status_w,LeftContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+        align="center",Ui.icon("sync",UiScale.dp(20,18,27),m.header_h,UiScale.dp(16,14,21),{icon_key="sync"}),
+        HorizontalSpan:new{width=UiScale.dp(2,1,3)},sync_value_cell,
+    }},self.opts.on_sync or self.opts.on_quick_panel)
+
+    add_status("battery",status_w,CenterContainer:new{dimen=Geom:new{w=status_w,h=m.header_h},HorizontalGroup:new{
+        align="center",Ui.icon("battery",UiScale.dp(22,19,29),m.header_h,UiScale.dp(17,15,22),{icon_key="battery"}),
+        HorizontalSpan:new{width=UiScale.dp(2,1,3)},battery_value_cell,
+    }},nil)
+
+    -- The final cell owns the remainder and no trailing span is painted outside
+    -- the safe inset. This is what keeps “更多” away from the bezel.
+    local menu_w=last_w
+    header[#header+1]=tappable(menu_w,m.header_h,
+        fixed_frame(menu_w,m.header_h,{bordersize=0,background=Blitbuffer.COLOR_WHITE},
+            Ui.text("更多",menu_w,m.header_h,face("smallinfofont",10.8,14.8),{bold=true})),function()
+        logger.info("[MiuRead][Home] more menu tapped")
+        if self.opts and self.opts.on_menu then self.opts.on_menu()
+        elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
+    end)
 
     self._header_text_refs={
-        account=account_cell[1],
-        wifi=wifi_value_cell[1],
-        sync=sync_value_cell[1],
-        time=time_cell[1],
-        battery=battery_value_cell[1],
+        account=account_cell[1],wifi=wifi_value_cell[1],bluetooth=bluetooth_value_cell and bluetooth_value_cell[1] or nil,
+        sync=sync_value_cell[1],battery=battery_value_cell[1],
     }
-    local field_x=m.margin+title_w+gap
-    self._header_field_dimens={}
-    self._header_field_dimens.account=Geom:new{x=field_x,y=m.margin,w=account_w,h=m.header_h}
-    field_x=field_x+account_w+gap
-    self._header_field_dimens.wifi=Geom:new{x=field_x,y=m.margin,w=wifi_w,h=m.header_h}
-    field_x=field_x+wifi_w+gap
-    self._header_field_dimens.sync=Geom:new{x=field_x,y=m.margin,w=sync_w,h=m.header_h}
-    field_x=field_x+sync_w+gap
-    self._header_field_dimens.time=Geom:new{x=field_x,y=m.margin,w=time_w,h=m.header_h}
-    field_x=field_x+time_w+gap
-    self._header_field_dimens.battery=Geom:new{x=field_x,y=m.margin,w=battery_w,h=m.header_h}
-
-    self:_add(children, m.margin, m.margin, header)
-    self:_add(children, m.margin, m.margin + m.header_h,
-        LineWidget:new{
-            background = Blitbuffer.COLOR_GRAY,
-            dimen = Geom:new{w = m.content_w, h = m.line or UiScale.line("thin")},
-        })
+    self:_add(children,header_x,m.margin,header)
+    self:_add(children,m.margin,m.margin+m.header_h,LineWidget:new{
+        background=Blitbuffer.COLOR_GRAY,dimen=Geom:new{w=m.content_w,h=m.line or UiScale.line("thin")},
+    })
 end
 
 function HomeWidget:_grid_geometry(m, width, available_h, count, force_rows)
@@ -1029,12 +1076,10 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
     local slot = 0
     for _,book in ipairs(books) do
         local folder=book and (book.local_folder==true or book.kind=="folder")
-        local weight=folder and 2 or 1
-        if folder and slot%columns==columns-1 then slot=slot+1 end
-        if slot+weight>capacity then break end
+        if slot>=capacity then break end
         local row = math.floor(slot / columns)
         local col = slot % columns
-        local item_w = folder and (card_w * 2 + col_gap) or card_w
+        local item_w = card_w
         local item_x = x + col * (card_w + col_gap)
         local item_y = y + row * (card_h + row_gap)
         self:_add(children,item_x,item_y,shelf_book_card(book, item_w, card_h, on_open, on_hold))
@@ -1046,7 +1091,7 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
                 }
             end
         end
-        slot = slot + weight
+        slot = slot + 1
     end
     return rows * card_h + math.max(0, rows - 1) * row_gap
 end
@@ -1074,6 +1119,152 @@ local function page_footer(width, height, page, pages, on_page)
     return row
 end
 
+local function dashboard_clock_card(width, height, time_text, date_text)
+    local pad = UiScale.dp(8, 7, 13)
+    local inner_w = math.max(1, width - pad * 2)
+    local inner_h = math.max(1, height - pad * 2)
+    local time_h = math.max(UiScale.dp(42, 36, 58), math.floor(inner_h * .62))
+    local date_h = math.max(1, inner_h - time_h)
+    local time_box = Ui.textbox(tostring(time_text or "--:--"), inner_w, time_h,
+        face("cfont", 25, 34, 21), {
+            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+        })
+    local date_box = Ui.textbox(tostring(date_text or ""), inner_w, date_h,
+        face("smallinfofont", 10.2, 14), {
+            bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            height_overflow_show_ellipsis = true,
+        })
+    local card = fixed_frame(width, height, {
+        bordersize = UiScale.line("thin"), radius = UiScale.radius(9, 6, 15),
+        padding = pad, background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
+    }, VerticalGroup:new{align = "center", time_box, date_box})
+    return card, {time = time_box[1], date = date_box[1]}
+end
+
+local DASH_WEEKDAY = {"一", "二", "三", "四", "五", "六", "日"}
+
+local function dashboard_duration(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    if hours > 0 then return tostring(hours) .. "小时" .. tostring(minutes) .. "分" end
+    return tostring(minutes) .. "分钟"
+end
+
+local function dashboard_short_duration(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor((seconds % 3600) / 60)
+    if hours > 0 then return tostring(hours) .. "时" .. tostring(minutes) .. "分" end
+    return tostring(minutes) .. "分"
+end
+
+local function dashboard_week_cells(stats, width, height)
+    stats = type(stats) == "table" and stats or {}
+    local rows = type(stats.daily) == "table" and stats.daily or {}
+    local threshold = math.max(0, tonumber(stats.threshold) or 1)
+    local gap = math.max(1, UiScale.dp(2, 1, 3))
+    local cell_w = math.max(1, math.floor((width - gap * 6) / 7))
+    local label_h = math.max(UiScale.dp(14, 12, 19), math.floor(height * .34))
+    local mark_h = math.max(1, height - label_h)
+    local mark_size = math.max(UiScale.dp(12, 10, 17), math.min(math.floor(cell_w * .64), math.floor(mark_h * .76)))
+    local marks = HorizontalGroup:new{align = "center"}
+    local labels = HorizontalGroup:new{align = "center"}
+    for index = 1, 7 do
+        local row = rows[index] or {}
+        local checked = (tonumber(row.seconds) or 0) >= threshold and row.future ~= true
+        local mark
+        if checked then
+            mark = fixed_frame(mark_size, mark_size, {
+                bordersize = 0, padding = 0, radius = math.floor(mark_size / 2),
+                background = Blitbuffer.COLOR_BLACK, color = Blitbuffer.COLOR_BLACK,
+            }, Widget:new{dimen = Geom:new{w = 1, h = 1}})
+        else
+            mark = fixed_frame(mark_size, mark_size, {
+                bordersize = math.max(1, UiScale.line("thick")), padding = 0, radius = math.floor(mark_size / 2),
+                background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_BLACK,
+            }, Widget:new{dimen = Geom:new{w = 1, h = 1}})
+        end
+        marks[#marks + 1] = CenterContainer:new{dimen = Geom:new{w = cell_w, h = mark_h}, mark}
+        labels[#labels + 1] = Ui.textbox(DASH_WEEKDAY[index], cell_w, label_h,
+            face("smallinfofont", 8.1, 10.9, 6.8), {
+                bold = true, alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_BLACK,
+            })
+        if index < 7 then
+            marks[#marks + 1] = HorizontalSpan:new{width = gap}
+            labels[#labels + 1] = HorizontalSpan:new{width = gap}
+        end
+    end
+    return VerticalGroup:new{align = "left", marks, labels}
+end
+
+local function dashboard_stats_card(title, stats, width, height, callback, expanded)
+    stats = type(stats) == "table" and stats or {}
+    local pad = math.max(UiScale.dp(5, 4, 8), math.floor(math.min(width, height) * .025))
+    local inner_w = math.max(1, width - pad * 2)
+    local inner_h = math.max(1, height - pad * 2)
+    local title_h = math.max(UiScale.dp(20, 18, 28), math.floor(inner_h * .17))
+    local caption_h = math.max(UiScale.dp(17, 15, 23), math.floor(inner_h * .13))
+    local main_h = math.max(UiScale.dp(30, 27, 42), math.floor(inner_h * .25))
+    local secondary_h = math.max(UiScale.dp(18, 16, 25), math.floor(inner_h * .15))
+    local checks_h = math.max(1, inner_h - title_h - caption_h - main_h - secondary_h)
+
+    local available = stats.available ~= false and tonumber(stats.total_seconds) ~= nil
+    local main_text = available and dashboard_duration(stats.total_seconds) or "--"
+    local caption = available and "本周阅读" or tostring(stats.message or "暂无阅读数据")
+    local secondary = ""
+    if available then
+        if tostring(stats.kind or "") == "local" then
+            secondary = "今日 " .. dashboard_short_duration(stats.today_seconds or 0)
+            if tonumber(stats.today_pages) then secondary = secondary .. " · " .. tostring(math.floor(stats.today_pages + .5)) .. "页" end
+            if expanded==true then
+                if tonumber(stats.average_seconds) then secondary = secondary .. " · 日均 " .. dashboard_short_duration(stats.average_seconds) end
+                if tonumber(stats.read_days) then secondary = secondary .. " · 本周 " .. tostring(math.floor(stats.read_days + .5)) .. "天" end
+            end
+        else
+            secondary = "今日 " .. dashboard_short_duration(stats.today_seconds or 0)
+            if tonumber(stats.average_seconds) then secondary = secondary .. " · 日均 " .. dashboard_short_duration(stats.average_seconds) end
+            if expanded==true and tonumber(stats.read_days) then
+                secondary = secondary .. " · 本周 " .. tostring(math.floor(stats.read_days + .5)) .. "天"
+            end
+        end
+    end
+
+    local body = VerticalGroup:new{align = "left",
+        Ui.textbox(tostring(title or "阅读数据") .. " ›", inner_w, title_h,
+            face("cfont", 10.5, 14.3, 8.9), {
+                bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
+            }),
+        Ui.textbox(caption, inner_w, caption_h,
+            face("smallinfofont", 8.8, 11.9, 7.4), {
+                bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
+            }),
+        Ui.textbox(main_text, inner_w, main_h,
+            face("cfont", 18.5, 24.5, 15.0), {
+                bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
+            }),
+        Ui.textbox(secondary, inner_w, secondary_h,
+            face("smallinfofont", 8.6, 11.6, 7.2), {
+                bold = true, alignment = "left", halign = "left", fgcolor = Blitbuffer.COLOR_BLACK,
+                height_overflow_show_ellipsis = true,
+            }),
+    }
+    if available and checks_h >= UiScale.dp(25, 22, 34) then
+        body[#body + 1] = dashboard_week_cells(stats, inner_w, checks_h)
+    else
+        body[#body + 1] = Widget:new{dimen = Geom:new{w = inner_w, h = checks_h}}
+    end
+
+    local card = fixed_frame(width, height, {
+        bordersize = UiScale.line("thin"), radius = UiScale.radius(9, 6, 15),
+        padding = pad, background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_GRAY,
+    }, body)
+    return tappable(width, height, card, callback)
+end
+
 function HomeWidget:_build_sections(children, m, compact, mode)
     local build_static = mode ~= "section"
     local build_section = mode ~= "static"
@@ -1089,6 +1280,13 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     local action_h = math.max(UiScale.dp(58, 54, 76), math.min(UiScale.dp(76, 64, 86), math.floor(m.body_h * .070)))
     local actions = self.opts.home_actions or {}
     local tabs_h = math.max(UiScale.dp(34, 31, 44), math.min(UiScale.dp(46, 37, 52), math.floor(m.body_h * .050)))
+    local shelf_subtabs = self.opts.shelf_subtabs or {}
+    -- A second shelf-level selector is used by 本地书库 only. The root row is
+    -- hidden when only one view is enabled; inside a child folder one compact
+    -- breadcrumb row remains so the user can go back without leaving Home.
+    local subtabs_h = #shelf_subtabs > 0
+        and math.max(UiScale.dp(29, 26, 39), math.min(UiScale.dp(38, 32, 45), math.floor(m.body_h * .041)))
+        or 0
     local books = self.opts.shelf_books or {}
     local title = tostring(self.opts.shelf_title or "")
     local section_h = title ~= "" and math.max(UiScale.dp(22, 20, 30), math.min(UiScale.dp(29, 25, 35), math.floor(m.body_h * .031))) or 0
@@ -1099,20 +1297,82 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             y = y + action_h + gap
         end
         local available_h = math.max(1, bottom - y)
-        local hero_w = math.max(UiScale.dp(230, 205, 360), math.min(math.floor(w * .33), UiScale.dp(390, 330, 520)))
-        local shelf_x = x + hero_w + gap
-        local shelf_w = math.max(1, w - hero_w - gap)
+        local hero_w = math.max(UiScale.dp(205, 180, 300), math.floor(w * .245))
+        local dashboard_w = math.max(UiScale.dp(205, 180, 300), math.floor(w * .245))
+        local dashboard_x = x + hero_w + gap
+        local shelf_x = dashboard_x + dashboard_w + gap
+        local shelf_w = math.max(1, w - hero_w - dashboard_w - gap * 2)
         if build_static then
+            local shelf_sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            if subtabs_h > 0 then shelf_sy = shelf_sy + subtabs_h + math.max(2, math.floor(gap * .25)) end
+            if section_h > 0 then shelf_sy = shelf_sy + section_h + math.max(2, math.floor(gap * .25)) end
+            local shelf_footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
+            local shelf_grid_h = math.max(1, bottom - shelf_sy - shelf_footer_h)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, shelf_w, shelf_grid_h, #books, 2)
+            local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
-                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact, self.opts.on_hold_book))
+                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact,
+                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h))
             else
                 self:_add(children, x, y, welcome_card(hero_w, available_h, self.opts.on_empty_account))
+            end
+            local dash_gap = math.max(UiScale.dp(3, 3, 6), math.floor(gap * .72))
+            local outer_inset=home_card_outer_inset()
+            local dashboard_y=y+outer_inset
+            local dashboard_h=math.max(1,available_h-outer_inset*2)
+            local show_weread=self.opts.show_weread_stats~=false
+            local show_local=self.opts.show_local_stats~=false
+            local stats_count=(show_weread and 1 or 0)+(show_local and 1 or 0)
+            local clock_h
+            if stats_count==0 then
+                clock_h=dashboard_h
+            else
+                clock_h=math.max(UiScale.dp(66, 58, 90), math.floor((dashboard_h - dash_gap * 2) * .32))
+            end
+            local clock_card, clock_refs = dashboard_clock_card(dashboard_w, clock_h,
+                self.opts.clock_text, self.opts.date_text)
+            self:_add(children, dashboard_x, dashboard_y, clock_card)
+            self._dashboard_text_refs={clock=clock_refs.time, date=clock_refs.date}
+            self._dashboard_card_slots={}
+            self._dashboard_field_dimens={
+                clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
+                date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
+            }
+            if stats_count>0 then
+                local stats_y=dashboard_y+clock_h+dash_gap
+                local stats_total_h=math.max(1,dashboard_h-clock_h-dash_gap)
+                if stats_count==1 then
+                    local title=show_weread and "微信读书" or "本地阅读"
+                    local data=show_weread and self.opts.weread_stats or self.opts.local_stats
+                    local callback=show_weread and self.opts.on_weread_stats or self.opts.on_local_stats
+                    local card=dashboard_stats_card(title,data,dashboard_w,stats_total_h,callback,true)
+                    self:_add(children,dashboard_x,stats_y,card)
+                    local slot_key=show_weread and "weread" or "local_stats"
+                    self._dashboard_card_slots[slot_key]={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_total_h,title=title,callback=callback,expanded=true}
+                    self._dashboard_field_dimens[slot_key]=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_total_h}
+                else
+                    local stats_h=math.max(1,math.floor((stats_total_h-dash_gap)/2))
+                    local final_stats_h=math.max(1,stats_total_h-dash_gap-stats_h)
+                    local weread_card=dashboard_stats_card("微信读书",self.opts.weread_stats,dashboard_w,stats_h,self.opts.on_weread_stats)
+                    self:_add(children,dashboard_x,stats_y,weread_card)
+                    self._dashboard_card_slots.weread={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats}
+                    self._dashboard_field_dimens.weread=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h}
+                    local local_y=stats_y+stats_h+dash_gap
+                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,dashboard_w,final_stats_h,self.opts.on_local_stats)
+                    self:_add(children,dashboard_x,local_y,local_card)
+                    self._dashboard_card_slots.local_stats={parent=children,index=#children,x=dashboard_x,y=local_y,w=dashboard_w,h=final_stats_h,title="本地阅读",callback=self.opts.on_local_stats}
+                    self._dashboard_field_dimens.local_stats=Geom:new{x=dashboard_x,y=local_y,w=dashboard_w,h=final_stats_h}
+                end
             end
         end
         self.section_dimen = Geom:new{x = shelf_x, y = y, w = shelf_w, h = available_h}
         if build_section then
             self:_add(children, shelf_x, y, category_tabs(self.opts.tabs, shelf_w, tabs_h, self.opts.on_shelf_all))
             local sy = y + tabs_h + math.max(3, math.floor(gap * .35))
+            if subtabs_h > 0 then
+                self:_add(children, shelf_x, sy, category_tabs(shelf_subtabs, shelf_w, subtabs_h, nil))
+                sy = sy + subtabs_h + math.max(2, math.floor(gap * .25))
+            end
             if section_h > 0 then
                 self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, nil))
                 sy = sy + section_h + math.max(2, math.floor(gap * .25))
@@ -1129,17 +1389,76 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         return
     end
 
-    local has_description = self.opts.hero and U.trim(tostring(self.opts.hero.description or self.opts.hero.intro or self.opts.hero.summary or "")) ~= ""
-    local hero_ratio = has_description and .285 or .235
     local hero_h = compact
-        and math.max(UiScale.dp(190, 180, 245), math.min(UiScale.dp(250, 220, 285), math.floor(m.body_h * .205)))
-        or math.max(UiScale.dp(245, 230, 315), math.min(UiScale.dp(330, 275, 360), math.floor(m.body_h * hero_ratio)))
+        and math.max(UiScale.dp(238, 215, 292), math.min(UiScale.dp(315, 276, 350), math.floor(m.body_h * .26)))
+        or math.max(UiScale.dp(292, 265, 350), math.min(UiScale.dp(372, 326, 410), math.floor(m.body_h * .30)))
     if y + hero_h < bottom then
         if build_static then
+            local hero_w = math.max(UiScale.dp(250, 215, 350), math.floor((w - gap) * .50))
+            local dashboard_x = x + hero_w + gap
+            local dashboard_w = math.max(1, w - hero_w - gap)
+            local shelf_y = y + hero_h + gap
+            if #actions > 0 and shelf_y + action_h < bottom then shelf_y = shelf_y + action_h + gap end
+            if shelf_y + tabs_h < bottom then shelf_y = shelf_y + tabs_h + math.max(3, math.floor(gap * .35)) end
+            if subtabs_h > 0 and shelf_y + subtabs_h < bottom then shelf_y = shelf_y + subtabs_h + math.max(2, math.floor(gap * .25)) end
+            if section_h > 0 and shelf_y + section_h < bottom then shelf_y = shelf_y + section_h + math.max(2, math.floor(gap * .25)) end
+            local shelf_footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
+            local shelf_grid_h = math.max(1, bottom - shelf_y - shelf_footer_h)
+            local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 2)
+            local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
-                self:_add(children, x, y, hero_card(self.opts.hero, w, hero_h, self.opts.hero.on_tap, compact, self.opts.on_hold_book))
+                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, hero_h, self.opts.hero.on_tap, compact,
+                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h))
             else
-                self:_add(children, x, y, welcome_card(w, hero_h, self.opts.on_empty_account))
+                self:_add(children, x, y, welcome_card(hero_w, hero_h, self.opts.on_empty_account))
+            end
+
+            local dash_gap = math.max(UiScale.dp(3, 3, 6), math.floor(gap * .72))
+            -- beta.26: the visible dashboard uses the same top/bottom inset as
+            -- the recent-reading frame, so both outer borders align exactly.
+            local outer_inset=home_card_outer_inset()
+            local dashboard_y=y+outer_inset
+            local dashboard_h=math.max(1,hero_h-outer_inset*2)
+            local show_weread=self.opts.show_weread_stats~=false
+            local show_local=self.opts.show_local_stats~=false
+            local stats_count=(show_weread and 1 or 0)+(show_local and 1 or 0)
+            local clock_h=stats_count==0 and dashboard_h
+                or math.max(UiScale.dp(68, 60, 92), math.floor((dashboard_h - dash_gap) * .29))
+            local clock_card, clock_refs = dashboard_clock_card(dashboard_w, clock_h,
+                self.opts.clock_text, self.opts.date_text)
+            self:_add(children, dashboard_x, dashboard_y, clock_card)
+            self._dashboard_text_refs={clock=clock_refs.time, date=clock_refs.date}
+            self._dashboard_card_slots={}
+            self._dashboard_field_dimens={
+                clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
+                date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
+            }
+            if stats_count>0 then
+                local stats_y=dashboard_y+clock_h+dash_gap
+                local stats_h=math.max(1,dashboard_h-clock_h-dash_gap)
+                if stats_count==1 then
+                    local title=show_weread and "微信读书" or "本地阅读"
+                    local data=show_weread and self.opts.weread_stats or self.opts.local_stats
+                    local callback=show_weread and self.opts.on_weread_stats or self.opts.on_local_stats
+                    local card=dashboard_stats_card(title,data,dashboard_w,stats_h,callback,true)
+                    self:_add(children,dashboard_x,stats_y,card)
+                    local slot_key=show_weread and "weread" or "local_stats"
+                    self._dashboard_card_slots[slot_key]={parent=children,index=#children,x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h,title=title,callback=callback,expanded=true}
+                    self._dashboard_field_dimens[slot_key]=Geom:new{x=dashboard_x,y=stats_y,w=dashboard_w,h=stats_h}
+                else
+                    local pair_gap=dash_gap
+                    local weread_w=math.max(1,math.floor((dashboard_w-pair_gap)/2))
+                    local local_w=math.max(1,dashboard_w-pair_gap-weread_w)
+                    local local_x=dashboard_x+weread_w+pair_gap
+                    local weread_card=dashboard_stats_card("微信读书",self.opts.weread_stats,weread_w,stats_h,self.opts.on_weread_stats)
+                    self:_add(children,dashboard_x,stats_y,weread_card)
+                    self._dashboard_card_slots.weread={parent=children,index=#children,x=dashboard_x,y=stats_y,w=weread_w,h=stats_h,title="微信读书",callback=self.opts.on_weread_stats}
+                    self._dashboard_field_dimens.weread=Geom:new{x=dashboard_x,y=stats_y,w=weread_w,h=stats_h}
+                    local local_card=dashboard_stats_card("本地阅读",self.opts.local_stats,local_w,stats_h,self.opts.on_local_stats)
+                    self:_add(children,local_x,stats_y,local_card)
+                    self._dashboard_card_slots.local_stats={parent=children,index=#children,x=local_x,y=stats_y,w=local_w,h=stats_h,title="本地阅读",callback=self.opts.on_local_stats}
+                    self._dashboard_field_dimens.local_stats=Geom:new{x=local_x,y=stats_y,w=local_w,h=stats_h}
+                end
             end
         end
         y = y + hero_h + gap
@@ -1153,6 +1472,10 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     if y + tabs_h < bottom then
         self:_add(children, x, y, category_tabs(self.opts.tabs, w, tabs_h, self.opts.on_shelf_all))
         y = y + tabs_h + math.max(3, math.floor(gap * .35))
+    end
+    if subtabs_h > 0 and y + subtabs_h < bottom then
+        self:_add(children, x, y, category_tabs(shelf_subtabs, w, subtabs_h, nil))
+        y = y + subtabs_h + math.max(2, math.floor(gap * .25))
     end
     if section_h > 0 and y + section_h < bottom then
         self:_add(children, x, y, section_header(title, w, section_h, nil))
@@ -1293,13 +1616,18 @@ end
 function HomeWidget:updateHeader(fields)
     fields=type(fields)=="table" and fields or {}
     self.opts=self.opts or {}
+    if fields.bluetooth_visible~=nil and (self.opts.bluetooth_visible==true)~=(fields.bluetooth_visible==true) then
+        self.opts.bluetooth_visible=fields.bluetooth_visible==true
+        if fields.bluetooth_text~=nil then self.opts.bluetooth_text=tostring(fields.bluetooth_text or "") end
+        return self:update(self.opts,"header")
+    end
     local refs=type(self._header_text_refs)=="table" and self._header_text_refs or {}
     local dimens=type(self._header_field_dimens)=="table" and self._header_field_dimens or {}
     local mapping={
         account_name={ref="account",default="未登录"},
         wifi_text={ref="wifi",default="Wi-Fi"},
+        bluetooth_text={ref="bluetooth",default="蓝牙 --"},
         sync_text={ref="sync",default="已同步"},
-        time_text={ref="time",default="--:--"},
         battery_text={ref="battery",default="--%"},
     }
     local changed_region
@@ -1335,10 +1663,80 @@ function HomeWidget:updateHeader(fields)
     return true
 end
 
+function HomeWidget:updateDashboard(fields)
+    fields=type(fields)=="table" and fields or {}
+    self.opts=self.opts or {}
+    local refs=type(self._dashboard_text_refs)=="table" and self._dashboard_text_refs or {}
+    local dimens=type(self._dashboard_field_dimens)=="table" and self._dashboard_field_dimens or {}
+    local changed_region
+    local changed=false
+    local fallback=false
+
+    local text_mapping={
+        clock_text={ref="clock",default="--:--"},
+        date_text={ref="date",default=""},
+    }
+    for key,spec in pairs(text_mapping) do
+        if fields[key]~=nil then
+            local value=tostring(fields[key] or "")
+            local display=value~="" and value or spec.default
+            if tostring(self.opts[key] or "")~=value then
+                self.opts[key]=value
+                changed=true
+                local ref=refs[spec.ref]
+                if ref and type(ref.setText)=="function" then
+                    ref:setText(display)
+                    local region=dimens[spec.ref]
+                    if region then changed_region=changed_region and changed_region:combine(region) or region:copy() end
+                else
+                    fallback=true
+                end
+            end
+        end
+    end
+
+    -- Statistics cards contain independent check-in cells, so updating only a
+    -- TextWidget is no longer enough. Replace just the relevant card in the
+    -- static layer; the recent-reading cover and shelf stay untouched.
+    local slots=type(self._dashboard_card_slots)=="table" and self._dashboard_card_slots or {}
+    local card_fields={weread_stats="weread",local_stats="local_stats"}
+    for key,slot_key in pairs(card_fields) do
+        if fields[key]~=nil then
+            self.opts[key]=fields[key]
+            changed=true
+            local slot=slots[slot_key]
+            if slot and slot.parent and slot.index and slot.w and slot.h then
+                local card=dashboard_stats_card(slot.title,fields[key],slot.w,slot.h,slot.callback,slot.expanded==true)
+                local old=slot.parent[slot.index]
+                slot.parent[slot.index]=OffsetContainer:new{x_off=slot.x,y_off=slot.y,card}
+                if old and old~=slot.parent[slot.index] and old.free then pcall(old.free,old) end
+                local region=dimens[slot_key]
+                if region then changed_region=changed_region and changed_region:combine(region) or region:copy() end
+            else
+                local visible=(slot_key=="weread" and self.opts.show_weread_stats~=false)
+                    or (slot_key=="local_stats" and self.opts.show_local_stats~=false)
+                if visible then fallback=true end
+            end
+        end
+    end
+
+    if not changed then return true end
+    if fallback or not changed_region then return self:update(self.opts,"content") end
+    local safety=UiScale.dp(3,2,5)
+    local x=math.max(0,(changed_region.x or 0)-safety)
+    local y=math.max(0,(changed_region.y or 0)-safety)
+    local right=math.min(Screen:getWidth(),(changed_region.x or 0)+(changed_region.w or 1)+safety)
+    local bottom=math.min(Screen:getHeight(),(changed_region.y or 0)+(changed_region.h or 1)+safety)
+    local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
+    UIManager:setDirty(self,function() return "ui",region end)
+    return true
+end
+
 function HomeWidget:updateSection(opts)
     local started=os.clock()
     opts = opts or {}
     self.opts.tabs = opts.tabs or self.opts.tabs
+    self.opts.shelf_subtabs = opts.shelf_subtabs or {}
     self.opts.shelf_title = opts.shelf_title or self.opts.shelf_title
     self.opts.shelf_books = opts.shelf_books or {}
     self.opts.empty_text = opts.empty_text or self.opts.empty_text
@@ -1750,7 +2148,16 @@ function HomeView.update_header(fields)
     return updated~=false
 end
 function HomeView.update_time(text)
-    return HomeView.update_header{time_text=tostring(text or "--:--")}
+    if not HomeView.is_shown() or not live_widget.updateDashboard then return false end
+    local ok, updated = pcall(live_widget.updateDashboard, live_widget, {clock_text=tostring(text or "--:--")})
+    if not ok then logger.warn("[MiuRead][Home] clock update failed", tostring(updated)); return false end
+    return updated~=false
+end
+function HomeView.update_dashboard(fields)
+    if not HomeView.is_shown() or not live_widget.updateDashboard then return false end
+    local ok, updated = pcall(live_widget.updateDashboard, live_widget, fields or {})
+    if not ok then logger.warn("[MiuRead][Home] dashboard update failed", tostring(updated)); return false end
+    return updated~=false
 end
 function HomeView.update_section(opts)
     if not HomeView.is_shown() or not live_widget.updateSection then return false end

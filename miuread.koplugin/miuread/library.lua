@@ -301,6 +301,15 @@ end
 function Library:_apply_stream_response(data)
     data=type(data)=="table" and data or {}
     local stream=type(data._miuread_stream)=="table" and data._miuread_stream or nil
+    if stream and stream.keep_cache==true then
+        local previous=self.store:shelf_cache() or {}
+        local books=type(previous.books)=="table" and previous.books or {}
+        local mp=type(previous.mp)=="table" and previous.mp or {}
+        logger.info("[MiuRead][ShelfStream] cached shelf retained",
+            "reason=",tostring(stream.reason or "stream_unavailable"),
+            "books=",tostring(#books),"mp=",tostring(#mp))
+        return books,mp,false,true
+    end
     if not (stream and stream.enabled==true and type(stream.ids)=="table" and #stream.ids>0) then
         local books,mp=self:normalize(data)
         self.store:save_shelf_cache({

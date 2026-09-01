@@ -3,7 +3,7 @@ local logger = require("logger")
 local U = require("miuread.util")
 
 local LocalMetadata = {}
-local METADATA_EXTRACTOR_VERSION = 3
+local METADATA_EXTRACTOR_VERSION = 4
 
 local function trim(value)
     return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -318,10 +318,14 @@ end
 
 local function read_document(filepath, cache_dir, out)
     local ok_registry, DocumentRegistry = pcall(require, "document/documentregistry")
-    if not ok_registry or not DocumentRegistry or type(DocumentRegistry.hasProvider) ~= "function" then return false end
+    if not ok_registry or not DocumentRegistry or type(DocumentRegistry.hasProvider) ~= "function" then
+        return false, "registry_unavailable"
+    end
     local provider_ok, has_provider = pcall(DocumentRegistry.hasProvider, DocumentRegistry, filepath)
-    if not provider_ok or not has_provider then return false end
+    if not provider_ok then return false, "provider_check_failed" end
+    if not has_provider then return false, "unsupported" end
     local document
+    local opened, loaded_ok = false, true
     local ok, err = xpcall(function()
         local provider
         if type(DocumentRegistry.getProvider) == "function" then
@@ -335,9 +339,10 @@ local function read_document(filepath, cache_dir, out)
         end
         document = DocumentRegistry:openDocument(filepath, provider)
         if not document then return end
+        opened = true
         if document.loadDocument then
             local loaded = document:loadDocument(false)
-            if loaded == false then return end
+            if loaded == false then loaded_ok = false; return end
         end
         if type(document.getProps) == "function" then apply_props(out, document:getProps()) end
         if not out.pages and not document.loadDocument and type(document.getPageCount) == "function" then
@@ -355,13 +360,15 @@ local function read_document(filepath, cache_dir, out)
     if document then pcall(document.close, document) end
     if not ok then
         logger.warn("[MiuRead][LocalMetadata] document extraction failed", tostring(filepath), tostring(err))
-        return false
+        return false, "open_error"
     end
+    if not opened then return false, "open_failed" end
+    if not loaded_ok then return false, "load_failed" end
     if out.title or out.author or out.cover_path or out.description then
         out.metadata_source = "document"
-        return true
+        return true, "found"
     end
-    return false
+    return true, "none"
 end
 
 function LocalMetadata.read(filepath, cache_dir, options)
@@ -383,10 +390,36 @@ function LocalMetadata.read(filepath, cache_dir, options)
     read_epub_package(filepath, out)
 
     if options.use_bim ~= false then read_bim(filepath, cache_dir, out) end
+    local document_state
     if options.open_document == true and (not out.cover_path or not out.title or not out.author or not out.description) then
-        read_document(filepath, cache_dir, out)
+        local document_ok, state = read_document(filepath, cache_dir, out)
+        document_state = state
+        if document_ok then
+            out.metadata_complete = true
+            out.metadata_state = out.cover_path and "found" or "confirmed_none"
+            out.metadata_retry_after = 0
+            out.metadata_error = ""
+        else
+            out.metadata_complete = false
+            out.metadata_state = "failed"
+            out.metadata_retry_after = os.time() + 10 * 60
+            out.metadata_error = tostring(state or "document_failed")
+        end
+    elseif options.open_document == true then
+        out.metadata_complete = true
+        out.metadata_state = out.cover_path and "found" or "confirmed_none"
+        out.metadata_retry_after = 0
+        out.metadata_error = ""
+    else
+        out.metadata_complete = false
+        out.metadata_state = "unknown"
     end
-    out.metadata_complete = options.open_document == true
+    if document_state == "unsupported" then
+        out.metadata_complete = true
+        out.metadata_state = out.cover_path and "found" or "confirmed_none"
+        out.metadata_retry_after = 0
+        out.metadata_error = ""
+    end
     out.metadata_extractor_version = METADATA_EXTRACTOR_VERSION
     return out
 end
@@ -416,7 +449,7 @@ function LocalMetadata.merge(book, metadata)
         book.progress = metadata.progress
         changed = true
     end
-    for _, key in ipairs({"metadata_source", "metadata_mtime", "metadata_checked_at", "metadata_complete", "metadata_extractor_version"}) do
+    for _, key in ipairs({"metadata_source", "metadata_mtime", "metadata_checked_at", "metadata_complete", "metadata_extractor_version", "metadata_state", "metadata_retry_after", "metadata_error"}) do
         if metadata[key] ~= nil and book[key] ~= metadata[key] then
             book[key] = metadata[key]
             changed = true
@@ -431,9 +464,13 @@ function LocalMetadata.needs_refresh(book, full)
     if tonumber(book.metadata_mtime or -1) ~= mtime then return true end
     if full then
         if tonumber(book.metadata_extractor_version or 0) < METADATA_EXTRACTOR_VERSION then return true end
+        if tostring(book.metadata_state or "") == "failed" then
+            return os.time() >= (tonumber(book.metadata_retry_after) or 0)
+        end
         if book.metadata_complete ~= true then return true end
-        -- Missing optional metadata is a valid completed result. A book that
-        -- genuinely has no description/ISBN/etc. must not be reopened forever.
+        -- A confirmed no-cover result is stable. A failed extraction is kept
+        -- separately above and retried after backoff instead of becoming a
+        -- permanent blank cover.
         if book.cover_path and not file_exists(book.cover_path) then return true end
         return false
     end
