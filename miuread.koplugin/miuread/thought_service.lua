@@ -1,5 +1,6 @@
 local Thoughts = require("miuread.thoughts")
 local ThoughtDatabase = require("miuread.thought_database")
+local ThoughtFetcher = require("miuread.thought_fetcher")
 local U = require("miuread.util")
 local logger = require("logger")
 
@@ -22,6 +23,18 @@ local function merged_groups(previous, current)
     return out
 end
 
+local function locator_ranges(rows)
+    local out,seen={},{}
+    for _,row in ipairs(type(rows)=="table" and rows or {}) do
+        local key=tostring(row.range or row.range_key or "")
+        if key~="" and not seen[key] then
+            seen[key]=true
+            out[#out+1]=key
+        end
+    end
+    return out
+end
+
 function ThoughtService:new(annotations, store)
     return setmetatable({annotations=annotations, store=store}, self)
 end
@@ -32,34 +45,11 @@ function ThoughtService:fetch_chapter(book_id, chapter_uid, options)
     local previous_state=ThoughtDatabase.chapter_status(self.store,book_id,chapter_uid)
     local previous_groups=select(1,Thoughts.load(self.store,book_id,chapter_uid))
     if type(previous_groups)~="table" then previous_groups={} end
+    local previous_comments=tonumber(previous_state.comments or 0) or 0
 
-    -- The body download owns range->text alignment. Reuse its persisted locators
-    -- for later comment downloads instead of requesting underlines again. A
-    -- forced refresh is the explicit exception: it re-reads underlines so newly
-    -- added WeRead ranges can be discovered without rebuilding the EPUB.
-    local locator_rows=ThoughtDatabase.load_locators(self.store,book_id,chapter_uid)
-    local supplied_underlines
-    if options.force_refresh~=true and #locator_rows>0 then
-        supplied_underlines={}
-        for _,locator in ipairs(locator_rows) do
-            supplied_underlines[#supplied_underlines+1]={
-                range=tostring(locator.range or ""),
-                markText=tostring(locator.source_text or ""),
-                _miu_embedded=locator.embedded==true,
-            }
-        end
-    end
-
-    local previous_checkpoint
-    if options.force_refresh~=true then
-        local raw_checkpoint=ThoughtDatabase.load_checkpoint(self.store,book_id,chapter_uid)
-        if type(raw_checkpoint)=="table" then
-            local ok,value=pcall(self.annotations.from_cache,self.annotations,raw_checkpoint)
-            if ok and type(value)=="table" then previous_checkpoint=value end
-        end
-    else
-        ThoughtDatabase.clear_checkpoint(self.store,book_id,chapter_uid)
-    end
+    -- 5.5 no longer consumes beta.10-beta.13 comment checkpoints. They describe
+    -- the old empty-verification state machine and can reproduce false success.
+    ThoughtDatabase.clear_checkpoint(self.store,book_id,chapter_uid)
 
     local function fail(message,kind,detail)
         ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,"error",false,
@@ -67,110 +57,123 @@ function ThoughtService:fetch_chapter(book_id, chapter_uid, options)
         return nil,tostring(message or "评论获取失败"),detail
     end
 
-    local checkpoint_state=previous_checkpoint
-    local function persist_checkpoint(snapshot)
-        local merged=self.annotations:merge(checkpoint_state,snapshot)
-        local cache=self.annotations:to_cache(merged)
-        local saved_checkpoint,checkpoint_err=ThoughtDatabase.save_checkpoint(self.store,book_id,chapter_uid,cache)
-        if not saved_checkpoint then error("评论断点保存失败："..tostring(checkpoint_err)) end
-        checkpoint_state=merged
-        if previous_state.complete~=true then
-            local combined=merged_groups(previous_groups,merged.review_groups or {})
-            local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,combined)
-            if not saved then error(tostring(save_err or "评论缓存写入失败")) end
+    -- Body/locator ownership stays unchanged. Normal comment refreshes reuse the
+    -- ranges persisted while the EPUB was generated. Only missing locators or an
+    -- explicit force refresh ask the annotation layer for underlines, with
+    -- fetch_reviews=false so the old comment state machine is completely bypassed.
+    local locator_rows=ThoughtDatabase.load_locators(self.store,book_id,chapter_uid)
+    if options.force_refresh==true or #locator_rows==0 then
+        progress("underlines",0,0,"更新正文定位")
+        local locator_result=self.annotations:fetch_chapter(book_id,chapter_uid,progress,{
+            force_refresh=true,
+            fetch_reviews=false,
+        })
+        if type(locator_result)~="table" or locator_result.underline_request_ok~=true then
+            local kind=tostring(locator_result and locator_result.error_kind or "server")
+            local message=(kind=="network" and "网络不可用，已保留原评论缓存")
+                or (kind=="authentication" and "登录状态已失效")
+                or (kind=="forbidden" and "当前账号暂时无法获取本章评论")
+                or (kind=="rate_limit" and "评论请求过于频繁，请稍后再试")
+                or "本章定位信息暂时无法获取，已保留原评论缓存"
+            return fail(message,kind,locator_result)
         end
-        ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,"partial",false,
-            table.concat(merged.errors or {}," | "))
-        return merged
-    end
 
-    local result=self.annotations:fetch_chapter(book_id,chapter_uid,progress,{
-        force_refresh=options.force_refresh==true,
-        previous=previous_checkpoint,
-        checkpoint=persist_checkpoint,
-        underlines=supplied_underlines,
-        fetch_reviews=true,
-    })
-    if type(result)~="table" then return fail("评论接口返回无效数据","invalid result") end
-
-    -- When underlines came from the server (new/legacy body or explicit refresh),
-    -- persist them as locators. They are not embedded until a body generation
-    -- proves that fact; merge mode preserves existing embedded=true rows.
-    if supplied_underlines==nil and result.underline_request_ok==true and result.underlines_partial~=true then
-        local rows=self.annotations:locator_rows(result,false)
-        local saved,save_err=ThoughtDatabase.save_locators(self.store,book_id,chapter_uid,rows,"",false)
+        local rows=self.annotations:locator_rows(locator_result,false)
+        local saved,save_err=ThoughtDatabase.save_locators(
+            self.store,book_id,chapter_uid,rows,"",false)
         if not saved then
-            logger.warn("[MiuRead][ThoughtLocator] save after comment fetch failed",
-                "book=",tostring(book_id),"chapter=",tostring(chapter_uid),"error=",tostring(save_err))
-        else
-            logger.info("[MiuRead][ThoughtLocator] refreshed",
-                "book=",tostring(book_id),"chapter=",tostring(chapter_uid),"ranges=",tostring(#rows))
+            return fail("正文定位保存失败","locator_save",save_err)
         end
+        locator_rows=ThoughtDatabase.load_locators(self.store,book_id,chapter_uid)
+        logger.info("[MiuRead][ThoughtLocator] refreshed for comments",
+            "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+            "ranges=",tostring(#locator_rows))
     end
 
-    if result.auth_required==true then return fail("登录状态已失效","authentication",result) end
-    if result.forbidden==true then return fail("当前账号暂时无法获取本章评论","forbidden",result) end
-    if result.rate_limited==true then return fail("评论请求过于频繁，请稍后再试","rate_limit",result) end
-    if result.underline_request_ok~=true and result.complete~=true then
-        local kind=tostring(result.error_kind or "server")
-        local message=(kind=="network" and "网络不可用，已保留原评论缓存")
-            or (kind=="server" and "评论服务暂时不可用，已保留原评论缓存")
-            or "本章评论暂时无法获取，已保留原评论缓存"
-        return fail(message,kind,result)
-    end
-
-    local merged=self.annotations:merge(previous_checkpoint,result)
-    local groups=type(merged.review_groups)=="table" and merged.review_groups or {}
-    if merged.complete~=true then groups=merged_groups(previous_groups,groups) end
-
-    local incoming_comments=tonumber(merged.thought_entry_count or 0) or 0
-    local previous_comments=tonumber(previous_state.comments or 0) or 0
-    local unverified_empty=(incoming_comments==0 and merged.verified_empty~=true)
-        and (#(merged.pending_ranges or {})>0 or merged.suspicious_empty==true or merged.complete~=true)
-
-    -- Never let an unverified zero erase data or become a false completion. This
-    -- covers both omitted ranges and ranges returned without parsable comments.
-    if unverified_empty or (merged.complete==true and incoming_comments==0 and previous_comments>0
-            and merged.verified_empty~=true) then
-        local combined=merged_groups(previous_groups,groups)
-        local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,combined)
-        if not saved then return fail(tostring(save_err or "评论缓存写入失败"),"save failed",result) end
-        ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,"suspicious_empty",false,
-            table.concat(merged.errors or {}," | "))
-        ThoughtDatabase.save_checkpoint(self.store,book_id,chapter_uid,self.annotations:to_cache(merged))
-        local counts=ThoughtDatabase.chapter_counts(self.store,book_id,chapter_uid)
+    local ranges=locator_ranges(locator_rows)
+    if #ranges==0 then
+        if previous_comments>0 then
+            ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,
+                "partial",false,"locator ranges empty; protected existing comments")
+            return {
+                book_id=tostring(book_id or ""),chapter_uid=tostring(chapter_uid or ""),
+                groups=tonumber(previous_state.groups or 0) or 0,
+                comments=previous_comments,server_comments=0,saved_comments=previous_comments,
+                complete=false,status="partial",protected=true,error_kind="locator_empty",
+                underlines=0,pending_ranges=0,locators=0,
+            }
+        end
+        local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,{})
+        if not saved then return fail(tostring(save_err or "评论缓存写入失败"),"save failed") end
+        ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,"verified_empty",true,"")
         return {
             book_id=tostring(book_id or ""),chapter_uid=tostring(chapter_uid or ""),
-            groups=tonumber(counts.groups or 0) or 0,comments=tonumber(counts.comments or 0) or 0,
-            server_comments=incoming_comments,saved_comments=tonumber(counts.comments or 0) or 0,
-            complete=false,status="suspicious_empty",protected=previous_comments>0,
-            error_kind="suspicious_empty",underlines=tonumber(merged.underline_count or 0) or 0,
-            pending_ranges=#(merged.pending_ranges or {}),locators=ThoughtDatabase.locator_count(self.store,book_id,chapter_uid),
+            groups=0,comments=0,server_comments=0,saved_comments=0,
+            complete=true,status="verified_empty",underlines=0,pending_ranges=0,locators=0,
         }
     end
 
-    local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,groups)
-    if not saved then return fail(tostring(save_err or "评论缓存写入失败"),"save failed",result) end
+    local result=ThoughtFetcher.fetch(
+        self.annotations.api,book_id,chapter_uid,ranges,progress)
+    if type(result)~="table" then
+        return fail("评论接口返回无效数据","invalid_result",result)
+    end
 
-    local complete=merged.complete==true
+    if result.error_kind=="authentication" then
+        return fail("登录状态已失效","authentication",result)
+    elseif result.error_kind=="forbidden" then
+        return fail("当前账号暂时无法获取本章评论","forbidden",result)
+    elseif result.error_kind=="rate_limit" then
+        return fail("评论请求过于频繁，请稍后再试","rate_limit",result)
+    end
+
+    local incoming_groups=type(result.groups)=="table" and result.groups or {}
+    local incoming_comments=tonumber(result.comments or 0) or 0
+    local complete=result.complete==true
+    local explicit_empty=complete and incoming_comments==0 and result.empty_confirmed==true
+
+    -- Partial/unknown zero results never erase existing comments. Even an
+    -- explicitly empty refresh is protected when this device already has real
+    -- cached comments; a later non-empty result can replace them normally.
+    local protected=complete~=true
+        or (incoming_comments==0 and not explicit_empty)
+        or (explicit_empty and previous_comments>0)
+
+    local groups=protected and merged_groups(previous_groups,incoming_groups)
+        or incoming_groups
+    local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,groups)
+    if not saved then
+        return fail(tostring(save_err or "评论缓存写入失败"),"save failed",result)
+    end
+
     local counts=ThoughtDatabase.chapter_counts(self.store,book_id,chapter_uid)
     local comments=tonumber(counts.comments or 0) or 0
     local status
-    if complete and comments>0 then status="ready"
-    elseif complete and merged.verified_empty==true then status="verified_empty"
-    else status="partial"; complete=false end
+
+    if protected then
+        complete=false
+        status="partial"
+    elseif comments>0 then
+        status="ready"
+    elseif explicit_empty then
+        status="verified_empty"
+    else
+        complete=false
+        status="partial"
+    end
+
+    local last_error=table.concat(type(result.errors)=="table" and result.errors or {}," | ")
     ThoughtDatabase.set_fetch_state(self.store,book_id,chapter_uid,status,complete,
-        complete and "" or table.concat(merged.errors or {}," | "))
-    if complete then ThoughtDatabase.clear_checkpoint(self.store,book_id,chapter_uid)
-    else ThoughtDatabase.save_checkpoint(self.store,book_id,chapter_uid,self.annotations:to_cache(merged)) end
+        complete and "" or last_error)
 
     return {
         book_id=tostring(book_id or ""),chapter_uid=tostring(chapter_uid or ""),
         groups=tonumber(counts.groups or 0) or 0,comments=comments,
         server_comments=incoming_comments,saved_comments=comments,
-        complete=complete,status=status,error_kind=merged.error_kind,
-        underlines=tonumber(merged.underline_count or 0) or 0,
-        pending_ranges=#(merged.pending_ranges or {}),locators=ThoughtDatabase.locator_count(self.store,book_id,chapter_uid),
+        complete=complete,status=status,protected=protected and previous_comments>0 or false,
+        error_kind=result.error_kind,
+        underlines=#ranges,pending_ranges=#(result.pending_ranges or {}),
+        locators=#locator_rows,
     }
 end
 
@@ -207,18 +210,12 @@ end
 function ThoughtService:delete_chapter(book_id,chapter_uid)
     local ok,err=ThoughtDatabase.delete_chapter(self.store,book_id,chapter_uid)
     if not ok then return nil,err end
-    -- beta.9 still keeps legacy JSON reading as an upgrade fallback. Remove the
-    -- matching old file too, otherwise a user-deleted cache could immediately
-    -- reappear through Thoughts.load()'s legacy fallback.
     local legacy=self.store:book_dir(book_id).."/thoughts/"..U.id_name(tostring(chapter_uid or ""))..".json"
     os.remove(legacy)
     return true
 end
 
 function ThoughtService:delete_book(book_id)
-    -- Comment deletion must not remove range->body locators. Those belong to the
-    -- downloaded body and allow comments to be fetched again without rebuilding
-    -- the EPUB. Only comment/cache tables and legacy comment files are removed.
     local ok,err=ThoughtDatabase.delete_book_comments(self.store,book_id)
     if not ok then return nil,err end
     local root=self.store:book_dir(book_id)
