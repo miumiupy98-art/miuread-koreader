@@ -1,3 +1,16 @@
+## 5.5.0-beta.3
+
+- 本版停止继续猜测评论解析或接口结构，改为针对真实空结果执行单点 A/B 定因：当前 locator 路径返回 range 但 `pageReviews` 为空时，仅选择一个待补 range 进行 fresh-underlines 对照。
+- 已逐行核对 v5.3.0 与 5.4/5.5：Web `readReviews` 的 endpoint、headers、`bookId`、`chapterUid` 与 `reviews(range/maxIdx/count/synckey)` 请求构造没有变化；因此本版不复制新的所谓 legacy API，也不修改 `api.lua`，避免制造没有意义的伪对照。
+- A 组继续使用正文阶段持久化的 locator range；B 组现场重新请求同一章节 underlines，并立即使用微信刚返回的 fresh range 调用与 5.3 相同的 raw Web `readReviews` 请求。
+- 对 locator range 与 fresh range 进行实机逐项比对：优先检查完全相同 range；不同时再使用 locator ordinal 与 source_text 做对应确认。只有对应关系足够明确时才允许把 fresh range 的评论结果映射回本地 locator range。
+- 若 fresh-underlines 后同一个 range 从空结果变为有评论，日志明确标记 `fresh_context_success`；若 locator 与 fresh range 不同且 fresh range 能获取评论，标记 `locator_range_mismatch_confirmed`。
+- 若 locator 与 fresh range 完全一致、fresh-underlines 后仍为空，则标记 `same_range_still_empty`，用于排除 locator 与 underlines 时序问题，继续把范围保持为待补。
+- 评论响应诊断新增 `totalCount`、`bookMarkCount`、`maxIdx`、`synckey`、`hasMore`、`isEnd` 与 `pageReviews` 数量，直接区分“服务器认为没有评论”和“服务器知道有评论但分页/cursor 没有返回内容”。
+- A/B 诊断只对每章第一个异常 range 执行一次；整本和多章批量获取不会对所有 range 重复增加请求。用户点击单条划线补全时，由于目标通常只有一个 range，可直接得到最完整的对照结果。
+- B 组如果实际取得评论，会立即写入现有 `thoughts.sqlite3`；已有非空评论仍受保护。A/B 均为空时继续保持 `partial`，不显示或记录为“无评论完成”。
+- 本版不修改 EPUB 正文生成、locator 生成规则、评论显示与收藏、阅读进度、阅读时间、用户批注同步、本地书库、微信书架、Kindle/Kobo 电源管理、后台下载、封面及 OTA 核心。
+
 ## 5.5.0-beta.2
 
 - 修复 5.5.0-beta.1 中“Web 已返回全部 range，但评论解析为 0 条后仍被记为无评论完成”的问题；本版彻底取消 `0 评论 -> empty -> complete` 自动判定。

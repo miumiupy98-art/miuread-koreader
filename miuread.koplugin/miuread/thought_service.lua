@@ -8,7 +8,7 @@ local logger = require("logger")
 local ThoughtService = {}
 ThoughtService.__index = ThoughtService
 
-local V55_MIGRATION_KEY = "thought_fetcher_v552_migrated"
+local V55_MIGRATION_KEY = "thought_fetcher_v553_migrated"
 
 local function ensure_v55_migration(store, book_id)
     if not ThoughtDatabase.exists(store, book_id) then return true end
@@ -23,7 +23,7 @@ local function ensure_v55_migration(store, book_id)
                     UPDATE thought_fetch_state
                        SET status = 'stale_empty',
                            complete = 0,
-                           last_error = '5.5.0-beta.2 parser migration'
+                           last_error = '5.5.0-beta.3 A/B diagnostic migration'
                      WHERE complete = 1
                        AND NOT EXISTS (
                             SELECT 1
@@ -152,7 +152,10 @@ function ThoughtService:fetch_chapter(book_id, chapter_uid, options)
     end
 
     local result=ThoughtFetcher.fetch(
-        self.annotations.api,book_id,chapter_uid,ranges,progress)
+        self.annotations.api,book_id,chapter_uid,ranges,progress,{
+            locators=locator_rows,
+            ab_diagnostic=options.ab_diagnostic~=false,
+        })
     if type(result)~="table" then
         return fail("评论接口返回无效数据","invalid_result",result)
     end
@@ -205,6 +208,7 @@ function ThoughtService:fetch_chapter(book_id, chapter_uid, options)
         error_kind=result.error_kind,
         underlines=#ranges,pending_ranges=#(result.pending_ranges or {}),
         locators=#locator_rows,
+        ab_diagnostic=result.ab_diagnostic,
     }
 end
 

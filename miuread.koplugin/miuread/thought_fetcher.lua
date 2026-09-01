@@ -117,6 +117,13 @@ local function review_texts_v53(group)
         nested_count=nested_count,
         invalid=invalid,
         keys=sorted_keys(group,12),
+        total_count=tonumber(rawget(group,"totalCount") or rawget(group,"reviewCount") or rawget(group,"total")),
+        bookmark_count=tonumber(rawget(group,"bookMarkCount") or rawget(group,"bookmarkCount")),
+        max_idx=tonumber(rawget(group,"maxIdx") or rawget(group,"maxIndex")),
+        synckey=tonumber(rawget(group,"synckey") or rawget(group,"syncKey")),
+        has_more=rawget(group,"hasMore"),
+        has_next=rawget(group,"hasNext"),
+        is_end=rawget(group,"isEnd"),
     }
 end
 
@@ -129,6 +136,118 @@ local function response_rows(value)
         invalid=invalid,
         keys=sorted_keys(value,12),
     }
+end
+
+
+local function bool_text(value)
+    if value==true then return "true" end
+    if value==false then return "false" end
+    return ""
+end
+
+local function range_fingerprint(value)
+    local text=tostring(value or "")
+    local hash=5381
+    for index=1,#text do
+        hash=(hash*33+text:byte(index))%4294967291
+    end
+    return string.format("%08x",hash)
+end
+
+local function request_fingerprint(book_id,chapter_uid,range)
+    return range_fingerprint(
+        tostring(book_id or "").."|"..tostring(chapter_uid or "").."|"..
+        tostring(range or "").."|0|30|0")
+end
+
+local function underline_source_text(row)
+    if type(row)~="table" then return "" end
+    for _,name in ipairs({"markText","bookmarkText","rangeText","abstract","text","content"}) do
+        local value=scalar_str(rawget(row,name))
+        if value~="" then return value end
+    end
+    return ""
+end
+
+local function fresh_underlines(api,book_id,chapter_uid)
+    local ok,value=pcall(api.underlines,api,book_id,chapter_uid)
+    if not ok or type(value)~="table" then
+        return nil,ok and "underlines returned invalid data" or tostring(value)
+    end
+    local container,name=array_from(value,{"underlines","updated","bookmarks"})
+    local rows,invalid,shape=table_entries(container)
+    return rows,nil,{
+        container=tostring(name or "none"),
+        shape=tostring(shape or "none"),
+        invalid=invalid,
+        count=#rows,
+        source=tostring(value._annotation_source or ""),
+    }
+end
+
+local function locator_for_range(locators,target)
+    for _,row in ipairs(type(locators)=="table" and locators or {}) do
+        local key=tostring(row.range or row.range_key or "")
+        if key==target then return row end
+    end
+    return nil
+end
+
+local function fresh_match(locator,fresh_rows,target)
+    -- Strongest comparison: the exact WeRead range still exists.
+    for index,row in ipairs(fresh_rows or {}) do
+        if range_key(row)==target then
+            return row,"exact",true,index
+        end
+    end
+
+    if type(locator)~="table" then return nil,"none",false,nil end
+    local source=tostring(locator.source_text or "")
+    local ordinal=tonumber(locator.ordinal or 0) or 0
+
+    -- If source_text uniquely identifies the same underline, this is strong
+    -- enough to diagnose a changed range and safely map recovered comments.
+    if source~="" then
+        local found,found_index
+        for index,row in ipairs(fresh_rows or {}) do
+            if underline_source_text(row)==source then
+                if found then
+                    found=nil
+                    found_index=nil
+                    break
+                end
+                found=row
+                found_index=index
+            end
+        end
+        if found then return found,"source_text",true,found_index end
+    end
+
+    -- Ordinal alone is useful diagnostic evidence but not strong enough to
+    -- rewrite/store comments under a different range.
+    if ordinal>=1 and type(fresh_rows[ordinal])=="table" then
+        local row=fresh_rows[ordinal]
+        local fresh_text=underline_source_text(row)
+        if source~="" and fresh_text==source then
+            return row,"ordinal+text",true,ordinal
+        end
+        return row,"ordinal_only",false,ordinal
+    end
+    return nil,"none",false,nil
+end
+
+local function rekey_parsed(parsed,from_key,to_key)
+    if type(parsed)~="table" or from_key==to_key then return parsed end
+    local items=parsed.comments_by_range and parsed.comments_by_range[from_key]
+    if type(items)~="table" or #items==0 then return parsed end
+    parsed.comments_by_range[to_key]=items
+    parsed.comments_by_range[from_key]=nil
+    if parsed.diagnostics then
+        parsed.diagnostics[to_key]=parsed.diagnostics[from_key]
+        parsed.diagnostics[from_key]=nil
+    end
+    parsed.returned[to_key]=true
+    return parsed
 end
 
 local function request_map(batch)
@@ -217,6 +336,13 @@ local function parse_transport(value,batch,source,book_id,chapter_uid)
                     "pages=",tostring(diag.page_count),
                     "nested_review=",tostring(diag.nested_count),
                     "parsed=",tostring(#comments),
+                    "totalCount=",tostring(diag.total_count or ""),
+                    "bookMarkCount=",tostring(diag.bookmark_count or ""),
+                    "maxIdx=",tostring(diag.max_idx or ""),
+                    "synckey=",tostring(diag.synckey or ""),
+                    "hasMore=",bool_text(diag.has_more),
+                    "hasNext=",bool_text(diag.has_next),
+                    "isEnd=",bool_text(diag.is_end),
                     "invalid=",tostring(diag.invalid))
             end
         end
@@ -291,9 +417,10 @@ local function unresolved_keys(batch,parsed)
     return unresolved
 end
 
-function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
+function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress,options)
     progress=type(progress)=="function" and progress or function() end
     ranges=type(ranges)=="table" and ranges or {}
+    options=type(options)=="table" and options or {}
 
     local batches
     if type(api.review_batches)=="function" then
@@ -313,13 +440,18 @@ function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
     local completed,pending={},{}
     local errors={}
     local last_error_kind
-    local source_counts={web=0,agent_fallback=0}
+    local source_counts={web=0,agent_fallback=0,fresh_web=0,fresh_agent=0}
+    local diagnostic_by_range={}
+    local ab_diagnostic=nil
     for _,range in ipairs(ranges) do
         range=tostring(range or "")
         if range~="" then pending[range]=true end
     end
 
     local function merge_parsed(parsed)
+        for key,diag in pairs(type(parsed.diagnostics)=="table" and parsed.diagnostics or {}) do
+            diagnostic_by_range[key]=diag
+        end
         for key,items in pairs(parsed.comments_by_range or {}) do
             by_range[key]=by_range[key] or {}
             seen_by_range[key]=seen_by_range[key] or {}
@@ -380,7 +512,7 @@ function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
                     agent_value,agent_batch,"agent_fallback",book_id,chapter_uid)
                 merge_parsed(agent_parsed)
                 if agent_parsed.comment_count==0 then
-                    errors[#errors+1]="Gateway returned ranges but no parsable comments"
+                    errors[#errors+1]="Gateway returned ranges but no comment rows"
                     last_error_kind=last_error_kind or "parser_unknown"
                 end
             else
@@ -395,6 +527,175 @@ function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
     for index,batch in ipairs(batches) do
         progress("thoughts",index,#batches,"")
         process_batch(batch,"comments batch "..tostring(index),0)
+    end
+
+
+    -- 5.5.0-beta.3 A/B diagnosis:
+    -- Only one unresolved range per chapter is tested. The ordinary A path has
+    -- already used the same raw _web_readreviews request construction as v5.3.
+    -- B asks underlines again immediately, compares the fresh WeRead range with
+    -- the persisted locator, then issues that same raw request once more.
+    if options.ab_diagnostic~=false then
+        local target
+        local pending_keys={}
+        for key in pairs(pending) do pending_keys[#pending_keys+1]=key end
+        table.sort(pending_keys)
+        target=pending_keys[1]
+
+        if target then
+            local locator=locator_for_range(options.locators,target)
+            local a_diag=diagnostic_by_range[target] or {}
+            ab_diagnostic={
+                target_range_fp=range_fingerprint(target),
+                request_fp=request_fingerprint(book_id,chapter_uid,target),
+                a_comments=type(by_range[target])=="table" and #by_range[target] or 0,
+                a_total_count=a_diag.total_count,
+                a_bookmark_count=a_diag.bookmark_count,
+                a_max_idx=a_diag.max_idx,
+                a_synckey=a_diag.synckey,
+                a_has_more=a_diag.has_more,
+                result="not_run",
+            }
+
+            logger.info("[MiuRead][ReviewAB] A",
+                "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+                "range_fp=",ab_diagnostic.target_range_fp,
+                "request_fp=",ab_diagnostic.request_fp,
+                "comments=",tostring(ab_diagnostic.a_comments),
+                "totalCount=",tostring(a_diag.total_count or ""),
+                "bookMarkCount=",tostring(a_diag.bookmark_count or ""),
+                "maxIdx=",tostring(a_diag.max_idx or ""),
+                "synckey=",tostring(a_diag.synckey or ""),
+                "hasMore=",bool_text(a_diag.has_more))
+
+            progress("thoughts",0,0,"A/B：重新读取划线")
+            local fresh_rows,fresh_error,fresh_shape=fresh_underlines(
+                api,book_id,chapter_uid)
+
+            if type(fresh_rows)~="table" then
+                ab_diagnostic.result="fresh_underlines_failed"
+                ab_diagnostic.error=tostring(fresh_error or "")
+                logger.warn("[MiuRead][ReviewAB] fresh underlines failed",
+                    "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+                    "error=",tostring(fresh_error))
+            else
+                local fresh_row,method,safe_map,fresh_index=
+                    fresh_match(locator,fresh_rows,target)
+                local fresh_key=range_key(fresh_row)
+                local same=fresh_key~="" and fresh_key==target
+
+                ab_diagnostic.fresh_underlines=#fresh_rows
+                ab_diagnostic.fresh_invalid=fresh_shape and fresh_shape.invalid or 0
+                ab_diagnostic.match_method=method
+                ab_diagnostic.same_range=same
+                ab_diagnostic.fresh_range_fp=fresh_key~="" and range_fingerprint(fresh_key) or ""
+                ab_diagnostic.fresh_index=fresh_index
+                ab_diagnostic.safe_map=safe_map==true
+
+                logger.info("[MiuRead][ReviewAB] range compare",
+                    "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+                    "locator_fp=",range_fingerprint(target),
+                    "fresh_fp=",fresh_key~="" and range_fingerprint(fresh_key) or "",
+                    "same=",tostring(same),
+                    "method=",tostring(method),
+                    "safe_map=",tostring(safe_map==true),
+                    "fresh_underlines=",tostring(#fresh_rows),
+                    "fresh_source=",tostring(fresh_shape and fresh_shape.source or ""),
+                    "fresh_invalid=",tostring(fresh_shape and fresh_shape.invalid or 0))
+
+                if fresh_key=="" then
+                    ab_diagnostic.result="fresh_range_unmatched"
+                else
+                    local one={{range=fresh_key,maxIdx=0,count=30,synckey=0}}
+                    progress("thoughts",0,0,"A/B：fresh range 请求评论")
+
+                    local b_value,b_error=request_web(api,book_id,chapter_uid,one)
+                    local b_parsed
+                    if b_value then
+                        source_counts.fresh_web=source_counts.fresh_web+1
+                        b_parsed=parse_transport(
+                            b_value,one,"fresh_web",book_id,chapter_uid)
+                    end
+
+                    if not b_parsed or b_parsed.comment_count==0 then
+                        local agent_value,agent_error=request_agent(
+                            api,book_id,chapter_uid,one)
+                        if agent_value then
+                            source_counts.fresh_agent=source_counts.fresh_agent+1
+                            local agent_parsed=parse_transport(
+                                agent_value,one,"fresh_agent",book_id,chapter_uid)
+                            if not b_parsed or agent_parsed.comment_count>0 then
+                                b_parsed=agent_parsed
+                            end
+                        elseif not b_parsed then
+                            b_error=agent_error or b_error
+                        end
+                    end
+
+                    local b_comments=b_parsed and
+                        tonumber(b_parsed.comment_count or 0) or 0
+                    local b_diag=b_parsed and
+                        b_parsed.diagnostics and
+                        b_parsed.diagnostics[fresh_key] or {}
+
+                    ab_diagnostic.b_comments=b_comments
+                    ab_diagnostic.b_total_count=b_diag and b_diag.total_count or nil
+                    ab_diagnostic.b_bookmark_count=b_diag and b_diag.bookmark_count or nil
+                    ab_diagnostic.b_max_idx=b_diag and b_diag.max_idx or nil
+                    ab_diagnostic.b_synckey=b_diag and b_diag.synckey or nil
+                    ab_diagnostic.b_has_more=b_diag and b_diag.has_more or nil
+
+                    logger.info("[MiuRead][ReviewAB] B",
+                        "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+                        "range_fp=",range_fingerprint(fresh_key),
+                        "same=",tostring(same),
+                        "method=",tostring(method),
+                        "comments=",tostring(b_comments),
+                        "totalCount=",tostring(b_diag and b_diag.total_count or ""),
+                        "bookMarkCount=",tostring(b_diag and b_diag.bookmark_count or ""),
+                        "maxIdx=",tostring(b_diag and b_diag.max_idx or ""),
+                        "synckey=",tostring(b_diag and b_diag.synckey or ""),
+                        "hasMore=",bool_text(b_diag and b_diag.has_more))
+
+                    if b_comments>0 then
+                        if same then
+                            merge_parsed(b_parsed)
+                            ab_diagnostic.result="fresh_context_success"
+                            if last_error_kind=="parser_unknown"
+                                or last_error_kind=="review_empty_response" then
+                                last_error_kind=nil
+                            end
+                        elseif safe_map==true then
+                            rekey_parsed(b_parsed,fresh_key,target)
+                            merge_parsed(b_parsed)
+                            ab_diagnostic.result="locator_range_mismatch_confirmed"
+                            if last_error_kind=="parser_unknown"
+                                or last_error_kind=="review_empty_response" then
+                                last_error_kind=nil
+                            end
+                        else
+                            ab_diagnostic.result="fresh_comments_unmapped"
+                        end
+                    elseif same then
+                        ab_diagnostic.result="same_range_still_empty"
+                    else
+                        ab_diagnostic.result="range_mismatch_fresh_empty"
+                    end
+
+                    if b_error and b_comments==0 then
+                        ab_diagnostic.error=tostring(b_error)
+                    end
+                end
+
+                logger.info("[MiuRead][ReviewAB] result",
+                    "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
+                    "result=",tostring(ab_diagnostic.result),
+                    "same=",tostring(ab_diagnostic.same_range),
+                    "method=",tostring(ab_diagnostic.match_method or ""),
+                    "a_comments=",tostring(ab_diagnostic.a_comments or 0),
+                    "b_comments=",tostring(ab_diagnostic.b_comments or 0))
+            end
+        end
     end
 
     local groups={}
@@ -422,7 +723,7 @@ function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
     -- A chapter is complete only when every requested range produced at least
     -- one real parsed comment. This is intentionally conservative for one beta.
     local complete=#ranges>0 and #pending_ranges==0 and comment_count>0
-    if comment_count==0 and not last_error_kind then last_error_kind="parser_unknown" end
+    if comment_count==0 and not last_error_kind then last_error_kind="review_empty_response" end
 
     logger.info("[MiuRead][CommentFetch] chapter finished",
         "book=",tostring(book_id),"chapter=",tostring(chapter_uid),
@@ -432,7 +733,10 @@ function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
         "pending=",tostring(#pending_ranges),
         "complete=",tostring(complete),
         "web_batches=",tostring(source_counts.web or 0),
-        "agent_batches=",tostring(source_counts.agent_fallback or 0))
+        "agent_batches=",tostring(source_counts.agent_fallback or 0),
+        "fresh_web=",tostring(source_counts.fresh_web or 0),
+        "fresh_agent=",tostring(source_counts.fresh_agent or 0),
+        "ab_result=",tostring(ab_diagnostic and ab_diagnostic.result or ""))
 
     return {
         groups=groups,
@@ -445,6 +749,7 @@ function Fetcher.fetch(api,book_id,chapter_uid,ranges,progress)
         errors=errors,
         error_kind=last_error_kind,
         source_counts=source_counts,
+        ab_diagnostic=ab_diagnostic,
     }
 end
 
