@@ -20809,7 +20809,7 @@ function Plugin:progress_sync_label()
         if kind=="context" or kind=="position" then return "需要修复" end
     end
     local state=session and session.progress_sync_state or nil
-    local labels={checking="正在检查",retrying="正在重试",mapping_pending="准备章节信息",mapping_preparing="准备章节信息",mapping_failed="章节信息失败",position_locating="正在定位",aligned="阅读中自动",local_selected="阅读中自动",local_uploaded="已上传并确认",uploading="正在上传",verifying_upload="正在确认",upload_failed="上传失败",upload_unconfirmed="云端未确认",source_conflict="云端来源冲突",remote_selected="已采用云端位置",different="等待选择",deferred="本次暂不处理",remote_unavailable="等待重新检查",remote_jump_unconfirmed="跳转待确认"}
+    local labels={checking="正在检查",retrying="正在重试",mapping_pending="准备章节信息",mapping_preparing="准备章节信息",mapping_failed="等待重建",position_locating="正在定位",aligned="阅读中自动",local_selected="阅读中自动",local_uploaded="已上传并确认",uploading="正在上传",verifying_upload="正在确认",upload_failed="需要处理",upload_unconfirmed="等待云端确认",source_conflict="云端来源冲突",remote_selected="已采用云端位置",different="等待选择",deferred="等待云端确认",remote_unavailable="等待云端确认",remote_jump_unconfirmed="位置待确认",waiting_network="等待网络"}
     return labels[state] or "阅读中自动"
 end
 
@@ -20893,6 +20893,41 @@ function Plugin:_show_auto_sync_success(text)
     self._sync_success_notified=true
     self:status_toast("同步完成",text or "已成功上传",3)
 end
+function Plugin:_sync_user_issue(status, session)
+    status=type(status)=="table" and status or (self.sync and self.sync:status() or {})
+    local record=status.record
+    local book_id=record and record.book and tostring(record.book.book_id or record.book.bookId or "") or ""
+    session=type(session)=="table" and session or (book_id~="" and (self.store:session(book_id) or {}) or {})
+    local progress_state=tostring(session.progress_sync_state or status.progress_state or "")
+    local report_state=tostring(session.report_state or "")
+    local kind=tostring(session.sync_repair_kind or session.last_error_kind or status.last_error_kind or "")
+
+    if not self:logged_in() or kind=="authentication" or report_state=="authentication" then
+        return {label="登录待验证",reason="微信读书登录状态需要重新验证",advice="检查账号状态或重新扫码登录",action="account"}
+    end
+    if progress_state=="waiting_network" or kind=="transport" or report_state=="transport" then
+        return {label="等待网络",reason="当前网络暂时无法连接微信读书",advice="网络恢复后会自动继续，无需修复书籍",action="none"}
+    end
+    if session.sync_repair_required==true or status.state=="repair_required" or kind=="context" or kind=="position" then
+        return {label="需要处理",reason="当前书籍的章节位置无法可靠对应",advice="检查并修复当前书籍同步",action="repair"}
+    end
+    if report_state=="unconfirmed" or progress_state=="upload_unconfirmed"
+        or progress_state=="remote_jump_unconfirmed" or progress_state=="verification_required"
+        or progress_state=="deferred" or progress_state=="remote_unavailable" then
+        return {label="待确认",reason="同步请求已经提交，但微信读书还没有明确确认",advice="无需重复上传，后续会继续确认",action="none"}
+    end
+    if progress_state=="upload_failed" then
+        return {label="需要处理",reason="本次阅读进度提交没有完成",advice="打开待确认进度查看原因并重新确认",action="progress"}
+    end
+    if progress_state=="mapping_failed" then
+        return {label="等待重建",reason=tostring(session.progress_sync_message or "当前章节位置暂时无法完成换算"),advice="继续阅读即可，结束阅读时会再次尝试",action="none"}
+    end
+    if kind=="server" or report_state=="server" or report_state=="time_only_failed" then
+        return {label="等待重试",reason="微信读书暂未完成本次同步",advice="稍后会自动重试，无需重复操作",action="none"}
+    end
+    return nil
+end
+
 function Plugin:_reading_time_status_label()
     local prefs=self.store:preferences().sync or {}
     if prefs.time_enabled~=true then return "已关闭" end
@@ -20901,9 +20936,13 @@ function Plugin:_reading_time_status_label()
     local id=tostring(r.book.book_id or r.book.bookId or "")
     local session=id~="" and (self.store:session(id) or {}) or {}
     local state=tostring(session.report_state or "")
-    if state=="ok" or (tonumber(self.sync and self.sync.last_upload or 0) or 0)>0 then return "已同步" end
+    local kind=tostring(session.last_error_kind or "")
+    if not self:logged_in() or kind=="authentication" or state=="authentication" then return "登录待验证" end
+    if kind=="transport" or state=="transport" then return "等待网络" end
+    if kind=="context" or state=="context" or session.sync_repair_required==true then return "需要处理" end
     if state=="unconfirmed" then return "待确认" end
-    if state=="time_only_failed" then return "异常" end
+    if kind=="server" or state=="server" or state=="time_only_failed" then return "等待重试" end
+    if state=="ok" or (tonumber(self.sync and self.sync.last_upload or 0) or 0)>0 then return "已同步" end
     return "等待首次同步"
 end
 
@@ -20922,20 +20961,18 @@ function Plugin:_progress_status_label()
     if not (r and r.book) then return "等待阅读" end
     local id=tostring(r.book.book_id or r.book.bookId or "")
     local session=id~="" and (self.store:session(id) or {}) or {}
-    if session.sync_repair_required==true then return "需要修复" end
-    if type(session.pending_progress)=="table" then
-        local state=tostring(session.progress_sync_state or "")
-        if state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="settling" then
-            return "同步中"
-        end
-        return "本机有更新"
-    end
     local state=tostring(session.progress_sync_state or "")
+    if not self:logged_in() then return "登录待验证" end
+    if session.sync_repair_required==true then return "需要处理" end
     if state=="local_uploaded" or state=="aligned" or state=="remote_selected" or state=="submitted" then return "已同步" end
     if state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="settling" then return "同步中" end
-    if state=="upload_unconfirmed" or state=="remote_jump_unconfirmed" or state=="remote_unavailable" or state=="deferred" then return "待确认" end
+    if state=="waiting_network" then return "等待网络" end
+    if state=="upload_unconfirmed" or state=="remote_jump_unconfirmed" or state=="remote_unavailable"
+        or state=="deferred" or state=="verification_required" then return "待确认" end
     if state=="different" or state=="source_conflict" then return "需要选择" end
-    if state=="upload_failed" or state=="mapping_failed" then return "异常" end
+    if state=="upload_failed" then return "需要处理" end
+    if state=="mapping_failed" then return "等待重建" end
+    if type(session.pending_progress)=="table" then return "本机有更新" end
     return "等待结束同步"
 end
 
@@ -21328,7 +21365,8 @@ function Plugin:_home_sync_summary(force)
     -- refreshed snapshot.
     local sessions=self:_persisted_sessions()
     local progress,time_count,progress_failed,progress_unconfirmed=0,0,0,0
-    local progress_active,progress_waiting=0,0
+    local progress_active,progress_waiting,progress_waiting_network=0,0,0
+    local auth_required,repair_required=(self:logged_in() and 0 or 1),0
     local pending_progress_states={
         waiting_network=true,uploading=true,retrying=true,finalizing=true,upload_unconfirmed=true,upload_failed=true,
         verifying_upload=true,deferred=true,verification_required=true,remote_jump_unconfirmed=true,
@@ -21337,6 +21375,7 @@ function Plugin:_home_sync_summary(force)
     for _,session in pairs(sessions) do
         if type(session)=="table" then
             local state=tostring(session.progress_sync_state or "")
+            if session.sync_repair_required==true then repair_required=repair_required+1 end
             local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
             local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
             local verified_seq=tonumber(session.progress_verified_sequence or 0) or 0
@@ -21369,6 +21408,7 @@ function Plugin:_home_sync_summary(force)
                     progress_active=progress_active+1
                 elseif state=="waiting_network" then
                     progress_waiting=progress_waiting+1
+                    progress_waiting_network=progress_waiting_network+1
                 end
             elseif live_without_snapshot then
                 progress_active=progress_active+1
@@ -21395,7 +21435,9 @@ function Plugin:_home_sync_summary(force)
         annotation_failed=tonumber(annotations.failed or 0) or 0,
         progress_failed=progress_failed,progress_unconfirmed=progress_unconfirmed,
         progress_active=progress_active,progress_waiting=progress_waiting,
-        progress_action_required=progress_failed,
+        progress_waiting_network=progress_waiting_network,
+        auth_required=auth_required,repair_required=repair_required,
+        progress_action_required=progress_failed+repair_required,
         failed=progress_failed+(tonumber(annotations.failed or 0) or 0),
         total=total,books=tonumber(annotations.books or 0) or 0,checking=checking,
     }
@@ -21407,18 +21449,23 @@ end
 
 function Plugin:_home_sync_status_label(force)
     local summary=self:_home_sync_summary(force)
+    if (tonumber(summary.auth_required or 0) or 0)>0 then return "登录待验证" end
+    if (tonumber(summary.repair_required or 0) or 0)>0 then return "需要处理 "..tostring(summary.repair_required) end
     if summary.annotation_upgrade_recheck>0 then
         return "待重新检查 "..tostring(summary.annotation_upgrade_recheck)
     end
     if summary.annotation_action_required>0 then
         return "批注待确认 "..tostring(summary.annotation_action_required)
     end
-    if summary.failed>0 then return "失败 "..tostring(summary.failed) end
+    if summary.failed>0 then return "需要处理 "..tostring(summary.failed) end
     if (tonumber(summary.progress_active or 0) or 0)>0 then
         return "进度同步中 "..tostring(summary.progress_active)
     end
     if (tonumber(summary.progress_unconfirmed or 0) or 0)>0 then
         return "进度待确认 "..tostring(summary.progress_unconfirmed)
+    end
+    if (tonumber(summary.progress_waiting_network or 0) or 0)>0 then
+        return "等待网络 "..tostring(summary.progress_waiting_network)
     end
     if (tonumber(summary.progress_waiting or 0) or 0)>0 then
         return "进度待同步 "..tostring(summary.progress_waiting)
@@ -21445,7 +21492,7 @@ function Plugin:_progress_sync_issue_items()
     local items={}
     local labels={
         upload_unconfirmed="等待云端确认",verifying_upload="正在确认",
-        waiting_network="等待网络",upload_failed="提交失败",
+        waiting_network="等待网络",upload_failed="需要处理",
         remote_jump_unconfirmed="位置待确认",verification_required="需要确认",
         uploading="正在上传",retrying="正在重试",finalizing="正在提交",deferred="等待确认",
     }
@@ -22953,17 +23000,15 @@ function Plugin:show_sync_status(detail)
     local remote=s.remote and math.floor((s.remote.percent or 0)+.5) or nil
     local local_text=s.local_percent~=nil and (tostring(s.local_percent).."%")
         or (s.local_chapter_percent~=nil and ("本章 "..tostring(s.local_chapter_percent).."%") or "—")
-    local time_text
-    if not s.time_enabled then time_text="已关闭"
-    elseif not s.record or s.state=="stopped" then time_text="未运行"
-    elseif s.state=="verification_required" or s.state=="fetching_remote" or s.state=="progress_sync" then time_text="等待位置确认"
-    elseif s.state=="repair_required" then time_text="需要修复同步"
-    elseif s.state=="paused" then time_text="已暂停"
-    elseif tostring(s.last_error_kind or "")=="authentication" then time_text="登录待验证"
-    elseif tostring(s.last_error_kind or "")=="transport" then time_text="等待网络恢复"
-    elseif tostring(s.last_error_kind or "")=="server" then time_text="等待自动重试"
-    elseif s.state=="uploading" then time_text="正在同步"
-    else time_text="运行中" end
+    local current_session={}
+    if s.record and s.record.book then
+        local current_id=tostring(s.record.book.book_id or s.record.book.bookId or "")
+        if current_id~="" then current_session=self.store:session(current_id) or {} end
+    end
+    local issue=self:_sync_user_issue(s,current_session)
+    local time_text=self:_reading_time_status_label()
+    if s.time_enabled and s.record and s.state=="paused" and not issue then time_text="已暂停" end
+    if s.time_enabled and s.record and s.state=="uploading" and not issue then time_text="正在同步" end
 
     if HomeView.is_shown() and not self:_active_reader_ui() then
         local pending=self:_home_sync_summary(true)
@@ -22974,12 +23019,14 @@ function Plugin:show_sync_status(detail)
             return count>0 and ("待同步 "..tostring(count)) or tostring(normal or "已同步")
         end
         local progress_status
-        if (tonumber(pending.progress_failed or 0) or 0)>0 then
-            progress_status="失败 "..tostring(pending.progress_failed)
+        if (tonumber(pending.repair_required or 0) or 0)>0 or (tonumber(pending.progress_failed or 0) or 0)>0 then
+            progress_status="需要处理 "..tostring((tonumber(pending.repair_required or 0) or 0)+(tonumber(pending.progress_failed or 0) or 0))
         elseif (tonumber(pending.progress_active or 0) or 0)>0 then
             progress_status="同步中 "..tostring(pending.progress_active)
         elseif (tonumber(pending.progress_unconfirmed or 0) or 0)>0 then
             progress_status="待确认 "..tostring(pending.progress_unconfirmed)
+        elseif (tonumber(pending.progress_waiting_network or 0) or 0)>0 then
+            progress_status="等待网络 "..tostring(pending.progress_waiting_network)
         elseif (tonumber(pending.progress_waiting or 0) or 0)>0 then
             progress_status="待同步 "..tostring(pending.progress_waiting)
         else
@@ -22996,6 +23043,14 @@ function Plugin:show_sync_status(detail)
         if pending.annotation_action_required>0 then
             rows[#rows+1]={text="批注同步问题",post_text=tostring(pending.annotation_action_required).." 条",callback=function() self:show_annotation_sync_issues() end}
         end
+        if issue then
+            rows[#rows+1]={text="原因",post_text=U.utf8_truncate(issue.reason,34,"…"),enabled=false}
+            local advice_row={text="建议",post_text=U.utf8_truncate(issue.advice,34,"…"),enabled=false}
+            if issue.action=="account" then advice_row.enabled=true; advice_row.callback=function() self:show_account_status() end
+            elseif issue.action=="repair" then advice_row.enabled=true; advice_row.callback=function() self:repair_current_sync() end
+            elseif issue.action=="progress" then advice_row.enabled=true; advice_row.callback=function() self:show_progress_sync_issues() end end
+            rows[#rows+1]=advice_row
+        end
         rows[#rows+1]={text="上次同步",post_text=self:_relative_time(s.last_upload),enabled=false}
         if detail then
             rows[#rows+1]={text="详细信息",separator=true,enabled=false}
@@ -23009,6 +23064,11 @@ function Plugin:show_sync_status(detail)
     local lines={"阅读同步","","阅读时间："..time_text,"阅读进度："..self:progress_sync_label(),"当前位置："..local_text}
     if remote then lines[#lines+1]="云端位置："..remote.."%" end
     lines[#lines+1]="上次同步："..self:_relative_time(s.last_upload)
+    if issue then
+        lines[#lines+1]=""
+        lines[#lines+1]="原因："..tostring(issue.reason)
+        lines[#lines+1]="建议："..tostring(issue.advice)
+    end
     if detail then
         lines[#lines+1]=""
         lines[#lines+1]="详细信息"
