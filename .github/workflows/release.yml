@@ -1,0 +1,555 @@
+name: Release stable full package
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "!v*.*.*-beta.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的正式版本，例如 5.3.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miuread-stable-release
+  cancel-in-progress: false
+
+jobs:
+  release-stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      RELEASE_CHANNEL: stable
+      CHANNEL_TAG: stable-channel
+      MANIFEST_NAME: update.json
+
+    steps:
+      - name: Check out main branch
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve and synchronize stable release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH_SHA="$(git rev-parse HEAD)"
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            RELEASE_TAG="v$VERSION"
+            EVENT_SHA="$BRANCH_SHA"
+          else
+            test "${GITHUB_REF_TYPE:-}" = "tag"
+            RELEASE_TAG="$GITHUB_REF_NAME"
+            VERSION="${RELEASE_TAG#v}"
+            EVENT_SHA="$GITHUB_SHA"
+
+            # Tag push 必须来自 main 当前 HEAD。
+            # 直接使用 GitHub 事件携带的 SHA，避免刚创建 tag 时的可见性竞态。
+            if [ "$EVENT_SHA" != "$BRANCH_SHA" ]; then
+              echo "::error::Tag $RELEASE_TAG 必须创建在 main 分支最新提交上。"
+              echo "::error::main=$BRANCH_SHA, event_source=$EVENT_SHA"
+              exit 1
+            fi
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无效的正式版本：$VERSION"
+            echo "::error::正确格式示例：5.3.0"
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+
+          python3 .github/scripts/sync_release_identity.py \
+            --channel stable \
+            --version "$VERSION" \
+            --tag "$RELEASE_TAG"
+
+          if ! git diff --quiet -- \
+              miuread.koplugin/miuread/config.lua \
+              miuread.koplugin/_meta.lua CHANGELOG.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add \
+              miuread.koplugin/miuread/config.lua \
+              miuread.koplugin/_meta.lua CHANGELOG.md
+            git commit -m "同步正式版本至 $VERSION" \
+              -m "根据 $RELEASE_TAG 自动同步源码版本、发布通道与版本记录。"
+            git push origin "HEAD:main"
+          fi
+
+          RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
+          CURRENT_TAG_SHA="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
+          if [ "$CURRENT_TAG_SHA" != "$RELEASE_SOURCE_SHA" ]; then
+            git tag -f "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
+            git push --force origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "RELEASE_SOURCE_SHA=$RELEASE_SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "PACKAGE_NAME=miuread-v$VERSION-full.zip" >> "$GITHUB_ENV"
+
+          echo "Stable release:"
+          echo "  version=$VERSION"
+          echo "  tag=$RELEASE_TAG"
+          echo "  source=$RELEASE_SOURCE_SHA"
+
+      - name: Read and validate stable identity
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d miuread.koplugin
+          test -f miuread.koplugin/main.lua
+          test -f miuread.koplugin/_meta.lua
+          test -f miuread.koplugin/miuread/config.lua
+          test -s CHANGELOG.md
+          test -s LICENSE
+          test -s NOTICE
+          test -s THIRD_PARTY_NOTICES
+          test -s miuread.koplugin/LICENSE
+          test -s miuread.koplugin/NOTICE
+          test -s miuread.koplugin/THIRD_PARTY_NOTICES
+          grep -Fq 'GNU AFFERO GENERAL PUBLIC LICENSE' LICENSE
+          grep -Fq '许可证：AGPL-3.0-only。' miuread.koplugin/main.lua
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag)
+          if not match or match.group(1) != version:
+              print(f"::error::正式版本与 tag 不一致：version={version}, tag={tag}")
+              sys.exit(1)
+
+          config = Path("miuread.koplugin/miuread/config.lua").read_text(encoding="utf-8")
+          meta = Path("miuread.koplugin/_meta.lua").read_text(encoding="utf-8")
+          version_pattern = r"[0-9]+\.[0-9]+\.[0-9]+"
+          config_version = re.search(
+              r'\bVERSION\s*=\s*["\'](' + version_pattern + r')["\']', config
+          )
+          meta_version = re.search(
+              r'\bversion\s*=\s*["\'](' + version_pattern + r')["\']', meta
+          )
+          if not config_version or not meta_version:
+              print("::error::无法读取 config.lua 或 _meta.lua 的正式版本号。")
+              sys.exit(1)
+          if config_version.group(1) != version or meta_version.group(1) != version:
+              print(
+                  "::error::tag、config.lua 与 _meta.lua 版本不一致："
+                  f"tag={version}, config={config_version.group(1)}, meta={meta_version.group(1)}"
+              )
+              sys.exit(1)
+
+          channel = re.search(r'\bUPDATE_CHANNEL\s*=\s*["\']([^"\']+)["\']', config)
+          label = re.search(r'\bUPDATE_CHANNEL_LABEL\s*=\s*["\']([^"\']+)["\']', config)
+          if not channel or channel.group(1) != "stable":
+              print("::error::插件不是正式通道。")
+              sys.exit(1)
+          if not label or label.group(1) != "正式通道":
+              print("::error::正式通道名称配置错误。")
+              sys.exit(1)
+
+          expected_manifest = (
+              "https://github.com/miumiupy98-art/miuread-koreader/"
+              "releases/download/stable-channel/update.json"
+          )
+          manifest = re.search(r'\bUPDATE_MANIFEST\s*=\s*["\']([^"\']+)["\']', config)
+          if not manifest or manifest.group(1) != expected_manifest:
+              print("::error::正式更新清单主地址配置错误。")
+              sys.exit(1)
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          lines = changelog.splitlines()
+          start = None
+          end = len(lines)
+          heading = f"## {version}"
+          for index, line in enumerate(lines):
+              if line == heading or line.startswith(heading + " - "):
+                  start = index + 1
+                  break
+          if start is None:
+              print(f"::error::CHANGELOG.md 缺少 {version}。")
+              sys.exit(1)
+          for index in range(start, len(lines)):
+              if lines[index].startswith("## "):
+                  end = index
+                  break
+          body = "\n".join(lines[start:end]).strip()
+          if not body:
+              print(f"::error::CHANGELOG.md 中 {version} 没有更新内容。")
+              sys.exit(1)
+
+          bullets = []
+          for line in lines[start:end]:
+              text = line.strip()
+              if text.startswith("- "):
+                  text = text[2:].strip()
+                  if text:
+                      bullets.append(text)
+          if not bullets:
+              print(f"::error::CHANGELOG.md 中 {version} 至少需要一条列表项。")
+              sys.exit(1)
+
+          summary_lines = []
+          remaining = 180
+          for text in bullets[:4]:
+              if remaining <= 0:
+                  break
+              separator = 1 if summary_lines else 0
+              available = remaining - separator
+              if available <= 0:
+                  break
+              if len(text) > available:
+                  if available >= 4:
+                      text = text[: available - 3].rstrip() + "..."
+                  else:
+                      text = text[:available]
+              summary_lines.append(text)
+              remaining -= len(text) + separator
+          summary = "\n".join(summary_lines).strip()
+          if not summary:
+              print("::error::无法生成设备更新摘要。")
+              sys.exit(1)
+
+          Path("release-notes.md").write_text(body + "\n", encoding="utf-8")
+          Path("update-summary.txt").write_text(summary + "\n", encoding="utf-8")
+          Path("release.env").write_text(
+              f"VERSION={version}\n"
+              f"RELEASE_TAG={tag}\n"
+              f"PACKAGE_NAME=miuread-v{version}-full.zip\n",
+              encoding="utf-8",
+          )
+          PY
+
+          cat release.env >> "$GITHUB_ENV"
+
+          if find miuread.koplugin -type f \( \
+              -iname '*.md' -o \
+              -iname '*.epub' -o \
+              -iname '*.log' -o \
+              -name '.DS_Store' -o \
+              -name 'miuread.lua' -o \
+              -name 'settings.reader.lua' \
+          \) | grep -q .; then
+            echo "::error::插件目录包含不应发布的文件。"
+            exit 1
+          fi
+
+      - name: Run Lua syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+
+      - name: Build stable full package and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+          import hashlib
+          import json
+          import os
+
+          version = os.environ["VERSION"]
+          package_name = os.environ["PACKAGE_NAME"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          root = Path("miuread.koplugin")
+          output = Path("dist") / package_name
+          fixed_time = (2020, 1, 1, 0, 0, 0)
+
+          excluded_names = {
+              ".DS_Store",
+              "miuread.lua",
+              "settings.reader.lua",
+              "NON_COMMERCIAL_NOTICE.txt",
+          }
+          excluded_suffixes = {".md", ".epub", ".log"}
+
+          def excluded(path):
+              return (
+                  "__MACOSX" in path.parts
+                  or path.name in excluded_names
+                  or path.suffix.lower() in excluded_suffixes
+              )
+
+          with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+              directories = [root] + sorted(
+                  [path for path in root.rglob("*") if path.is_dir()],
+                  key=lambda path: path.as_posix(),
+              )
+              for path in directories:
+                  info = ZipInfo(path.as_posix().rstrip("/") + "/", fixed_time)
+                  info.create_system = 3
+                  info.external_attr = (0o40755 << 16) | 0x10
+                  archive.writestr(info, b"")
+
+              files = sorted(
+                  [path for path in root.rglob("*") if path.is_file() and not excluded(path)],
+                  key=lambda path: path.as_posix(),
+              )
+              for path in files:
+                  info = ZipInfo(path.as_posix(), fixed_time)
+                  info.create_system = 3
+                  info.external_attr = 0o100644 << 16
+                  info.compress_type = ZIP_DEFLATED
+                  archive.writestr(info, path.read_bytes())
+
+          payload = output.read_bytes()
+          official = (
+              f"https://github.com/{repo}/releases/download/"
+              f"v{version}/{package_name}"
+          )
+          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
+          manifest = {
+              "version": version,
+              "name": f"觅阅 · 微信读书助手 {version}",
+              "channel": "stable",
+              "package_type": "full",
+              "package_url": official,
+              "package_urls": [
+                  official,
+                  f"https://ghfast.top/{official}",
+                  f"https://gh-proxy.com/{official}",
+                  f"https://ghproxy.net/{official}",
+              ],
+              "size": len(payload),
+              "sha256": hashlib.sha256(payload).hexdigest(),
+              "summary": summary,
+              "notes": summary,
+          }
+          Path("dist/update.json").write_text(
+              json.dumps(manifest, ensure_ascii=True, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Verify stable package and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -t "dist/$PACKAGE_NAME"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import hashlib
+          import json
+          import os
+          import sys
+
+          package = Path("dist") / os.environ["PACKAGE_NAME"]
+          manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
+          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
+          required = {
+              "miuread.koplugin/_meta.lua",
+              "miuread.koplugin/main.lua",
+              "miuread.koplugin/miuread/config.lua",
+              "miuread.koplugin/LICENSE",
+              "miuread.koplugin/NOTICE",
+              "miuread.koplugin/THIRD_PARTY_NOTICES",
+          }
+          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
+          forbidden_suffixes = {".md", ".epub", ".log"}
+
+          with ZipFile(package) as archive:
+              names = archive.namelist()
+              damaged = archive.testzip()
+
+          errors = []
+          if damaged:
+              errors.append(f"ZIP 损坏：{damaged}")
+          for name in sorted(required.difference(names)):
+              errors.append(f"安装包缺少：{name}")
+          for name in names:
+              path = Path(name)
+              if not name.startswith("miuread.koplugin/"):
+                  errors.append(f"安装包根目录错误：{name}")
+              if (
+                  path.name in forbidden_names
+                  or path.suffix.lower() in forbidden_suffixes
+                  or "__MACOSX" in path.parts
+              ):
+                  errors.append(f"不应进入安装包：{name}")
+          if manifest.get("version") != os.environ["VERSION"]:
+              errors.append("更新清单版本错误")
+          if manifest.get("channel") != "stable":
+              errors.append("更新清单通道错误")
+          if manifest.get("notes") != summary or manifest.get("summary") != summary:
+              errors.append("线上更新摘要错误")
+          if len(summary.splitlines()) > 4 or len(summary) > 180:
+              errors.append("设备更新摘要超过 4 行或 180 个字符")
+          if manifest.get("size") != package.stat().st_size:
+              errors.append("更新清单文件大小错误")
+          if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
+              errors.append("更新清单 SHA-256 错误")
+
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+          print(f"正式版安装包检查通过，共 {len(names)} 个条目。")
+          PY
+
+      - name: Create or update stable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          FILE="dist/$PACKAGE_NAME"
+          NOTES_FILE="release-notes.md"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "觅阅 · 微信读书助手 $VERSION" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "觅阅 · 微信读书助手 $VERSION" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          fi
+
+          gh release upload "$RELEASE_TAG" "$FILE" --clobber
+
+          COUNT="$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
+            exit 1
+          fi
+
+      - name: Quick-check public download URL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
+          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update.json"))["sha256"])')"
+          success=0
+          for attempt in 1 2 3; do
+            rm -f dist/public-download.zip
+            if curl --fail --location --silent --show-error \
+                --connect-timeout 5 --max-time 20 \
+                --output dist/public-download.zip "$URL"; then
+              ACTUAL="$(sha256sum dist/public-download.zip | awk '{print $1}')"
+              if [ "$ACTUAL" = "$EXPECTED" ]; then
+                success=1
+                break
+              fi
+            fi
+            [ "$attempt" = "3" ] || sleep 2
+          done
+          if [ "$success" != "1" ]; then
+            echo "::warning::Release 已由 GitHub API 确认上传，但当前 runner 暂时无法从公开 CDN 回读；继续发布正式清单。"
+          fi
+
+      - name: Publish fixed stable channel manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          NOTES="Machine-readable update manifest for MiuRead Stable. Do not install this release directly."
+          if gh release view "$CHANNEL_TAG" >/dev/null 2>&1; then
+            gh release edit "$CHANNEL_TAG" \
+              --title "MiuRead Stable Update Channel" \
+              --notes "$NOTES" \
+              --latest=false
+          else
+            gh release create "$CHANNEL_TAG" \
+              --target "$RELEASE_SOURCE_SHA" \
+              --title "MiuRead Stable Update Channel" \
+              --notes "$NOTES" \
+              --latest=false
+          fi
+
+          gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME" --clobber
+
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$CHANNEL_TAG/$MANIFEST_NAME"
+          success=0
+          for attempt in 1 2 3; do
+            rm -f dist/public-manifest.json
+            if curl --fail --location --silent --show-error \
+                --connect-timeout 5 --max-time 15 \
+                --output dist/public-manifest.json "$URL" && \
+                cmp -s "dist/$MANIFEST_NAME" dist/public-manifest.json; then
+              success=1
+              break
+            fi
+            [ "$attempt" = "3" ] || sleep 2
+          done
+          if [ "$success" != "1" ]; then
+            echo "::warning::正式清单已由 GitHub API 上传，但当前 runner 暂时无法从公开 CDN 回读。"
+          fi
+
+      - name: Sync released main history back to beta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main beta
+          MAIN_SHA="$(git rev-parse origin/main)"
+          BETA_SHA="$(git rev-parse origin/beta)"
+
+          if [ "$MAIN_SHA" != "$RELEASE_SOURCE_SHA" ]; then
+            echo "::warning::main 已在发布过程中继续前进，跳过自动回同步 beta。"
+            exit 0
+          fi
+
+          # 只有在 beta 确实已经被本次 main 吸收时才自动回同步。
+          # 若 beta 在发布期间又有新提交，不强行改写，避免覆盖新开发内容。
+          if ! git merge-base --is-ancestor "$BETA_SHA" "$MAIN_SHA"; then
+            echo "::warning::beta 已有未包含在本次正式版中的新提交，跳过自动回同步。"
+            exit 0
+          fi
+
+          git checkout -B beta-sync "$BETA_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # main 相对 beta 只应增加正式版身份/记录及可能的正式热修。
+          # 合并历史后恢复 beta 自身的版本号和默认通道，避免下一次 beta -> main
+          # 因发布身份不同产生重复冲突。
+          git merge --no-ff --no-commit "$MAIN_SHA"
+          git restore --source="$BETA_SHA" --staged --worktree -- \
+            miuread.koplugin/miuread/config.lua \
+            miuread.koplugin/_meta.lua
+
+          if git diff --cached --quiet; then
+            git merge --abort || true
+            echo "beta 已包含正式发布历史，无需回同步。"
+            exit 0
+          fi
+
+          git commit -m "同步正式版 $VERSION 发布记录回 beta" \
+            -m "保留 beta 自身版本与内测通道，仅同步 main 的正式发布历史，减少下一次合并冲突。"
+
+          if ! git push origin "HEAD:beta"; then
+            echo "::warning::beta 在回同步期间发生变化，未覆盖新提交；本次正式版发布不受影响。"
+            exit 0
+          fi
