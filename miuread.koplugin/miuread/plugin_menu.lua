@@ -7,8 +7,6 @@ local function comment_and_thought_menu(plugin)
         {text="我的想法",callback=function()
             plugin:_show_reader_records("thought",function() plugin:_show_koreader_reader_menu() end)
         end},
-        {text=plugin:_current_chapter_comment_action_label(),post_text=plugin:_current_chapter_comment_action_status(),
-            callback=function() plugin:fetch_current_chapter_comments() end},
         {text="阅读评论",post_text=plugin:_thoughts_enabled_label(),checked_func=function()
             return plugin:_thoughts_enabled()
         end,keep_menu_open=true,callback=function() plugin:_toggle_thoughts_enabled() end},

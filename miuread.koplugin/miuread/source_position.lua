@@ -116,25 +116,6 @@ local function fetch_coord_html(reader, record, anchor, options)
     return coord_html, false
 end
 
-function M.chapterCoordHtml(reader, record, chapter, options)
-    record = type(record) == "table" and record or {}
-    chapter = type(chapter) == "table" and chapter or {}
-    local book = type(record.book) == "table" and record.book or {}
-    local nested = type(record.record) == "table" and record.record or {}
-    local uid = chapter_uid(chapter)
-    if uid == "" then uid = scalar(chapter.chapter_uid or chapter.chapterUid or chapter.uid) end
-    if uid == "" then return nil, nil, "chapter_uid_missing" end
-    local anchor = {
-        chapter_uid = uid,
-        chapter_index = chapter_index(chapter, 0),
-        chapter_title = scalar(chapter.title or chapter.chapterTitle or chapter.chapter_title),
-        book_version = tonumber(chapter.book_version or chapter.bookVersion
-            or book.version or book.bookVersion or book.book_version
-            or nested.book_version or nested.bookVersion) or 0,
-    }
-    return fetch_coord_html(reader, record, anchor, options)
-end
-
 function M.cacheChapter(reader, book_id, uid, version, coord_html)
     coord_html = tostring(coord_html or "")
     if coord_html == "" then return false, "coord_html_missing" end

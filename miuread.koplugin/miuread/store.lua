@@ -2320,6 +2320,28 @@ function Store:identify_file(path,relink)
     return self:file_record_from_identity(path,meta,relink)
 end
 
+-- Reader-session recovery must be stricter than general library relinking.
+-- Only an EPUB carrying MiuRead's embedded book id is allowed to become a
+-- WeRead session; a same-title ordinary EPUB must stay a local book.
+function Store:recover_miuread_file(path,relink)
+    local book,record,kind=self:file_record_fast(path,relink)
+    if book then return book,record,kind,"record" end
+    local meta=self:epub_identity(path)
+    local book_id=type(meta)=="table" and tostring(meta.book_id or "") or ""
+    if book_id=="" then return nil end
+    book,record,kind=self:file_record_from_identity(path,meta,relink)
+    if not book then return nil end
+    local _,saved,save_error=self:save_book(book_id,book)
+    if saved~=true then
+        logger.warn("[MiuRead][Store] embedded EPUB identity recovered but persistence failed",
+            "book=",book_id,"error=",tostring(save_error or "unknown"))
+    else
+        logger.info("[MiuRead][Store] embedded EPUB identity recovered",
+            "book=",book_id,"variant=",tostring(kind or "recovered"),"file=",tostring(path))
+    end
+    return book,record,kind,"embedded_book_id"
+end
+
 function Store:file_record(path)
     return self:identify_file(path,true)
 end
