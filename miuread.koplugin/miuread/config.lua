@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.4.0-beta.10",
+    VERSION = "5.4.5-beta.2",
     SCHEMA = 120,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -100,6 +100,15 @@ local C = {
     -- second long-lived power state. When this deadline expires the local
     -- checkpoint remains authoritative and Kindle may return to native sleep.
     READER_FINALIZER_DEADLINE_SECONDS = 20,
+
+    -- 5.4.5-beta.1 resolves downloaded-book positions from persisted source
+    -- caches before any chapter network fetch. Local mapping gets a short
+    -- foreground priority window; network recovery remains a bounded fallback
+    -- only for an actively open book. Detached close/suspend never waits on it.
+    PROGRESS_SOURCE_LOCAL_TIMEOUT_SECONDS = 10,
+    PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS = 40,
+    PROGRESS_SOURCE_PRIORITY_BARRIER_SECONDS = 12,
+
     PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
 
     -- Automatic home maintenance is serialized on memory-constrained Kindles.
@@ -259,6 +268,29 @@ local C = {
     -- when a heavy download stage and real memory pressure overlap.
     DOWNLOAD_COVER_COEXIST_MIN_KB = 80 * 1024,
     DOWNLOAD_HIBERNATE_WAIT_SECONDS = 8,
+    -- External KOReader Exit/Restart is already inside teardown broadcast. It
+    -- cannot safely wait on the normal asynchronous Home quit dialog, so give
+    -- the active download a short synchronous checkpoint window and then stop
+    -- the child if it still owns a large Lua heap. Chapter checkpoints remain
+    -- authoritative and are reused on the next download.
+    DOWNLOAD_EXIT_QUIESCE_SECONDS = 3.0,
+    DOWNLOAD_EXIT_CANCEL_GRACE_SECONDS = 0.8,
+
+    -- Service-friendly pacing for long full-book downloads. The ordinary
+    -- interactive reader keeps its existing cadence; only the isolated download
+    -- worker progressively lowers its sustained request rate as a book grows.
+    DOWNLOAD_CONTENT_PACING_MIN_CHAPTERS = 8,
+    DOWNLOAD_CONTENT_REQUEST_INTERVAL = 0.60,
+    DOWNLOAD_CONTENT_LONG_AFTER_CHAPTERS = 40,
+    DOWNLOAD_CONTENT_LONG_REQUEST_INTERVAL = 0.80,
+    DOWNLOAD_CONTENT_VERY_LONG_AFTER_CHAPTERS = 120,
+    DOWNLOAD_CONTENT_VERY_LONG_REQUEST_INTERVAL = 1.00,
+    -- A confirmed WeRead rate-limit response is a circuit breaker for the
+    -- current download. Do not probe the same endpoint repeatedly after 429 /
+    -- service rate-limit markers; keep the checkpoint and let the user resume
+    -- after the shared cooldown.
+    DOWNLOAD_RATE_LIMIT_RETRIES = 0,
+
     DOWNLOAD_INTERACTION_RESUME_DELAY = 1.8,
     -- beta.21 foreground arbitration: ordinary UI interaction no longer hard-pauses
     -- the download worker. Heavy local stages yield behind a short absolute

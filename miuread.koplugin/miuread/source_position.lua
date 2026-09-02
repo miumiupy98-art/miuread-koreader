@@ -1,6 +1,7 @@
 local U = require("miuread.util")
 local PosMap = require("miuread.annotations.posmap")
 local WRCo = require("miuread.wr_co")
+local lfs = require("libs/libkoreader-lfs")
 
 local M = {}
 
@@ -27,32 +28,38 @@ local function chapter_words(chapter)
     return math.max(0, tonumber(chapter.wordCount or chapter.word_count or 0) or 0)
 end
 
-local function cache_paths(reader, book_id, uid, version)
+local function cache_roots(reader, book_id)
     local store = reader and reader.store or nil
-    local name = U.id_name(tostring(uid or "unknown"))
-        .. "-v" .. U.id_name(tostring(version or 0)) .. ".xhtml"
-    local paths = {}
-
-    -- beta.14: keep coordinate source beside the book cache so downloaded
-    -- chapters remain precisely mappable after restart and while offline.
+    local roots = {}
     if store and type(store.book_dir) == "function" and tostring(book_id or "") ~= "" then
         local ok, book_root = pcall(store.book_dir, store, tostring(book_id))
         if ok and tostring(book_root or "") ~= "" then
             local root = tostring(book_root) .. "/progress-source-position"
             U.mkdir(root)
-            paths[#paths + 1] = root .. "/" .. name
+            roots[#roots + 1] = root
         end
     end
-
-    -- Read the old beta.13 temp cache as a compatibility fallback. New writes
-    -- prefer the persistent per-book path above.
     local temp_root = store and tostring(store.temp_dir or "") or ""
     if temp_root ~= "" then
         local root = temp_root .. "/progress-source-position"
         local dir = root .. "/" .. U.id_name(tostring(book_id or "unknown"))
         U.mkdir(root)
         U.mkdir(dir)
-        paths[#paths + 1] = dir .. "/" .. name
+        roots[#roots + 1] = dir
+    end
+    return roots
+end
+
+local function cache_filename(uid, version)
+    return U.id_name(tostring(uid or "unknown"))
+        .. "-v" .. U.id_name(tostring(version or 0)) .. ".xhtml"
+end
+
+local function cache_paths(reader, book_id, uid, version)
+    local name = cache_filename(uid, version)
+    local paths = {}
+    for _, root in ipairs(cache_roots(reader, book_id)) do
+        paths[#paths + 1] = root .. "/" .. name
     end
     return paths
 end
@@ -64,6 +71,63 @@ local function read_cached(path)
     local value = U.read_file(path, true)
     if type(value) ~= "string" or value == "" then return nil end
     return value
+end
+
+local function pattern_escape(value)
+    return tostring(value or ""):gsub("([^%w])", "%%%1")
+end
+
+local function file_mtime(path)
+    local ok, attr = pcall(lfs.attributes, path)
+    if ok and type(attr) == "table" then return tonumber(attr.modification) or 0 end
+    return 0
+end
+
+-- Older downloads may have a perfectly valid coordinate source stored under a
+-- different bookVersion. Treat version as freshness metadata, not as the sole
+-- identity. Candidates are only accepted when the current Reader anchor maps
+-- unambiguously in that source, so a stale chapter is never used blindly.
+local function legacy_cache_candidates(reader, book_id, uid, version)
+    local current = {}
+    for _, path in ipairs(cache_paths(reader, book_id, uid, version)) do current[path] = true end
+    local prefix = U.id_name(tostring(uid or "unknown")) .. "-v"
+    local escaped = "^" .. pattern_escape(prefix) .. ".*%.xhtml$"
+    local out, seen = {}, {}
+    for _, root in ipairs(cache_roots(reader, book_id)) do
+        local ok = pcall(function()
+            for name in lfs.dir(root) do
+                if name ~= "." and name ~= ".." and tostring(name):match(escaped) then
+                    local path = root .. "/" .. name
+                    if not current[path] and not seen[path] and read_cached(path) then
+                        seen[path] = true
+                        out[#out + 1] = {path=path, mtime=file_mtime(path)}
+                    end
+                end
+            end
+        end)
+        if not ok then -- A missing/unreadable compatibility cache is non-fatal.
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.mtime == b.mtime then return tostring(a.path) < tostring(b.path) end
+        return a.mtime > b.mtime
+    end)
+    return out
+end
+
+local function validate_anchor_source(coord_html, anchor)
+    local text = U.trim(tostring(type(anchor) == "table" and anchor.anchor_text or ""))
+    if text == "" then return nil, "anchor_text_missing" end
+    local built_ok, map = pcall(PosMap.build, coord_html)
+    if not built_ok or type(map) ~= "table" then
+        return nil, "source_map_build_failed"
+    end
+    local range_key, locate_error = PosMap.locate(map, text, {
+        context_before = tostring(anchor.context_before or ""),
+        context_after = tostring(anchor.context_after or ""),
+    })
+    if not range_key then return nil, tostring(locate_error or "not_found") end
+    return map
 end
 
 local function fetch_coord_html(reader, record, anchor, options)
@@ -81,10 +145,34 @@ local function fetch_coord_html(reader, record, anchor, options)
     local paths = cache_paths(reader, book.book_id or book.bookId, uid, version)
     for _, path in ipairs(paths) do
         local cached = read_cached(path)
-        if cached then return cached, true end
+        if cached then
+            return cached, true, nil, {kind="exact", path=path, version=version}
+        end
     end
+
+    local legacy_seen, legacy_error = false, nil
+    if U.trim(tostring(anchor.anchor_text or "")) ~= "" then
+        for _, candidate in ipairs(legacy_cache_candidates(reader, book.book_id or book.bookId, uid, version)) do
+            local cached = read_cached(candidate.path)
+            if cached then
+                legacy_seen = true
+                local map, verify_error = validate_anchor_source(cached, anchor)
+                if map then
+                    return cached, true, nil, {
+                        kind="legacy_verified", path=candidate.path, version=version,
+                        prebuilt_map=map,
+                    }
+                end
+                legacy_error = legacy_error or verify_error
+            end
+        end
+    end
+
     if options.cache_only == true then
-        return nil, nil, "coord_cache_missing"
+        if legacy_seen then
+            return nil, nil, "source_cache_anchor_mismatch:" .. tostring(legacy_error or "not_found")
+        end
+        return nil, nil, "source_cache_missing"
     end
 
     local chapter = {
@@ -104,7 +192,7 @@ local function fetch_coord_html(reader, record, anchor, options)
 
     local ok, downloaded, _, _, state = pcall(reader.chapter, reader,
         book_arg, chapter, "epub", {images=false})
-    if not ok then return nil, nil, "coord_fetch_failed:" .. tostring(downloaded) end
+    if not ok then return nil, nil, "source_network_fetch_failed:" .. tostring(downloaded) end
 
     local coord_html = type(state) == "table" and tostring(state.coord_html or "") or ""
     if coord_html == "" then coord_html = tostring(downloaded or "") end
@@ -113,7 +201,7 @@ local function fetch_coord_html(reader, record, anchor, options)
 
     local write_path = paths[1]
     if write_path then pcall(U.atomic_write, write_path, coord_html, true) end
-    return coord_html, false
+    return coord_html, false, nil, {kind="network_refresh", path=write_path, version=version}
 end
 
 function M.cacheChapter(reader, book_id, uid, version, coord_html)
@@ -207,11 +295,15 @@ local function locate_single(reader, record, anchor, options)
     local words_before = math.max(0, tonumber(anchor.words_before) or 0)
     if words <= 0 or total_words <= 0 then return nil, "catalog_word_counts_missing" end
 
-    local coord_html, cache_hit, fetch_error = fetch_coord_html(reader, record, anchor, options)
+    local coord_html, cache_hit, fetch_error, cache_meta = fetch_coord_html(reader, record, anchor, options)
     if not coord_html then return nil, fetch_error end
-    local built_ok, map = pcall(PosMap.build, coord_html)
-    if not built_ok or type(map) ~= "table" then
-        return nil, "source_map_build_failed:" .. tostring(map)
+    local map = type(cache_meta) == "table" and cache_meta.prebuilt_map or nil
+    if type(map) ~= "table" then
+        local built_ok, built = pcall(PosMap.build, coord_html)
+        if not built_ok or type(built) ~= "table" then
+            return nil, "source_map_build_failed:" .. tostring(built)
+        end
+        map = built
     end
 
     local located, locate_error = locate_anchor(map, anchor)
@@ -251,6 +343,8 @@ local function locate_single(reader, record, anchor, options)
         native_offset = native_ok,
         confidence = native_ok and "native" or "exact",
         source_cache_hit = cache_hit == true,
+        source_cache_kind = type(cache_meta) == "table" and tostring(cache_meta.kind or "") or nil,
+        source_cache_legacy_recovered = type(cache_meta) == "table" and cache_meta.kind == "legacy_verified" or false,
         source_html_start = located.html_start,
         source_html_boundary = located.html_boundary,
         source_html_boundary_kind = located.html_boundary_kind,
@@ -376,10 +470,12 @@ function M.remoteProgress(reader, record, remote, catalog)
         chapter_uid = uid,
         chapter_index = chapter_index(selected.row, idx or selected.index),
         chapter_title = tostring(selected.row.title or ""),
-        book_version = tonumber(type(record) == "table" and type(record.book) == "table"
-            and (record.book.version or record.book.bookVersion) or nil) or 0,
+        book_version = tonumber(type(record) == "table" and type(record.record) == "table"
+            and record.record.progress_source_book_version or nil)
+            or tonumber(type(record) == "table" and type(record.book) == "table"
+                and (record.book.version or record.book.bookVersion) or nil) or 0,
     }
-    local coord_html, cache_hit, fetch_error = fetch_coord_html(reader, record, anchor, nil)
+    local coord_html, cache_hit, fetch_error, cache_meta = fetch_coord_html(reader, record, anchor, nil)
     if not coord_html then return nil, fetch_error end
     local built_ok, map = pcall(PosMap.build, coord_html)
     if not built_ok or type(map) ~= "table" then
@@ -416,6 +512,7 @@ function M.remoteProgress(reader, record, remote, catalog)
     out.native_resolved = true
     out.native_exact = resolved.exact ~= false
     out.source_cache_hit = cache_hit == true
+    out.source_cache_kind = type(cache_meta) == "table" and tostring(cache_meta.kind or "") or nil
     return out
 end
 

@@ -538,7 +538,7 @@ local function cache_load_assets(cache, entry)
     return assets
 end
 
-local function cache_save_base(cache, chapter, coord_body, body, style, assets, state)
+local function cache_save_base(cache, chapter, coord_body, body, style, assets, state, source_cache)
     local uid = tostring(chapter.chapterUid or chapter.uid)
     local paths = chapter_paths(cache, uid)
     U.remove_tree(paths.dir)
@@ -570,6 +570,10 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
     entry.content_transform_version = CONTENT_TRANSFORM_VERSION
     entry.title_transform_version = tonumber(entry.title_transform_version
         or cache.manifest.title_transform_version) or TITLE_TRANSFORM_VERSION
+    source_cache = type(source_cache) == "table" and source_cache or {}
+    entry.source_cache_done = source_cache.done == true or nil
+    entry.source_cache_version = tonumber(source_cache.version)
+    entry.source_cache_error = source_cache.done == true and nil or tostring(source_cache.error or "source_cache_write_failed")
     entry.error = nil
     cache.manifest.chapters[uid] = entry
     if state and (state.psvts or state.pclts or state.token or state.url) then
@@ -985,6 +989,10 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         range_end_title=opt.range_end_title,content_type="book",
         sync_enabled=true,progress_sync_enabled=true,read_report_enabled=not partial_range,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
+        progress_source_complete=opt.progress_source_complete==true,
+        progress_source_chapter_count=tonumber(opt.progress_source_chapter_count) or 0,
+        progress_source_cached_count=tonumber(opt.progress_source_cached_count) or 0,
+        progress_source_book_version=tonumber(opt.progress_source_book_version) or tonumber(book.version) or 0,
         title_transform_version=tonumber(opt.title_transform_version) or TITLE_TRANSFORM_VERSION,
         access_scope=access_scope,catalog_count=tonumber(opt.catalog_chapter_count) or 0,
         catalog_complete=opt.catalog_complete==true,
@@ -1085,6 +1093,10 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         access_scope=access_scope,
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         chapter_map=map,failures=U.copy(failures or {}),complete=true,
+        progress_source_complete=opt.progress_source_complete==true,
+        progress_source_chapter_count=tonumber(opt.progress_source_chapter_count) or 0,
+        progress_source_cached_count=tonumber(opt.progress_source_cached_count) or 0,
+        progress_source_book_version=tonumber(opt.progress_source_book_version) or tonumber(book.version) or 0,
         file_size=defer_install and U.file_size(pending_path) or U.file_size(path),
         previous_chapter_map=defer_install and U.copy(previous_chapters or {}) or nil,
         task_id=opt.download_run_id,
@@ -1675,6 +1687,38 @@ function Downloader:book(input, opt, progress)
     local function process_one(chapter, index, retry_round)
         if opt.cancelled and opt.cancelled() then error("download cancelled") end
         respect_reader_priority("chapter")
+
+        -- Full-book downloads are sustained background crawls, not interactive
+        -- page turns. Keep small books reasonably quick, but progressively
+        -- lower the request cadence once a task has already consumed dozens of
+        -- chapters. This changes only the isolated download worker's default
+        -- WeRead pacing; API calls with stricter endpoint-specific intervals
+        -- (notably annotation-agent requests) keep their own larger minimum.
+        if self.http then
+            local min_chapters=math.max(2,tonumber(Config.DOWNLOAD_CONTENT_PACING_MIN_CHAPTERS) or 8)
+            local interval=.45
+            local lane="short"
+            if expected>=min_chapters and opt.prefetch~=true then
+                interval=math.max(.35,tonumber(Config.DOWNLOAD_CONTENT_REQUEST_INTERVAL) or .60)
+                local long_after=math.max(1,tonumber(Config.DOWNLOAD_CONTENT_LONG_AFTER_CHAPTERS) or 40)
+                local very_long_after=math.max(long_after+1,tonumber(Config.DOWNLOAD_CONTENT_VERY_LONG_AFTER_CHAPTERS) or 120)
+                lane="normal"
+                if index>very_long_after then
+                    interval=math.max(interval,tonumber(Config.DOWNLOAD_CONTENT_VERY_LONG_REQUEST_INTERVAL) or 1.00)
+                    lane="very_long"
+                elseif index>long_after then
+                    interval=math.max(interval,tonumber(Config.DOWNLOAD_CONTENT_LONG_REQUEST_INTERVAL) or .80)
+                    lane="long"
+                end
+            end
+            local previous=tonumber(self.http.min_weread_interval) or 0
+            if math.abs(previous-interval)>.01 then
+                self.http.min_weread_interval=interval
+                logger.info("[MiuRead][DownloadPacer] request cadence updated",
+                    "lane=",lane,"chapter=",tostring(index),"total=",tostring(expected),
+                    "min_interval=",tostring(interval))
+            end
+        end
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
         local body, style, new_assets, coord_body
@@ -1753,6 +1797,24 @@ function Downloader:book(input, opt, progress)
         local annotation_current=not requested_annotations or (
             entry and entry.annotation_pending~=true
             and tostring(entry.annotation_account_key or "")==tostring(annotation_account_key))
+
+        -- A checkpoint created by 5.3/5.4 already contains coord.xhtml even
+        -- though it predates the source-cache completeness fields. Seed the
+        -- persistent source cache from that local file before reusing the
+        -- completed chapter; no chapter network request is needed for migration.
+        if entry and entry.complete and entry.source_cache_done~=true
+            and tostring(entry.coord_file or "")~="" then
+            local old_coord=U.read_file(absolute(cache.root,entry.coord_file),true)
+            if type(old_coord)=="string" and old_coord~="" then
+                local seeded,seed_error=SourcePosition.cacheChapter(
+                    self.reader,book.bookId,uid,book.version or 0,old_coord)
+                entry.source_cache_done=seeded==true or nil
+                entry.source_cache_version=tonumber(book.version) or 0
+                entry.source_cache_error=seeded==true and nil or tostring(seed_error or "source_cache_write_failed")
+                cache_save(cache)
+            end
+        end
+
         if entry and entry.complete and annotation_current then
             local cached_path, cached_style = cache_load_final_source(cache, entry)
             if cached_path then
@@ -1843,6 +1905,10 @@ function Downloader:book(input, opt, progress)
             if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
             local cached_source, cache_error = SourcePosition.cacheChapter(
                 self.reader, book.bookId, uid, book.version or 0, coord_body)
+            local source_cache_state={
+                done=cached_source==true, version=tonumber(book.version) or 0,
+                error=cached_source==true and nil or tostring(cache_error or "source_cache_write_failed"),
+            }
             if not cached_source then
                 logger.warn("[MiuRead][ProgressSource] download cache seed failed",
                     "book=",tostring(book.bookId),"chapter=",uid,"reason=",tostring(cache_error or "unknown"))
@@ -1863,7 +1929,7 @@ function Downloader:book(input, opt, progress)
                 "chapter=",uid,"decoded_bytes=",tostring(#tostring(downloaded or "")),
                 "body_count=",tostring(body_count or 0),"merged_bytes=",tostring(#tostring(body or "")))
             body, style, new_assets = namespace_assets(body, downloaded_style, downloaded_assets, uid)
-            entry = cache_save_base(cache, chapter, coord_body, body, style, new_assets, state)
+            entry = cache_save_base(cache, chapter, coord_body, body, style, new_assets, state, source_cache_state)
         end
 
         local annotation
@@ -2171,6 +2237,28 @@ function Downloader:book(input, opt, progress)
     opt.preview_mode = preview and preview_mode or nil
     opt.guard_chapter_uid = guard_uid
     opt.checkpointed = true
+
+    -- Coordinate source completeness is part of the generated-book identity.
+    -- This does not block EPUB creation: a missing source is recorded so later
+    -- sync can recover just that chapter instead of pretending the whole book
+    -- has a reliable local progress basis.
+    local source_expected,source_cached=0,0
+    for _,cached_entry in pairs(type(cache.manifest.chapters)=="table" and cache.manifest.chapters or {}) do
+        if type(cached_entry)=="table" and cached_entry.content_done==true
+            and cached_entry.structural~=true and tostring(cached_entry.uid or "")~="" then
+            source_expected=source_expected+1
+            if cached_entry.source_cache_done==true then source_cached=source_cached+1 end
+        end
+    end
+    opt.progress_source_chapter_count=source_expected
+    opt.progress_source_cached_count=source_cached
+    opt.progress_source_complete=source_expected>0 and source_cached==source_expected
+    opt.progress_source_book_version=tonumber(book.version) or 0
+    logger.info("[MiuRead][ProgressSource] download source summary",
+        "book=",tostring(book.bookId),"cached=",tostring(source_cached),
+        "expected=",tostring(source_expected),"complete=",tostring(opt.progress_source_complete==true),
+        "version=",tostring(opt.progress_source_book_version))
+
     local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session, progress)
     record.annotation_summary = annotation_summary
     cache.manifest.final_repair_required=nil

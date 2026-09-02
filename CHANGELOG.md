@@ -1,3 +1,23 @@
+## 5.4.5-beta.2
+
+- 修复 Issue #71 对应的 KOReader 原生退出缺口：External Exit / Restart 现在会先把正在运行的下载子进程收口到一个有上限的退出边界，优先保存断点并安全休眠；若 worker 卡在网络或重任务阶段无法及时让出，则停止该子进程并保留章节断点，不再让 Kindle launcher 接管时仍残留大 Lua heap。
+- 保留觅阅自身“退出 KOReader”的原有可取消安全等待；原生 KOReader Exit 已进入广播 teardown，改用独立的短时同步 quiesce，不依赖异步回调去阻止整个退出流程。
+- 针对 Issue #76 为持续多章节下载增加主动请求节流：8 章以上任务从 0.60 秒基础间隔开始，连续超过 40 / 120 章后分别收紧到 0.80 / 1.00 秒；短章节任务、预取、普通阅读与同步保持原有节奏。
+- 微信读书明确返回 429 / 499 / 服务端频率限制标记后，当前下载不再自动重复探测同一接口；立即保存现有断点并停止继续请求，后续由共享 cooldown 与用户继续下载接管。
+- 下载退出、限流和长任务 pacing 增加独立诊断日志，便于区分“安全休眠”“退出强制停止”“服务端限流”与普通网络故障。
+
+## 5.4.5-beta.1
+
+- 针对 Issue #81 重做完整版书籍的精确进度定位：每次同步先只读取下载时已经保存的原始章节坐标源，不再把重新联网取章节作为默认路径。
+- 修复 source cache 过度绑定 `bookVersion`：当前版本缓存未命中时，会在同一 `bookId + chapterUid` 的历史版本缓存中寻找候选，并用当前 Reader 文本锚点与上下文做唯一性验证；只有验证通过才使用，避免旧正文被盲目套用。
+- 旧版已下载书无需重新下载：5.3/5.4 已留下的 `progress-source-position` 版本缓存可以按当前章节直接恢复精确位置；命中兼容缓存后全程本地完成，不再依赖网络碰运气。
+- 精确定位改为“两阶段 worker”：本地 cache-only 解析先执行，只有当前书仍处于打开状态且本地可信 source 确实不可用时，才启动原有 40 秒上限的网络恢复；返回主页/休眠等 detached 收尾不再新开章节网络请求。
+- 本地精确定位获得短时前台优先级：交互式同步期间暂停自己持有的普通下载任务，并短暂阻止主页 metadata/cover 等可选后台工作抢占；完成本地解析后立即释放，不把下载暂停延长到网络恢复阶段。
+- 保持 beta.10 的 Kindle 20 秒 reader-finalizer 总截止不变：熄屏时本地 source 缺失会保留待确认状态，而不是为了补章节 source 继续阻止深睡。
+- 下载器记录每章 source cache 是否成功落盘，并把 `progress_source_complete / chapter_count / cached_count / book_version` 写入 EPUB 内嵌身份和本地 variant 记录，后续可直接判断完整书是否具备离线精确定位基础。
+- 不再把底层错误全部压成 `source_position_failed`：日志与手动同步可区分 `source_cache_missing`、`source_cache_anchor_mismatch`、`source_worker_timeout`、`source_network_fetch_failed` 等实际阶段，方便没有 crash.log 的反馈直接定位。
+- 同时覆盖 Issue #74 中“多点几次才能成功上传进度”的同类路径；本版本不改前光、评论虚实线和阅读时长协议，避免把无关问题混入进度修复。
+
 ## 5.4.0-beta.10
 
 - 针对 Issue #65 收紧低内存设备的后台调度：自动书架刷新、本地扫描、元数据和封面渲染在 RuntimePressure 或 low/critical memory 下延后，不再与 Reader 首屏和用户操作抢资源。
