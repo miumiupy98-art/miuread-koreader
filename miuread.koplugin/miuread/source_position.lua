@@ -99,6 +99,8 @@ local function fetch_coord_html(reader, record, anchor, options)
         book_id = tostring(book.book_id or book.bookId or ""),
         title = book.title,
         author = book.author,
+        version = version,
+        bookVersion = version,
     }
     if book_arg.bookId == "" then return nil, nil, "book_id_missing" end
 
@@ -116,16 +118,16 @@ local function fetch_coord_html(reader, record, anchor, options)
     return coord_html, false
 end
 
+-- Read or fetch the immutable WeRead chapter XHTML used by server ranges.
+-- Independent comments use the same source-coordinate cache as progress and
+-- annotation mapping without modifying the generated EPUB.
 function M.chapterSource(reader, book_id, uid, version, options)
     options = type(options) == "table" and options or {}
     local record = {
         book = {
-            book_id = tostring(book_id or ""),
-            bookId = tostring(book_id or ""),
-            version = tonumber(version) or 0,
-            bookVersion = tonumber(version) or 0,
-            title = tostring(options.book_title or ""),
-            author = tostring(options.book_author or ""),
+            book_id = tostring(book_id or ""), bookId = tostring(book_id or ""),
+            version = tonumber(version) or 0, bookVersion = tonumber(version) or 0,
+            title = tostring(options.book_title or ""), author = tostring(options.book_author or ""),
         },
     }
     local anchor = {

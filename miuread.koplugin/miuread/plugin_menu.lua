@@ -9,15 +9,16 @@ local function comment_and_thought_menu(plugin)
         end},
         {text="阅读评论",post_text=plugin:_thoughts_enabled_label(),checked_func=function()
             return plugin:_thoughts_enabled()
-        end,keep_menu_open=true,callback=function() plugin:_toggle_thoughts_enabled() end},
+        end,callback=function() plugin:_toggle_thoughts_enabled() end},
     }
     local current=plugin:_current_book_record()
-    if current and current.book then
-        local book={bookId=current.book.book_id or current.book.bookId,title=current.book.title,author=current.book.author,cover=current.book.cover}
-        rows[#rows+1]={text="当前书籍评论数据",sub_item_table_func=function() return plugin:comment_data_menu(book,current.record) end}
+    if current and current.book and plugin.comment_controller then
+        rows[#rows+1]={text="本书评论数据",sub_item_table_func=function()
+            return plugin.comment_controller:menu_rows(current.book,current.record)
+        end}
     end
     rows[#rows+1]={text="评论显示设置",sub_item_table_func=function() return plugin:thought_font_settings_menu() end}
-    rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end}
+    rows[#rows+1]={text="旧评论数据迁移",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end}
     return rows
 end
 

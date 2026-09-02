@@ -757,7 +757,7 @@ function Plugin:init()
     if self.ui and self.ui.styletweak
         and type(self.ui.styletweak.getCssText)=="function" then
         self:_install_marks_getCssText_wrapper(self.ui.styletweak)
-        self._annotation_mark_style_hidden=not self:_marks_enabled()
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
     end
     -- Internal thought links must also work on keyboard-only/non-touch devices.
     self:_install_thought_link_guard()
@@ -862,9 +862,6 @@ function Plugin:init()
     self.api=Api:new(self.http,self.store,self.reader)
     self.mp=MP:new(self.reader,self.http,self.store,self.api)
     self.annotations=Annotations:new(self.api)
-    self.thought_database=require("miuread.thought_database")
-    self.comment_download_service=require("miuread.comment_download_service"):new(self.annotations,self.reader,self.store)
-    self.thought_runtime=require("miuread.thought_runtime"):new(self)
     self.annotation_sync=AnnotationSync:new(self.api,self.reader,self.store)
     do
         self:_annotation_sync_preferences()
@@ -873,6 +870,10 @@ function Plugin:init()
     end
     self.downloader=Downloader:new(self.reader,self.api,self.annotations,self.store,self.http)
     self.download_task=DownloadTask:new(self.store)
+    -- 5.6 beta.3: independent clean-book comments live behind one isolated
+    -- controller. The existing Thoughts/annotation/downloader stack remains the
+    -- authoritative implementation for personal annotations and notes EPUBs.
+    self.comment_controller=require("miuread.comment_controller"):new(self)
     self.cache_cleanup_task=CacheCleanupTask:new(self.store)
     self.library=Library:new(self.api,self.http,self.store)
     local cover_quality_version=tonumber(self.store:get("cover_quality_version",0)) or 0
@@ -900,23 +901,6 @@ function Plugin:init()
     -- Current-chapter thought prewarming is read-only and optional. Keep it on
     -- its own worker so SQLite cold opens never compete with taps or sync.
     self.thought_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
-    -- Independent public-comment downloads use their own worker and checkpoint
-    -- database. They never block or change the content-download completion state.
-    self.comment_async=Async:new(self.store,{poll_interval=.35,allow_android=true,disable_fallback=true})
-    self._comment_job=nil
-    self._comment_job_poll_task=nil
-    self._comment_job_generation=0
-    self._comment_runtime_task=nil
-    self._comment_runtime_generation=0
-    self._comment_runtime_scope_key=nil
-    do
-        local shared=rawget(_G,"__MIUREAD_COMMENT_DOWNLOAD_SHARED")
-        if type(shared)~="table" then
-            shared={owner=nil,job=nil}
-            rawset(_G,"__MIUREAD_COMMENT_DOWNLOAD_SHARED",shared)
-        end
-        self._comment_shared=shared
-    end
     self._thought_prewarm_task=nil
     self._thought_prewarm_generation=0
     self._thought_prewarm_key=nil
@@ -1832,16 +1816,17 @@ function Plugin:_download_menu_text()
     if self:_has_download_status() then
         return "下载管理 · "..tostring(self:_download_status_label()):gsub("^后台下载%s*[：·]?%s*","")
     end
-    local current_comment_job=self:_current_comment_job()
-    if current_comment_job then
-        local job=self.thought_database.job_state(self.store,current_comment_job.book_id) or {}
-        local total=math.max(0,tonumber(job.total) or tonumber(current_comment_job.total) or 0)
-        local processed=math.max(0,tonumber(job.processed) or 0)
+    local comment_job=self.comment_controller and self.comment_controller:current_job() or nil
+    if comment_job then
+        local db=require("miuread.comment_download_database")
+        local state=db.job(self.store,comment_job.book_id) or {}
+        local total=math.max(0,tonumber(state.total) or tonumber(comment_job.total) or 0)
+        local processed=math.max(0,tonumber(state.processed) or 0)
         local percent=total>0 and math.floor(processed/total*100+.5) or 0
         return "下载管理 · 评论 "..tostring(percent).."%"
     end
     local queue=self.store:download_queue()
-    local comment_queue=self:_comment_queue()
+    local comment_queue=self.comment_controller and self.comment_controller:queue() or {}
     local waiting=#queue+#comment_queue
     return waiting>0 and ("下载管理 · "..tostring(waiting).." 项等待") or "下载管理"
 end
@@ -1879,11 +1864,14 @@ end
 
 function Plugin:_confirm_current_book_rebuild(book,annotations,download_comments)
     local label=annotations and "划线与想法版" or (download_comments and "纯净版 + 评论" or "纯净版")
+    local detail=annotations and "沿用现有划线与想法版生成流程。"
+        or (download_comments and "纯净 EPUB 会先完成；随后独立下载评论，评论失败不会影响 EPUB。"
+        or "重新生成纯净 EPUB，不下载公共评论。")
     UIManager:show(ConfirmBox:new{
-        text="重新生成当前书籍的"..label.."？\n\n正文生成完成后才会启动独立评论任务；评论失败不会影响纯净 EPUB。",
+        text="重新生成当前书籍的"..label.."？\n\n"..detail,
         ok_text="重新生成",
         cancel_text="取消",
-        ok_callback=function() self:choose_download_mode(book,{annotations=annotations,download_comments_after=download_comments==true},false) end,
+        ok_callback=function() self:choose_download_mode(book,{annotations=annotations==true,download_comments_after=download_comments==true},false) end,
     })
 end
 
@@ -1929,7 +1917,11 @@ function Plugin:current_book_menu()
         {text="下载章节",sub_item_table_func=function() return self:current_book_download_menu(b) end},
         {text="重新生成",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
         {text="管理本地文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
-        {text="评论数据与显示",sub_item_table_func=function() return self:comment_data_menu(b,r.record) end},
+        {text="评论数据与显示",sub_item_table_func=function()
+            local rows=self.comment_controller and self.comment_controller:menu_rows(b,r.record) or {}
+            rows[#rows+1]={text="旧评论数据迁移",sub_item_table_func=function() return self:book_repair_settings_menu() end}
+            return rows
+        end},
     }
 end
 
@@ -2233,14 +2225,9 @@ function Plugin:_prepare_shelf_rows(rows)
     for id,path in pairs(self._cover_index_pending or {}) do cover_index[id]=path end
     local cover_index_changed=false
     local download_state=self:_download_state()
-    local current_comment_job=self:_current_comment_job()
-    local active_comment_job=current_comment_job and self.thought_database.job_state(self.store,current_comment_job.book_id) or nil
     for _,b in ipairs(rows or {}) do
         b.download_active=false
         b.download_progress=nil
-        b.comment_active=false
-        b.comment_progress=nil
-        b.comment_status=nil
         local id=tostring(b.bookId or b.book_id or "")
         if id~="" then
             local session=self.store:session(id) or {}
@@ -2276,16 +2263,11 @@ function Plugin:_prepare_shelf_rows(rows)
             elseif download_state.status=="completed" and download_state.annotation_fallback==true then b.download_status="已生成"
             elseif download_state.status=="completed" and download_state.seen~=true then b.download_status="刚刚生成完成" end
         end
-        if current_comment_job and tostring(current_comment_job.book_id or "")==tostring(b.bookId or "")
-            and type(active_comment_job)=="table" and tostring(active_comment_job.status or "")=="active" then
-            local total=math.max(0,tonumber(active_comment_job.total) or 0)
-            local processed=math.max(0,tonumber(active_comment_job.processed) or 0)
-            local ratio=total>0 and math.max(0,math.min(1,processed/total)) or 0
-            b.comment_active=true
-            b.comment_progress=ratio
-            b.comment_status="评论 "..tostring(math.floor(ratio*100+.5)).."%"
-        end
         b.status_text=self:_shelf_status_text(b)
+    end
+    if self.comment_controller then
+        self.comment_controller:decorate_home_rows(rows)
+        for _,b in ipairs(rows or {}) do b.status_text=self:_shelf_status_text(b) end
     end
     if cover_index_changed then self.store:set("cover_index",cover_index) end
     return rows
@@ -2431,11 +2413,10 @@ function Plugin:_home_finish_download_card(book_id,status)
     end)
     if changed and HomeView.is_shown() and not self:_active_reader_ui() then
         local updated=HomeView.update_book(book_id)
-        logger.info("[MiuRead][HomeDownload] completion reconciled",
-            "book=",book_id,"status=",tostring(status or "complete"),"visible=",tostring(updated==true))
-        return updated==true
+        logger.info("[MiuRead][HomeDownload] terminal card update",
+            "book=",book_id,"status=",tostring(status or "ready"),"visible=",tostring(updated==true))
     end
-    return false
+    return changed
 end
 
 function Plugin:_flush_cover_index()
@@ -6267,7 +6248,7 @@ function Plugin:reader_quick_panel_settings_menu()
             checked_func=function() return self:_reader_toolbar_enabled() end,keep_menu_open=true,callback=function()
                 self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
             end},
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,callback=function() self:_toggle_thoughts_enabled() end},
         {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
@@ -8372,6 +8353,10 @@ function Plugin:_home_variant_download_action(target,annotations,context)
     local installed=context.installed~=nil
     local task=context.task
     local repair=context.repair
+    if annotations~=true then
+        if task and type(task.options)=="table" and task.options.download_comments_after==true then task=nil end
+        if repair and type(repair.options)=="table" and repair.options.download_comments_after==true then repair=nil end
+    end
     local label,detail,callback
 
     if task and task.status=="active" then
@@ -8397,6 +8382,40 @@ function Plugin:_home_variant_download_action(target,annotations,context)
         icon=annotations==true and "highlight" or "⇩",
         label=label,detail=detail,callback=callback,
     }
+end
+
+function Plugin:_home_clean_comments_download_action(target,context)
+    context=context or self:_home_variant_download_context(target and (target.bookId or target.book_id),false)
+    local installed=context.installed~=nil
+    local task=context.task
+    local repair=context.repair
+    if task and (type(task.options)~="table" or task.options.download_comments_after~=true) then task=nil end
+    -- The protected downloader intentionally keys clean partial checkpoints by
+    -- content shape only (clean/images/book-range), not by the outer post-content
+    -- comment action. Reuse any compatible clean repair here and reattach the
+    -- explicit "+ 评论" intent selected by the user below.
+    local label,detail,callback
+    if task and task.status=="active" then
+        local percent=self:_download_percent(task.state)
+        label=(installed and "更新纯净版 + 评论中 " or "纯净版 + 评论下载中 ")..tostring(percent).."%"
+        detail="正文任务进行中；正文完成后再下载评论"
+        callback=function() self:show_downloads() end
+    elseif task or repair then
+        label=(installed and "继续更新" or "继续下载").."纯净版 + 评论"
+        detail="继续正文断点；正文完成后补全独立评论"
+        local options=U.copy((task and task.options) or (repair and repair.options) or {})
+        options.annotations=false
+        options.download_comments_after=true
+        callback=function() self:choose_download_mode(target,options,false) end
+    else
+        label=(installed and "更新" or "下载").."纯净版 + 评论"
+        detail=installed and "重新生成纯净正文，完成后独立更新评论"
+            or "先生成纯净 EPUB，完成后再独立下载评论"
+        callback=function()
+            self:choose_download_mode(target,{annotations=false,download_comments_after=true},false)
+        end
+    end
+    return {icon="comment",label=label,detail=detail,callback=callback}
 end
 
 function Plugin:_home_open_book(book,anchor,ges,direct_read)
@@ -9696,7 +9715,14 @@ function Plugin:_home_hold_book(book,anchor)
     local clean_context=self:_home_variant_download_context(id,false,download_state,repairs)
     local notes_context=self:_home_variant_download_context(id,true,download_state,repairs)
     actions[#actions+1]=self:_home_variant_download_action(target,false,clean_context)
+    actions[#actions+1]=self:_home_clean_comments_download_action(target,clean_context)
     actions[#actions+1]=self:_home_variant_download_action(target,true,notes_context)
+    if self.comment_controller and clean_context.installed then
+        local comment_book,comment_chapters=self.comment_controller:book_context(id,clean_context.installed)
+        actions[#actions+1]={icon="comment",label="评论数据",
+            detail=self.comment_controller:status_label(id,comment_chapters,comment_book.version),
+            callback=function() self.comment_controller:show_book_menu(target,clean_context.installed) end}
+    end
 
     local same_download=tostring(download_state.book_id or download_state.bookId or "")==id
     local task_options=same_download and self:_home_download_task_options(download_state) or nil
@@ -13181,37 +13207,27 @@ function Plugin:_set_thoughts_enabled(enabled)
     local changed=(p.thoughts.enabled~=false)~=enabled
     local legacy_marks=p.thoughts.show_marks~=nil
     p.thoughts.enabled=enabled
-    -- show_marks was a beta.6/beta.7 compatibility field. Keep it absent from
-    -- current preferences so "阅读评论" remains the only source of truth.
     p.thoughts.show_marks=nil
-    if changed or legacy_marks then self:_save_ui_preferences(p,"thoughts_enabled") end
+    local saved=true
+    if changed or legacy_marks then saved=self:_save_ui_preferences(p,"thoughts_enabled")~=false end
 
-    -- WeRead marks and their comments are one presentation feature. Applying
-    -- the stylesheet here makes the underline visibility follow this switch
-    -- immediately without rewriting the EPUB or deleting any local data.
     self:_apply_annotation_mark_style(enabled and "comments enabled" or "comments disabled")
+    if self.comment_controller then self.comment_controller:on_display_switch(enabled) end
 
     local current=self.sync and self.sync.current or nil
     local record=current and current.record or {}
     local variant=tostring(current and (current.variant or record.variant) or "")
     local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
-        self:_setup_thought_tap()
-        if not annotation_book then
-            self._comment_runtime_scope_key=nil
-            self:_schedule_comment_runtime_refresh(.15,"comments enabled")
-        end
+        if annotation_book then self:_setup_thought_tap() end
         if changed then self:toast("阅读评论已开启",1.5) end
     else
         self:_close_active_thought_popup("comments disabled")
-        -- Notes EPUBs keep the internal-link guard installed, but clean EPUBs
-        -- must lose every dynamic line/hitbox immediately. The paint layer also
-        -- checks this preference as a final gate, so a late callback cannot
-        -- resurrect comments after the switch is off.
-        self:_cancel_comment_runtime("comments disabled")
         if annotation_book then self:_setup_thought_tap() end
         if changed then self:toast("阅读评论已关闭，评论数据不会删除",2) end
     end
+    logger.info("[MiuRead][ThoughtDisplay] master switch",
+        "enabled=",tostring(enabled),"saved=",tostring(saved))
     return true
 end
 
@@ -13221,427 +13237,6 @@ end
 
 function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
-end
-
-function Plugin:_comment_chapter_uid(chapter)
-    return tostring(type(chapter)=="table" and (chapter.uid or chapter.chapterUid or chapter.chapter_uid) or "")
-end
-
-function Plugin:_comment_record_is_clean(record)
-    if type(record)~="table" then return false end
-    local variant=tostring(record.variant or record.base_variant or record.download_variant or "")
-    return record.annotation_requested~=true and variant:find("notes",1,true)==nil
-end
-
-function Plugin:_comment_local_chapters(book_id,preferred_record)
-    book_id=tostring(book_id or "")
-    local library_book=self.store:book(book_id) or {}
-    local collected,seen={},{}
-    local function add_chapter(ch,index)
-        if type(ch)~="table" then return end
-        local uid=self:_comment_chapter_uid(ch)
-        if uid=="" or seen[uid] then return end
-        seen[uid]=true
-        collected[#collected+1]={
-            uid=uid,chapterUid=uid,title=tostring(ch.title or ch.name or ""),
-            index=tonumber(ch.index or ch.chapterIdx or ch.chapter_index) or tonumber(index) or 0,
-            word_count=tonumber(ch.word_count or ch.wordCount) or 0,
-        }
-    end
-    local function add_record(record)
-        if not self:_comment_record_is_clean(record) then return end
-        if tostring(record.file or "")=="" or not U.file_exists(record.file) then return end
-        if type(record.chapter_map)=="table" and #record.chapter_map>0 then
-            for index,ch in ipairs(record.chapter_map) do add_chapter(ch,index) end
-        elseif tostring(record.chapter_uid or "")~="" then
-            add_chapter({uid=record.chapter_uid,title=record.title,index=record.chapter_index},record.chapter_index)
-        end
-    end
-    if type(preferred_record)=="table" and self:_comment_record_is_clean(preferred_record) then
-        add_record(preferred_record)
-    else
-        for kind,record in pairs(library_book.variants or {}) do
-            if tostring(kind):find("clean",1,true) then add_record(record) end
-        end
-        for uid,row in pairs(library_book.chapters or {}) do
-            for kind,record in pairs(row or {}) do
-                if tostring(kind):find("clean",1,true) then
-                    if type(record)=="table" and not record.chapter_uid then record=U.merge(record,{chapter_uid=uid}) end
-                    add_record(record)
-                end
-            end
-        end
-    end
-    local order={}
-    for index,ch in ipairs(library_book.catalog or {}) do order[self:_comment_chapter_uid(ch)]=index end
-    table.sort(collected,function(a,b)
-        local ai=order[a.uid] or (tonumber(a.index) or 999999)
-        local bi=order[b.uid] or (tonumber(b.index) or 999999)
-        if ai~=bi then return ai<bi end
-        return a.uid<b.uid
-    end)
-    return collected
-end
-
-function Plugin:_comment_book_context(book_id,preferred_record)
-    book_id=tostring(book_id or "")
-    local stored=self.store:book(book_id) or {}
-    local current=self:_current_book_record()
-    local source=(current and current.book and tostring(current.book.book_id or current.book.bookId or "")==book_id)
-        and current.book or stored
-    local book={
-        bookId=book_id,book_id=book_id,title=tostring(source.title or stored.title or ""),
-        author=tostring(source.author or stored.author or ""),cover=source.cover or stored.cover,
-        version=tonumber(source.version or source.bookVersion
-            or (type(preferred_record)=="table" and (preferred_record.book_version or preferred_record.bookVersion))
-            or stored.version or stored.bookVersion) or 0,
-    }
-    return book,self:_comment_local_chapters(book_id,preferred_record)
-end
-
-function Plugin:_comment_status(book_id,chapters,book_version)
-    chapters=type(chapters)=="table" and chapters or {}
-    local states=self.thought_database.fetch_states(self.store,book_id)
-    local expected_version=tonumber(book_version) or 0
-    local out={total=#chapters,ready=0,complete=0,empty=0,partial=0,failed=0,suspicious=0,stale=0,never=0,comments=0}
-    for _,chapter in ipairs(chapters) do
-        local row=states[self:_comment_chapter_uid(chapter)]
-        if type(row)~="table" then out.never=out.never+1 else
-            local status=tostring(row.status or "never")
-            local row_version=tonumber(row.book_version) or 0
-            out.comments=out.comments+(tonumber(row.comment_count) or 0)
-            if expected_version>0 and row_version~=expected_version then
-                out.stale=out.stale+1
-            elseif status=="complete" then out.complete=out.complete+1; out.ready=out.ready+1
-            elseif status=="empty" then out.empty=out.empty+1; out.ready=out.ready+1
-            elseif status=="suspicious_zero" then out.suspicious=out.suspicious+1
-            elseif status=="failed" then out.failed=out.failed+1
-            elseif status=="partial" or status=="rate_limited" or status=="auth_required" or status=="fetching" then out.partial=out.partial+1
-            else out.never=out.never+1 end
-        end
-    end
-    return out
-end
-
-function Plugin:_comment_status_label(book_id,chapters,book_version)
-    local state=self:_comment_status(book_id,chapters,book_version)
-    if state.total==0 then return "没有可绑定的纯净版章节" end
-    local text=tostring(state.ready).."/"..tostring(state.total).."章"
-    if state.comments>0 then text=text.." · "..tostring(state.comments).."条" end
-    if state.stale>0 then text=text.." · "..tostring(state.stale).."章需更新"
-    elseif state.suspicious>0 then text=text.." · "..tostring(state.suspicious).."章待确认"
-    elseif state.partial>0 then text=text.." · "..tostring(state.partial).."章待继续"
-    elseif state.failed>0 then text=text.." · "..tostring(state.failed).."章失败" end
-    return text
-end
-
-function Plugin:_current_comment_job()
-    local shared=self._comment_shared
-    if type(shared)=="table" and type(shared.job)=="table" then return shared.job end
-    return self._comment_job
-end
-
-function Plugin:_comment_queue()
-    local value=self.store:get("comment_download_queue",{})
-    return type(value)=="table" and value or {}
-end
-
-function Plugin:_save_comment_queue(queue)
-    return self.store:set("comment_download_queue",type(queue)=="table" and queue or {})
-end
-
-function Plugin:_queue_comment_download(book,chapters,options)
-    options=type(options)=="table" and options or {}
-    chapters=type(chapters)=="table" and chapters or {}
-    if #chapters==0 then self:toast("没有可绑定的纯净版章节",3); return false end
-    local book_id=tostring(book and (book.bookId or book.book_id) or "")
-    if book_id=="" then return false end
-    local queue=self:_comment_queue()
-    local mode=options.force_refresh==true and "refresh" or "missing"
-    local fingerprint={}
-    for _,ch in ipairs(chapters) do fingerprint[#fingerprint+1]=self:_comment_chapter_uid(ch) end
-    local key=book_id.."|"..mode.."|"..table.concat(fingerprint,",")
-    local active=self:_current_comment_job()
-    if active and type(active.request)=="table" and tostring(active.request.key or "")==key then
-        self:toast("这项评论下载正在进行中",2)
-        return true
-    end
-    for _,row in ipairs(queue) do
-        if tostring(row.key or "")==key then
-            self:toast("评论下载已经在等待队列中",2)
-            return true
-        end
-    end
-    queue[#queue+1]={
-        key=key,book=U.copy(book),chapters=U.copy(chapters),mode=mode,
-        force_refresh=options.force_refresh==true,queued_at=os.time(),
-    }
-    self:_save_comment_queue(queue)
-    self:status_toast("评论下载",tostring(book.title or "本书").."已加入评论下载队列",3)
-    self:_start_next_comment_download()
-    return true
-end
-
-function Plugin:_stop_comment_job_poll()
-    if self._comment_job_poll_task then UIManager:unschedule(self._comment_job_poll_task); self._comment_job_poll_task=nil end
-end
-
-function Plugin:_home_update_comment_card(book_id,job)
-    book_id=tostring(book_id or "")
-    if book_id=="" then return false end
-    job=type(job)=="table" and job or {}
-    local total=math.max(0,tonumber(job.total) or 0)
-    local processed=math.max(0,tonumber(job.processed) or 0)
-    local ratio=total>0 and math.max(0,math.min(1,processed/total)) or 0
-    local changed=self:_home_mutate_book_rows(book_id,function(book)
-        book.comment_active=tostring(job.status or "")=="active"
-        book.comment_progress=book.comment_active and ratio or nil
-        if book.comment_active then
-            book.comment_status="评论 "..tostring(math.floor(ratio*100+.5)).."%"
-        elseif tostring(job.status or "")=="completed" then
-            book.comment_status=nil
-        elseif tostring(job.status or "")=="partial" then
-            book.comment_status="评论待继续"
-        else
-            book.comment_status=nil
-        end
-        book.status_text=self:_shelf_status_text(book)
-    end)
-    if changed and HomeView.is_shown() and not self:_active_reader_ui() then HomeView.update_book(book_id) end
-    return changed
-end
-
-function Plugin:_schedule_comment_job_poll()
-    self:_stop_comment_job_poll()
-    if not self._comment_job then return end
-    local generation=tonumber(self._comment_job_generation) or 0
-    local task
-    task=function()
-        if self._comment_job_poll_task~=task or generation~=self._comment_job_generation or not self._comment_job then return end
-        local book_id=tostring(self._comment_job.book_id or "")
-        local job=self.thought_database.job_state(self.store,book_id) or {status="active",total=self._comment_job.total,processed=0}
-        self:_home_update_comment_card(book_id,job)
-        if self._downloads_menu and not self._downloads_menu._miuread_closing then
-            -- Do not rebuild the menu every second. The card/status source stays
-            -- fresh and is reflected immediately when the menu is reopened.
-        end
-        UIManager:scheduleIn(1.0,task)
-    end
-    self._comment_job_poll_task=task
-    UIManager:scheduleIn(.8,task)
-end
-
-function Plugin:_start_next_comment_download()
-    local shared=self._comment_shared
-    if type(shared)=="table" and shared.owner and shared.owner~=self and type(shared.job)=="table" then return false end
-    if self._comment_job or (self.comment_async and self.comment_async:busy()) then return false end
-    if self.download_task and self.download_task:busy() then return false end
-    if #self.store:download_queue()>0 then return false end
-    local queue=self:_comment_queue()
-    local request=table.remove(queue,1)
-    if type(request)~="table" then return false end
-    self:_save_comment_queue(queue)
-    local book=type(request.book)=="table" and request.book or {}
-    local chapters=type(request.chapters)=="table" and request.chapters or {}
-    local book_id=tostring(book.bookId or book.book_id or "")
-    if book_id=="" or #chapters==0 then return self:_start_next_comment_download() end
-    if not self:logged_in() then
-        queue=self:_comment_queue(); table.insert(queue,1,request); self:_save_comment_queue(queue)
-        self:status_toast("评论下载","登录后可继续下载评论",4)
-        return false
-    end
-    self._comment_job_generation=(tonumber(self._comment_job_generation) or 0)+1
-    local generation=self._comment_job_generation
-    self._comment_job={book_id=book_id,title=tostring(book.title or ""),total=#chapters,request=request}
-    if type(self._comment_shared)=="table" then self._comment_shared.owner=self; self._comment_shared.job=self._comment_job end
-    self.thought_database.save_job_state(self.store,book_id,{
-        status="active",title=tostring(book.title or ""),mode=request.mode,total=#chapters,
-        processed=0,complete=0,empty=0,partial=0,failed=0,suspicious=0,
-        started_at=os.time(),completed_at=0,updated_at=os.time(),last_error="",
-    })
-    self:_home_update_comment_card(book_id,self.thought_database.job_state(self.store,book_id))
-    self:_schedule_comment_job_poll()
-    local service=self.comment_download_service
-    local started,err=self.comment_async:run("comment-download:"..book_id,function()
-        return service:download(book,chapters,{
-            force_refresh=request.force_refresh==true,started_at=os.time(),stop_on_error=false,
-        })
-    end,function(result)
-        if generation~=self._comment_job_generation then return end
-        local current=self._comment_job
-        self._comment_job=nil
-        if type(self._comment_shared)=="table" and self._comment_shared.owner==self then
-            self._comment_shared.owner=nil; self._comment_shared.job=nil
-        end
-        self:_stop_comment_job_poll()
-        if not result or result.ok~=true then
-            self.thought_database.save_job_state(self.store,book_id,{
-                status="partial",title=tostring(book.title or ""),total=#chapters,
-                updated_at=os.time(),completed_at=os.time(),
-            })
-            self:_home_update_comment_card(book_id,self.thought_database.job_state(self.store,book_id))
-            logger.warn("[MiuRead][CommentDownload] stopped","book=",book_id,"error=",tostring(result and result.error or "unknown"))
-            self:status_toast("评论下载",tostring(book.title or "本书").."评论未完成，断点已保留",4)
-        else
-            local value=type(result.value)=="table" and result.value or {}
-            self:_home_update_comment_card(book_id,self.thought_database.job_state(self.store,book_id))
-            Thoughts.clear_memory_cache()
-            self._comment_runtime_scope_key=nil
-            self:_schedule_comment_runtime_refresh(.15,"comment download completed")
-            if tostring(value.status or "")=="completed" then
-                self:status_toast("评论下载",tostring(book.title or "本书").."评论下载完成",4)
-            else
-                self:status_toast("评论下载",tostring(book.title or "本书").."评论已保存，部分章节待继续",4)
-            end
-        end
-        self:_start_next_comment_download()
-    end,math.max(600,math.min(7200,#chapters*45)))
-    if not started then
-        self._comment_job=nil
-        if type(self._comment_shared)=="table" and self._comment_shared.owner==self then
-            self._comment_shared.owner=nil; self._comment_shared.job=nil
-        end
-        self:_stop_comment_job_poll()
-        queue=self:_comment_queue(); table.insert(queue,1,request); self:_save_comment_queue(queue)
-        self.thought_database.save_job_state(self.store,book_id,{status="partial",updated_at=os.time(),last_error=tostring(err or "worker_unavailable")})
-        self:status_toast("评论下载","评论任务暂时无法启动",4)
-        return false
-    end
-    logger.info("[MiuRead][CommentDownload] started","book=",book_id,"chapters=",tostring(#chapters),"mode=",tostring(request.mode))
-    return true
-end
-
-function Plugin:_cancel_comment_download(reason,requeue)
-    local shared=self._comment_shared
-    if not self._comment_job and type(shared)=="table" and shared.owner and shared.owner~=self
-        and type(shared.owner._cancel_comment_download)=="function" then
-        return shared.owner:_cancel_comment_download(reason,requeue)
-    end
-    local job=self._comment_job
-    if not job then return false end
-    self._comment_job_generation=(tonumber(self._comment_job_generation) or 0)+1
-    if self.comment_async and self.comment_async:busy() then self.comment_async:cancel(reason or "comment download cancelled") end
-    self:_stop_comment_job_poll()
-    self._comment_job=nil
-    if type(shared)=="table" and shared.owner==self then shared.owner=nil; shared.job=nil end
-    if requeue~=false and type(job.request)=="table" then
-        local queue=self:_comment_queue(); table.insert(queue,1,job.request); self:_save_comment_queue(queue)
-    end
-    self.thought_database.save_job_state(self.store,job.book_id,{status="partial",updated_at=os.time(),completed_at=os.time()})
-    self:_home_update_comment_card(job.book_id,self.thought_database.job_state(self.store,job.book_id))
-    return true
-end
-
-function Plugin:_comment_runtime_scope()
-    if not self:_thoughts_enabled() or not self:_reader_session_is_weread()
-        or self:_current_book_supports_miuread_marks() or not self:_reader_is_reflowable() then return nil end
-    local current=self:_current_book_record()
-    if not (current and current.book) then return nil end
-    local record=current.record or {}
-    if not self:_comment_record_is_clean(record) then return nil end
-    local scope=self:_current_thought_favorite_scope()
-    if tostring(scope.book_id or "")=="" or tostring(scope.chapter_uid or "")=="" then return nil end
-    local book=current.book or {}
-    scope.book_version=tonumber(book.version or book.bookVersion or record.book_version or record.bookVersion) or 0
-    scope.book_title=U.trim(tostring(book.title or ""))
-    scope.book_author=U.trim(tostring(book.author or ""))
-    local function fill(rows)
-        for index,ch in ipairs(type(rows)=="table" and rows or {}) do
-            local uid=self:_comment_chapter_uid(ch)
-            if uid==scope.chapter_uid then
-                scope.chapter_index=tonumber(ch.chapterIdx or ch.chapter_idx or ch.index) or index
-                if scope.chapter_title=="" then scope.chapter_title=U.trim(tostring(ch.title or ch.name or "")) end
-                return true
-            end
-        end
-    end
-    if not fill(record.chapter_map) then fill(book.catalog) end
-    scope.chapter_index=tonumber(scope.chapter_index) or 0
-    return scope
-end
-
-function Plugin:_cancel_comment_runtime(reason)
-    self._comment_runtime_generation=(tonumber(self._comment_runtime_generation) or 0)+1
-    if self._comment_runtime_task then UIManager:unschedule(self._comment_runtime_task); self._comment_runtime_task=nil end
-    self._comment_runtime_scope_key=nil
-    if self.thought_runtime then self.thought_runtime:clear(false) end
-    if reason then logger.dbg("[MiuRead][ThoughtRuntime] cancelled",tostring(reason)) end
-end
-
-function Plugin:_schedule_comment_runtime_refresh(delay,reason)
-    self._comment_runtime_generation=(tonumber(self._comment_runtime_generation) or 0)+1
-    local generation=self._comment_runtime_generation
-    if self._comment_runtime_task then UIManager:unschedule(self._comment_runtime_task) end
-    local task
-    task=function()
-        if self._comment_runtime_task~=task or generation~=self._comment_runtime_generation then return end
-        self._comment_runtime_task=nil
-        if not self:_thoughts_enabled() or self._miuread_suspended==true or HOME_SESSION.suspended==true
-            or not self:_active_reader_ui() then
-            if self.thought_runtime then self.thought_runtime:clear(false) end
-            return
-        end
-        local scope=self:_comment_runtime_scope()
-        if not scope then if self.thought_runtime then self.thought_runtime:clear(false) end; return end
-        local key=tostring(scope.book_id).."|"..tostring(scope.chapter_uid)
-        if self._comment_runtime_scope_key==key and self.thought_runtime and self.thought_runtime:is_scope(scope.book_id,scope.chapter_uid) then return end
-        local book={bookId=scope.book_id,title=scope.book_title,author=scope.book_author,version=scope.book_version}
-        local chapter={uid=scope.chapter_uid,title=scope.chapter_title,index=scope.chapter_index}
-        local marks,err=self.comment_download_service:runtime_marks(book,chapter)
-        if type(marks)~="table" then
-            self._comment_runtime_scope_key=key
-            if self.thought_runtime then self.thought_runtime:clear(false) end
-            logger.dbg("[MiuRead][ThoughtRuntime] no local comments","book=",scope.book_id,"chapter=",scope.chapter_uid,"reason=",tostring(err or "empty"))
-            return
-        end
-        self:_setup_thought_tap()
-        local mapped,map_err=self.thought_runtime:map_current(scope.book_id,scope.chapter_uid,marks,{max_marks=120})
-        self._comment_runtime_scope_key=key
-        if not mapped then logger.warn("[MiuRead][ThoughtRuntime] map failed",tostring(map_err or "unknown")) end
-    end
-    self._comment_runtime_task=task
-    UIManager:scheduleIn(math.max(.12,tonumber(delay) or .35),task)
-    return true
-end
-
-function Plugin:comment_data_menu(book,preferred_record)
-    book=type(book)=="table" and book or {}
-    local book_id=tostring(book.bookId or book.book_id or "")
-    local context,chapters=self:_comment_book_context(book_id,preferred_record)
-    local rows={
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,
-            keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="评论数据",post_text=self:_comment_status_label(book_id,chapters,context.version),enabled=false},
-    }
-    if #chapters>0 then
-        local current_scope=self:_comment_runtime_scope()
-        if current_scope and tostring(current_scope.book_id)==book_id then
-            rows[#rows+1]={text="下载／更新当前章评论",callback=function()
-                local target
-                for _,chapter in ipairs(chapters) do if self:_comment_chapter_uid(chapter)==tostring(current_scope.chapter_uid) then target=chapter; break end end
-                if not target then self:toast("当前章节不在这份纯净版中",3); return end
-                self:_queue_comment_download(context,{target},{force_refresh=true})
-            end}
-        end
-        rows[#rows+1]={text="补全本书评论",post_text="只处理缺失或未完成章节",callback=function()
-            self:_queue_comment_download(context,chapters,{force_refresh=false})
-        end}
-        rows[#rows+1]={text="更新本书全部评论",post_text="重新检查本地全部章节",callback=function()
-            self:_queue_comment_download(context,chapters,{force_refresh=true})
-        end}
-        rows[#rows+1]={text="重置独立评论下载状态",post_text="保留已经保存的评论正文",callback=function()
-            UIManager:show(ConfirmBox:new{text="重置《"..tostring(context.title or "本书").."》的独立评论下载状态？\n\n已保存评论会保留；划线与想法版的现有评论弹窗也不会受到影响。",ok_callback=function()
-                self.thought_database.clear_fetch_state(self.store,book_id,nil)
-                local root=self.store:book_dir(book_id).."/comments"
-                DownloadDatabase.remove_partial(root)
-                self:status_toast("评论数据","独立评论下载状态已重置",3)
-            end})
-        end}
-    else
-        rows[#rows+1]={text="独立评论需要纯净版正文",post_text="请先生成纯净版或纯净版 + 评论",enabled=false}
-    end
-    rows[#rows+1]={text="旧评论数据迁移与修复",sub_item_table_func=function() return PluginSettings.comment_data(self) end}
-    return rows
 end
 
 -- Downloaded annotation/thought books encode visible marks in EPUB CSS.
@@ -13656,21 +13251,18 @@ function Plugin:_marks_enabled_label()
 end
 
 function Plugin:_annotation_mark_hide_css()
-    local css=[[/* MiuRead 5.6: ordinary public underlines are never visible */
+    local ANNOTATION_MARK_HIDE_CSS=[[/* MiuRead: hide annotation marks (reader preference) */
 .miu-inline-mark {
     text-decoration: none !important;
-    border-bottom: none !important;
 }
-]]
-    if self:_marks_enabled() then return css end
-    return css..[[
-/* MiuRead: hide comment anchors while preserving local comment data */
 .miu-thought-mark, .miu-has-thought {
     text-decoration: none !important;
     border-bottom: 2px solid transparent !important;
     padding-bottom: 2px !important;
 }
 ]]
+    if self:_marks_enabled() then return nil end
+    return ANNOTATION_MARK_HIDE_CSS
 end
 
 function Plugin:_current_book_supports_miuread_marks()
@@ -13702,7 +13294,7 @@ function Plugin:_apply_annotation_mark_style(reason)
     if not doc or type(doc.setStyleSheet)~="function" then return false end
     if not self:_reader_is_reflowable() then return false end
     local hide_css=self:_annotation_mark_hide_css()
-    local want_hidden=not self:_marks_enabled()
+    local want_hidden=hide_css~=nil
     if (self._annotation_mark_style_hidden==true)==want_hidden then return false end
     local ui=self.ui
     local st=ui.styletweak or nil
@@ -13740,7 +13332,7 @@ end
 function Plugin:_sync_reader_annotation_mark_style(reason)
     local st=self.ui and self.ui.styletweak or nil
     if st~=nil and rawget(st,"_miuread_marks_original_getCssText")~=nil
-        and (self._annotation_mark_style_hidden==true)==(not self:_marks_enabled()) then
+        and (self._annotation_mark_style_hidden==true)==(self:_annotation_mark_hide_css()~=nil) then
         return false
     end
     self._annotation_mark_style_hidden=nil
@@ -13895,14 +13487,19 @@ function Plugin:_show_reader_comment_center(back_callback)
                     end},
             }
             local display_rows={
-                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
+                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function()
                     self:_toggle_thoughts_enabled()
+                    UIManager:scheduleIn(.10,reopen)
                 end},
                 {icon="settings",label="评论显示设置",
                     value="字号 "..self:_thought_font_size_label(),
                     arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
             }
-            local sections={{title="评论内容",rows=content_rows}}
+            local sections={}
+            if self.comment_controller then
+                sections[#sections+1]={title="评论数据",rows=self.comment_controller:reader_data_rows()}
+            end
+            sections[#sections+1]={title="评论内容",rows=content_rows}
             sections[#sections+1]={title="评论显示",rows=display_rows}
             return sections
         end,
@@ -15816,7 +15413,7 @@ function Plugin:_show_reader_gesture_panel(back_callback)
                 {label="正文区域",value="保持翻页与选词手势",arrow=false},
             }
             if self:_reader_session_is_weread() then
-                rows[#rows+1]={label="阅读评论",value=self:_thoughts_enabled_label(),keep_open=true,callback=function() self:_toggle_thoughts_enabled() end}
+                rows[#rows+1]={label="阅读评论",value=self:_thoughts_enabled_label(),callback=function() self:_toggle_thoughts_enabled() end}
             end
             return rows
         end,
@@ -18431,10 +18028,13 @@ function Plugin:book_menu(b)
     end
     items[#items+1]={text="生成／更新书籍",callback=function() self:choose_download(b,nil,false) end}
     items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
-    local comment_context,comment_chapters=self:_comment_book_context(b.bookId,nil)
-    if #comment_chapters>0 then
-        items[#items+1]={text="评论数据",post_text=self:_comment_status_label(tostring(b.bookId),comment_chapters,comment_context.version),
-            sub_item_table_func=function() return self:comment_data_menu(b,nil) end}
+    if self.comment_controller then
+        local comment_book,comment_chapters=self.comment_controller:book_context(b.bookId,nil)
+        if #comment_chapters>0 then
+            items[#items+1]={text="评论数据",
+                post_text=self.comment_controller:status_label(b.bookId,comment_chapters,comment_book.version),
+                callback=function() self.comment_controller:show_book_menu(b,nil) end}
+        end
     end
     if self:_has_range_variant(b.bookId) then
         items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
@@ -18761,11 +18361,11 @@ function Plugin:_finish_download_runtime(runtime,result)
                 or (content_pending and "content_pending" or (validation_failed and "validation" or nil))))),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
-        self:_update_open_shelf_download_status(b.bookId,
-            auth_required and "等待登录恢复" or (rate_limited and "请求受限 · 稍后继续"
-                or (network_failed and "等待网络 · 可继续"
-                or (image_missing and "正文图片待修复 · 断点已保留" or "生成未完成"))))
-        self:_home_finish_download_card(b.bookId,"生成未完成")
+        local failure_status=auth_required and "等待登录恢复" or (rate_limited and "请求受限 · 稍后继续"
+            or (network_failed and "等待网络 · 可继续"
+            or (image_missing and "正文图片待修复 · 断点已保留" or "生成未完成")))
+        self:_update_open_shelf_download_status(b.bookId,failure_status)
+        self:_home_finish_download_card(b.bookId,failure_status)
         self:_notify_home_data_changed("content")
         local first
         if auth_required then
@@ -18869,7 +18469,9 @@ function Plugin:_finish_download_runtime(runtime,result)
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
     local annotation_pending=DownloadResult.annotation_pending(rec)
     local annotation_fallback=DownloadResult.annotation_fallback(rec)
-    self:_update_open_shelf_download_status(b.bookId,DownloadResult.shelf_status(rec,pending))
+    local terminal_status=DownloadResult.shelf_status(rec,pending)
+    self:_update_open_shelf_download_status(b.bookId,terminal_status)
+    self:_home_finish_download_card(b.bookId,terminal_status)
     if pending or annotation_pending then
         self:_write_download_state(DownloadResult.state(rec,pending),{
             title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
@@ -18882,15 +18484,11 @@ function Plugin:_finish_download_runtime(runtime,result)
     else
         self.store:clear_download_state()
     end
-    self:_home_finish_download_card(b.bookId,DownloadResult.shelf_status(rec,pending))
-    self:_notify_home_data_changed("content")
-    if opt.download_comments_after==true and pending~=true and self:_comment_record_is_clean(rec) then
-        local comment_book,comment_chapters=self:_comment_book_context(b.bookId,rec)
-        if #comment_chapters>0 then
-            self:_queue_comment_download(comment_book,comment_chapters,{force_refresh=false})
-            UIManager:scheduleIn(.45,function() self:_start_next_comment_download() end)
-        end
+    if self.comment_controller and opt.download_comments_after==true
+        and not pending and not annotation_pending and opt.annotations~=true then
+        self.comment_controller:queue_after_download(b,rec,opt)
     end
+    self:_notify_home_data_changed("content")
     if done then done(rec,was_background); self:_start_next_queued_download(); return end
     if pending then
         local text=DownloadResult.notice(b.title,rec,true)
@@ -19383,6 +18981,7 @@ function Plugin:_install_pending_downloads(notify)
     if installed>0 then
         local remaining=self.store:prune_pending_installs()
         local state=self.store:download_state()
+        local comments_after_install=type(state.options)=="table" and state.options.download_comments_after==true
         local aggregate=DownloadResult.aggregate(installed_records)
         local any_pending=aggregate.annotation_pending==true
         local any_fallback=aggregate.annotation_fallback==true
@@ -19406,6 +19005,7 @@ function Plugin:_install_pending_downloads(notify)
                 state.title=stored and stored.title or record.title
                 state.book=stored and {bookId=record.book_id,title=stored.title,author=stored.author,cover=stored.cover} or nil
                 state.options=self:_annotation_retry_options(record._kind,record,record._chapter_uid)
+                if comments_after_install then state.options.download_comments_after=true end
             else
                 state.file=pending_record and pending_record.file or (last_record and last_record.file)
                 state.book=nil
@@ -19421,6 +19021,18 @@ function Plugin:_install_pending_downloads(notify)
         state.updated_at=os.time()
         self.store:save_download_state(state)
         self:_refresh_local_files()
+        if comments_after_install and #remaining==0 and installed==1 and self.comment_controller then
+            local record=installed_records[1]
+            local kind=tostring(record._kind or record.variant or "")
+            if kind:find("clean",1,true) and record.pending_install~=true then
+                local stored=self.store:book(record.book_id) or {}
+                self.comment_controller:queue_after_download({
+                    bookId=tostring(record.book_id or ""),book_id=tostring(record.book_id or ""),
+                    title=tostring(stored.title or record.title or ""),author=tostring(stored.author or ""),
+                    version=tonumber(record.book_version or record.bookVersion or stored.version or stored.bookVersion) or 0,
+                },record,{download_comments_after=true})
+            end
+        end
         if notify then
             local text
             if any_pending then text=installed>1 and "多个新版本已安装" or "新版本已安装"
@@ -19511,7 +19123,14 @@ function Plugin:_start_next_queued_download()
     if not self:logged_in() or self:_network_radio_hint()==false then return false end
     local queue=self.store:download_queue()
     local next_job=queue[1]
-    if not next_job then return self:_start_next_comment_download() end
+    if not next_job then
+        if self.comment_controller then
+            UIManager:scheduleIn(.20,function()
+                if self.comment_controller then self.comment_controller:start_next() end
+            end)
+        end
+        return false
+    end
     if next_job.defer_until_reader_closed==true and self:_active_reader_ui() then return false end
     local job=self.store:dequeue_download()
     if not job then return false end
@@ -19526,7 +19145,7 @@ function Plugin:show_waiting_downloads()
     local job=queue[1]
     local title=tostring(job.book and job.book.title or "未命名")
     local variant=(job.options and job.options.annotations) and "划线与想法版"
-        or ((job.options and job.options.download_comments_after) and "纯净版 + 评论" or "纯净版")
+        or ((job.options and job.options.download_comments_after==true) and "纯净版 + 评论" or "纯净版")
     if job.options and job.options.range_start_index then variant="章节版 · "..variant end
     if job.defer_until_reader_closed==true then variant=variant.." · 退出阅读后开始" end
     local items={
@@ -19542,9 +19161,6 @@ end
 function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     opt=U.copy(opt or {})
     local is_prefetch=opt.prefetch==true
-    if not is_prefetch and self:_current_comment_job() then
-        self:_cancel_comment_download("content download priority",true)
-    end
     if is_prefetch then
         if not self:logged_in() or self:_network_radio_hint()==false then return false end
         if #(self.store:download_queue() or {})>0 then return false end
@@ -19555,6 +19171,9 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         elseif not self:is_online() then
             self:info(_("Network unavailable")); return
         end
+    end
+    if not is_prefetch and self.comment_controller then
+        self.comment_controller:yield_to_content_download()
     end
     local requested_id=tostring(b and (b.bookId or b.book_id) or "")
     if from_queue~=true and requested_id~="" then
@@ -20843,6 +20462,7 @@ end
 
 function Plugin:_commit_complete_book_delete(book_id,documents)
     book_id=tostring(book_id or "")
+    if self.comment_controller then self.comment_controller:forget_book(book_id) end
     local ok_history,history=pcall(require,"readhistory")
     if ok_history and history and type(history.removeItemByPath)=="function" then
         for _,path in ipairs(documents or {}) do pcall(history.removeItemByPath,history,path) end
@@ -21054,58 +20674,6 @@ function Plugin:show_download_cleanup_dialog()
     UIManager:show(dialog)
 end
 
-function Plugin:_comment_download_status_label()
-    local job=self:_current_comment_job()
-    if not job then return nil end
-    local state=self.thought_database.job_state(self.store,job.book_id) or {}
-    local total=math.max(0,tonumber(state.total) or tonumber(job.total) or 0)
-    local processed=math.max(0,tonumber(state.processed) or 0)
-    local percent=total>0 and math.floor(processed/total*100+.5) or 0
-    return "评论下载：《"..U.utf8_truncate(job.title or "未命名",9).."》 "..tostring(percent).."%"
-end
-
-function Plugin:show_comment_download_status()
-    local job=self:_current_comment_job()
-    if not job then self:info("当前没有正在运行的评论下载。"); return end
-    local state=self.thought_database.job_state(self.store,job.book_id) or {}
-    local total=math.max(0,tonumber(state.total) or tonumber(job.total) or 0)
-    local processed=math.max(0,tonumber(state.processed) or 0)
-    local percent=total>0 and math.floor(processed/total*100+.5) or 0
-    local dialog
-    dialog=ButtonDialog:new{title="评论下载\n"..tostring(job.title or "未命名")..
-        "\n"..tostring(processed).."/"..tostring(total).."章 · "..tostring(percent).."%",title_align="center",buttons={
-        {{text="暂停并保留断点",callback=function()
-            UIManager:close(dialog)
-            self:_cancel_comment_download("user paused",true)
-            self:status_toast("评论下载","已暂停，断点和已下载评论均已保留",3)
-        end}},
-        {{text="关闭",callback=function() UIManager:close(dialog) end}},
-    }}
-    UIManager:show(dialog)
-end
-
-function Plugin:show_waiting_comment_downloads()
-    local queue=self:_comment_queue()
-    if #queue==0 then self:info("当前没有等待中的评论下载。"); return end
-    local items={}
-    for index,row in ipairs(queue) do
-        local row_index=index
-        local request=row
-        local title=tostring(request.book and request.book.title or "未命名")
-        local chapters=type(request.chapters)=="table" and #request.chapters or 0
-        items[#items+1]={text=title,post_text=tostring(chapters).."章 · "..(request.force_refresh==true and "全部更新" or "补全缺失"),
-            callback=function()
-                UIManager:show(ConfirmBox:new{text="从评论下载队列移除《"..title.."》？",ok_text="移除",cancel_text="保留",ok_callback=function()
-                    local current=self:_comment_queue()
-                    table.remove(current,row_index)
-                    self:_save_comment_queue(current)
-                    self:toast("已移出评论下载队列")
-                end})
-            end}
-    end
-    self:list("等待评论下载",items)
-end
-
 function Plugin:show_downloads(back_callback)
     if type(back_callback)=="function" then
         self._downloads_return_callback=back_callback
@@ -21125,13 +20693,12 @@ function Plugin:show_downloads(back_callback)
     end
     local items={}
     if self:_has_download_status() then items[#items+1]={text=self:_download_status_label(),callback=function() self:show_download_status() end} end
-    local comment_label=self:_comment_download_status_label()
-    if comment_label then items[#items+1]={text=comment_label,callback=function() self:show_comment_download_status() end} end
     items[#items+1]={text="下载设置",post_text="策略 目录与提醒",sub_item_table_func=function() return self:download_settings_menu() end}
     local queue=self.store:download_queue()
-    items[#items+1]={text="等待正文下载",post_text=tostring(#queue).." 项",callback=function() self:show_waiting_downloads() end}
-    local comment_queue=self:_comment_queue()
-    items[#items+1]={text="等待评论下载",post_text=tostring(#comment_queue).." 项",callback=function() self:show_waiting_comment_downloads() end}
+    items[#items+1]={text="等待下载",post_text=tostring(#queue).." 项",callback=function() self:show_waiting_downloads() end}
+    if self.comment_controller then
+        for _,row in ipairs(self.comment_controller:download_menu_rows()) do items[#items+1]=row end
+    end
     items[#items+1]={text="存储占用",callback=function() self:show_storage_usage() end}
     items[#items+1]={text="存储与清理",callback=function() self:show_download_cleanup_dialog() end}
     items[#items+1]={text="已完成",enabled=false}
@@ -21253,6 +20820,14 @@ function Plugin:downloaded_book_menu(book_ref)
                 items[#items+1]={text="继续未完成下载",post_text=tostring(repairable).." 个可恢复断点",callback=function() self:_repair_downloaded_book(book_id) end}
             end
             items[#items+1]={text=repairable>0 and "清理下载断点与缓存" or "清理下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
+        end
+    end
+    if self.comment_controller then
+        local comment_book,comment_chapters=self.comment_controller:book_context(book_id,nil)
+        if #comment_chapters>0 then
+            items[#items+1]={text="评论数据",
+                post_text=self.comment_controller:status_label(book_id,comment_chapters,comment_book.version),
+                callback=function() self.comment_controller:show_book_menu({bookId=book_id,title=b.title,author=b.author},nil) end}
         end
     end
     if #variants>0 or chapter_count>0 or has_cache then
@@ -24923,7 +24498,7 @@ end
 function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
-        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
+        {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,callback=function() self:_toggle_thoughts_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()
@@ -25550,7 +25125,7 @@ local function extract_thought_href(value,seen,depth)
     for _,child in pairs(value) do local found=extract_thought_href(child,seen,depth+1); if found then return found end end
 end
 function Plugin:_teardown_thought_tap()
-    self:_cancel_comment_runtime("thought tap teardown")
+    if self.comment_controller then self.comment_controller:clear_runtime("thought tap teardown") end
     if self._thought_tap_setup and self.ui and self.ui.unRegisterTouchZones then pcall(function() self.ui:unRegisterTouchZones({{id="miuread_thought_popup",overrides={"tap_link"}}}) end) end
     self._thought_tap_setup=nil
     if self._thought_link_guard and self.ui and self.ui.link then
@@ -26398,21 +25973,21 @@ function Plugin:_on_thought_tap(ges)
             if self:_thought_edge_page_turn(ges) then return true end
             return self:_show_thought_href(href)
         end
-        -- A genuine EPUB link or footnote always outranks the optional runtime
-        -- comment layer.
+        -- Existing EPUB links/footnotes always outrank the external comment layer.
         return false
     end
     if self:_reader_top_menu_tap(ges) then
         logger.info("[MiuRead][ReaderToolbar] opened by top tap through thought layer")
         return self:show_reader_quick_panel()
     end
-    if self.thought_runtime and self.thought_runtime:native_hit_test(ges and ges.pos) then
-        return false
-    end
-    local runtime_info=self.thought_runtime and self.thought_runtime:hit_test(ges and ges.pos) or nil
-    if runtime_info then
-        if self:_thought_edge_page_turn(ges) then return true end
-        return self:_show_thought_href(Thoughts.href(runtime_info.book_id,runtime_info.chapter_uid,runtime_info.range))
+    if self.comment_controller then
+        local pos=ges and ges.pos or nil
+        if self.comment_controller:native_hit_test(pos) then return false end
+        local info=self.comment_controller:hit_test(pos)
+        if info then
+            if self:_thought_edge_page_turn(ges) then return true end
+            return self:_show_thought_href(Thoughts.href(info.book_id,info.chapter_uid,info.range))
+        end
     end
     if GestureBridge.dispatch(ges) then return true end
     return false
@@ -26563,17 +26138,13 @@ function Plugin:on_sync_record_ready(current)
         if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("sync record ready")
-            if self.thought_runtime then self.thought_runtime:clear(false) end
-        elseif self:_thoughts_enabled() and self:_comment_record_is_clean(record) then
-            self:_setup_thought_tap()
-            self._comment_runtime_scope_key=nil
-            self:_schedule_comment_runtime_refresh(.35,"sync record ready")
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
         -- without a synchronous disk flush or another delayed timer.
         self:_record_recent_read(path,current.book,current.record)
     end
+    if self.comment_controller then self.comment_controller:on_sync_record_ready(current) end
     -- A late identity result is allowed to finish while the device is locking,
     -- but it must not restart cloud checks or the 60 s worker after the final
     -- reading position has already been frozen. This was the beta.3 suspend race.
@@ -26949,7 +26520,7 @@ function Plugin:onDocSettingsLoad()
         return false
     end
     if self:_install_marks_getCssText_wrapper(st) then
-        self._annotation_mark_style_hidden=not self:_marks_enabled()
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
     else
         self._annotation_mark_style_hidden=nil
     end
@@ -26963,7 +26534,7 @@ function Plugin:onReadSettings()
         return false
     end
     if rawget(st,"_miuread_marks_original_getCssText")~=nil then
-        self._annotation_mark_style_hidden=not self:_marks_enabled()
+        self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
         return false
     end
     self:_install_marks_getCssText_wrapper(st)
@@ -27101,12 +26672,7 @@ function Plugin:onReaderReady()
         if record and (record.annotation_requested==true or tostring(variant or record.variant or ""):find("notes",1,true)) then
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("reader ready")
-            if self.thought_runtime then self.thought_runtime:clear(false) end
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
-        elseif record and self:_thoughts_enabled() and self:_comment_record_is_clean(record) and self:_reader_session_is_weread() then
-            self:_setup_thought_tap()
-            self._comment_runtime_scope_key=nil
-            self:_schedule_comment_runtime_refresh(.8,"reader ready")
         end
         local pending=HOME_SESSION.pending_annotation_jump
         if type(pending)=="table" then
@@ -27318,9 +26884,7 @@ function Plugin:onPageUpdate(page)
     if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
-        if self:_thoughts_enabled() and not self:_current_book_supports_miuread_marks() then
-            self:_schedule_comment_runtime_refresh(.55,"page update")
-        end
+        if self.comment_controller then self.comment_controller:on_page_update(page) end
     end
 end
 function Plugin:_annotation_sync_preferences()
@@ -28209,6 +27773,7 @@ function Plugin:onSuspend()
     -- 书摘局域网传输只属于前台交互。任何 Suspend 边沿都先关闭它，
     -- 不申请下载/同步的后台保活，也不会在 Resume 后自动恢复。
     BookExcerptDialog.close("suspend")
+    if self.comment_controller then self.comment_controller:on_suspend() end
     -- A backend may receive duplicate Suspend edges while its visual lock is
     -- already active. Kindle beta.4 never synthesizes Wake; deep-suspend hold
     -- is handled only at powerd ReadyToSuspend. Kobo keeps its legacy path.
@@ -28356,8 +27921,6 @@ function Plugin:onSuspend()
     StatusToast.set_blocked(true)
     StatusToast.close()
     self:_cancel_thought_prewarm("suspend")
-    self:_cancel_comment_runtime("suspend")
-    if self:_current_comment_job() then self:_cancel_comment_download("suspend",true) end
     self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)
@@ -28489,6 +28052,7 @@ function Plugin:onResume()
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
+    if self.comment_controller then self.comment_controller:on_resume() end
     -- Never reuse the pre-suspend Wi-Fi label. Kindle may keep the radio flag
     -- while association/IP routing is still being restored for several seconds.
     if self:_network_radio_hint()~=false then
@@ -28633,8 +28197,6 @@ function Plugin:onResume()
         UIManager:scheduleIn(.12,repaint_task)
         self:_schedule_download_resume_after_wake(3.5)
         self:_schedule_hibernated_download_resume("resume into reader")
-        self:_schedule_comment_runtime_refresh(1.5,"resume")
-        UIManager:scheduleIn(2.5,function() self:_start_next_comment_download() end)
     end
     if not close_pending and not native_menu_pending and not reader_active and HomeView.is_shown() then
         self:_set_foreground("home")

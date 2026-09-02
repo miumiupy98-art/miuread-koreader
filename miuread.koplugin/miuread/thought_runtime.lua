@@ -39,11 +39,8 @@ end
 
 local function paint_dashed(bb,x,y,w,h)
     if w<=0 or h<=0 then return end
-    local use_rgb=bb.getType and bb:getType()==BlitBuffer.TYPE_BBRGB32 and type(bb.paintRectRGB32)=="function"
-    local color=BlitBuffer.ColorRGB32(0xFF,0x6B,0x35,0xFF)
     local function segment(px,pw)
-        if use_rgb then bb:paintRectRGB32(px,y,pw,h,color)
-        else bb:paintRect(px,y,pw,h,BlitBuffer.COLOR_BLACK) end
+        bb:paintRect(px,y,pw,h,BlitBuffer.COLOR_BLACK)
     end
     local dash=math.max(4,h*3); local gap=math.max(3,h*2); local right=x+w; local px=x
     while px<right do local pw=math.min(dash,right-px); segment(px,pw); px=px+dash+gap end
@@ -67,7 +64,7 @@ function Overlay:paintTo(bb,x,y)
             for _,box in ipairs(boxes) do
                 local bx,by,bw,bh=tonumber(box.x),tonumber(box.y),tonumber(box.w),tonumber(box.h)
                 if bx and by and bw and bh and bw>0 and bh>0 then
-                    local sr={x=x+bx,y=y+by,w=bw,h=bh}
+                    local sr={x=bx,y=by,w=bw,h=bh}
                     local blocked=false
                     for _,native in ipairs(own) do if intersects(sr,native) then blocked=true; break end end
                     if not blocked then
@@ -99,7 +96,7 @@ end
 function Runtime:clear(redraw)
     self.entries={}; self.hit_boxes={}; self.scope_key=""; self.enabled=false; self.stats=nil
     self.generation=(tonumber(self.generation) or 0)+1
-    if redraw~=false and self.ui then UIManager:setDirty(self.ui,"ui") end
+    if redraw~=false and self.ui then UIManager:setDirty(self.ui.dialog or self.ui,"ui") end
 end
 
 function Runtime:is_scope(book_id,chapter_uid)
@@ -179,13 +176,13 @@ function Runtime:map_current(book_id,chapter_uid,marks,options)
     self.generation=(tonumber(self.generation) or 0)+1; local generation=self.generation
     local wanted_toc=current_toc_index(ui)
     local entries,missing,ambiguous={},0,0
-    local max_marks=math.max(1,math.min(300,tonumber(options.max_marks) or 120))
+    local max_marks=math.max(1,math.min(300,tonumber(options.max_marks) or 300))
     local rows,by_key,key_sources={},{},{}
     for index,row in ipairs(type(marks)=="table" and marks or {}) do
         if index>max_marks then break end
         local source=U.trim(tostring(row.source_text or ""))
         local length=U.utf8_len(source)
-        if source=="" or length<2 or length>300 then missing=missing+1 else
+        if source=="" or length<2 or length>800 then missing=missing+1 else
             local key=norm(source)
             if key=="" then missing=missing+1 else
                 local item={row=row,source=source,key=key}
@@ -230,7 +227,7 @@ function Runtime:map_current(book_id,chapter_uid,marks,options)
     end
     self.entries=entries; self.hit_boxes={}; self.scope_key=tostring(book_id or "").."|"..tostring(chapter_uid or ""); self.enabled=true
     self.stats={mapped=#entries,missing=missing,ambiguous=ambiguous,total=#(marks or {})}
-    UIManager:setDirty(ui,"ui")
+    UIManager:setDirty(ui.dialog or ui,"ui")
     logger.info("[MiuRead][ThoughtRuntime] mapped","book=",tostring(book_id),"chapter=",tostring(chapter_uid),"mapped=",tostring(#entries),"missing=",tostring(missing),"ambiguous=",tostring(ambiguous))
     return self.stats
 end

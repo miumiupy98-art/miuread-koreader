@@ -810,23 +810,7 @@ end
 
 function Annotations:apply(html, data, coord_html)
     if not data or data.underline_count == 0 then return html, "", {underlines=0,thoughts=0} end
-    -- 5.6: public underlines without an actual review are protocol lookup
-    -- material only. They must never become visible solid marks in generated
-    -- EPUBs. Keep using the full range set to query readReviews, but render
-    -- only ranges that own at least one real comment.
-    local display=U.copy(data)
-    display.underlines={}
-    for _,row in ipairs(data.underlines or {}) do
-        local key=range_key(row)
-        if key~="" and type(data.review_map)=="table" and #(data.review_map[key] or {})>0 then
-            display.underlines[#display.underlines+1]=row
-        end
-    end
-    display.underline_count=#display.underlines
-    if display.underline_count==0 then
-        return html,"",{underlines=0,thoughts=0,thought_entries=0,errors=#(data.errors or {})}
-    end
-    local rendered, alignment = inject(html, display, coord_html)
+    local rendered, alignment = inject(html, data, coord_html)
     logger.info("[MiuRead][Annotations] alignment",
         "book=", tostring(data.book_id or ""), "chapter=", tostring(data.chapter_uid or ""),
         "official=", tostring(alignment and alignment.official or 0),
@@ -838,7 +822,7 @@ function Annotations:apply(html, data, coord_html)
         "dropped=", tostring(alignment and alignment.dropped or 0),
         "fallback=", tostring(alignment and alignment.fallback or 0))
     return rendered, CSS, {
-        underlines=display.underline_count, thoughts=data.thought_count,
+        underlines=data.underline_count, thoughts=data.thought_count,
         thought_entries=data.thought_entry_count or 0, errors=#(data.errors or {}),
         official=alignment and alignment.official or 0,
         official_verified=alignment and alignment.official_verified or 0,
