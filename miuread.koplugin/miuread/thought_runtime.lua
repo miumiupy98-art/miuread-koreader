@@ -34,20 +34,18 @@ end
 local function native_highlight_rects(ui)
     local view=ui and ui.view or nil
     local highlight=view and view.highlight or nil
-    local boxes=highlight and highlight.visible_boxes or nil
-    return collect_rects(boxes)
+    return collect_rects(highlight and highlight.visible_boxes or nil)
 end
 
-local function paint_line(bb,x,y,w,h,thought)
+local function paint_dashed(bb,x,y,w,h)
     if w<=0 or h<=0 then return end
     local use_rgb=bb.getType and bb:getType()==BlitBuffer.TYPE_BBRGB32 and type(bb.paintRectRGB32)=="function"
-    local color=thought and BlitBuffer.ColorRGB32(0xFF,0x6B,0x35,0xFF) or BlitBuffer.ColorRGB32(0,0,0,0xFF)
+    local color=BlitBuffer.ColorRGB32(0xFF,0x6B,0x35,0xFF)
     local function segment(px,pw)
         if use_rgb then bb:paintRectRGB32(px,y,pw,h,color)
         else bb:paintRect(px,y,pw,h,BlitBuffer.COLOR_BLACK) end
     end
-    if not thought then segment(x,w); return end
-    local dash=math.max(3,h*3); local gap=math.max(2,h*2); local right=x+w; local px=x
+    local dash=math.max(4,h*3); local gap=math.max(3,h*2); local right=x+w; local px=x
     while px<right do local pw=math.min(dash,right-px); segment(px,pw); px=px+dash+gap end
 end
 
@@ -55,12 +53,15 @@ local Overlay=Widget:extend{}
 function Overlay:paintTo(bb,x,y)
     local runtime=self.runtime
     if not runtime or runtime.enabled~=true then return end
+    if runtime.host and type(runtime.host._thoughts_enabled)=="function" and runtime.host:_thoughts_enabled()~=true then
+        runtime.hit_boxes={}
+        return
+    end
     local doc=runtime.ui and runtime.ui.document
     if not doc or type(doc.getScreenBoxesFromPositions)~="function" then return end
     local own=native_highlight_rects(runtime.ui)
     local hits={}
     for _,entry in ipairs(runtime.entries or {}) do
-        local thickness=entry.thought==true and 2 or 1
         local ok,boxes=pcall(doc.getScreenBoxesFromPositions,doc,entry.pos0,entry.pos1,true)
         if ok and type(boxes)=="table" then
             for _,box in ipairs(boxes) do
@@ -70,9 +71,9 @@ function Overlay:paintTo(bb,x,y)
                     local blocked=false
                     for _,native in ipairs(own) do if intersects(sr,native) then blocked=true; break end end
                     if not blocked then
-                        local ly=sr.y+sr.h-thickness
-                        paint_line(bb,sr.x,ly,sr.w,thickness,entry.thought==true)
-                        if entry.thought==true then hits[#hits+1]={x=sr.x,y=sr.y,w=sr.w,h=sr.h,info=entry.info} end
+                        local thickness=2
+                        paint_dashed(bb,sr.x,sr.y+sr.h-thickness,sr.w,thickness)
+                        hits[#hits+1]={x=sr.x,y=sr.y,w=sr.w,h=sr.h,info=entry.info}
                     end
                 end
             end
@@ -82,8 +83,7 @@ function Overlay:paintTo(bb,x,y)
 end
 
 function Runtime:new(host)
-    return setmetatable({host=host,ui=nil,overlay=nil,entries={},hit_boxes={},enabled=false,
-        scope_key="",generation=0,line_width=2,stats=nil},self)
+    return setmetatable({host=host,ui=nil,overlay=nil,entries={},hit_boxes={},enabled=false,scope_key="",generation=0,stats=nil},self)
 end
 
 function Runtime:install(ui)
@@ -92,7 +92,7 @@ function Runtime:install(ui)
     self:clear(false)
     self.ui=ui
     self.overlay=Overlay:new{runtime=self}
-    ui.view:registerViewModule("miuread_public_annotations",self.overlay)
+    ui.view:registerViewModule("miuread_thought_runtime",self.overlay)
     return true
 end
 
@@ -172,120 +172,81 @@ function Runtime:map_current(book_id,chapter_uid,marks,options)
     if not (doc and type(doc.findAllText)=="function" and type(doc.getScreenBoxesFromPositions)=="function") then
         self:clear(false); return nil,"runtime_mapping_unavailable"
     end
+    if self.host and type(self.host._thoughts_enabled)=="function" and self.host:_thoughts_enabled()~=true then
+        self:clear(false); return {mapped=0,missing=0,ambiguous=0,total=0,disabled=true}
+    end
     if not self:install(ui) then return nil,"runtime_overlay_unavailable" end
     self.generation=(tonumber(self.generation) or 0)+1; local generation=self.generation
     local wanted_toc=current_toc_index(ui)
     local entries,missing,ambiguous={},0,0
     local max_marks=math.max(1,math.min(300,tonumber(options.max_marks) or 120))
-
-    -- Build one exact source identity per public range. Long excerpts are omitted
-    -- rather than partially highlighted: a partial visual range would be worse
-    -- than a missing optional public mark.
     local rows,by_key,key_sources={},{},{}
     for index,row in ipairs(type(marks)=="table" and marks or {}) do
         if index>max_marks then break end
         local source=U.trim(tostring(row.source_text or ""))
         local length=U.utf8_len(source)
-        if source=="" or length<2 or length>180 then
-            missing=missing+1
-        else
+        if source=="" or length<2 or length>300 then missing=missing+1 else
             local key=norm(source)
             if key=="" then missing=missing+1 else
                 local item={row=row,source=source,key=key}
-                rows[#rows+1]=item
-                by_key[key]=by_key[key] or {}
-                by_key[key][#by_key[key]+1]=item
-                key_sources[key]=source
+                rows[#rows+1]=item; by_key[key]=by_key[key] or {}; by_key[key][#by_key[key]+1]=item; key_sources[key]=source
             end
         end
     end
-
-    local keys={}
-    for key in pairs(key_sources) do keys[#keys+1]=key end
-    table.sort(keys)
-    local buckets={}
-    local BATCH_SIZE=16
-    local MAX_HITS=320
+    local keys={}; for key in pairs(key_sources) do keys[#keys+1]=key end; table.sort(keys)
+    local buckets={}; local BATCH_SIZE=12; local MAX_HITS=240
     local function pattern_for(source)
         local compact=U.trim(tostring(source or "")):gsub("%s+"," ")
-        local escaped=escape_regex(compact)
-        return escaped:gsub(" ","\\s+")
+        return escape_regex(compact):gsub(" ","\\s+")
     end
     for first=1,#keys,BATCH_SIZE do
         if generation~=self.generation then break end
-        local last=math.min(#keys,first+BATCH_SIZE-1)
-        local parts,batch_keys={},{}
-        for i=first,last do
-            local key=keys[i]
-            parts[#parts+1]="(?:"..pattern_for(key_sources[key])..")"
-            batch_keys[key]=true
-        end
-        local pattern=table.concat(parts,"|")
-        local ok,results=pcall(doc.findAllText,doc,pattern,true,0,MAX_HITS,true,0x00FF)
+        local last=math.min(#keys,first+BATCH_SIZE-1); local parts,batch_keys={},{}
+        for i=first,last do local key=keys[i]; parts[#parts+1]="(?:"..pattern_for(key_sources[key])..")"; batch_keys[key]=true end
+        local ok,results=pcall(doc.findAllText,doc,table.concat(parts,"|"),true,0,MAX_HITS,true,0x00FF)
         if ok and type(results)=="table" then
             for _,result in ipairs(results) do
-                if type(result)=="table" and result.start and result["end"]
-                    and result_in_current_chapter(ui,result,wanted_toc) then
+                if type(result)=="table" and result.start and result["end"] and result_in_current_chapter(ui,result,wanted_toc) then
                     local key=norm(result.matched_text)
-                    if batch_keys[key] then
-                        buckets[key]=buckets[key] or {}
-                        buckets[key][#buckets[key]+1]=result
-                    end
+                    if batch_keys[key] then buckets[key]=buckets[key] or {}; buckets[key][#buckets[key]+1]=result end
                 end
             end
         end
     end
-
     local used={}
     for _,item in ipairs(rows) do
-        local candidates=buckets[item.key] or {}
-        local chosen
-        if #candidates==1 and #(by_key[item.key] or {})==1 then
-            chosen=candidates[1]
+        local candidates=buckets[item.key] or {}; local chosen
+        if #candidates==1 and #(by_key[item.key] or {})==1 then chosen=candidates[1]
         elseif #candidates>0 then
             local supported={}
             for ci,candidate in ipairs(candidates) do
-                if not used[item.key..":"..tostring(ci)] and context_support(doc,candidate,item.row) then
-                    supported[#supported+1]={candidate=candidate,index=ci}
-                end
+                if not used[item.key..":"..tostring(ci)] and context_support(doc,candidate,item.row) then supported[#supported+1]={candidate=candidate,index=ci} end
             end
-            if #supported==1 then
-                chosen=supported[1].candidate
-                used[item.key..":"..tostring(supported[1].index)]=true
-            else
-                ambiguous=ambiguous+1
-            end
-        else
-            missing=missing+1
-        end
+            if #supported==1 then chosen=supported[1].candidate; used[item.key..":"..tostring(supported[1].index)]=true else ambiguous=ambiguous+1 end
+        else missing=missing+1 end
         if chosen then
-            entries[#entries+1]={pos0=chosen.start,pos1=chosen["end"],thought=tonumber(item.row.thought_state)==1,
-                info={book_id=tostring(book_id or ""),chapter_uid=tostring(chapter_uid or ""),range=tostring(item.row.range or "")}}
+            entries[#entries+1]={pos0=chosen.start,pos1=chosen["end"],info={book_id=tostring(book_id or ""),chapter_uid=tostring(chapter_uid or ""),range=tostring(item.row.range or "")}}
         end
     end
-
-    self.entries=entries; self.hit_boxes={}; self.scope_key=tostring(book_id or "").."|"..tostring(chapter_uid or "")
-    self.enabled=true; self.stats={mapped=#entries,missing=missing,ambiguous=ambiguous,total=#(marks or {})}
+    self.entries=entries; self.hit_boxes={}; self.scope_key=tostring(book_id or "").."|"..tostring(chapter_uid or ""); self.enabled=true
+    self.stats={mapped=#entries,missing=missing,ambiguous=ambiguous,total=#(marks or {})}
     UIManager:setDirty(ui,"ui")
-    logger.info("[MiuRead][PublicAnnotations] mapped","book=",tostring(book_id),"chapter=",tostring(chapter_uid),
-        "mapped=",tostring(#entries),"missing=",tostring(missing),"ambiguous=",tostring(ambiguous))
+    logger.info("[MiuRead][ThoughtRuntime] mapped","book=",tostring(book_id),"chapter=",tostring(chapter_uid),"mapped=",tostring(#entries),"missing=",tostring(missing),"ambiguous=",tostring(ambiguous))
     return self.stats
 end
 
 function Runtime:native_hit_test(pos)
     if type(pos)~="table" then return false end
     local x,y=tonumber(pos.x),tonumber(pos.y); if not x or not y then return false end
-    for _,b in ipairs(native_highlight_rects(self.ui)) do
-        if x>=b.x and y>=b.y and x<=b.x+b.w and y<=b.y+b.h then return true end
-    end
+    for _,b in ipairs(native_highlight_rects(self.ui)) do if x>=b.x and y>=b.y and x<=b.x+b.w and y<=b.y+b.h then return true end end
     return false
 end
 
 function Runtime:hit_test(pos)
     if self.enabled~=true or type(pos)~="table" then return nil end
+    if self.host and type(self.host._thoughts_enabled)=="function" and self.host:_thoughts_enabled()~=true then return nil end
     local x,y=tonumber(pos.x),tonumber(pos.y); if not x or not y then return nil end
-    for i=#(self.hit_boxes or {}),1,-1 do local b=self.hit_boxes[i]
-        if x>=b.x and y>=b.y and x<=b.x+b.w and y<=b.y+b.h then return b.info end end
+    for i=#(self.hit_boxes or {}),1,-1 do local b=self.hit_boxes[i]; if x>=b.x and y>=b.y and x<=b.x+b.w and y<=b.y+b.h then return b.info end end
 end
 
 return Runtime
