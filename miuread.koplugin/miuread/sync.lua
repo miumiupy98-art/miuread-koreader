@@ -400,6 +400,7 @@ function Sync:new(reader, api, store, host, async, identity_async)
         reading_time_session_id=nil, reading_time_segment_id=nil,
         resume_after_finalizer=false,
         progress_write_fence=false, progress_write_fence_seq=0,
+        writer_wait_generation=0, quiescing=false,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -3810,16 +3811,31 @@ function Sync:writer_barrier_result(seq)
     return type(daemon.writer_barrier_result)=="table" and U.copy(daemon.writer_barrier_result) or nil
 end
 
+function Sync:cancel_writer_barrier_waits(reason)
+    self.writer_wait_generation=(tonumber(self.writer_wait_generation) or 0)+1
+    logger.info("[MiuRead][ReadReport] writer barrier waits invalidated",
+        "generation=",tostring(self.writer_wait_generation),
+        "reason=",tostring(reason or "cancelled"))
+    return self.writer_wait_generation
+end
+
 function Sync:wait_writer_barrier(seq,callback,timeout)
     callback=type(callback)=="function" and callback or function() end
     seq=tonumber(seq or 0) or 0
     if seq<=0 or self:writer_barrier_done(seq) then callback(true,self:writer_barrier_result(seq)); return true end
     local started=os.time()
     timeout=math.max(2,tonumber(timeout) or 12)
+    local wait_generation=tonumber(self.writer_wait_generation) or 0
     local done=false
     local poll
     poll=function()
         if done then return end
+        if wait_generation~=(tonumber(self.writer_wait_generation) or 0) then
+            done=true
+            logger.info("[MiuRead][ReadReport] writer barrier wait cancelled",
+                "seq=",tostring(seq),"generation=",tostring(wait_generation))
+            return
+        end
         if self:writer_barrier_done(seq) then
             done=true
             callback(true,self:writer_barrier_result(seq))
@@ -3915,6 +3931,13 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
 end
 
 function Sync:start(reason)
+    if self.quiescing==true then
+        self.state="stopped"
+        self.last_stage="KOReader 正在退出"
+        logger.info("[MiuRead][ReadReport] start ignored","reason=exit_quiesce",
+            "requested=",tostring(reason or "start"))
+        return false,"KOReader 正在退出"
+    end
     self.last_activity = os.time()
     if (self.host and (self.host._reading_end_barrier_active==true
             or self.host._reading_end_sync_active==true))
@@ -4088,6 +4111,7 @@ function Sync:_resolve_reader_record(generation,attempt)
 end
 
 function Sync:on_reader_ready()
+    self.quiescing=false
     self:_import_daemon_status(true)
     if self.host and (self.host._reading_end_barrier_active==true
         or self.host._reading_end_sync_active==true) then
@@ -4208,6 +4232,7 @@ function Sync:on_suspend(options)
 end
 
 function Sync:on_resume(_slept)
+    self.quiescing=false
     self:_import_daemon_status(true)
     self.suspended = false
     self.last_upload = 0
@@ -4230,6 +4255,32 @@ function Sync:resume_after_reading_end()
     self.reading_end_finalized=false
     self:start("resume")
     logger.info("[MiuRead][ReadReport] resumed after interrupted finalizer")
+    return true
+end
+
+function Sync:quiesce_for_exit(reason)
+    reason=tostring(reason or "koreader_exit")
+    self.quiescing=true
+    self:cancel_writer_barrier_waits(reason)
+    self:_cancel_record_retry()
+    if self.identity_async then self.identity_async:cancel(reason) end
+    if self.async then self.async:cancel(reason) end
+    if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
+    if self.session_flush_task then UIManager:unschedule(self.session_flush_task); self.session_flush_task=nil end
+    if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
+    -- Request one final daemon flush if a verified reading session is still
+    -- active, but never wait for it during UIManager teardown. The child has no
+    -- inherited KOReader sockets and will terminate when its parent disappears.
+    if self.daemon and self.daemon.active then
+        pcall(self._stop_daemon_fast,self,reason,nil)
+    end
+    self.busy=false
+    self.progress_hold=false
+    self.resume_after_finalizer=false
+    self.state="stopped"
+    logger.info("[MiuRead][ReadReport] exit quiesce complete",
+        "reason=",reason,
+        "daemon=",tostring(self.daemon and self.daemon.pid or "-"))
     return true
 end
 

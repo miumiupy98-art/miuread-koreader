@@ -1,3 +1,14 @@
+## 5.4.0-beta.10
+
+- 针对 Issue #65 收紧低内存设备的后台调度：自动书架刷新、本地扫描、元数据和封面渲染在 RuntimePressure 或 low/critical memory 下延后，不再与 Reader 首屏和用户操作抢资源。
+- Kindle/KOReader 约 512 MiB 设备的内存保护阈值提前，并结合总内存比例动态计算；一次 `reader_open > 6s` 即进入临时性能保护，不再等待第二次严重卡顿。
+- ReaderReady 的微信读书同步和预取清理改为等待 Reader 真正空闲后再启动，优先保证 EPUB 首屏、翻页和菜单响应。
+- 针对 Issue #66 收紧 Kindle `SCREEN_SAVER_HOLD` 生命周期：reader finalizer 使用单一 generation owner，真实 Wake 会立即使旧 owner 失效，并只清理 `reader_finalizer`，不影响仍在运行的下载任务。
+- Kindle reader finalizer 增加 20 秒全局硬截止；达到截止后保留本地 checkpoint/待同步状态，释放休眠保活，并在当前 KOReader 进程内熔断后续 finalizer 伪锁屏，避免反复休眠/唤醒叠加 writer barrier。
+- writer barrier 等待支持 generation 失效；Wake、退出或重启后旧轮询不会继续回调并控制新的生命周期。
+- KOReader 退出/重启前统一 quiesce 阅读时间同步和 reader finalizer，取消等待/异步控制权并释放独立休眠 lease；下载保活保持独立。
+- 保留 beta.9 对 Issue #63 书籍身份恢复与 Issue #69 登录凭据轮换的修复，不修改 Kobo legacy 后台电源实现。
+
 ## 5.4.0-beta.9
 
 - 修复 Issue #63：从 KOReader 文件浏览器、历史记录或其他非觅阅入口打开觅阅生成的 EPUB 时，快速记录匹配失败后会读取 EPUB 内嵌的 MiuRead book id，恢复微信读书身份与版本类型，不再把纯净版误记为本地书。

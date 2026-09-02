@@ -3884,9 +3884,12 @@ function Plugin:_background_claim(key,options,retry)
     if not self.background_scheduler then return true,nil,false end
     options=options or {}
     key=tostring(key or "background")
+    options.heavy=options.heavy==true or HEAVY_BACKGROUND_KEYS[key]==true
     options.blocked_reason=self:_background_block_reason(options)
 
-    -- beta.24 allows visible cover fetching to coexist with a healthy download.
+    -- beta.10: automatic heavy Home work obeys RuntimePressure as a real
+    -- scheduling gate. User-requested work may still run, but covers, shelf
+    -- refreshes, scans and metadata never compete with a struggling Reader.
     -- It yields only when a heavy download stage overlaps with genuine memory
     -- pressure, avoiding the old all-or-nothing "downloading means no covers"
     -- trade-off.
@@ -3946,7 +3949,9 @@ function Plugin:_background_claim(key,options,retry)
         and not tostring(reason or ""):find("^power_")
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
-        if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
+        if reason=="memory_critical" or reason=="memory_low" or reason=="runtime_pressure" then
+            retry_delay=math.max(4.0,tonumber(retry_delay) or .9)
+        end
         if reason=="download_yielding" or reason=="download_hibernating" or reason=="download_heavy"
             or reason=="download_memory_pressure" then
             retry_delay=math.max(.4,math.min(1.5,tonumber(retry_delay) or .9))
@@ -12256,6 +12261,7 @@ end
 function Plugin:_begin_koreader_exit(reason)
     Orientation.release_session(reason or "KOReader exit")
     self:_cancel_interactive_network(reason or "KOReader exit")
+    self:_quiesce_reader_background_for_exit(reason or "KOReader exit")
     self:_cancel_native_menu_guard()
     HOME_EXITING=true
     HOME_SESSION_SUPPRESSED=true
@@ -26562,10 +26568,23 @@ function Plugin:onReaderReady()
     self:_reset_chapter_navigation_context("reader ready")
     self._chapter_catalog_confirm_running=false
     if type(self.store.prune_hidden_prefetch)=="function" then
-        local removed=self.store:prune_hidden_prefetch(Config.CHAPTER_PREFETCH_TTL)
-        if tonumber(removed or 0)>0 then logger.info("[MiuRead][Prefetch] stale cache pruned","count=",tostring(removed)) end
+        local cleanup_task
+        cleanup_task=function()
+            if not (self.ui and self.ui.document)
+                or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
+                or reader_close_active() then return end
+            if not self:_reader_background_idle() then
+                UIManager:scheduleIn(.75,cleanup_task)
+                return
+            end
+            local removed=self.store:prune_hidden_prefetch(Config.CHAPTER_PREFETCH_TTL)
+            if tonumber(removed or 0)>0 then
+                logger.info("[MiuRead][Prefetch] stale cache pruned","count=",tostring(removed))
+            end
+        end
+        UIManager:scheduleIn(1.5,cleanup_task)
     end
-    self:_schedule_reader_toolbar_state_refresh(nil,.35)
+    self:_schedule_reader_toolbar_state_refresh(nil,.55)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
     if self:_reader_session_is_weread() then
         -- Catalog lookup waits for reader idle and is cached once for this
@@ -26587,14 +26606,22 @@ function Plugin:onReaderReady()
     local task
     task=function()
         if self._reader_sync_ready_task~=task then return end
+        if not (self.ui and self.ui.document)
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
+            or reader_close_active() then
+            self._reader_sync_ready_task=nil
+            return
+        end
+        if not self:_reader_background_idle() then
+            UIManager:scheduleIn(.55,task)
+            return
+        end
         self._reader_sync_ready_task=nil
-        if self.ui and self.ui.document
-            and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
-            and not reader_close_active() then self.sync:on_reader_ready() end
+        self.sync:on_reader_ready()
     end
     self._reader_sync_ready_task=task
     if self:_reader_session_is_weread() then
-        UIManager:scheduleIn(.18,task)
+        UIManager:scheduleIn(.55,task)
     else
         self._reader_sync_ready_task=nil
         logger.info("[MiuRead][ReaderSession] cloud reader-ready work skipped",
@@ -26768,6 +26795,14 @@ function Plugin:_reading_end_sync(reason,options,callback)
     local book_id=tostring(current.book.book_id or current.book.bookId or "")
     if book_id=="" then return false end
     local started_at=monotonic_wall_time()
+    local critical_deadline=tonumber(options.critical_deadline_clock)
+    local function critical_wait_seconds(default_seconds)
+        default_seconds=math.max(2,tonumber(default_seconds) or 12)
+        if not critical_deadline or critical_deadline<=0 then return default_seconds end
+        local remaining=critical_deadline-monotonic_wall_time()
+        if remaining<=0 then return 0 end
+        return math.max(2,math.min(default_seconds,math.floor(remaining+.5)))
+    end
 
     self._reading_end_barrier_active=true
     self._reading_end_barrier_reason=reason
@@ -26823,10 +26858,12 @@ function Plugin:_reading_end_sync(reason,options,callback)
     end
     local function finish_critical_after_time(ok,stage)
         if not time_handoff then return mark_critical_done(ok,stage) end
+        local wait_seconds=critical_wait_seconds(20)
+        if wait_seconds<=0 then return mark_critical_done(false,"finalizer_deadline") end
         self.sync:wait_writer_barrier(time_handoff,function(barrier_ok)
             mark_critical_done(ok==true and barrier_ok==true,
                 barrier_ok and (stage or "time_finished") or "time_barrier_timeout")
-        end,20)
+        end,wait_seconds)
         return true
     end
     local task_states={
@@ -26995,10 +27032,19 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     local barrier_attempt=0
                     local function wait_final_time()
                         barrier_attempt=barrier_attempt+1
+                        local wait_seconds=critical_wait_seconds(18)
+                        if wait_seconds<=0 then
+                            self._reading_end_background_verify_active=false
+                            self:_save_progress_state(book_id,"deferred",
+                                "最终位置已保存；休眠收尾达到时间上限，稍后再提交进度",
+                                tonumber(snapshot.progress),nil,snapshot.progress_sequence)
+                            mark_critical_done(false,"finalizer_deadline")
+                            return
+                        end
                         self.sync:wait_writer_barrier(time_handoff,function(barrier_ok)
                             if barrier_ok then
                                 start_background_progress()
-                            elseif barrier_attempt<2 then
+                            elseif not critical_deadline and barrier_attempt<2 then
                                 UIManager:scheduleIn(2,wait_final_time)
                             else
                                 self._reading_end_background_verify_active=false
@@ -27009,7 +27055,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                                     "book=",book_id,"barrier=",tostring(time_handoff))
                                 mark_critical_done(false,"time_barrier_timeout")
                             end
-                        end,18)
+                        end,wait_seconds)
                     end
                     wait_final_time()
                 else
@@ -27461,7 +27507,110 @@ function Plugin:onAnnotationsModified()
     -- gesture callback.
     self:_schedule_local_annotation_snapshot("annotations_modified",2.4)
 end
-function Plugin:_finish_suspend_reader_finalizer(ok)
+function Plugin:_reader_finalizer_state()
+    local state=rawget(_G,"__MIUREAD_READER_FINALIZER")
+    if type(state)~="table" then
+        state={
+            generation=0,owner_generation=0,deadline_clock=0,
+            fused=false,fuse_reason=nil,last_transition=nil,
+        }
+        rawset(_G,"__MIUREAD_READER_FINALIZER",state)
+    end
+    state.generation=tonumber(state.generation) or 0
+    state.owner_generation=tonumber(state.owner_generation) or 0
+    state.deadline_clock=tonumber(state.deadline_clock) or 0
+    state.fused=state.fused==true
+    return state
+end
+
+function Plugin:_reader_finalizer_current(generation)
+    local state=self:_reader_finalizer_state()
+    generation=tonumber(generation or 0) or 0
+    return generation>0
+        and generation==tonumber(state.owner_generation or 0)
+        and generation==tonumber(state.generation or 0)
+end
+
+function Plugin:_reader_finalizer_begin(deadline_seconds)
+    local state=self:_reader_finalizer_state()
+    state.generation=(tonumber(state.generation) or 0)+1
+    state.owner_generation=state.generation
+    state.deadline_clock=monotonic_wall_time()+math.max(2,tonumber(deadline_seconds) or 20)
+    state.last_transition="begin"
+    return state.owner_generation,state.deadline_clock
+end
+
+function Plugin:_reader_finalizer_invalidate(reason,fuse)
+    local state=self:_reader_finalizer_state()
+    state.generation=(tonumber(state.generation) or 0)+1
+    state.owner_generation=0
+    state.deadline_clock=0
+    state.last_transition=tostring(reason or "invalidated")
+    if fuse==true then
+        state.fused=true
+        state.fuse_reason=tostring(reason or "lifecycle_conflict")
+    end
+    return state.generation
+end
+
+function Plugin:_cancel_reader_finalizer_owner(reason,fuse)
+    reason=tostring(reason or "cancelled")
+    local pseudo=PseudoLockscreen.snapshot() or {}
+    local tasks=type(pseudo.tasks)=="table" and pseudo.tasks or {}
+    local had_owner=(tonumber(self:_reader_finalizer_state().owner_generation or 0) or 0)>0
+        or self._reading_end_finalizer_active==true
+        or self._reading_end_standby_held==true
+        or SuspendWorkLease.has("reader_finalizer")
+        or tasks.reader_finalizer==true
+    if had_owner then self:_reader_finalizer_invalidate(reason,fuse==true) end
+    self._reading_end_finalizer_active=false
+    self._reading_end_standby_held=false
+    if self.sync then
+        self.sync.resume_after_finalizer=false
+        if type(self.sync.cancel_writer_barrier_waits)=="function" then
+            pcall(self.sync.cancel_writer_barrier_waits,self.sync,reason)
+        end
+    end
+    SuspendWorkLease.release("reader_finalizer")
+    pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+    pcall(PseudoLockscreen.background_task_done,"reader_finalizer_"..reason)
+    if had_owner then
+        logger.warn("[MiuRead][ReadingEnd] reader finalizer owner cancelled",
+            "reason=",reason,
+            "fused=",tostring(fuse==true),
+            "download=",tostring(tasks.download==true))
+    end
+    return had_owner
+end
+
+function Plugin:_quiesce_reader_background_for_exit(reason)
+    reason=tostring(reason or "koreader_exit")
+    self:_cancel_reader_finalizer_owner("exit:"..reason,false)
+    if self.sync and type(self.sync.quiesce_for_exit)=="function" then
+        pcall(self.sync.quiesce_for_exit,self.sync,reason)
+    end
+    local snapshot=PseudoLockscreen.snapshot() or {}
+    local tasks=type(snapshot.tasks)=="table" and snapshot.tasks or {}
+    -- Never tear down a genuine download hold here. The quit path hibernates
+    -- downloads before reaching this function; external restarts may still have
+    -- a live download and must keep its own marker isolated from finalizer work.
+    if tasks.download~=true then pcall(PseudoLockscreen.force_clear,"exit:"..reason) end
+    logger.info("[MiuRead][Power] reader background quiesced for exit",
+        "reason=",reason,
+        "download=",tostring(tasks.download==true))
+    return true
+end
+
+function Plugin:_finish_suspend_reader_finalizer(ok,generation,stage)
+    generation=tonumber(generation or self:_reader_finalizer_state().owner_generation or 0) or 0
+    stage=tostring(stage or "done")
+    if generation>0 and not self:_reader_finalizer_current(generation) then
+        logger.info("[MiuRead][ReadingEnd] stale reader finalizer callback ignored",
+            "generation=",tostring(generation),
+            "current=",tostring(self:_reader_finalizer_state().owner_generation or 0),
+            "stage=",stage)
+        return false
+    end
     local still_suspended=HOME_SESSION.suspended==true and self._miuread_suspended==true
 
     if not still_suspended then
@@ -27469,8 +27618,11 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
         SuspendWorkLease.release("reader_finalizer")
         pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
         pcall(PseudoLockscreen.background_task_done,"reader_finalizer_user_visible")
+        if generation>0 and self:_reader_finalizer_current(generation) then
+            self:_reader_finalizer_invalidate("completed_after_wake:"..stage,false)
+        end
         logger.info("[MiuRead][Power] reader finalizer ended after user wake",
-            "ok=",tostring(ok==true))
+            "ok=",tostring(ok==true),"stage=",stage)
         return true
     end
 
@@ -27489,8 +27641,20 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     local hold_active=PseudoLockscreen.active()==true
     local hold_platform=PseudoLockscreen.device_platform()
     local hold_state=hold_platform=="kindle" and "SCREEN_SAVER_HOLD" or "PSEUDO_LOCKED"
-    local target=hold_active and hold_state
-        or (download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND")
+    local target
+    if hold_platform=="kindle" then
+        -- Finalizer ownership ends in this function. A Kindle hold that has no
+        -- real download left must therefore converge to native suspend intent,
+        -- even though powerd may remain visually in screenSaver until its next
+        -- readyToSuspend edge.
+        target=download_continue
+            and (hold_active and hold_state or "DOWNLOAD_LOCKED")
+            or "REAL_SUSPEND"
+    else
+        -- Keep Kobo's validated legacy pseudo-lock transition unchanged.
+        target=hold_active and hold_state
+            or (download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND")
+    end
     local power=PowerState.transition(target,"reading_end_complete",{
         download_active=self.download_task and self.download_task:busy() or false,
         download_continue=download_continue,sync_continue=false,
@@ -27515,8 +27679,11 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     pcall(PseudoLockscreen.background_task_done,"reader_finalizer")
     local hold_after=PseudoLockscreen.snapshot() or {}
     local remaining=type(hold_after.tasks)=="table" and hold_after.tasks or {}
+    if generation>0 and self:_reader_finalizer_current(generation) then
+        self:_reader_finalizer_invalidate("completed:"..stage,false)
+    end
     logger.info("[MiuRead][Power] reader finalizer completed",
-        "ok=",tostring(ok==true),"to=",tostring(target),
+        "ok=",tostring(ok==true),"stage=",stage,"to=",tostring(target),
         "generation=",tostring(power.generation),
         "download_continue=",tostring(download_continue),
         "download_reason=",download_reason,
@@ -27664,8 +27831,19 @@ function Plugin:onSuspend()
     local sync_candidate=suspend_background_supported
         and self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true
-    local pseudo_active=false
     local power_platform=PseudoLockscreen.device_platform()
+    local guarded_finalizer=power_platform=="kindle"
+    if sync_candidate and guarded_finalizer and self:_reader_finalizer_state().fused==true then
+        sync_candidate=false
+        logger.warn("[MiuRead][ReadingEnd] suspend finalizer bypassed by session fuse",
+            "reason=",tostring(self:_reader_finalizer_state().fuse_reason or "lifecycle_conflict"))
+    end
+    local finalizer_generation,finalizer_deadline=nil,nil
+    if sync_candidate and guarded_finalizer then
+        finalizer_generation,finalizer_deadline=self:_reader_finalizer_begin(
+            tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 20)
+    end
+    local pseudo_active=false
     if power_platform=="kindle" then
         pcall(PseudoLockscreen.set_download_active,download_continue)
         if sync_candidate then pcall(PseudoLockscreen.set_task_active,"reader_finalizer",true) end
@@ -27686,6 +27864,9 @@ function Plugin:onSuspend()
             if power_platform=="kindle" and sync_candidate then
                 sync_candidate=false
                 pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+                if finalizer_generation and self:_reader_finalizer_current(finalizer_generation) then
+                    self:_reader_finalizer_invalidate("background_hold_failed",false)
+                end
             end
         end
     end
@@ -27712,8 +27893,16 @@ function Plugin:onSuspend()
             show_status=false,after="进入休眠",timeout=5,
             release_early=true,source_defer_seconds=.55,
             defer_resume_until_critical=true,
+            finalizer_generation=finalizer_generation,
+            critical_deadline_clock=finalizer_deadline,
             on_critical_done=function(ok,stage)
-                self:_finish_suspend_reader_finalizer(ok)
+                if finalizer_generation and not self:_reader_finalizer_current(finalizer_generation) then
+                    logger.info("[MiuRead][ReadingEnd] stale suspend finalizer result detached",
+                        "generation=",tostring(finalizer_generation),
+                        "stage=",tostring(stage or "done"))
+                    return
+                end
+                self:_finish_suspend_reader_finalizer(ok,finalizer_generation,stage)
                 if ok then
                     logger.info("[MiuRead][ReadingEnd] suspend critical sync submitted",
                         "stage=",tostring(stage or "done"))
@@ -27725,13 +27914,37 @@ function Plugin:onSuspend()
         },function(ok)
             logger.info("[MiuRead][ReadingEnd] suspend foreground handoff",
                 "snapshot_frozen=",tostring(ok==true),
-                "reader_finalizer=held")
+                "reader_finalizer=held",
+                "generation=",tostring(finalizer_generation or "-"))
         end)==true
+        if sync_continue and finalizer_generation and finalizer_deadline then
+            local delay=math.max(.1,finalizer_deadline-monotonic_wall_time())
+            UIManager:scheduleIn(delay,function()
+                if not self:_reader_finalizer_current(finalizer_generation) then return end
+                local finalizer_state=self:_reader_finalizer_state()
+                finalizer_state.fused=true
+                finalizer_state.fuse_reason="hard_deadline"
+                self._reading_end_finalizer_active=false
+                if self.sync then
+                    self.sync.resume_after_finalizer=false
+                    if type(self.sync.cancel_writer_barrier_waits)=="function" then
+                        pcall(self.sync.cancel_writer_barrier_waits,self.sync,"reader_finalizer_deadline")
+                    end
+                end
+                logger.warn("[MiuRead][ReadingEnd] reader finalizer hard deadline",
+                    "generation=",tostring(finalizer_generation),
+                    "seconds=",tostring(tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 20))
+                self:_finish_suspend_reader_finalizer(false,finalizer_generation,"hard_deadline")
+            end)
+        end
         if not sync_continue then
             self._reading_end_standby_held=false
             SuspendWorkLease.release("reader_finalizer")
             pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
             pcall(PseudoLockscreen.background_task_done,"reader_finalizer_not_started")
+            if finalizer_generation and self:_reader_finalizer_current(finalizer_generation) then
+                self:_reader_finalizer_invalidate("finalizer_not_started",false)
+            end
         end
     end
     -- Kindle keeps Amazon powerd in its native screenSaver state and only
@@ -27886,7 +28099,11 @@ function Plugin:onResume()
             "time=ignored","progress=ignored","annotations=ignored")
         return
     end
-    if self._reading_end_standby_held or SuspendWorkLease.has("reader_finalizer") then
+    -- Kindle ScreenSaver Hold gets the strict wake boundary introduced in
+    -- beta.10. Kobo keeps its already-validated legacy lifecycle unchanged.
+    if PseudoLockscreen.device_platform()=="kindle" then
+        self:_cancel_reader_finalizer_owner("user_wake",true)
+    elseif self._reading_end_standby_held or SuspendWorkLease.has("reader_finalizer") then
         self._reading_end_standby_held=false
         SuspendWorkLease.release("reader_finalizer")
     end
