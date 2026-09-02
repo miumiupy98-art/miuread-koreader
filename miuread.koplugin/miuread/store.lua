@@ -2021,6 +2021,16 @@ local function identity_from_blob(blob,identity)
         or blob:match("miuread://book/([^<%s\"]+)")
     identity.variant=identity.variant or blob:match('"variant"%s*:%s*"([^"]+)"')
     identity.content_type=identity.content_type or blob:match('"content_type"%s*:%s*"([^"]+)"')
+    if identity.progress_source_complete==nil then
+        if blob:match('"progress_source_complete"%s*:%s*true') then identity.progress_source_complete=true
+        elseif blob:match('"progress_source_complete"%s*:%s*false') then identity.progress_source_complete=false end
+    end
+    identity.progress_source_chapter_count=identity.progress_source_chapter_count
+        or tonumber(blob:match('"progress_source_chapter_count"%s*:%s*(%d+)'))
+    identity.progress_source_cached_count=identity.progress_source_cached_count
+        or tonumber(blob:match('"progress_source_cached_count"%s*:%s*(%d+)'))
+    identity.progress_source_book_version=identity.progress_source_book_version
+        or tonumber(blob:match('"progress_source_book_version"%s*:%s*(%d+)'))
     if identity.standalone==nil and blob:match('"standalone"%s*:%s*true') then identity.standalone=true end
     identity.chapter_uid=identity.chapter_uid or blob:match('"chapter_uid"%s*:%s*"?([^",}%s]+)')
     identity.title=identity.title or xml_unescape(blob:match("<dc:title[^>]*>(.-)</dc:title>"))
@@ -2308,6 +2318,20 @@ function Store:file_record_from_identity(path,meta,relink)
         if standalone and uid~="" then record.chapter_uid=uid; book.chapters[uid]={[kind]=record}
         else book.variants[kind]=record end
         all[id]=book
+    end
+    if record then
+        if meta.progress_source_complete~=nil then
+            record.progress_source_complete=meta.progress_source_complete==true
+        end
+        if tonumber(meta.progress_source_chapter_count)~=nil then
+            record.progress_source_chapter_count=tonumber(meta.progress_source_chapter_count) or 0
+        end
+        if tonumber(meta.progress_source_cached_count)~=nil then
+            record.progress_source_cached_count=tonumber(meta.progress_source_cached_count) or 0
+        end
+        if tonumber(meta.progress_source_book_version)~=nil then
+            record.progress_source_book_version=tonumber(meta.progress_source_book_version) or 0
+        end
     end
     if record and relink then relink_saved_record(self,all,book,record,path,current_size,true) end
     return book,record,kind

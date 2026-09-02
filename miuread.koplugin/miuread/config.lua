@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.4.0-beta.10",
+    VERSION = "5.4.5-beta.1",
     SCHEMA = 120,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -100,6 +100,15 @@ local C = {
     -- second long-lived power state. When this deadline expires the local
     -- checkpoint remains authoritative and Kindle may return to native sleep.
     READER_FINALIZER_DEADLINE_SECONDS = 20,
+
+    -- 5.4.5-beta.1 resolves downloaded-book positions from persisted source
+    -- caches before any chapter network fetch. Local mapping gets a short
+    -- foreground priority window; network recovery remains a bounded fallback
+    -- only for an actively open book. Detached close/suspend never waits on it.
+    PROGRESS_SOURCE_LOCAL_TIMEOUT_SECONDS = 10,
+    PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS = 40,
+    PROGRESS_SOURCE_PRIORITY_BARRIER_SECONDS = 12,
+
     PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
 
     -- Automatic home maintenance is serialized on memory-constrained Kindles.

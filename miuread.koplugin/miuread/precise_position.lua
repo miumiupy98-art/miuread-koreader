@@ -398,7 +398,8 @@ function M.capture(ui, record, catalog)
         point_side = point_side,
         anchor_kind = anchor_kind,
         anchor_chars = U.utf8_len(anchor_text),
-        book_version = tonumber(record.book and (record.book.version or record.book.bookVersion))
+        book_version = tonumber(record.record and record.record.progress_source_book_version)
+            or tonumber(record.book and (record.book.version or record.book.bookVersion))
             or tonumber(record.record and (record.record.book_version or record.record.bookVersion)) or 0,
         chapter_candidates = catalog_neighbor_candidates(catalog, catalog_row.index, catalog_row.total),
     }

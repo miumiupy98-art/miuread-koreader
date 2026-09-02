@@ -1065,6 +1065,7 @@ function Sync:resolve_local_progress(callback, options)
                     "precision=",tostring(position.precision_level),
                     "progress=",string.format("%.3f",tonumber(position.progress) or 0),
                     "cache=",tostring(position.source_cache_hit == true),
+                    "cache_kind=",tostring(position.source_cache_kind or "-"),
                     "handoff=", "source_first")
                 if options.require_cloud_coordinate==true and not exact_cloud then
                     if callback then callback(nil,"cloud_coordinate_unavailable",{error_kind="position"}) end
@@ -1140,7 +1141,8 @@ function Sync:resolve_local_progress(callback, options)
                 "native=",tostring(position.native_offset == true),
                 "precision=",tostring(position.precision_level),
                 "progress=",string.format("%.3f",tonumber(position.progress) or 0),
-                "cache=",tostring(position.source_cache_hit == true))
+                "cache=",tostring(position.source_cache_hit == true),
+                "cache_kind=",tostring(position.source_cache_kind or "-"))
             if options.require_cloud_coordinate==true and not exact_cloud then
                 if callback then callback(nil,"cloud_coordinate_unavailable",{error_kind="position"}) end
                 return
@@ -1177,13 +1179,10 @@ function Sync:_source_position_async(callback, options)
     local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
     local ui = self.host and self.host.ui or nil
     if not record or not ui or not ui.document then return false, "position_context_missing" end
-    -- The source-coordinate path is intentionally subprocess-only. If this
-    -- device cannot fork a worker, keep the existing local precision path
-    -- rather than doing a network request on the Reader UI thread.
+    -- Source mapping remains subprocess-only. 5.4.5-beta.1 makes it local-first:
+    -- downloaded books must exhaust their persisted coordinate sources before a
+    -- network chapter fetch is even considered.
     if not self.async or not self.async:available() then return false, "source_worker_unavailable" end
-    -- A detached reading-end resolver must freeze its Reader anchor before the
-    -- document is allowed to close. A busy worker is therefore not a reason to
-    -- skip capture: keep the immutable anchor and launch the subprocess later.
     local worker_busy=self.async:busy()==true
     if worker_busy and not detached then return false, "source_worker_busy" end
 
@@ -1198,68 +1197,175 @@ function Sync:_source_position_async(callback, options)
     if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
     local reader = self.reader
     local source_cache_only=options.cache_only==true
+    -- Detached close/suspend resolvers never start a fresh chapter network fetch.
+    -- Their immutable anchor is retained as pending state and can be retried after
+    -- wake/open. This keeps the beta.10 finalizer deadline authoritative.
+    local allow_network=not source_cache_only and not detached
+    if options.allow_network_fallback~=nil then
+        allow_network=options.allow_network_fallback==true and not source_cache_only and not detached
+    end
     local record_snapshot = {
         book = U.copy(record.book or {}),
         record = U.copy(record.record or {}),
         variant = record.variant,
         path = record.path,
     }
-    local function on_result(result)
-        local current = self:record()
-        if not detached and (generation ~= tonumber(self.record_generation or 0)
-            or not current
-            or tostring(current.book and current.book.book_id or "") ~= book_id
-            or tostring(current.path or "") ~= path) then
+
+    local priority_reason="progress_precision"
+    local download_pause_owned=false
+    local function priority_begin()
+        local scheduler=self.host and self.host.background_scheduler or nil
+        if scheduler and type(scheduler.set_foreground_barrier)=="function" then
+            pcall(scheduler.set_foreground_barrier,scheduler,
+                tonumber(Config.PROGRESS_SOURCE_PRIORITY_BARRIER_SECONDS) or 6,
+                priority_reason)
+        end
+        -- Do not touch download lifecycle ownership during detached close/suspend.
+        -- For an interactive resolver, pause only if we were the owner that added
+        -- this reason; existing pause reasons remain untouched.
+        local task=not detached and self.host and self.host.download_task or nil
+        if task and type(task.busy)=="function" and task:busy()
+            and type(task.is_paused)=="function" and not task:is_paused()
+            and type(task.pause)=="function" then
+            local ok,wrote=pcall(task.pause,task,priority_reason)
+            download_pause_owned=ok and wrote==true
+        end
+    end
+    local function priority_end()
+        if not download_pause_owned then return end
+        download_pause_owned=false
+        local task=self.host and self.host.download_task or nil
+        if task and type(task.resume)=="function" then pcall(task.resume,task,priority_reason) end
+    end
+
+    local function still_current()
+        if detached then return true end
+        local current=self:record()
+        return generation == tonumber(self.record_generation or 0)
+            and current
+            and tostring(current.book and current.book.book_id or "") == book_id
+            and tostring(current.path or "") == path
+    end
+
+    local function normalize_source_error(detail)
+        detail=tostring(detail or "source_position_failed")
+        if detail=="worker timeout" then return "source_worker_timeout" end
+        if detail=="worker returned no result" then return "source_worker_no_result" end
+        if detail=="worker result decode failed" then return "source_worker_decode_failed" end
+        if detail=="coord_cache_missing" then return "source_cache_missing" end
+        if detail=="not_found" then return "source_anchor_not_found" end
+        if detail=="ambiguous" then return "source_anchor_ambiguous" end
+        if detail:find("^source_cache_anchor_mismatch",1,false) then return detail end
+        if detail:find("^source_map_build_failed",1,false) then return detail end
+        if detail:find("^source_network_fetch_failed",1,false) then return detail end
+        return detail
+    end
+
+    local function local_failure_allows_network(detail)
+        detail=tostring(detail or "")
+        return detail=="source_cache_missing" or detail=="coord_cache_missing"
+            or detail=="not_found" or detail=="ambiguous"
+            or detail:find("^source_cache_anchor_mismatch",1,false)~=nil
+            or detail:find("^source_map_build_failed",1,false)~=nil
+    end
+
+    local function consume_success(value)
+        if not still_current() then
             if callback then callback(nil, "stale_position_result") end
+            return
+        end
+        local current=self:record()
+        local mapping_record=detached and record_snapshot or current
+        local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, value, ratio_snapshot)
+        adjusted.captured_at = os.time()
+        if adjusted.mapping_recovered==true then
+            logger.info("[MiuRead][ProgressSource] neighbour chapter mapping recovered",
+                "book=",book_id,
+                "from=",tostring(adjusted.mapping_original_chapter_uid or "-"),
+                "to=",tostring(adjusted.chapter_uid or "-"))
+        end
+        if adjusted.source_cache_legacy_recovered==true then
+            logger.info("[MiuRead][ProgressSource] compatible cached source recovered",
+                "book=",book_id,"chapter=",tostring(adjusted.chapter_uid or "-"),
+                "cache_kind=",tostring(adjusted.source_cache_kind or "legacy_verified"))
+        end
+        if callback then callback(adjusted, nil) end
+    end
+
+    local launch_network
+    local function finish_failure(detail)
+        priority_end()
+        local normalized=normalize_source_error(detail)
+        logger.warn("[MiuRead][ProgressSource] source mapping failed",
+            "book=",book_id,"error=",normalized)
+        if callback then callback(nil, normalized) end
+    end
+
+    local function on_phase_result(phase,result)
+        if phase=="local" then priority_end() end
+        if not still_current() then
+            if callback then callback(nil,"stale_position_result") end
             return
         end
         local envelope=result and result.ok==true and type(result.value)=="table" and result.value or nil
         local value=envelope and envelope.position or nil
-        if type(value) == "table" and value.safe == true then
-            local mapping_record=detached and record_snapshot or current
-            local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, value, ratio_snapshot)
-            adjusted.captured_at = os.time()
-            if adjusted.mapping_recovered==true then
-                logger.info("[MiuRead][ProgressSource] neighbour chapter mapping recovered",
-                    "book=",book_id,
-                    "from=",tostring(adjusted.mapping_original_chapter_uid or "-"),
-                    "to=",tostring(adjusted.chapter_uid or "-"))
-            end
-            if callback then callback(adjusted, nil) end
+        if type(value)=="table" and value.safe==true then
+            consume_success(value)
             return
         end
         local detail=tostring(envelope and envelope.error or (result and result.error) or "source_position_failed")
-        logger.warn("[MiuRead][ProgressSource] source mapping failed",
-            "book=",book_id,"error=",detail)
-        if callback then callback(nil, "source_position_failed") end
+        if phase=="local" and allow_network and local_failure_allows_network(detail) then
+            logger.info("[MiuRead][ProgressSource] local source unavailable; network recovery",
+                "book=",book_id,"reason=",normalize_source_error(detail))
+            local started,run_error=launch_network()
+            if not started then finish_failure(run_error) end
+            return
+        end
+        finish_failure(detail)
     end
-    local function launch()
+
+    local function launch_local()
         if self.async:busy() then return false,"source_worker_busy" end
-        return self.async:run("progress_source_position", function()
-            local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=source_cache_only})
+        priority_begin()
+        local started,run_error=self.async:run("progress_source_position_local", function()
+            local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=true})
             return {position=value,error=source_error}
-        end,on_result,40)
+        end,function(result) on_phase_result("local",result) end,
+            tonumber(Config.PROGRESS_SOURCE_LOCAL_TIMEOUT_SECONDS) or 10)
+        if not started then priority_end() end
+        return started,run_error
     end
+
+    launch_network=function()
+        if self.async:busy() then return false,"source_worker_busy" end
+        return self.async:run("progress_source_position_network", function()
+            local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=false})
+            return {position=value,error=source_error}
+        end,function(result) on_phase_result("network",result) end,
+            tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
+    end
+
     local defer_seconds=math.max(0,tonumber(options.defer_seconds) or 0)
     if detached and (defer_seconds>0 or worker_busy) then
-        -- The anchor above is already frozen while ReaderUI/document is alive.
-        -- Mapping can now yield to the close/screen-saver paint and retry behind
-        -- a temporarily busy worker without losing the exact source position.
+        -- Anchor capture already happened while ReaderUI was alive. Defer only
+        -- the local resolver behind screen/home paint; do not turn a close edge
+        -- into a fresh chapter network request.
         local attempts=0
         local function deferred_launch()
             attempts=attempts+1
-            local started,run_error=launch()
+            local started,run_error=launch_local()
             if started then return end
             if tostring(run_error or "")=="source_worker_busy" and attempts<6 then
                 UIManager:scheduleIn(1.0,deferred_launch)
                 return
             end
-            if callback then callback(nil,tostring(run_error or "source_worker_unavailable")) end
+            finish_failure(run_error or "source_worker_unavailable")
         end
         UIManager:scheduleIn(math.max(.02,defer_seconds),deferred_launch)
         return true
     end
-    local started,run_error=launch()
+
+    local started,run_error=launch_local()
     if not started then return false,run_error end
     return true
 end
