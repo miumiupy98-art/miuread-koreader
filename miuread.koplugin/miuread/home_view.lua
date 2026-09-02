@@ -749,24 +749,28 @@ local function category_tabs(tabs, width, height, on_more)
     local more_w = on_more and math.max(UiScale.dp(34, 30, 50), math.floor(width * .055)) or 0
     local tabs_w = math.max(1, width - (more_w > 0 and more_w + gap or 0))
     local item_w = math.floor((tabs_w - gap * (#tabs - 1)) / #tabs)
+    local visual_x = UiScale.dp(2, 2, 4)
+    local visual_y = UiScale.dp(3, 2, 5)
     local row = HorizontalGroup:new{align = "center"}
     for index, tab in ipairs(tabs) do
         local label = tostring(tab.title or "")
         if tonumber(tab.count) then label = label .. " " .. tostring(tab.count) end
-        local item = OverlapGroup:new{dimen = Geom:new{w = item_w, h = height}, allow_mirroring = false}
-        item[#item + 1] = Ui.textbox(label, math.max(1, item_w - 8), height,
+        local visual_w = math.max(1, item_w - visual_x * 2)
+        local visual_h = math.max(1, height - visual_y * 2)
+        local visual = fixed_frame(visual_w, visual_h, {
+            bordersize = 0,
+            padding = UiScale.dp(1, 1, 2),
+            radius = UiScale.radius(7, 5, 11),
+            background = tab.selected and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE,
+        }, Ui.textbox(label, math.max(1, visual_w - UiScale.dp(8, 6, 12)), visual_h,
             face("smallinfofont", 10.8, 15), {
-                bold = true, alignment = "center", halign = "center",
+                bold = tab.selected == true, alignment = "center", halign = "center",
                 fgcolor = Blitbuffer.COLOR_BLACK,
-            })
-        if tab.selected then
-            local line_w = math.max(28, math.floor(item_w * .54))
-            item[#item + 1] = OffsetContainer:new{
-                x_off = math.floor((item_w - line_w) / 2),
-                y_off = math.max(0, height - UiScale.line("thick")),
-                LineWidget:new{background = Blitbuffer.COLOR_BLACK, dimen = Geom:new{w = line_w, h = UiScale.line("thick")}},
-            }
-        end
+            }))
+        local item = OverlapGroup:new{dimen = Geom:new{w = item_w, h = height}, allow_mirroring = false}
+        item[#item + 1] = OffsetContainer:new{x_off = visual_x, y_off = visual_y, visual}
+        -- Keep the full tab hit target even though the selected visual is a
+        -- compact pill. This avoids shrinking touch targets on smaller Kindles.
         row[#row + 1] = tappable(item_w, height, item, tab.on_tap)
         if index < #tabs then row[#row + 1] = HorizontalSpan:new{width = gap} end
     end
