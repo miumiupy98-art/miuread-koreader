@@ -66,6 +66,7 @@ end
 
 function M.comments(plugin)
     local rows={}
+    rows[#rows+1]={text="我的评论收藏",post_text=tostring(plugin:_thought_favorite_count()).." 条",callback=function() plugin:show_thought_favorites() end}
     append(rows,plugin:thought_font_settings_menu())
     rows[#rows+1]={text="本地划线与想法",post_text="显示与本地数据",enabled=false}
     rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return M.comment_data(plugin) end}

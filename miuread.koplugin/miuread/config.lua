@@ -1,17 +1,17 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.3.0",
-    SCHEMA = 119,
+    VERSION = "5.4.0-beta.10",
+    SCHEMA = 120,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
 
     -- 当前安装包自身仍有 stable/beta 身份；用户选择的 OTA 通道独立保存。
     -- beta.20 起所有实时更新清单都由统一仓库 miuread-koreader 提供。
-    UPDATE_CHANNEL = "stable",
-    UPDATE_CHANNEL_LABEL = "正式通道",
-    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+    UPDATE_CHANNEL = "beta",
+    UPDATE_CHANNEL_LABEL = "内测通道",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     },
     UPDATE_CHANNELS = {
         stable = {
@@ -96,13 +96,23 @@ local C = {
     -- beta.26 this no longer throttles an already-running downloader; only a
     -- manual lightweight choice or real memory pressure is global.
     PERFORMANCE_AUTO_PROTECT_SECONDS = 10 * 60,
+    -- A screen-off reader finalizer is a short best-effort task, never a
+    -- second long-lived power state. When this deadline expires the local
+    -- checkpoint remains authoritative and Kindle may return to native sleep.
+    READER_FINALIZER_DEADLINE_SECONDS = 20,
     PERFORMANCE_MEMORY_PROTECT_SECONDS = 30 * 60,
 
     -- Automatic home maintenance is serialized on memory-constrained Kindles.
     -- Soft pressure enables temporary lightweight behavior; critical pressure
     -- defers optional heavy work until memory becomes available again.
-    BACKGROUND_MEMORY_SOFT_KB = 48 * 1024,
-    BACKGROUND_MEMORY_CRITICAL_KB = 28 * 1024,
+    BACKGROUND_MEMORY_SOFT_KB = 64 * 1024,
+    BACKGROUND_MEMORY_CRITICAL_KB = 40 * 1024,
+    BACKGROUND_MEMORY_SOFT_RATIO = 0.12,
+    BACKGROUND_MEMORY_CRITICAL_RATIO = 0.08,
+    -- Ratio-based thresholds are capped so high-memory Android devices do not
+    -- get treated like constrained 512 MiB Kindles.
+    BACKGROUND_MEMORY_SOFT_MAX_KB = 128 * 1024,
+    BACKGROUND_MEMORY_CRITICAL_MAX_KB = 80 * 1024,
     BACKGROUND_MEMORY_CHECK_SECONDS = 3,
     BACKGROUND_SERIAL_GAP_SECONDS = 0.35,
     BACKGROUND_RETRY_SECONDS = 0.9,
@@ -138,7 +148,7 @@ local C = {
         home_panel = {slow_ms = 1000, extreme_ms = 2000, repeat_count = 2},
         reader_toolbar = {slow_ms = 800, extreme_ms = 1800, repeat_count = 2},
         thought_popup = {slow_ms = 1200, extreme_ms = 2500, repeat_count = 2},
-        reader_open = {slow_ms = 3000, extreme_ms = 6000, repeat_count = 2},
+        reader_open = {slow_ms = 3000, extreme_ms = 6000, repeat_count = 2, single_extreme = true},
         reader_home = {slow_ms = 4000, extreme_ms = 8000, repeat_count = 2, single_extreme = true},
     },
 

@@ -666,10 +666,28 @@ function Plugin:_reader_session_classify_ready(path,preserve_session)
         book_id=tostring(HOME_SESSION.opening_book_id or "")
     end
     if kind=="" and path then
-        local book=self.store and self.store:file_record_fast(path,false) or nil
+        local book,record,variant,source
+        if self.store and type(self.store.recover_miuread_file)=="function"
+            and tostring(path):lower():match("%.epub$") then
+            local ok,recovered,recovered_record,recovered_variant,recovered_source=
+                pcall(self.store.recover_miuread_file,self.store,path,true)
+            if ok then
+                book,record,variant,source=recovered,recovered_record,recovered_variant,recovered_source
+            else
+                logger.warn("[MiuRead][ReaderSession] identity recovery failed",tostring(recovered))
+            end
+        else
+            book=self.store and self.store:file_record_fast(path,false) or nil
+        end
         if book then
             kind="weread"
             book_id=tostring(book.book_id or book.bookId or "")
+            if source=="embedded_book_id" then
+                logger.info("[MiuRead][ReaderSession] identity recovered",
+                    "book=",book_id~="" and book_id or "-",
+                    "variant=",tostring(variant or (record and record.variant) or "-"),
+                    "source=",source)
+            end
         end
     end
     if kind=="" then
@@ -752,20 +770,14 @@ function Plugin:init()
     else
         self:_set_navigation_state("native","file manager plugin initialized")
     end
-    -- 划线隐藏：在 ReaderTypeset 首次组装样式（ReadSettings）之前装好
-    -- getCssText 包装器，让隐藏规则进入首帧且与 cre 渲染缓存 key 一致
-    -- （打开书不再整本重排，消除卡顿）。init 在每次 reader 打开时都会
-    -- 执行且早于 ReadSettings；onDocSettingsLoad 与 onReadSettings 再提供
-    -- 兜底（本处无副作用：非 reader 上下文时 self.ui.styletweak 为空）。
+    -- Keep the annotation-mark preference in the first CRE stylesheet so a
+    -- hidden-mark book does not need a second full re-render after opening.
     if self.ui and self.ui.styletweak
         and type(self.ui.styletweak.getCssText)=="function" then
         self:_install_marks_getCssText_wrapper(self.ui.styletweak)
         self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
     end
-    -- 想法链接拦截（设备无关）：Kindle 3 无触摸，tap touch zone 不生效，
-    -- 必须靠包装 ReaderLink:onGotoLink 覆盖键盘 Tab+Press 激活路径。这里
-    -- 提前装好，避免等 sync 识别；非带想法的书没有 miuthought 链接，
-    -- 包装零副作用（全部走原逻辑）。
+    -- Internal thought links must also work on keyboard-only/non-touch devices.
     self:_install_thought_link_guard()
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
@@ -3872,9 +3884,12 @@ function Plugin:_background_claim(key,options,retry)
     if not self.background_scheduler then return true,nil,false end
     options=options or {}
     key=tostring(key or "background")
+    options.heavy=options.heavy==true or HEAVY_BACKGROUND_KEYS[key]==true
     options.blocked_reason=self:_background_block_reason(options)
 
-    -- beta.24 allows visible cover fetching to coexist with a healthy download.
+    -- beta.10: automatic heavy Home work obeys RuntimePressure as a real
+    -- scheduling gate. User-requested work may still run, but covers, shelf
+    -- refreshes, scans and metadata never compete with a struggling Reader.
     -- It yields only when a heavy download stage overlaps with genuine memory
     -- pressure, avoiding the old all-or-nothing "downloading means no covers"
     -- trade-off.
@@ -3934,7 +3949,9 @@ function Plugin:_background_claim(key,options,retry)
         and not tostring(reason or ""):find("^power_")
     if retryable and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
-        if reason=="memory_critical" then retry_delay=math.max(4.0,tonumber(retry_delay) or .9) end
+        if reason=="memory_critical" or reason=="memory_low" or reason=="runtime_pressure" then
+            retry_delay=math.max(4.0,tonumber(retry_delay) or .9)
+        end
         if reason=="download_yielding" or reason=="download_hibernating" or reason=="download_heavy"
             or reason=="download_memory_pressure" then
             retry_delay=math.max(.4,math.min(1.5,tonumber(retry_delay) or .9))
@@ -6206,7 +6223,6 @@ function Plugin:reader_quick_panel_settings_menu()
                 self:_set_reader_toolbar_enabled(not self:_reader_toolbar_enabled())
             end},
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="显示划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论显示设置",post_text=self:_thought_font_size_label(),sub_item_table_func=function() return self:thought_font_settings_menu() end},
     }
 end
@@ -6972,18 +6988,24 @@ function Plugin:_wifi_schedule_reconcile(source,want_on)
         UIManager:scheduleIn(delay,function()
             if generation~=self._wifi_reconcile_generation then return end
             local state=self:_wifi_refresh_state(tostring(source or "toggle").."+"..tostring(delay))
-            local linked=state.connected==true or (state.connected==nil and state.online==true)
-            if (want_on==true and linked) or (want_on~=true and state.wifi_on==false) then
+            local linked=state.network_phase=="connected"
+                or (state.connected==true and state.online==true)
+            if want_on==true and linked then
+                require("miuread.network_health").note_success("wifi-reconcile")
+                self._wifi_reconcile_generation=generation+1
+            elseif want_on~=true and state.wifi_on==false then
                 self._wifi_reconcile_generation=generation+1
             end
         end)
     end
-    schedule(.8)
-    schedule(3)
-    schedule(6)
+    -- Kindle can take tens of seconds to re-associate after a real suspend.
+    -- Keep these sparse so recovery is visible without polling continuously.
+    for _,delay in ipairs({.8,3,6,12,24,40,52}) do schedule(delay) end
 end
 
 function Plugin:_wifi_start(NetworkMgr,source)
+    require("miuread.network_health").mark_recovering(tostring(source or "toggle")..":start")
+    HomeData.invalidate_device_state()
     local completed=false
     local function complete()
         if completed then return end
@@ -7046,6 +7068,7 @@ function Plugin:_wifi_stop(NetworkMgr,source)
         ok=pcall(NetworkMgr.turnOffWifi,NetworkMgr,complete)
     end
     if ok then
+        require("miuread.network_health").clear()
         HomeData.invalidate_device_state()
         self:_wifi_schedule_reconcile(source,false)
     end
@@ -7134,13 +7157,18 @@ function Plugin:_reader_wifi_settings(back_callback)
 end
 
 function Plugin:_home_wifi_text()
-    local state=HomeData.cached_device_state() or HomeData.quick_device_state() or {}
-    if state.wifi_on==false then return "已关闭" end
+    local state=HomeData.cached_device_state() or {}
+    local health=require("miuread.network_health").snapshot()
+    local phase=tostring(state.network_phase or "")
+    if state.wifi_on==false or phase=="off" then return "已关闭" end
+    if phase=="recovering" or (health.state=="recovering" and health.age<=50) then return "正在恢复" end
+    if phase=="unavailable" or (health.state=="down" and health.age<=20) then return "网络不可用" end
+    if phase=="connecting" then return "正在连接" end
     if state.wifi_on==true then
-        local linked=state.connected==true or (state.connected==nil and state.online==true)
+        local linked=state.connected==true and state.online==true
         local ssid=U.trim(tostring(state.wifi_name or ""))
         if linked and ssid~="" then return U.utf8_truncate(ssid,13,"…") end
-        return linked and "已连接" or "未连接"
+        return linked and "已连接" or "正在连接"
     end
     return "Wi-Fi"
 end
@@ -7303,7 +7331,7 @@ function Plugin:_home_local_excluded_paths(root)
     if root=="/mnt/us" then
         -- These are application/system trees, not Kindle user book folders.
         -- documents, Books and any other user-created sibling remain visible.
-        for _,name in ipairs({"koreader","system","extensions","mrpackages","linkfonts"}) do add(name) end
+        for _,name in ipairs({"koreader","system","extensions","mrpackages","linkfonts","fonts"}) do add(name) end
     elseif root=="/storage/emulated/0" or root=="/sdcard" then
         -- Avoid traversing Android application sandboxes while keeping ordinary
         -- Books/Documents/Download and arbitrary user folders discoverable.
@@ -7333,6 +7361,14 @@ function Plugin:_home_recent_local_metadata_cache()
     if tonumber(cache.version)~=1 then cache={version=1,rows={}} end
     cache.version=1
     cache.rows=type(cache.rows)=="table" and cache.rows or {}
+    local cleaned=false
+    for path in pairs(cache.rows) do
+        if LocalLibrary.is_resource_path(path) then
+            cache.rows[path]=nil
+            cleaned=true
+        end
+    end
+    if cleaned then self.store:set("home_local_recent_metadata_v1",cache) end
     return cache
 end
 
@@ -7976,10 +8012,24 @@ end
 function Plugin:_recent_authoritative_state()
     local shared=HOME_SESSION.recent_authoritative_state
     if type(shared)=="table" and tonumber(shared.version)==2 then
-        return self:_normalize_recent_authoritative_state(shared)
+        local shared_file=type(shared.current)=="table" and LocalLibrary.normalize(shared.current.file or "") or ""
+        if shared_file~="" and LocalLibrary.is_resource_path(shared_file) then
+            logger.info("[MiuRead][RecentState] stale resource session cleared",shared_file)
+            HOME_SESSION.recent_authoritative_state=nil
+            HOME_SESSION.recent_read_snapshot=nil
+        else
+            return self:_normalize_recent_authoritative_state(shared)
+        end
     end
 
     local stored=self.store and self.store:get("recent_read_state",nil) or nil
+    local stored_file=type(stored)=="table" and type(stored.current)=="table"
+        and LocalLibrary.normalize(stored.current.file or "") or ""
+    if stored_file~="" and LocalLibrary.is_resource_path(stored_file) then
+        logger.info("[MiuRead][RecentState] stale resource record cleared",stored_file)
+        stored={version=2,seq=math.max(0,tonumber(stored.seq or 0) or 0),current=nil}
+        if self.store and self.store.set then self.store:set("recent_read_state",U.copy(stored)) end
+    end
     local state=self:_normalize_recent_authoritative_state(stored)
     if not state.current then
         -- One-time compatibility migration from the existing recent-read
@@ -7993,7 +8043,9 @@ function Plugin:_recent_authoritative_state()
         for _,item in ipairs(type(history.items)=="table" and history.items or {}) do
             local id,file=home_recent_item_identity(item)
             local stamp=normalized_home_time(item.read_at)
-            if (id~="" or file~="") and stamp>0 then
+            if file~="" and LocalLibrary.is_resource_path(file) then
+                logger.info("[MiuRead][RecentState] migration resource skipped",file)
+            elseif (id~="" or file~="") and stamp>0 then
                 local snapshot=self:_home_build_recent_snapshot(id,file,stamp,nil,nil)
                 snapshot.seq=1
                 snapshot.recent_seq=1
@@ -8336,6 +8388,14 @@ function Plugin:_home_open_book(book,anchor,ges,direct_read)
         return self:_home_open_koreader_filemanager(folder,true)
     end
     if book and (book.source=="local" or book.local_file==true) then
+        local local_path=LocalLibrary.normalize(book.file or "")
+        if local_path~="" and LocalLibrary.is_resource_path(local_path) then
+            logger.warn("[MiuRead][HomeInput] resource book open discarded",local_path)
+            self._home_recent_read_dirty=true
+            HOME_SESSION.recent_read_dirty=true
+            self:toast("已忽略非书籍资源文件",2)
+            return true
+        end
         if direct_read==true then return self:_home_open_local(book) end
         return self:_home_hold_book(book,anchor)
     end
@@ -9195,6 +9255,7 @@ function Plugin:_show_home_search_popup(anchor)
             {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
             {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
             {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
+            {icon="bookmark",label="评论收藏",detail="离线查看已收藏的微信读书评论",callback=function() self:show_thought_favorites() end},
         },
     }
 end
@@ -9204,7 +9265,7 @@ function Plugin:_show_home_settings_center()
     return self:_show_standalone_menu("觅阅设置",{
         {text="首页与书架",post_text="布局 书架与快捷入口",sub_item_table_func=function() return self:display_settings_menu() end},
         {text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
-        {text="评论、划线与想法",post_text="评论显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
+        {text="评论、划线与想法",post_text="评论收藏、显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
         {text="时间与时区",post_text="时间来源与地区显示",sub_item_table_func=function() return self:time_display_settings_menu() end},
         {text="更新与关于",post_text="版本 更新通道与说明",sub_item_table_func=function() return PluginSettings.update_about(self) end},
         {text="工具与维护",post_text="修复 清理与诊断",sub_item_table_func=function() return self:maintenance_menu() end},
@@ -9219,7 +9280,7 @@ function Plugin:_show_home_settings_popup(anchor)
         {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function()
             self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor})
         end},
-        {icon="✎",label="评论与批注",detail="评论 划线与想法",callback=function()
+        {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function()
             self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor})
         end},
         {icon="◷",label="时间与时区",detail="时间来源与地区显示",callback=function()
@@ -9248,7 +9309,7 @@ function Plugin:_show_home_file_manager_popup(anchor)
         title="文件管理",subtitle="本地文件入口",
         actions={
             {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
-            {icon="▦",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+            {icon="library",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         },
     }
 end
@@ -9357,6 +9418,7 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
         {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
         {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
+        {icon="bookmark",label="评论收藏",detail="离线查看已收藏评论",callback=function() self:show_thought_favorites() end},
         {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
         {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
         {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
@@ -9386,7 +9448,7 @@ function Plugin:_home_action_function_actions(key,anchor)
     if key=="miuread_settings" then return {
         {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
         {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor}) end},
-        {icon="✎",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
+        {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
         {icon="⇅",label="同步",detail="进度 时间与批注同步",callback=function() self:_show_standalone_menu("同步",self:sync_settings_menu(),{anchor=anchor}) end},
         {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor}) end},
         {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor}) end},
@@ -9401,7 +9463,7 @@ function Plugin:_home_action_function_actions(key,anchor)
     } end
     if key=="file_manager" then return {
         {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
-        {icon="▦",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+        {icon="library",label="我的分类",detail="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
     } end
     if key=="screenshot" then return {
         {icon="▣",label="开始截图",detail="进入截图模式",callback=function() ScreenshotMode.start(self,anchor) end},
@@ -9510,7 +9572,7 @@ function Plugin:_show_home_local_book_more(book,anchor)
         title=tostring(book.title or "本地书籍"),subtitle="KOReader 管理",
         actions={
             {icon="▤",label="在文件管理中查看",detail="由 KOReader 管理文件",callback=function() self:_home_open_koreader_filemanager(book and book.file,true) end},
-            {icon="▦",label="我的分类",detail="打开 KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+            {icon="library",label="我的分类",detail="打开 KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
         },
         footer_action={label="返回书籍操作",callback=function() self:_home_hold_book(book,anchor) end},
     }
@@ -10887,17 +10949,20 @@ function Plugin:_local_browser_decorate(snapshot,root_path,direct_only)
     local folders={}
     for _,folder in ipairs(snapshot.folders or {}) do
         local path=LocalLibrary.normalize(folder.folder_path or folder.path)
-        folders[#folders+1]={
-            kind="folder",local_folder=true,source="local",title=tostring(folder.title or LocalLibrary.basename(path)),
-            folder_path=path,path=path,root_path=LocalLibrary.normalize(root_path or path),status_text="文件夹",
-        }
+        if not LocalLibrary.is_resource_path(path) then
+            folders[#folders+1]={
+                kind="folder",local_folder=true,source="local",title=tostring(folder.title or LocalLibrary.basename(path)),
+                folder_path=path,path=path,root_path=LocalLibrary.normalize(root_path or path),status_text="文件夹",
+            }
+        end
     end
     local books={}
     local source_index=self:_home_local_source_index()
     local metadata_cache=self:_home_recent_local_metadata_cache()
     for _,book in ipairs(self:_local_book_list(snapshot,direct_only==true)) do
         local path=LocalLibrary.normalize(book.file)
-        if path~="" and U.file_exists(path) and not self:_home_local_is_miuread_file(path,source_index,false) then
+        if path~="" and U.file_exists(path) and not LocalLibrary.is_resource_path(path)
+            and not self:_home_local_is_miuread_file(path,source_index,false) then
             local cached=metadata_cache.rows[path]
             -- If beta.9 already verified a moved MiuRead EPUB, keep that exclusion.
             local known_generated=type(cached)=="table"
@@ -12196,6 +12261,7 @@ end
 function Plugin:_begin_koreader_exit(reason)
     Orientation.release_session(reason or "KOReader exit")
     self:_cancel_interactive_network(reason or "KOReader exit")
+    self:_quiesce_reader_background_for_exit(reason or "KOReader exit")
     self:_cancel_native_menu_guard()
     HOME_EXITING=true
     HOME_SESSION_SUPPRESSED=true
@@ -13068,22 +13134,32 @@ end
 function Plugin:_set_thoughts_enabled(enabled)
     enabled=enabled~=false
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    if (p.thoughts.enabled~=false)==enabled then return true end
+    local changed=(p.thoughts.enabled~=false)~=enabled
+    local legacy_marks=p.thoughts.show_marks~=nil
     p.thoughts.enabled=enabled
-    self:_save_ui_preferences(p,"thoughts_enabled")
+    -- show_marks was a beta.6/beta.7 compatibility field. Keep it absent from
+    -- current preferences so "阅读评论" remains the only source of truth.
+    p.thoughts.show_marks=nil
+    if changed or legacy_marks then self:_save_ui_preferences(p,"thoughts_enabled") end
+
+    -- WeRead marks and their comments are one presentation feature. Applying
+    -- the stylesheet here makes the underline visibility follow this switch
+    -- immediately without rewriting the EPUB or deleting any local data.
+    self:_apply_annotation_mark_style(enabled and "comments enabled" or "comments disabled")
+
     local current=self.sync and self.sync.current or nil
     local record=current and current.record or {}
     local variant=tostring(current and (current.variant or record.variant) or "")
     local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
         if annotation_book then self:_setup_thought_tap() end
-        self:toast("阅读评论已开启",1.5)
+        if changed then self:toast("阅读评论已开启",1.5) end
     else
         self:_close_active_thought_popup("comments disabled")
         -- Keep the MiuRead internal-link guard installed. Hiding comments must
         -- not hand #miuthought links back to KOReader as invalid external links.
         if annotation_book then self:_setup_thought_tap() end
-        self:toast("阅读评论已关闭，划线和评论数据不会删除",2)
+        if changed then self:toast("阅读评论已关闭，划线和评论数据不会删除",2) end
     end
     return true
 end
@@ -13096,44 +13172,41 @@ function Plugin:_thoughts_enabled_label()
     return self:_thoughts_enabled() and "已开启" or "已关闭"
 end
 
--- 划线显示：下载的“带想法”书籍把划线/想法标记直接写进 EPUB 的内联 CSS
--- （.miu-inline-mark 实线下划线、.miu-thought-mark 橙色虚线）。关闭划线不
--- 重写书籍文件，而是在阅读时向 KOReader 追加一段样式覆盖，把两类标记的
--- 可见装饰去掉；标记本身与评论数据仍保留，想法链接也依旧可以点按。
--- 注意：CSS 常量必须定义在函数内部而非文件顶层——main.lua 顶层局部变量
--- 数已逼近 LuaJIT 的 200 上限，顶层再加 local 会令整个插件无法加载。
-
+-- Downloaded annotation/thought books encode visible marks in EPUB CSS.
+-- beta.8 deliberately derives mark visibility from the single comments switch;
+-- these compatibility helpers no longer own or persist a second preference.
 function Plugin:_marks_enabled()
-    return (self.store:preferences().thoughts or {}).show_marks~=false
+    return self:_thoughts_enabled()
 end
 
 function Plugin:_marks_enabled_label()
-    return self:_marks_enabled() and "已开启" or "已关闭"
+    return self:_thoughts_enabled_label()
 end
 
 function Plugin:_annotation_mark_hide_css()
     local ANNOTATION_MARK_HIDE_CSS=[[/* MiuRead: hide annotation marks (reader preference) */
-.miu-inline-mark, .miu-thought-mark, .miu-has-thought {
+.miu-inline-mark {
     text-decoration: none !important;
-    border-bottom: 0 !important;
-    padding-bottom: 0 !important;
+}
+.miu-thought-mark, .miu-has-thought {
+    text-decoration: none !important;
+    border-bottom: 2px solid transparent !important;
+    padding-bottom: 2px !important;
 }
 ]]
     if self:_marks_enabled() then return nil end
     return ANNOTATION_MARK_HIDE_CSS
 end
 
+function Plugin:_current_book_supports_miuread_marks()
+    local path=tostring(self:_current_document_path() or "")
+    if path:find("%[划线与想法版%]%.epub$") then return true end
+    local record=self.sync and self.sync:record() or nil
+    local variant=tostring(record and (record.variant or record.download_variant) or "")
+    return record and (record.annotation_requested==true or variant:find("notes",1,true)~=nil) or false
+end
+
 function Plugin:_install_marks_getCssText_wrapper(st)
-    -- Wrap the aggregated style-tweak css so any later native re-application
-    -- (style tweak / font changes / chapter switches) keeps our hide rules.
-    -- Must run before ReaderTypeset:onReadSettings assembles the first
-    -- stylesheet of a ReaderUI: then the hidden-mark rules land in the very
-    -- first rendered frame, and the assembled stylesheet matches the cre
-    -- rendering-cache key, so opening a book does not invalidate the cached
-    -- layout (no full re-render -> no lag, no flicker).
-    -- This wrapper lives on the styletweak instance (per ReaderUI) and is
-    -- idempotent; a fresh ReaderUI rebuild gets a fresh styletweak and simply
-    -- re-installs it via onDocSettingsLoad / Plugin:init.
     if not (st and type(st.getCssText)=="function") then return false end
     if rawget(st,"_miuread_marks_original_getCssText")~=nil then return true end
     local original=st.getCssText
@@ -13149,6 +13222,7 @@ function Plugin:_install_marks_getCssText_wrapper(st)
 end
 
 function Plugin:_apply_annotation_mark_style(reason)
+    if self.ui and self.ui.document and not self:_current_book_supports_miuread_marks() then return false end
     local doc=self.ui and self.ui.document or nil
     if not doc or type(doc.setStyleSheet)~="function" then return false end
     if not self:_reader_is_reflowable() then return false end
@@ -13159,16 +13233,11 @@ function Plugin:_apply_annotation_mark_style(reason)
     local st=ui.styletweak or nil
     local applied=false
     if self:_install_marks_getCssText_wrapper(st) then
-        -- Preferred path: re-apply via ApplyStyleSheet so the updated rules
-        -- enter the live document. ReaderTypeset:onApplyStyleSheet re-sets the
-        -- stylesheet from typeset.css + styletweak:getCssText() (now wrapped).
         if type(ui.handleEvent)=="function" then
             ui:handleEvent(Event:new("ApplyStyleSheet"))
             applied=true
         end
     elseif hide_css~=nil or self._annotation_mark_style_direct==true then
-        -- Fallback for builds without ReaderStyleTweak: append the override
-        -- stylesheet next to KOReader's main document css.
         local main_css=(ui.typeset and ui.typeset.css) or doc.default_css
         local base=""
         if st and type(st.css_text)=="string" then base=st.css_text end
@@ -13194,10 +13263,6 @@ function Plugin:_apply_annotation_mark_style(reason)
 end
 
 function Plugin:_sync_reader_annotation_mark_style(reason)
-    -- A fresh ReaderUI rebuilds the styletweak instance, so drop the cached
-    -- applied state and re-install the hide rules for the current book. A
-    -- preserved rebuild keeps both the wrapper and the applied state, and is
-    -- left untouched to avoid a needless reflow.
     local st=self.ui and self.ui.styletweak or nil
     if st~=nil and rawget(st,"_miuread_marks_original_getCssText")~=nil
         and (self._annotation_mark_style_hidden==true)==(self:_annotation_mark_hide_css()~=nil) then
@@ -13208,22 +13273,13 @@ function Plugin:_sync_reader_annotation_mark_style(reason)
 end
 
 function Plugin:_set_marks_enabled(enabled)
-    enabled=enabled~=false
-    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-    if (p.thoughts.show_marks~=false)==enabled then return true end
-    p.thoughts.show_marks=enabled
-    self:_save_ui_preferences(p,"marks_enabled")
-    self:_apply_annotation_mark_style(enabled and "marks enabled" or "marks disabled")
-    if enabled then
-        self:toast("划线显示已开启",1.5)
-    else
-        self:toast("划线已隐藏，划线和评论数据不会删除",2)
-    end
-    return true
+    -- Compatibility entry point for older callbacks. There is no independent
+    -- mark state from beta.8 onward.
+    return self:_set_thoughts_enabled(enabled)
 end
 
 function Plugin:_toggle_marks_enabled()
-    return self:_set_marks_enabled(not self:_marks_enabled())
+    return self:_toggle_thoughts_enabled()
 end
 
 function Plugin:_thought_font_size_value(prefs)
@@ -13275,16 +13331,12 @@ end
 function Plugin:_show_reader_comment_settings(back_callback)
     local return_to_comments=function() self:_show_reader_comment_settings(back_callback) end
     local function comment_preview_text()
-        return "这是一段评论文字，用来预览当前字体、字号和实际阅读效果。"
+        return "这是一段评论文字，用来预览当前字体、字号和 Emoji 😂 ❤️ 👍。"
     end
     ReaderTypographyDialog.show{
         title="评论显示",
         subtitle=function()
-            if not self:_thoughts_enabled() then
-                if not self:_marks_enabled() then return "阅读评论已关闭 · 划线已隐藏 · 数据仍保留" end
-                return "阅读评论已关闭 · 划线与评论数据仍保留"
-            end
-            if not self:_marks_enabled() then return "划线已隐藏 · 评论数据仍保留" end
+            if not self:_thoughts_enabled() then return "阅读评论已关闭 · 划线已隐藏 · 数据仍保留" end
             local prefs=self.store:preferences().thoughts or {}
             return (prefs.follow_body_font==true and "字体跟随正文" or self:_thought_font_face_label(prefs)).." · 字号 "..self:_thought_font_size_label()
         end,
@@ -13295,15 +13347,14 @@ function Plugin:_show_reader_comment_settings(back_callback)
             local follow=prefs.follow_body_font==true
             return {
                 {kind="select",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_toggle_thoughts_enabled() end},
-                {kind="select",label="显示划线",value=self:_marks_enabled_label(),value_bold=true,callback=function() self:_toggle_marks_enabled() end},
                 {kind="select",label="评论字体",value=follow and ("跟随正文 · "..self:_reader_font_label()) or self:_thought_font_face_label(prefs),close=true,callback=function()
                     self:_show_reader_menu_table("评论字体",self:thought_font_face_menu(),return_to_comments)
                 end},
                 {kind="step",label="字号",value=function() return self:_thought_font_size_label() end,
-                    on_decrease=function() self:_adjust_thought_font_size(-1) end,
-                    on_increase=function() self:_adjust_thought_font_size(1) end,
-                    on_decrease_hold=function() self:_adjust_thought_font_size(-3) end,
-                    on_increase_hold=function() self:_adjust_thought_font_size(3) end},
+                    on_decrease=self:_thought_font_size_value()>12 and function() self:_adjust_thought_font_size(-1) end or nil,
+                    on_increase=self:_thought_font_size_value()<48 and function() self:_adjust_thought_font_size(1) end or nil,
+                    on_decrease_hold=self:_thought_font_size_value()>12 and function() self:_adjust_thought_font_size(-3) end or nil,
+                    on_increase_hold=self:_thought_font_size_value()<48 and function() self:_adjust_thought_font_size(3) end or nil},
                 {kind="select",label="跟随正文字体",value=follow and "已开启" or "已关闭",value_bold=true,callback=function() self:_toggle_thought_follow_body_font() end},
             }
         end,
@@ -13317,20 +13368,68 @@ function Plugin:_show_reader_comment_settings(back_callback)
                 {label="恢复默认",callback=function()
                     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
                     p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
-                    p.thoughts.show_marks=true
                     self:_save_ui_preferences(p,"thought_font_reset")
                     self:_refresh_thought_display(p.thoughts)
-                    self:_apply_annotation_mark_style("thought font reset")
                     self:toast("评论显示已恢复默认",1.5)
                 end},
-                {label="应用到全部评论",primary=true,callback=function()
-                    -- 评论显示偏好本身就是觅阅全局偏好；这里显式保存并
-                    -- 给用户一个明确的“应用到全部”操作，而不再另造一份状态。
-                    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                    self:_save_ui_preferences(p,"thought_font_global")
-                    self:toast("已应用到全部评论",1.5)
-                end},
             }
+        end,
+    }
+    return true
+end
+
+function Plugin:_show_reader_comment_center(back_callback)
+    local function reopen() self:_show_reader_comment_center(back_callback) end
+    ReaderSettingsDialog.show{
+        title="评论",
+        subtitle=function()
+            local scope=self:_current_thought_favorite_scope()
+            local total=self:_thought_favorite_count()
+            local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
+            return "评论收藏 "..tostring(book_count).." / "..tostring(total).." · "..self:_thoughts_enabled_label()
+        end,
+        on_back=back_callback or function() self:show_reader_quick_panel() end,
+        on_home=function() return self:_reader_home_action("reader surface") end,
+        sections=function()
+            local scope=self:_current_thought_favorite_scope()
+            local total=self:_thought_favorite_count()
+            local book_count=scope.book_id~="" and self:_thought_favorite_count({book_id=scope.book_id}) or 0
+            local chapter_count=(scope.book_id~="" and scope.chapter_uid~="")
+                and self:_thought_favorite_count({book_id=scope.book_id,chapter_uid=scope.chapter_uid}) or 0
+            local content_rows={
+                {icon="bookmark",label="本章评论收藏",value=scope.chapter_uid~="" and (tostring(chapter_count).." 条") or "当前章节不可识别",
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
+                        self:show_thought_favorites{
+                            book_id=scope.book_id,chapter_uid=scope.chapter_uid,scope_label="本章评论收藏",
+                            reader_context=true,back_callback=reopen,
+                        }
+                    end},
+                {icon="current-book",label="本书评论收藏",value=scope.book_id~="" and (tostring(book_count).." 条") or "当前书籍不可识别",
+                    enabled=scope.book_id~="",arrow=true,callback=function()
+                        self:show_thought_favorites{
+                            book_id=scope.book_id,scope_label="本书评论收藏",
+                            reader_context=true,back_callback=reopen,
+                        }
+                    end},
+                {icon="bookmark",label="全部评论收藏",value=tostring(total).." 条",enabled=total>0,arrow=true,callback=function()
+                    self:show_thought_favorites{reader_context=true,scope_label="全部评论收藏",back_callback=reopen}
+                end},
+                {icon="search",label="搜索收藏评论",value=total>0 and "评论、原文、作者、书名" or "暂无收藏",
+                    enabled=total>0,arrow=true,callback=function()
+                        self:_search_thought_favorites{reader_context=true,back_callback=reopen}
+                    end},
+            }
+            local display_rows={
+                {icon="comment",label="阅读评论",value=self:_thoughts_enabled_label(),value_bold=true,keep_open=true,callback=function()
+                    self:_toggle_thoughts_enabled()
+                end},
+                {icon="settings",label="评论显示设置",
+                    value="字号 "..self:_thought_font_size_label(),
+                    arrow=true,callback=function() self:_show_reader_comment_settings(reopen) end},
+            }
+            local sections={{title="评论内容",rows=content_rows}}
+            sections[#sections+1]={title="评论显示",rows=display_rows}
+            return sections
         end,
     }
     return true
@@ -13378,13 +13477,18 @@ end
 
 function Plugin:_reader_wifi_summary()
     local state=HomeData.cached_device_state() or {}
-    if state.wifi_on==false then return "Wi-Fi关",false end
-    if state.wifi_on==nil then return "Wi-Fi",true end
-    local linked=state.connected==true or (state.connected==nil and state.online==true)
+    local health=require("miuread.network_health").snapshot()
+    local phase=tostring(state.network_phase or "")
+    if state.wifi_on==false or phase=="off" then return "Wi-Fi关",false end
+    if phase=="recovering" or (health.state=="recovering" and health.age<=50) then return "Wi-Fi恢复中",true end
+    if phase=="unavailable" or (health.state=="down" and health.age<=20) then return "网络不可用",true end
+    if phase=="connecting" then return "Wi-Fi连接中",true end
+    local linked=state.connected==true and state.online==true
     local ssid=U.trim(tostring(state.wifi_name or ""))
     if linked and ssid~="" then return ssid,false end
     if linked then return "已连接",false end
-    return "Wi-Fi!",true
+    if state.wifi_on==true then return "Wi-Fi连接中",true end
+    return "Wi-Fi",true
 end
 
 function Plugin:_reader_sync_summary()
@@ -15301,7 +15405,7 @@ function Plugin:_reader_control_categories()
                 callback=function() self:_open_next_single_chapter() end,
             })
         end
-        reading_items[#reading_items+1]={icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_settings(back_to("reading")) end}
+        reading_items[#reading_items+1]={icon="comment",label="评论",value=self:_thoughts_enabled_label(),value_bold=true,callback=function() self:_show_reader_comment_center(back_to("reading")) end}
     end
 
     local book_items
@@ -15392,21 +15496,21 @@ function Plugin:_reader_quick_definitions()
     return {
         toc={key="toc",icon="toc",label="目录",callback=function() self:_show_reader_toc(function() self:show_reader_quick_panel() end) end},
         progress={key="progress",icon="progress",label="进度",callback=function() self:_show_reader_progress_control(function() self:show_reader_quick_panel() end) end},
-        search={key="search",icon="search",label="搜索",icon_scale=.94,callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
+        search={key="search",icon="search",label="搜索",callback=function() self:_reader_show_search(function() self:show_reader_quick_panel() end) end},
         -- Keep the legacy key so existing customized quick-panel layouts do not
         -- lose this slot after OTA; its action is now the requested Home action.
-        back={key="back",icon="home",label=self:_home_enabled() and "主页" or "书架",icon_scale=.98,callback=function() self:_reader_home_action("reader quick panel") end},
+        back={key="back",icon="home",label=self:_home_enabled() and "主页" or "书架",callback=function() self:_reader_home_action("reader quick panel") end},
         font={key="font",icon="font",label="字体",callback=function() self:_show_reader_font_panel(function() self:show_reader_quick_panel() end) end},
         spacing={key="spacing",icon="line-spacing",label="行距",callback=function() self:_show_reader_spacing_panel(function() self:show_reader_quick_panel() end) end},
         page={key="page",icon="display",label="页面",callback=function() self:_show_reader_page_panel(function() self:show_reader_quick_panel() end) end},
-        comments={key="comments",icon="comment",label="评论",icon_scale=1.16,icon_nudge_y=-1,active=self:_thoughts_enabled(),callback=function()
-            self:_show_reader_comment_settings(function() self:show_reader_quick_panel() end)
+        comments={key="comments",icon="comment",label="评论",active=self:_thoughts_enabled(),callback=function()
+            self:_show_reader_comment_center(function() self:show_reader_quick_panel() end)
         end,hold_callback=function()
             self:_toggle_thoughts_enabled()
             UIManager:scheduleIn(.05,function() self:show_reader_quick_panel() end)
         end},
-        annotations={key="annotations",icon="highlight",label="批注",icon_scale=1.28,icon_nudge_y=-2,callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
-        edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",icon_scale=1.02,active=edge_enabled,callback=function()
+        annotations={key="annotations",icon="highlight",label="批注",callback=function() self:_show_reader_annotation_panel(function() self:show_reader_quick_panel() end) end},
+        edge_guard={key="edge_guard",icon=edge_enabled and "edge-guard" or "edge-guard-off",label="防误触",active=edge_enabled,callback=function()
             self:_show_reader_edge_guard_panel(function() self:show_reader_quick_panel() end)
         end},
         sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
@@ -16466,6 +16570,11 @@ end
 
 function Plugin:_home_prepare_hero_book(book)
     if type(book)~="table" then return nil end
+    local hero_path=LocalLibrary.normalize(book.file or "")
+    if hero_path~="" and LocalLibrary.is_resource_path(hero_path) then
+        logger.warn("[MiuRead][RecentHero] resource entry ignored",hero_path)
+        return nil
+    end
     local source=tostring(book.source or "")
     if source=="account" or source=="mp" then
         local prepared=self:_home_prepare_cloud_page(source,{book},nil)
@@ -19853,6 +19962,10 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
     local open_request_clock=monotonic_wall_time()
     path=normalized_reader_file(path)
     if not path or not U.file_exists(path) then self:info(_("No cached file")); return false end
+    if tostring(session_kind or "")=="local" and LocalLibrary.is_resource_path(path) then
+        logger.warn("[MiuRead][Reader] resource local open blocked",path)
+        return false
+    end
 
     local supported,support_error=self:_reader_provider_supported(path)
     if supported==false then
@@ -24254,7 +24367,6 @@ function Plugin:thought_font_settings_menu()
     local prefs=self.store:preferences().thoughts or {}
     return {
         {text="阅读评论",post_text=self:_thoughts_enabled_label(),checked_func=function() return self:_thoughts_enabled() end,keep_menu_open=true,callback=function() self:_toggle_thoughts_enabled() end},
-        {text="显示划线",post_text=self:_marks_enabled_label(),checked_func=function() return self:_marks_enabled() end,keep_menu_open=true,callback=function() self:_toggle_marks_enabled() end},
         {text="评论字体跟随正文",checked_func=function()
             return (self.store:preferences().thoughts or {}).follow_body_font==true
         end,keep_menu_open=true,callback=function()
@@ -24886,10 +24998,17 @@ function Plugin:_teardown_thought_tap()
     if self._thought_link_guard and self.ui and self.ui.link then
         local link_mod=self.ui.link
         local original=rawget(link_mod,"_miuread_original_onGotoLink")
-        if type(original)=="function" then link_mod.onGotoLink=original end
+        local wrapper=rawget(link_mod,"_miuread_wrapper_onGotoLink")
+        -- Restore only if MiuRead still owns the active hook. If another plugin
+        -- wrapped onGotoLink after us, leave its chain untouched.
+        if type(original)=="function" and wrapper~=nil and link_mod.onGotoLink==wrapper then
+            link_mod.onGotoLink=original
+        end
         link_mod._miuread_original_onGotoLink=nil
+        link_mod._miuread_wrapper_onGotoLink=nil
         self._thought_link_guard=nil
-        logger.info("[MiuRead][ThoughtPopup] link guard removed")
+        logger.info("[MiuRead][ThoughtPopup] link guard removed",
+            "owned=",tostring(wrapper~=nil and link_mod.onGotoLink==original))
     end
 end
 function Plugin:_thought_font_size(value)
@@ -24925,7 +25044,7 @@ function Plugin:_thought_font_name(prefs)
     if doc and type(doc.getFontFace)=="function" then
         local ok,value=pcall(doc.getFontFace,doc)
         if ok then
-            name=usable_font_name(value)
+            local name=usable_font_name(value)
             if name then return name end
         end
     end
@@ -25092,6 +25211,446 @@ function Plugin:_schedule_thought_prewarm()
     UIManager:scheduleIn(math.max(1.8,tonumber(Config.THOUGHT_PREWARM_DELAY) or 2.8),task)
 end
 
+function Plugin:_thought_chapter_title_from_rows(rows, wanted_uid)
+    wanted_uid=tostring(wanted_uid or "")
+    if wanted_uid=="" or type(rows)~="table" then return "" end
+    for _,chapter in ipairs(rows) do
+        if type(chapter)=="table" then
+            local uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or chapter.chapterId or "")
+            if uid==wanted_uid then
+                return U.trim(tostring(chapter.title or chapter.name or chapter.chapterTitle or ""))
+            end
+        end
+    end
+    return ""
+end
+
+function Plugin:_thought_favorite_context(info)
+    info=type(info)=="table" and info or {}
+    local book_id=tostring(info.book_id or "")
+    local chapter_uid=tostring(info.chapter_uid or "")
+    local book=self.store and self.store:book(book_id) or nil
+    local current=self:_current_book_record()
+    if current and current.book and tostring(current.book.book_id or current.book.bookId or "")==book_id then
+        book=current.book
+    end
+    book=type(book)=="table" and book or {}
+    local chapter_title=""
+    if current and current.record then
+        chapter_title=self:_thought_chapter_title_from_rows(current.record.chapter_map,chapter_uid)
+    end
+    if chapter_title=="" then chapter_title=self:_thought_chapter_title_from_rows(book.catalog,chapter_uid) end
+    if chapter_title=="" and self.sync and type(self.sync.chapter_catalog_context)=="function" then
+        local ok,ctx=pcall(self.sync.chapter_catalog_context,self.sync,current)
+        if ok and type(ctx)=="table" then
+            chapter_title=self:_thought_chapter_title_from_rows(ctx.chapters,chapter_uid)
+        end
+    end
+    return {
+        book_id=book_id,
+        book_title=U.trim(tostring(book.title or book.name or "")),
+        book_author=U.trim(tostring(book.author or "")),
+        chapter_uid=chapter_uid,
+        chapter_title=chapter_title,
+        range_key=tostring(info.range or ""),
+    }
+end
+
+function Plugin:_thought_favorite_row(context,comment,source_text)
+    context=type(context)=="table" and context or {}
+    comment=type(comment)=="table" and comment or {}
+    return {
+        book_id=tostring(context.book_id or ""),
+        book_title=tostring(context.book_title or ""),
+        book_author=tostring(context.book_author or ""),
+        chapter_uid=tostring(context.chapter_uid or ""),
+        chapter_title=tostring(context.chapter_title or ""),
+        range_key=tostring(context.range_key or ""),
+        review_id=tostring(comment.review_id or ""),
+        source_text=tostring(source_text or ""),
+        comment_author=tostring(comment.author or ""),
+        comment_content=tostring(comment.content or ""),
+        likes=tonumber(comment.likes or 0) or 0,
+        comment_created=tonumber(comment.created or 0) or 0,
+    }
+end
+
+function Plugin:_copy_thought_comment(comment,source_text,include_source)
+    comment=type(comment)=="table" and comment or {}
+    local author=U.trim(tostring(comment.author or ""))
+    local content=U.trim(tostring(comment.content or ""))
+    local source=U.trim(tostring(source_text or ""))
+    if content=="" then self:toast("没有可复制的评论",2); return false end
+    local text
+    if include_source==true and source~="" then
+        text="“"..source.."”\n\n"..(author~="" and (author.."：") or "")..content
+    else
+        text=(author~="" and (author.."：") or "")..content
+    end
+    if not (Device and Device.input and type(Device.input.setClipboardText)=="function") then
+        self:toast("当前设备不支持系统剪贴板",2.5)
+        return false
+    end
+    local ok,err=pcall(Device.input.setClipboardText,Device.input,text)
+    if not ok then
+        logger.warn("[MiuRead][ThoughtFavorite] clipboard failed",tostring(err))
+        self:toast("复制失败",2)
+        return false
+    end
+    self:toast(include_source==true and "原文和评论已复制" or "评论已复制",2)
+    return true
+end
+
+function Plugin:_thought_favorite_count(options)
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local ok,value=pcall(ThoughtFavorites.count,self.store,type(options)=="table" and options or nil)
+    return ok and (tonumber(value) or 0) or 0
+end
+
+function Plugin:_current_thought_favorite_scope()
+    local scope={book_id="",book_title="",chapter_uid="",chapter_title=""}
+    if not self:_reader_session_is_weread() then return scope end
+    local current=self:_current_book_record()
+    if not (current and current.book) then return scope end
+    local book=current.book or {}
+    local record=current.record or {}
+    scope.book_id=tostring(book.book_id or book.bookId or "")
+    scope.book_title=U.trim(tostring(book.title or book.name or ""))
+    scope.chapter_uid=tostring(record.chapter_uid or record.chapterUid or "")
+    if self.sync and type(self.sync.local_position)=="function" then
+        local ok,position=pcall(self.sync.local_position,self.sync)
+        if ok and type(position)=="table" and tostring(position.chapter_uid or "")~="" then
+            scope.chapter_uid=tostring(position.chapter_uid)
+        end
+    end
+    scope.chapter_title=self:_thought_chapter_title_from_rows(record.chapter_map,scope.chapter_uid)
+    if scope.chapter_title=="" then
+        scope.chapter_title=self:_thought_chapter_title_from_rows(book.catalog,scope.chapter_uid)
+    end
+    if scope.chapter_title=="" and self.sync and type(self.sync.chapter_catalog_context)=="function" then
+        local ok,context=pcall(self.sync.chapter_catalog_context,self.sync,current)
+        if ok and type(context)=="table" then
+            scope.chapter_title=self:_thought_chapter_title_from_rows(context.chapters,scope.chapter_uid)
+        end
+    end
+    return scope
+end
+
+function Plugin:_thought_favorite_sort_label(sort)
+    sort=tostring(sort or "saved")
+    if sort=="created" then return "评论时间" end
+    if sort=="likes" then return "点赞最多" end
+    return "最近收藏"
+end
+
+function Plugin:_thought_favorite_callbacks(context)
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local host=self
+    return {
+        is_favorite=function(comment,source_text)
+            local row=host:_thought_favorite_row(context,comment,source_text)
+            local ok,value=pcall(ThoughtFavorites.contains,host.store,row)
+            return ok and value==true
+        end,
+        toggle_favorite=function(comment,source_text)
+            local row=host:_thought_favorite_row(context,comment,source_text)
+            local ok,state_or_err,detail=pcall(ThoughtFavorites.toggle,host.store,row)
+            if not ok then
+                logger.warn("[MiuRead][ThoughtFavorite] toggle failed",tostring(state_or_err))
+                host:toast("收藏保存失败",2.5)
+                return nil
+            end
+            if state_or_err==nil then
+                logger.warn("[MiuRead][ThoughtFavorite] toggle failed",tostring(detail or "unknown"))
+                host:toast("收藏保存失败",2.5)
+                return nil
+            end
+            host:toast(state_or_err and "已收藏到本地" or "已取消收藏",2)
+            return state_or_err==true
+        end,
+        copy=function(comment,source_text,include_source)
+            return host:_copy_thought_comment(comment,source_text,include_source==true)
+        end,
+    }
+end
+
+function Plugin:_favorite_comment_from_saved(favorite)
+    favorite=type(favorite)=="table" and favorite or {}
+    return {
+        author=tostring(favorite.comment_author or "微信读书用户"),
+        content=tostring(favorite.comment_content or ""),
+        likes=tonumber(favorite.likes or 0) or 0,
+        review_id=tostring(favorite.review_id or ""),
+        created=tonumber(favorite.comment_created or 0) or 0,
+    }
+end
+
+function Plugin:_open_saved_thought_favorite(favorite,on_close)
+    favorite=type(favorite)=="table" and favorite or {}
+    local context={
+        book_id=tostring(favorite.book_id or ""),
+        book_title=tostring(favorite.book_title or ""),
+        book_author=tostring(favorite.book_author or ""),
+        chapter_uid=tostring(favorite.chapter_uid or ""),
+        chapter_title=tostring(favorite.chapter_title or ""),
+        range_key=tostring(favorite.range_key or ""),
+    }
+    local callbacks=self:_thought_favorite_callbacks(context)
+    local prefs=self.store:preferences().thoughts or {}
+    return ThoughtNativePopup.show{
+        source_text=tostring(favorite.source_text or ""),
+        comments={self:_favorite_comment_from_saved(favorite)},
+        cache_key="favorite|"..tostring(favorite.favorite_id or ""),
+        font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
+        font_name=self:_thought_font_name(prefs),
+        width_ratio=tonumber(prefs.width_ratio) or 0.91,
+        height_ratio=tonumber(prefs.height_ratio) or 0.55,
+        is_favorite_callback=callbacks.is_favorite,
+        toggle_favorite_callback=callbacks.toggle_favorite,
+        copy_callback=callbacks.copy,
+        on_interact=function() self:_mark_reader_busy(15) end,
+        on_close=on_close,
+        on_error=function() self:info("收藏评论暂时无法显示。") end,
+    }
+end
+
+function Plugin:_show_saved_thought_favorite_actions(favorite,reopen)
+    favorite=type(favorite)=="table" and favorite or {}
+    local comment=self:_favorite_comment_from_saved(favorite)
+    local dialog
+    local function finish(action)
+        if dialog then pcall(UIManager.close,UIManager,dialog) end
+        if action then pcall(action) end
+        if reopen then UIManager:scheduleIn(.08,reopen) end
+        return true
+    end
+    dialog=ButtonDialog:new{
+        title="收藏评论操作",
+        title_align="center",
+        buttons={
+            {{text="复制评论",callback=function()
+                return finish(function() self:_copy_thought_comment(comment,favorite.source_text,false) end)
+            end}},
+            {{text="复制原文+评论",callback=function()
+                return finish(function() self:_copy_thought_comment(comment,favorite.source_text,true) end)
+            end}},
+            {{text="取消收藏",callback=function()
+                return finish(function()
+                    local ThoughtFavorites=require("miuread.thought_favorites")
+                    local ok,err=ThoughtFavorites.remove(self.store,tostring(favorite.favorite_id or ""))
+                    if ok then self:toast("已取消收藏",1.8)
+                    else self:info("取消收藏失败：\n"..U.first_line(err,120)) end
+                end)
+            end}},
+            {{text="返回",callback=function() return finish() end}},
+        },
+    }
+    UIManager:show(dialog,"ui")
+    return true
+end
+
+function Plugin:_show_thought_favorite_sort(options)
+    options=type(options)=="table" and U.copy(options) or {}
+    local dialog
+    local function choose(sort)
+        if dialog then pcall(UIManager.close,UIManager,dialog) end
+        options.sort=sort
+        UIManager:scheduleIn(.06,function() self:show_thought_favorites(options) end)
+        return true
+    end
+    dialog=ButtonDialog:new{
+        title="评论收藏排序",
+        title_align="center",
+        buttons={
+            {{text="最近收藏",callback=function() return choose("saved") end}},
+            {{text="评论时间",callback=function() return choose("created") end}},
+            {{text="点赞最多",callback=function() return choose("likes") end}},
+            {{text="返回",callback=function()
+                if dialog then pcall(UIManager.close,UIManager,dialog) end
+                UIManager:scheduleIn(.06,function() self:show_thought_favorites(options) end)
+                return true
+            end}},
+        },
+    }
+    UIManager:show(dialog,"ui")
+    return true
+end
+
+function Plugin:_show_thought_favorite_books(options)
+    options=type(options)=="table" and U.copy(options) or {}
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local books=ThoughtFavorites.books(self.store) or {}
+    if #books==0 then self:info("还没有收藏评论。") return true end
+    local items={}
+    for _,book in ipairs(books) do
+        local saved=book
+        local label=U.trim(tostring(saved.book_title or ""))
+        if label=="" then label="未命名书籍" end
+        items[#items+1]={
+            label=label,text=label,
+            detail=U.trim(tostring(saved.book_author or "")),
+            value=tostring(saved.count or 0).." 条",post_text=tostring(saved.count or 0).." 条",
+            callback=function()
+                local next_options=U.copy(options)
+                next_options.book_id=tostring(saved.book_id or "")
+                next_options.chapter_uid=nil
+                next_options.scope_label="本书评论收藏"
+                self:show_thought_favorites(next_options)
+            end,
+        }
+    end
+    local back=function() self:show_thought_favorites(options) end
+    if options.reader_context==true then
+        return ReaderListDialog.show{
+            title="按书籍查看",subtitle=tostring(#books).." 本有评论收藏",items=items,page_size=6,
+            on_back=back,on_home=function() return self:_reader_home_action("thought favorites") end,
+        }
+    end
+    local menu_items={}
+    for _,item in ipairs(items) do
+        menu_items[#menu_items+1]={text=item.text,post_text=item.post_text,close_before_action=true,callback=item.callback}
+    end
+    return self:_show_standalone_menu("按书籍查看",menu_items,{page_size=8,on_close=back})
+end
+
+function Plugin:_search_thought_favorites(options)
+    options=type(options)=="table" and U.copy(options) or {}
+    local dialog
+    dialog=InputDialog:new{
+        title="搜索评论收藏",
+        description="搜索评论、原文、作者、书名和章节",
+        input=tostring(self._thought_favorite_last_search or options.query or ""),
+        buttons={{
+            {text="取消",id="close",callback=function()
+                UIManager:close(dialog)
+                if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
+            end},
+            {text="搜索",is_enter_default=true,callback=function()
+                local query=U.trim(dialog:getInputText())
+                UIManager:close(dialog)
+                if query=="" then
+                    if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
+                    return
+                end
+                self._thought_favorite_last_search=query
+                options.query=query
+                options.scope_label="搜索评论收藏"
+                UIManager:scheduleIn(.05,function() self:show_thought_favorites(options) end)
+            end},
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+    return true
+end
+
+function Plugin:show_thought_favorites(options)
+    if type(options)=="string" then options={book_id=options} end
+    options=type(options)=="table" and U.copy(options) or {}
+    local ThoughtFavorites=require("miuread.thought_favorites")
+    local query_options={
+        book_id=options.book_id,chapter_uid=options.chapter_uid,query=options.query,
+        sort=options.sort or "saved",limit=tonumber(options.limit) or 300,
+    }
+    local rows,err=ThoughtFavorites.list(self.store,query_options)
+    if not rows then
+        self:info("本地收藏暂时无法读取：\n"..U.first_line(err,120))
+        if options.back_callback then UIManager:scheduleIn(.05,options.back_callback) end
+        return
+    end
+    if #rows==0 then
+        local message
+        if U.trim(tostring(options.query or ""))~="" then
+            message="没有找到包含“"..tostring(options.query).."”的收藏评论。"
+        elseif U.trim(tostring(options.chapter_uid or ""))~="" then
+            message="本章还没有收藏的评论。\n\n阅读时长按评论即可收藏。"
+        elseif U.trim(tostring(options.book_id or ""))~="" then
+            message="本书还没有收藏的评论。\n\n阅读时长按评论即可收藏。"
+        else
+            message="还没有收藏评论。\n\n阅读时长按感兴趣的评论即可收藏到本地。"
+        end
+        self:info(message)
+        if options.back_callback then UIManager:scheduleIn(.08,options.back_callback) end
+        return
+    end
+
+    local title=tostring(options.scope_label or "")
+    if title=="" then
+        if U.trim(tostring(options.query or ""))~="" then title="搜索评论收藏"
+        elseif U.trim(tostring(options.chapter_uid or ""))~="" then title="本章评论收藏"
+        elseif U.trim(tostring(options.book_id or ""))~="" then title="本书评论收藏"
+        else title="我的评论收藏" end
+    end
+    local sort=options.sort or "saved"
+    local reopen=function() self:show_thought_favorites(options) end
+    local items={}
+    if #rows>1 then
+        items[#items+1]={
+            icon="settings",label="排序方式",text="排序方式",
+            value=self:_thought_favorite_sort_label(sort),post_text=self:_thought_favorite_sort_label(sort),
+            callback=function() self:_show_thought_favorite_sort(options) end,
+        }
+    end
+    if U.trim(tostring(options.book_id or ""))=="" then
+        local books=ThoughtFavorites.books(self.store) or {}
+        if #books>1 then
+            items[#items+1]={
+                icon="current-book",label="按书籍查看",text="按书籍查看",
+                value=tostring(#books).." 本",post_text=tostring(#books).." 本",
+                callback=function() self:_show_thought_favorite_books(options) end,
+            }
+        end
+    end
+
+    for _,favorite in ipairs(rows) do
+        local saved=favorite
+        local book_title=U.trim(tostring(saved.book_title or ""))
+        local chapter=U.trim(tostring(saved.chapter_title or ""))
+        local author=U.trim(tostring(saved.comment_author or ""))
+        local preview=U.trim(tostring(saved.comment_content or "")):gsub("%s+"," ")
+        if U.utf8_len(preview)>48 then preview=U.utf8_sub(preview,1,48).."…" end
+        local source_preview=U.trim(tostring(saved.source_text or "")):gsub("%s+"," ")
+        if U.utf8_len(source_preview)>34 then source_preview=U.utf8_sub(source_preview,1,34).."…" end
+        local label
+        if U.trim(tostring(options.book_id or ""))=="" then
+            label=(book_title~="" and ("《"..book_title.."》") or "未命名书籍")..(chapter~="" and (" · "..chapter) or "")
+        else
+            label=chapter~="" and chapter or (author~="" and author or "收藏评论")
+        end
+        local meta=author~="" and author or "微信读书用户"
+        if tonumber(saved.likes or 0)>0 then meta=meta.." · 赞 "..tostring(saved.likes) end
+        local detail=meta..(preview~="" and (" · "..preview) or "")
+        if source_preview~="" and U.utf8_len(detail)<72 then detail=detail.." · 原文“"..source_preview.."”" end
+        local saved_date=tonumber(saved.saved_at or 0)>0 and os.date("%Y-%m-%d",tonumber(saved.saved_at)) or ""
+        items[#items+1]={
+            icon="bookmark",label=label,text=label..(preview~="" and (" · "..preview) or ""),
+            detail=detail,value=saved_date,post_text=author,
+            callback=function()
+                self:_open_saved_thought_favorite(saved,function() UIManager:scheduleIn(.05,reopen) end)
+            end,
+            hold_callback=function()
+                self:_show_saved_thought_favorite_actions(saved,reopen)
+            end,
+        }
+    end
+
+    if options.reader_context==true then
+        local subtitle=tostring(#rows).." 条 · "..self:_thought_favorite_sort_label(sort)
+        if U.trim(tostring(options.query or ""))~="" then subtitle="“"..tostring(options.query).."” · "..subtitle end
+        return ReaderListDialog.show{
+            title=title,subtitle=subtitle,items=items,page_size=6,
+            on_back=options.back_callback or function() self:_show_reader_comment_center() end,
+            on_home=function() return self:_reader_home_action("thought favorites") end,
+        }
+    end
+
+    local menu_items={}
+    for _,item in ipairs(items) do
+        menu_items[#menu_items+1]={text=item.text,post_text=item.post_text,close_before_action=true,callback=item.callback}
+    end
+    return self:_show_standalone_menu(title,menu_items,{page_size=8,on_close=options.back_callback})
+end
+
 function Plugin:_close_active_thought_popup(reason)
     local popup=self._thought_popup
     self._thought_popup_generation=(tonumber(self._thought_popup_generation) or 0)+1
@@ -25129,6 +25688,8 @@ function Plugin:_open_thought_info(info,generation)
         local parts_ms=math.floor((monotonic_wall_time()-parts_started)*1000+.5)
         if tostring(source or "")=="" and #(comments or {})==0 then notice="没有想法内容"; return end
         local show_started=monotonic_wall_time()
+        local favorite_context=self:_thought_favorite_context(info)
+        local favorite_callbacks=self:_thought_favorite_callbacks(favorite_context)
         popup=ThoughtNativePopup.show{
             source_text=source,
             comments=comments,
@@ -25140,6 +25701,9 @@ function Plugin:_open_thought_info(info,generation)
             font_name=self:_thought_font_name(prefs),
             width_ratio=tonumber(prefs.width_ratio) or 0.91,
             height_ratio=tonumber(prefs.height_ratio) or 0.55,
+            is_favorite_callback=favorite_callbacks.is_favorite,
+            toggle_favorite_callback=favorite_callbacks.toggle_favorite,
+            copy_callback=favorite_callbacks.copy,
             on_close=on_close,
             on_interact=function() self:_mark_reader_busy(30) end,
             on_error=function()
@@ -25285,23 +25849,17 @@ function Plugin:_on_thought_tap(ges)
     return false
 end
 function Plugin:_install_thought_link_guard()
-    -- Kindle 3 等无触摸设备没有 tap 手势，想法链接的点击拦截（touch zone）
-    -- 完全不生效；Tab 选中链接 + Press 激活会走 ReaderLink:onGotoLink。
-    -- 触摸设备的 tap_link、滑动跟随链接最终也汇聚到 onGotoLink，因此包装
-    -- 这一个方法即可覆盖全部激活路径（键盘/触摸/滑动），设备无关。
-    -- 拦截 #miuthought 想法链接并打开评论弹窗；其他链接原样交给 KOReader。
-    -- 幂等：每个 ReaderUI 有独立的 ReaderLink 实例，重复安装直接返回。
     local ui=self.ui
     local link_mod=ui and ui.link or nil
     if not link_mod or type(link_mod.onGotoLink)~="function" then return false end
     if rawget(link_mod,"_miuread_original_onGotoLink")~=nil then return true end
     local original=link_mod.onGotoLink
     link_mod._miuread_original_onGotoLink=original
-    link_mod.onGotoLink=function(self2,link_obj,...)
+    local wrapper
+    wrapper=function(self2,link_obj,...)
         if link_obj then
             local href=extract_thought_href(link_obj,{},0)
             if not href then
-                -- 兜底：个别 crengine 版本只暴露目标 xpointer，扫描字符串字段
                 for _,v in pairs(link_obj) do
                     if type(v)=="string" then
                         local found=tostring(v):match("(#?miuthought%-[%x%.]+)")
@@ -25315,6 +25873,8 @@ function Plugin:_install_thought_link_guard()
         end
         return original(self2,link_obj,...)
     end
+    link_mod._miuread_wrapper_onGotoLink=wrapper
+    link_mod.onGotoLink=wrapper
     self._thought_link_guard=true
     logger.info("[MiuRead][ThoughtPopup] link guard installed (keyboard/non-touch path)")
     return true
@@ -25322,8 +25882,6 @@ end
 
 function Plugin:_setup_thought_tap()
     if self._thought_tap_setup or not self.ui then return end
-    -- 设备无关：无触摸设备（Kindle 3）没有 tap 手势，靠包装 onGotoLink
-    -- 拦截键盘（Tab+Press）激活的想法链接；触摸设备也装一份作兜底。
     self:_install_thought_link_guard()
     if not self.ui.registerTouchZones then return end
     local ok,Device=pcall(require,"device"); if ok and Device.isTouchDevice and not Device:isTouchDevice() then return end
@@ -25333,6 +25891,10 @@ end
 
 function Plugin:_record_recent_read(path,book,record)
     path=normalized_reader_file(path) or tostring(path or "")
+    if path~="" and LocalLibrary.is_resource_path(path) then
+        logger.warn("[MiuRead][RecentState] resource read ignored",path)
+        return false
+    end
     local book_id=tostring((book and (book.book_id or book.bookId))
         or (record and (record.book_id or record.bookId)) or "")
     if path=="" and book_id=="" then return false end
@@ -25803,23 +26365,12 @@ function Plugin:_reader_rebuild_ready_state()
     return true,false
 end
 
--- 划线隐藏样式必须在 KOReader 首次应用文档 CSS（ReadSettings 阶段、
--- 文档渲染之前）就挂载好，这样第一帧渲染自带隐藏规则。更关键的是：
--- cre 的渲染缓存以"最终样式表内容"为 key，若打开书后再改样式表，
--- 缓存必然失效并触发整本 full rendering（Kindle 上即卡顿）。因此包装器
--- 必须在 ReaderTypeset:onReadSettings 组装样式之前安装（onDocSettingsLoad
--- 与 Plugin:init 双保险），让 typeset 首次应用的样式就含隐藏规则，与
--- 缓存 key 一致 → 打开书不重排、不闪屏、不卡顿。
--- 注意：CSS 常量保持在 _annotation_mark_hide_css 函数内部，不要提升到
--- 文件顶层（顶层局部变量数已逼近 LuaJIT 200 上限，会导致插件无法加载）。
+-- Install the mark visibility rule before CRE builds the first document
+-- stylesheet.  This avoids reopening a cached book and then forcing a second
+-- full layout pass merely to hide its annotation decoration.
 function Plugin:onDocSettingsLoad()
-    -- DocSettingsLoad 先于 ReadSettings 派发。此时 ReaderUI 模块已创建
-    -- （styletweak 可用）、文档尚未应用样式表；装好包装器后，typeset 在
-    -- ReadSettings 阶段组装出的样式天然包含隐藏规则。
     local st=self.ui and self.ui.styletweak or nil
     if not (st and type(st.getCssText)=="function") then
-        -- PDF/KOpt 等非 reflowable 文档没有 styletweak 模块，无样式可挂；
-        -- 保持未知状态，交给 _sync_reader_annotation_mark_style 兜底。
         self._annotation_mark_style_hidden=nil
         return false
     end
@@ -25834,22 +26385,13 @@ end
 function Plugin:onReadSettings()
     local st=self.ui and self.ui.styletweak or nil
     if not (st and type(st.getCssText)=="function") then
-        -- PDF/KOpt 等非 reflowable 文档没有 styletweak 模块，无样式可挂；
-        -- 保持未知状态，交给 _sync_reader_annotation_mark_style 兜底。
         self._annotation_mark_style_hidden=nil
         return false
     end
     if rawget(st,"_miuread_marks_original_getCssText")~=nil then
-        -- 包装器已在 DocSettingsLoad / Plugin:init 阶段装好，ReaderTypeset
-        -- 组装样式时已包含隐藏规则：首帧即最终效果，样式与 cre 渲染缓存
-        -- 一致，无需重放（不触发整本重排，也不闪屏）。
         self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
         return false
     end
-    -- 兜底：DocSettingsLoad 未派发到本插件（非标准流程）。ReaderTypeset 已
-    -- 用未包装的样式表应用过一遍；这里补装包装器并重放，保证划线隐藏
-    -- 生效。main_css 用 typeset.css（ReaderTypeset:onReadSettings 已赋值，
-    -- 与它实际应用的主样式一致），避免样式被替换成不匹配的默认样式。
     self:_install_marks_getCssText_wrapper(st)
     local want_hidden=self:_annotation_mark_hide_css()~=nil
     if want_hidden then
@@ -26026,10 +26568,23 @@ function Plugin:onReaderReady()
     self:_reset_chapter_navigation_context("reader ready")
     self._chapter_catalog_confirm_running=false
     if type(self.store.prune_hidden_prefetch)=="function" then
-        local removed=self.store:prune_hidden_prefetch(Config.CHAPTER_PREFETCH_TTL)
-        if tonumber(removed or 0)>0 then logger.info("[MiuRead][Prefetch] stale cache pruned","count=",tostring(removed)) end
+        local cleanup_task
+        cleanup_task=function()
+            if not (self.ui and self.ui.document)
+                or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
+                or reader_close_active() then return end
+            if not self:_reader_background_idle() then
+                UIManager:scheduleIn(.75,cleanup_task)
+                return
+            end
+            local removed=self.store:prune_hidden_prefetch(Config.CHAPTER_PREFETCH_TTL)
+            if tonumber(removed or 0)>0 then
+                logger.info("[MiuRead][Prefetch] stale cache pruned","count=",tostring(removed))
+            end
+        end
+        UIManager:scheduleIn(1.5,cleanup_task)
     end
-    self:_schedule_reader_toolbar_state_refresh(nil,.35)
+    self:_schedule_reader_toolbar_state_refresh(nil,.55)
     self:_schedule_reader_toolbar_prewarm(ready_session,1.1)
     if self:_reader_session_is_weread() then
         -- Catalog lookup waits for reader idle and is cached once for this
@@ -26051,14 +26606,22 @@ function Plugin:onReaderReady()
     local task
     task=function()
         if self._reader_sync_ready_task~=task then return end
+        if not (self.ui and self.ui.document)
+            or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
+            or reader_close_active() then
+            self._reader_sync_ready_task=nil
+            return
+        end
+        if not self:_reader_background_idle() then
+            UIManager:scheduleIn(.55,task)
+            return
+        end
         self._reader_sync_ready_task=nil
-        if self.ui and self.ui.document
-            and tonumber(HOME_SESSION.reader_session_generation or 0)==ready_session
-            and not reader_close_active() then self.sync:on_reader_ready() end
+        self.sync:on_reader_ready()
     end
     self._reader_sync_ready_task=task
     if self:_reader_session_is_weread() then
-        UIManager:scheduleIn(.18,task)
+        UIManager:scheduleIn(.55,task)
     else
         self._reader_sync_ready_task=nil
         logger.info("[MiuRead][ReaderSession] cloud reader-ready work skipped",
@@ -26232,6 +26795,14 @@ function Plugin:_reading_end_sync(reason,options,callback)
     local book_id=tostring(current.book.book_id or current.book.bookId or "")
     if book_id=="" then return false end
     local started_at=monotonic_wall_time()
+    local critical_deadline=tonumber(options.critical_deadline_clock)
+    local function critical_wait_seconds(default_seconds)
+        default_seconds=math.max(2,tonumber(default_seconds) or 12)
+        if not critical_deadline or critical_deadline<=0 then return default_seconds end
+        local remaining=critical_deadline-monotonic_wall_time()
+        if remaining<=0 then return 0 end
+        return math.max(2,math.min(default_seconds,math.floor(remaining+.5)))
+    end
 
     self._reading_end_barrier_active=true
     self._reading_end_barrier_reason=reason
@@ -26287,10 +26858,12 @@ function Plugin:_reading_end_sync(reason,options,callback)
     end
     local function finish_critical_after_time(ok,stage)
         if not time_handoff then return mark_critical_done(ok,stage) end
+        local wait_seconds=critical_wait_seconds(20)
+        if wait_seconds<=0 then return mark_critical_done(false,"finalizer_deadline") end
         self.sync:wait_writer_barrier(time_handoff,function(barrier_ok)
             mark_critical_done(ok==true and barrier_ok==true,
                 barrier_ok and (stage or "time_finished") or "time_barrier_timeout")
-        end,20)
+        end,wait_seconds)
         return true
     end
     local task_states={
@@ -26459,10 +27032,19 @@ function Plugin:_reading_end_sync(reason,options,callback)
                     local barrier_attempt=0
                     local function wait_final_time()
                         barrier_attempt=barrier_attempt+1
+                        local wait_seconds=critical_wait_seconds(18)
+                        if wait_seconds<=0 then
+                            self._reading_end_background_verify_active=false
+                            self:_save_progress_state(book_id,"deferred",
+                                "最终位置已保存；休眠收尾达到时间上限，稍后再提交进度",
+                                tonumber(snapshot.progress),nil,snapshot.progress_sequence)
+                            mark_critical_done(false,"finalizer_deadline")
+                            return
+                        end
                         self.sync:wait_writer_barrier(time_handoff,function(barrier_ok)
                             if barrier_ok then
                                 start_background_progress()
-                            elseif barrier_attempt<2 then
+                            elseif not critical_deadline and barrier_attempt<2 then
                                 UIManager:scheduleIn(2,wait_final_time)
                             else
                                 self._reading_end_background_verify_active=false
@@ -26473,7 +27055,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                                     "book=",book_id,"barrier=",tostring(time_handoff))
                                 mark_critical_done(false,"time_barrier_timeout")
                             end
-                        end,18)
+                        end,wait_seconds)
                     end
                     wait_final_time()
                 else
@@ -26925,7 +27507,110 @@ function Plugin:onAnnotationsModified()
     -- gesture callback.
     self:_schedule_local_annotation_snapshot("annotations_modified",2.4)
 end
-function Plugin:_finish_suspend_reader_finalizer(ok)
+function Plugin:_reader_finalizer_state()
+    local state=rawget(_G,"__MIUREAD_READER_FINALIZER")
+    if type(state)~="table" then
+        state={
+            generation=0,owner_generation=0,deadline_clock=0,
+            fused=false,fuse_reason=nil,last_transition=nil,
+        }
+        rawset(_G,"__MIUREAD_READER_FINALIZER",state)
+    end
+    state.generation=tonumber(state.generation) or 0
+    state.owner_generation=tonumber(state.owner_generation) or 0
+    state.deadline_clock=tonumber(state.deadline_clock) or 0
+    state.fused=state.fused==true
+    return state
+end
+
+function Plugin:_reader_finalizer_current(generation)
+    local state=self:_reader_finalizer_state()
+    generation=tonumber(generation or 0) or 0
+    return generation>0
+        and generation==tonumber(state.owner_generation or 0)
+        and generation==tonumber(state.generation or 0)
+end
+
+function Plugin:_reader_finalizer_begin(deadline_seconds)
+    local state=self:_reader_finalizer_state()
+    state.generation=(tonumber(state.generation) or 0)+1
+    state.owner_generation=state.generation
+    state.deadline_clock=monotonic_wall_time()+math.max(2,tonumber(deadline_seconds) or 20)
+    state.last_transition="begin"
+    return state.owner_generation,state.deadline_clock
+end
+
+function Plugin:_reader_finalizer_invalidate(reason,fuse)
+    local state=self:_reader_finalizer_state()
+    state.generation=(tonumber(state.generation) or 0)+1
+    state.owner_generation=0
+    state.deadline_clock=0
+    state.last_transition=tostring(reason or "invalidated")
+    if fuse==true then
+        state.fused=true
+        state.fuse_reason=tostring(reason or "lifecycle_conflict")
+    end
+    return state.generation
+end
+
+function Plugin:_cancel_reader_finalizer_owner(reason,fuse)
+    reason=tostring(reason or "cancelled")
+    local pseudo=PseudoLockscreen.snapshot() or {}
+    local tasks=type(pseudo.tasks)=="table" and pseudo.tasks or {}
+    local had_owner=(tonumber(self:_reader_finalizer_state().owner_generation or 0) or 0)>0
+        or self._reading_end_finalizer_active==true
+        or self._reading_end_standby_held==true
+        or SuspendWorkLease.has("reader_finalizer")
+        or tasks.reader_finalizer==true
+    if had_owner then self:_reader_finalizer_invalidate(reason,fuse==true) end
+    self._reading_end_finalizer_active=false
+    self._reading_end_standby_held=false
+    if self.sync then
+        self.sync.resume_after_finalizer=false
+        if type(self.sync.cancel_writer_barrier_waits)=="function" then
+            pcall(self.sync.cancel_writer_barrier_waits,self.sync,reason)
+        end
+    end
+    SuspendWorkLease.release("reader_finalizer")
+    pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+    pcall(PseudoLockscreen.background_task_done,"reader_finalizer_"..reason)
+    if had_owner then
+        logger.warn("[MiuRead][ReadingEnd] reader finalizer owner cancelled",
+            "reason=",reason,
+            "fused=",tostring(fuse==true),
+            "download=",tostring(tasks.download==true))
+    end
+    return had_owner
+end
+
+function Plugin:_quiesce_reader_background_for_exit(reason)
+    reason=tostring(reason or "koreader_exit")
+    self:_cancel_reader_finalizer_owner("exit:"..reason,false)
+    if self.sync and type(self.sync.quiesce_for_exit)=="function" then
+        pcall(self.sync.quiesce_for_exit,self.sync,reason)
+    end
+    local snapshot=PseudoLockscreen.snapshot() or {}
+    local tasks=type(snapshot.tasks)=="table" and snapshot.tasks or {}
+    -- Never tear down a genuine download hold here. The quit path hibernates
+    -- downloads before reaching this function; external restarts may still have
+    -- a live download and must keep its own marker isolated from finalizer work.
+    if tasks.download~=true then pcall(PseudoLockscreen.force_clear,"exit:"..reason) end
+    logger.info("[MiuRead][Power] reader background quiesced for exit",
+        "reason=",reason,
+        "download=",tostring(tasks.download==true))
+    return true
+end
+
+function Plugin:_finish_suspend_reader_finalizer(ok,generation,stage)
+    generation=tonumber(generation or self:_reader_finalizer_state().owner_generation or 0) or 0
+    stage=tostring(stage or "done")
+    if generation>0 and not self:_reader_finalizer_current(generation) then
+        logger.info("[MiuRead][ReadingEnd] stale reader finalizer callback ignored",
+            "generation=",tostring(generation),
+            "current=",tostring(self:_reader_finalizer_state().owner_generation or 0),
+            "stage=",stage)
+        return false
+    end
     local still_suspended=HOME_SESSION.suspended==true and self._miuread_suspended==true
 
     if not still_suspended then
@@ -26933,8 +27618,11 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
         SuspendWorkLease.release("reader_finalizer")
         pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
         pcall(PseudoLockscreen.background_task_done,"reader_finalizer_user_visible")
+        if generation>0 and self:_reader_finalizer_current(generation) then
+            self:_reader_finalizer_invalidate("completed_after_wake:"..stage,false)
+        end
         logger.info("[MiuRead][Power] reader finalizer ended after user wake",
-            "ok=",tostring(ok==true))
+            "ok=",tostring(ok==true),"stage=",stage)
         return true
     end
 
@@ -26953,8 +27641,20 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     local hold_active=PseudoLockscreen.active()==true
     local hold_platform=PseudoLockscreen.device_platform()
     local hold_state=hold_platform=="kindle" and "SCREEN_SAVER_HOLD" or "PSEUDO_LOCKED"
-    local target=hold_active and hold_state
-        or (download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND")
+    local target
+    if hold_platform=="kindle" then
+        -- Finalizer ownership ends in this function. A Kindle hold that has no
+        -- real download left must therefore converge to native suspend intent,
+        -- even though powerd may remain visually in screenSaver until its next
+        -- readyToSuspend edge.
+        target=download_continue
+            and (hold_active and hold_state or "DOWNLOAD_LOCKED")
+            or "REAL_SUSPEND"
+    else
+        -- Keep Kobo's validated legacy pseudo-lock transition unchanged.
+        target=hold_active and hold_state
+            or (download_continue and "DOWNLOAD_LOCKED" or "REAL_SUSPEND")
+    end
     local power=PowerState.transition(target,"reading_end_complete",{
         download_active=self.download_task and self.download_task:busy() or false,
         download_continue=download_continue,sync_continue=false,
@@ -26979,8 +27679,11 @@ function Plugin:_finish_suspend_reader_finalizer(ok)
     pcall(PseudoLockscreen.background_task_done,"reader_finalizer")
     local hold_after=PseudoLockscreen.snapshot() or {}
     local remaining=type(hold_after.tasks)=="table" and hold_after.tasks or {}
+    if generation>0 and self:_reader_finalizer_current(generation) then
+        self:_reader_finalizer_invalidate("completed:"..stage,false)
+    end
     logger.info("[MiuRead][Power] reader finalizer completed",
-        "ok=",tostring(ok==true),"to=",tostring(target),
+        "ok=",tostring(ok==true),"stage=",stage,"to=",tostring(target),
         "generation=",tostring(power.generation),
         "download_continue=",tostring(download_continue),
         "download_reason=",download_reason,
@@ -27128,8 +27831,19 @@ function Plugin:onSuspend()
     local sync_candidate=suspend_background_supported
         and self.ui and self.ui.document and self:_reader_session_is_weread()
         and self.sync and self.sync.reading_end_finalized~=true
-    local pseudo_active=false
     local power_platform=PseudoLockscreen.device_platform()
+    local guarded_finalizer=power_platform=="kindle"
+    if sync_candidate and guarded_finalizer and self:_reader_finalizer_state().fused==true then
+        sync_candidate=false
+        logger.warn("[MiuRead][ReadingEnd] suspend finalizer bypassed by session fuse",
+            "reason=",tostring(self:_reader_finalizer_state().fuse_reason or "lifecycle_conflict"))
+    end
+    local finalizer_generation,finalizer_deadline=nil,nil
+    if sync_candidate and guarded_finalizer then
+        finalizer_generation,finalizer_deadline=self:_reader_finalizer_begin(
+            tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 20)
+    end
+    local pseudo_active=false
     if power_platform=="kindle" then
         pcall(PseudoLockscreen.set_download_active,download_continue)
         if sync_candidate then pcall(PseudoLockscreen.set_task_active,"reader_finalizer",true) end
@@ -27150,6 +27864,9 @@ function Plugin:onSuspend()
             if power_platform=="kindle" and sync_candidate then
                 sync_candidate=false
                 pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
+                if finalizer_generation and self:_reader_finalizer_current(finalizer_generation) then
+                    self:_reader_finalizer_invalidate("background_hold_failed",false)
+                end
             end
         end
     end
@@ -27176,8 +27893,16 @@ function Plugin:onSuspend()
             show_status=false,after="进入休眠",timeout=5,
             release_early=true,source_defer_seconds=.55,
             defer_resume_until_critical=true,
+            finalizer_generation=finalizer_generation,
+            critical_deadline_clock=finalizer_deadline,
             on_critical_done=function(ok,stage)
-                self:_finish_suspend_reader_finalizer(ok)
+                if finalizer_generation and not self:_reader_finalizer_current(finalizer_generation) then
+                    logger.info("[MiuRead][ReadingEnd] stale suspend finalizer result detached",
+                        "generation=",tostring(finalizer_generation),
+                        "stage=",tostring(stage or "done"))
+                    return
+                end
+                self:_finish_suspend_reader_finalizer(ok,finalizer_generation,stage)
                 if ok then
                     logger.info("[MiuRead][ReadingEnd] suspend critical sync submitted",
                         "stage=",tostring(stage or "done"))
@@ -27189,13 +27914,37 @@ function Plugin:onSuspend()
         },function(ok)
             logger.info("[MiuRead][ReadingEnd] suspend foreground handoff",
                 "snapshot_frozen=",tostring(ok==true),
-                "reader_finalizer=held")
+                "reader_finalizer=held",
+                "generation=",tostring(finalizer_generation or "-"))
         end)==true
+        if sync_continue and finalizer_generation and finalizer_deadline then
+            local delay=math.max(.1,finalizer_deadline-monotonic_wall_time())
+            UIManager:scheduleIn(delay,function()
+                if not self:_reader_finalizer_current(finalizer_generation) then return end
+                local finalizer_state=self:_reader_finalizer_state()
+                finalizer_state.fused=true
+                finalizer_state.fuse_reason="hard_deadline"
+                self._reading_end_finalizer_active=false
+                if self.sync then
+                    self.sync.resume_after_finalizer=false
+                    if type(self.sync.cancel_writer_barrier_waits)=="function" then
+                        pcall(self.sync.cancel_writer_barrier_waits,self.sync,"reader_finalizer_deadline")
+                    end
+                end
+                logger.warn("[MiuRead][ReadingEnd] reader finalizer hard deadline",
+                    "generation=",tostring(finalizer_generation),
+                    "seconds=",tostring(tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 20))
+                self:_finish_suspend_reader_finalizer(false,finalizer_generation,"hard_deadline")
+            end)
+        end
         if not sync_continue then
             self._reading_end_standby_held=false
             SuspendWorkLease.release("reader_finalizer")
             pcall(PseudoLockscreen.set_task_active,"reader_finalizer",false)
             pcall(PseudoLockscreen.background_task_done,"reader_finalizer_not_started")
+            if finalizer_generation and self:_reader_finalizer_current(finalizer_generation) then
+                self:_reader_finalizer_invalidate("finalizer_not_started",false)
+            end
         end
     end
     -- Kindle keeps Amazon powerd in its native screenSaver state and only
@@ -27350,7 +28099,11 @@ function Plugin:onResume()
             "time=ignored","progress=ignored","annotations=ignored")
         return
     end
-    if self._reading_end_standby_held or SuspendWorkLease.has("reader_finalizer") then
+    -- Kindle ScreenSaver Hold gets the strict wake boundary introduced in
+    -- beta.10. Kobo keeps its already-validated legacy lifecycle unchanged.
+    if PseudoLockscreen.device_platform()=="kindle" then
+        self:_cancel_reader_finalizer_owner("user_wake",true)
+    elseif self._reading_end_standby_held or SuspendWorkLease.has("reader_finalizer") then
         self._reading_end_standby_held=false
         SuspendWorkLease.release("reader_finalizer")
     end
@@ -27363,6 +28116,17 @@ function Plugin:onResume()
     self._miuread_suspended=false
     HOME_SESSION.suspended=false
     StatusToast.set_blocked(false)
+    -- Never reuse the pre-suspend Wi-Fi label. Kindle may keep the radio flag
+    -- while association/IP routing is still being restored for several seconds.
+    if self:_network_radio_hint()~=false then
+        require("miuread.network_health").mark_recovering("resume")
+        HomeData.invalidate_device_state()
+        ReaderToolbar.invalidate()
+        self:_wifi_schedule_reconcile("resume",true)
+    else
+        require("miuread.network_health").clear()
+        HomeData.invalidate_device_state()
+    end
     local close_pending=reader_close_active()
     local native_menu_pending=NATIVE_MENU_GUARD.active==true
     if close_pending then

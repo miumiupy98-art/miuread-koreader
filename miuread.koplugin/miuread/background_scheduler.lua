@@ -98,8 +98,16 @@ function Scheduler:claim(key,options)
     end
 
     local memory=RuntimePressure.memory_snapshot(false)
-    if memory and memory.level=="critical" and options.user_requested~=true then
-        return nil,"memory_critical"
+    if options.user_requested~=true then
+        if memory and memory.level=="critical" then
+            return nil,"memory_critical"
+        end
+        if options.heavy==true and memory and memory.level=="low" then
+            return nil,"memory_low"
+        end
+        if options.heavy==true and RuntimePressure.active() then
+            return nil,"runtime_pressure"
+        end
     end
 
     if self.active then

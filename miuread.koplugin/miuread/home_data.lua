@@ -2,6 +2,7 @@ local DataStorage = require("datastorage")
 local Device = require("device")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local NetworkHealth = require("miuread.network_health")
 
 local HomeData = {}
 local stats_cache
@@ -556,7 +557,7 @@ function HomeData.quick_device_state(force)
     if not force and device_cache and now - device_cache.at < 60 then
         return device_cache.value
     end
-    local state = {online = nil, wifi_on = nil, connected = nil, wifi_name = nil, battery = nil, charging = false}
+    local state = {online = nil, wifi_on = nil, connected = nil, wifi_name = nil, network_phase = nil, battery = nil, charging = false}
     local power=read_power_state()
     state.battery=power.battery
     state.charging=power.charging==true
@@ -585,6 +586,35 @@ function HomeData.quick_device_state(force)
                 local ssid = tostring(current.ssid or current.name or ""):gsub("^%s+", ""):gsub("%s+$", "")
                 if ssid ~= "" then state.wifi_name = ssid end
             end
+        end
+    end
+
+    local health = NetworkHealth.snapshot()
+    if state.wifi_on == false then
+        state.network_phase = "off"
+    else
+        local is_kindle = false
+        if type(Device.isKindle) == "function" then
+            local ok, value = pcall(Device.isKindle, Device)
+            is_kindle = ok and value == true
+        end
+        local manager_ready = state.connected == true and state.online == true
+            and (not is_kindle or tostring(state.wifi_name or "") ~= "")
+        if health.state == "recovering" and health.age <= 50 then
+            -- During resume do not trust the manager's cached connected bit by
+            -- itself. A real HTTP response (recorded by network_health) clears
+            -- this state immediately; otherwise we keep showing recovery until
+            -- the grace window expires.
+            state.network_phase = "recovering"
+        elseif manager_ready then
+            NetworkHealth.note_success("network-manager")
+            state.network_phase = "connected"
+        elseif health.state == "down" and health.age <= 20 then
+            state.network_phase = "unavailable"
+        elseif state.wifi_on == true then
+            state.network_phase = "connecting"
+        else
+            state.network_phase = "unknown"
         end
     end
     device_cache = {at = now, power_at=now, value = state}

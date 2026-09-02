@@ -85,6 +85,30 @@ function LocalLibrary.basename(path) return basename(LocalLibrary.normalize(path
 function LocalLibrary.dirname(path) return dirname(LocalLibrary.normalize(path)) end
 function LocalLibrary.title_from_path(path) return title_from_path(path) end
 
+local RESOURCE_ROOTS = {
+    "/mnt/us/fonts",
+    "/mnt/us/koreader",
+    "/mnt/us/system",
+    "/mnt/us/extensions",
+    "/mnt/us/mrpackages",
+    "/mnt/us/linkfonts",
+    "/mnt/onboard/.adds/koreader",
+    "/sdcard/koreader",
+    "/storage/emulated/0/koreader",
+    "/storage/emulated/0/Android",
+}
+
+function LocalLibrary.is_resource_path(path)
+    path = LocalLibrary.normalize(path)
+    if path == "" then return false end
+    local lower = path:lower()
+    for _, root in ipairs(RESOURCE_ROOTS) do
+        root = root:lower()
+        if lower == root or lower:sub(1, #root + 1) == root .. "/" then return true end
+    end
+    return false
+end
+
 -- KOReader owns format support. MiuRead deliberately keeps no extension list.
 function LocalLibrary.is_supported(path)
     local registry_value = document_registry()
@@ -159,6 +183,7 @@ end
 function LocalLibrary.book_from_path(path, options)
     options = options or {}
     path = LocalLibrary.normalize(path)
+    if LocalLibrary.is_resource_path(path) then return nil end
     local attr = lfs.attributes(path)
     local name = basename(path)
     if not attr or attr.mode ~= "file" or not native_file_visible(name, path) then return nil end
@@ -259,7 +284,7 @@ function TreeScan:_accept(name)
     if name == "." or name == ".." then return end
     local base = self.current_path
     local full = (base == "/" and "/" .. name or base .. "/" .. name)
-    if excluded_path(full, self.excluded_paths) then return end
+    if excluded_path(full, self.excluded_paths) or LocalLibrary.is_resource_path(full) then return end
     local attr = lfs.attributes(full)
     if attr and attr.mode == "directory" then
         if native_dir_visible(name) and not is_symlink(full) then

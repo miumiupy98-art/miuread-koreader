@@ -11,6 +11,8 @@ local module_dir = source:match("^(.*[/\\])") or ""
 local plugin_root = module_dir:gsub("miuread[/\\]$", "")
 local icon_root = plugin_root .. "resources/icons/miuread/"
 
+-- Lucide 1.34.0 outlines, remapped to local filenames. Glyph aliases keep
+-- older menus working; missing names fall through to the same-named SVG.
 local MAP = {
     ["‹"] = "back", ["←"] = "back", back = "back",
     ["⌂"] = "home", home = "home",
@@ -49,13 +51,25 @@ local MAP = {
     ["⏻"] = "power", power = "power", quit = "power",
     ["↺"] = "restart", restart = "restart",
     rotate = "rotate", ["旋转"] = "rotate",
-    ["orientation-lock"] = "orientation-lock", ["orientation-auto"] = "orientation-auto",
+    ["orientation-lock"] = "orientation-lock", ["orientation-auto"] = "orientation-auto", ["方向"] = "orientation-auto",
     night = "night", warmth = "warmth", battery = "battery",
     ["full-refresh"] = "full-refresh",
     ["return"] = "return",
     ["ko-reader"] = "ko-reader", koreader = "ko-reader",
-    display = "display", tools = "repair", device = "device", book = "book", folder = "folder", ["📁"] = "folder", wifi = "wifi", ["⌁"] = "wifi",
+    display = "display", tools = "repair", device = "device", book = "book", folder = "folder", ["📁"] = "folder",
+    wifi = "wifi", ["⌁"] = "wifi", ["Wi-Fi"] = "wifi",
     bluetooth = "bluetooth", bt = "bluetooth",
+    ["⌫"] = "trash", trash = "trash", delete = "trash",
+    ["✎"] = "pencil", ["✏"] = "pencil", ["✐"] = "pencil",
+    pencil = "pencil", edit = "pencil",
+    ["↔"] = "swap", swap = "swap",
+    ["☁"] = "cloud", cloud = "cloud",
+    ["◎"] = "newspaper", newspaper = "newspaper", mp = "newspaper",
+    ["■"] = "power-off", ["power-off"] = "power-off",
+    ["⇥"] = "cache", cache = "cache",
+    ["✓"] = "check", check = "check",
+    ["•"] = "dot", dot = "dot",
+    library = "library", collections = "library",
 }
 
 function Registry.key(value)
@@ -75,12 +89,15 @@ function Registry.widget(value, size, opts)
     local path = opts.path or Registry.path(value)
     if path and path ~= "" and lfs.attributes(path, "mode") == "file" then
         local image
+        -- Do not pass scale_factor=0: that keeps the SVG's aspect ratio and
+        -- letterboxes optically-small glyphs. Nil stretches to the square slot,
+        -- matching KOReader IconWidget. Stroke/fill live on each shape so
+        -- NanoSVG does not depend on parent inheritance.
         local ok = pcall(function()
             image = ImageWidget:new{
                 file = path,
                 width = size,
                 height = size,
-                scale_factor = 0,
                 file_do_cache = true,
                 is_icon = true,
             }

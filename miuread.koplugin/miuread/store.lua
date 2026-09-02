@@ -1548,6 +1548,21 @@ function Store:migrate()
             logger.info("[MiuRead][Migration] schema 118 -> 119 done",
                 "logged_in=",tostring(logged),"revision=",tostring(auth.auth_revision))
         end
+        if schema<120 then
+            logger.info("[MiuRead][Migration] schema 119 -> 120 begin","from=",tostring(schema))
+            -- beta.8 makes "阅读评论" the single presentation switch for both
+            -- WeRead comments and their in-book marks. beta.6/beta.7 may have
+            -- persisted a second show_marks value; discard it once so the two
+            -- surfaces can never drift apart again. No EPUB/comment/favorite
+            -- data is rewritten by this migration.
+            local current=self:preferences()
+            current.thoughts=type(current.thoughts)=="table" and current.thoughts or {}
+            current.thoughts.enabled=current.thoughts.enabled~=false
+            current.thoughts.show_marks=nil
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 119 -> 120 done",
+                "comments_enabled=",tostring(current.thoughts.enabled))
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -2303,6 +2318,28 @@ function Store:identify_file(path,relink)
     if book then return book,record,kind end
     local meta=self:epub_identity(path)
     return self:file_record_from_identity(path,meta,relink)
+end
+
+-- Reader-session recovery must be stricter than general library relinking.
+-- Only an EPUB carrying MiuRead's embedded book id is allowed to become a
+-- WeRead session; a same-title ordinary EPUB must stay a local book.
+function Store:recover_miuread_file(path,relink)
+    local book,record,kind=self:file_record_fast(path,relink)
+    if book then return book,record,kind,"record" end
+    local meta=self:epub_identity(path)
+    local book_id=type(meta)=="table" and tostring(meta.book_id or "") or ""
+    if book_id=="" then return nil end
+    book,record,kind=self:file_record_from_identity(path,meta,relink)
+    if not book then return nil end
+    local _,saved,save_error=self:save_book(book_id,book)
+    if saved~=true then
+        logger.warn("[MiuRead][Store] embedded EPUB identity recovered but persistence failed",
+            "book=",book_id,"error=",tostring(save_error or "unknown"))
+    else
+        logger.info("[MiuRead][Store] embedded EPUB identity recovered",
+            "book=",book_id,"variant=",tostring(kind or "recovered"),"file=",tostring(path))
+    end
+    return book,record,kind,"embedded_book_id"
 end
 
 function Store:file_record(path)

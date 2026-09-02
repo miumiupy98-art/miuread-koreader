@@ -12,6 +12,8 @@ local logger = require("logger")
 local FaceFactory = {
     initialized = false,
     emoji_path = nil,
+    emoji_checked = false,
+    emoji_missing_logged = false,
     font_paths_cache = {},
     face_cache = {},
     fallback_cache = {},
@@ -55,34 +57,153 @@ local function resolve_bundled_font(fontname)
     return nil
 end
 
+local EMOJI_FONT_NAMES = {
+    "NotoEmoji-VariableFont_wght.ttf",
+    "NotoEmoji-Regular.ttf",
+    "NotoColorEmoji.ttf",
+    "Symbola.ttf",
+    "SegoeUIEmoji.ttf",
+    "Segoe UI Emoji.ttf",
+}
+
 function FaceFactory:findEmojiFont()
-    if self.emoji_path and file_exists(self.emoji_path) then return self.emoji_path end
+    if self.emoji_path and file_exists(self.emoji_path) then
+        self.emoji_checked = true
+        return self.emoji_path
+    end
+    if self.emoji_checked then return nil end
+
+    -- Release packages stage a pinned Google Noto Emoji monochrome font inside
+    -- MiuRead. Prefer that deterministic asset before any device/user font so
+    -- Kindle, Kobo and Android render the same real Emoji glyphs.
+    local bundled_candidates = {
+        "plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+        "/mnt/us/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+        "/mnt/onboard/.adds/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+        "/sdcard/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf",
+    }
+    local ok_ds, DataStorage = pcall(require, "datastorage")
+    if ok_ds and DataStorage then
+        for _, method in ipairs({"getDataDir", "getFullDataDir"}) do
+            if type(DataStorage[method]) == "function" then
+                local ok_dir, data_dir = pcall(DataStorage[method], DataStorage)
+                if ok_dir and type(data_dir) == "string" and data_dir ~= "" then
+                    bundled_candidates[#bundled_candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-VariableFont_wght.ttf"
+                end
+            end
+        end
+    end
+    for _, path in ipairs(bundled_candidates) do
+        local resolved = realpath(path)
+        if resolved then
+            self.emoji_path = resolved
+            self.emoji_checked = true
+            logger.info("[MiuRead][ThoughtEmoji] bundled emoji font:", resolved)
+            return resolved
+        end
+    end
+
+    -- Development/source installs may not contain the release-staged font.
+    -- Fall back to fonts already known to KOReader or installed by the user.
+    for _, fontname in ipairs(EMOJI_FONT_NAMES) do
+        local resolved = resolve_bundled_font(fontname)
+        if resolved then
+            self.emoji_path = resolved
+            self.emoji_checked = true
+            logger.info("[MiuRead][ThoughtEmoji] fallback emoji font:", resolved)
+            return resolved
+        end
+    end
 
     local candidates = {
         "plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf",
-        "plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf",
         "/mnt/us/koreader/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf",
-        "/mnt/us/koreader/plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf",
+        "/mnt/us/koreader/fonts/NotoEmoji-Regular.ttf",
         "/mnt/us/fonts/NotoEmoji-Regular.ttf",
+        "/mnt/onboard/.adds/koreader/fonts/NotoEmoji-Regular.ttf",
+        "/mnt/onboard/fonts/NotoEmoji-Regular.ttf",
+        "/sdcard/koreader/fonts/NotoEmoji-Regular.ttf",
+        "/sdcard/fonts/NotoEmoji-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
     }
-    local ok_ds, DataStorage = pcall(require, "datastorage")
-    if ok_ds and DataStorage and type(DataStorage.getDataDir) == "function" then
-        local data_dir = DataStorage:getDataDir()
-        candidates[#candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf"
-        candidates[#candidates + 1] = data_dir .. "/plugins/weread.koplugin/fonts/NotoEmoji-Regular.ttf"
+    if ok_ds and DataStorage then
+        if type(DataStorage.getDataDir) == "function" then
+            local ok_dir, data_dir = pcall(DataStorage.getDataDir, DataStorage)
+            if ok_dir and type(data_dir) == "string" and data_dir ~= "" then
+                candidates[#candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf"
+                candidates[#candidates + 1] = data_dir .. "/fonts/NotoEmoji-Regular.ttf"
+            end
+        end
+        if type(DataStorage.getFullDataDir) == "function" then
+            local ok_dir, data_dir = pcall(DataStorage.getFullDataDir, DataStorage)
+            if ok_dir and type(data_dir) == "string" and data_dir ~= "" then
+                candidates[#candidates + 1] = data_dir .. "/plugins/miuread.koplugin/fonts/NotoEmoji-Regular.ttf"
+                candidates[#candidates + 1] = data_dir .. "/fonts/NotoEmoji-Regular.ttf"
+            end
+        end
     end
 
     for _, path in ipairs(candidates) do
         local resolved = realpath(path)
         if resolved then
             self.emoji_path = resolved
-            logger.info("[MiuRead][ThoughtPopup] emoji fallback font:", resolved)
+            self.emoji_checked = true
+            logger.info("[MiuRead][ThoughtEmoji] fallback emoji font:", resolved)
             return resolved
         end
     end
+
+    -- Last chance: some KOReader builds expose user/system font paths without
+    -- a predictable basename. Accept only paths whose names explicitly say
+    -- Emoji, avoiding accidental dependency on unrelated plugin assets.
+    local ok, fonts = pcall(FontList.getFontList, FontList)
+    if ok and type(fonts) == "table" then
+        for _, path in ipairs(fonts) do
+            if type(path) == "string" and path:lower():find("emoji", 1, true) then
+                local resolved = realpath(path)
+                if resolved then
+                    self.emoji_path = resolved
+                    self.emoji_checked = true
+                    logger.info("[MiuRead][ThoughtEmoji] fallback emoji font:", resolved)
+                    return resolved
+                end
+            end
+        end
+    end
+
     self.emoji_path = nil
+    self.emoji_checked = true
+    if not self.emoji_missing_logged then
+        self.emoji_missing_logged = true
+        logger.info("[MiuRead][ThoughtEmoji] bundled/system emoji font missing; using emergency text fallbacks")
+    end
     return nil
+end
+
+
+local EMOJI_TEXT_FALLBACKS = {
+    {"❤️", "[爱心]"}, {"❤", "[爱心]"}, {"💔", "[心碎]"},
+    {"🤣", "[笑哭]"}, {"😂", "[笑哭]"}, {"😄", "[笑]"}, {"😁", "[笑]"},
+    {"😊", "[微笑]"}, {"😅", "[汗]"}, {"😭", "[哭]"}, {"😢", "[难过]"},
+    {"😍", "[喜欢]"}, {"😘", "[亲亲]"}, {"😡", "[生气]"}, {"🤔", "[思考]"},
+    {"😱", "[惊讶]"}, {"😎", "[酷]"}, {"👍", "[赞]"}, {"👎", "[不赞]"},
+    {"👏", "[鼓掌]"}, {"🙏", "[谢谢]"}, {"🔥", "[火]"}, {"🎉", "[庆祝]"},
+    {"✨", "[闪亮]"}, {"💯", "[100]"}, {"🥹", "[感动]"}, {"🥰", "[喜欢]"},
+}
+
+function FaceFactory:displayText(value)
+    local text = tostring(value or "")
+    self:init()
+    if self.emoji_path then return text end
+    for _, pair in ipairs(EMOJI_TEXT_FALLBACKS) do
+        text = text:gsub(pair[1], pair[2])
+    end
+    -- Variation selectors are useful only to Emoji-capable fonts. Removing
+    -- them prevents visible tofu boxes after a known Emoji was converted.
+    text = text:gsub("️", "")
+    return text
 end
 
 function FaceFactory:init()
@@ -292,6 +413,8 @@ function FaceFactory:clearCache()
     self.face_cache = {}
     self.fallback_cache = {}
     self.emoji_path = nil
+    self.emoji_checked = false
+    self.emoji_missing_logged = false
     self.initialized = false
 end
 

@@ -163,9 +163,20 @@ function RuntimePressure.memory_snapshot(force)
         state.last_memory=nil
         return nil
     end
-    local soft=math.max(1,tonumber(Config.BACKGROUND_MEMORY_SOFT_KB) or 48*1024)
-    local critical=math.max(1,tonumber(Config.BACKGROUND_MEMORY_CRITICAL_KB) or 28*1024)
+    local fixed_soft=math.max(1,tonumber(Config.BACKGROUND_MEMORY_SOFT_KB) or 64*1024)
+    local fixed_critical=math.max(1,tonumber(Config.BACKGROUND_MEMORY_CRITICAL_KB) or 40*1024)
+    local total=math.max(0,tonumber(memory.total_kb) or 0)
+    local soft_ratio=tonumber(Config.BACKGROUND_MEMORY_SOFT_RATIO) or 0.12
+    local critical_ratio=tonumber(Config.BACKGROUND_MEMORY_CRITICAL_RATIO) or 0.08
+    local soft_ratio_limit=math.max(fixed_soft,tonumber(Config.BACKGROUND_MEMORY_SOFT_MAX_KB) or 128*1024)
+    local critical_ratio_limit=math.max(fixed_critical,tonumber(Config.BACKGROUND_MEMORY_CRITICAL_MAX_KB) or 80*1024)
+    local ratio_soft=math.min(soft_ratio_limit,math.floor(total*soft_ratio+.5))
+    local ratio_critical=math.min(critical_ratio_limit,math.floor(total*critical_ratio+.5))
+    local soft=math.max(fixed_soft,ratio_soft)
+    local critical=math.max(fixed_critical,ratio_critical)
     if critical>soft then critical=soft end
+    memory.soft_kb=soft
+    memory.critical_kb=critical
     memory.level=memory.available_kb<=critical and "critical"
         or (memory.available_kb<=soft and "low" or "normal")
     state.last_memory=memory

@@ -7,6 +7,7 @@ local ok_lfs, lfs = pcall(require, "lfs")
 local Json = require("miuread.json")
 local Config = require("miuread.config")
 local NetworkPolicy = require("miuread.network_policy")
+local NetworkHealth = require("miuread.network_health")
 local Cookies = require("miuread.cookies")
 local Protocol = require("miuread.protocol")
 local Util = require("miuread.util")
@@ -686,6 +687,15 @@ function Http:request(opt)
         for attempt = 1, retries + 1 do
             local text, code, headers, url, err = self:_request_once(opt)
             last_text, last_code, last_headers, last_url, last_error = text, code, headers, url, err
+            -- Keep UI Wi-Fi state honest across worker processes. Any HTTP status
+            -- proves transport is usable; only a no-status socket failure marks
+            -- the link degraded. This file lives in /tmp and is intentionally
+            -- independent from authentication/rate-limit semantics.
+            if code then
+                NetworkHealth.note_success("http:" .. tostring(code))
+            elseif err then
+                NetworkHealth.note_failure(err)
+            end
             limited_code = (tonumber(code) == 429 or tonumber(code) == 499)
                 and tostring(code) or body_rate_limit(text)
             if limited_code then break end

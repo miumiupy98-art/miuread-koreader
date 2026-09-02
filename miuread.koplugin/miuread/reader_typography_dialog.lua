@@ -16,6 +16,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local FaceFactory = require("miuread.thought_face_factory")
+local DialogTransition = require("miuread.dialog_transition")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -376,7 +377,15 @@ function Dialog:init()
     self[1] = self:_build_content()
 end
 
+function Dialog:onShow()
+    if self.frame_dimen then
+        UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.frame_dimen) end)
+    end
+    return true
+end
+
 function Dialog:onCloseWidget()
+    local old_region=self.frame_dimen and Skin.expand_region(self.frame_dimen) or nil
     if live_dialog == self then live_dialog = nil end
     if self.rebuild_task then
         UIManager:unschedule(self.rebuild_task)
@@ -384,7 +393,7 @@ function Dialog:onCloseWidget()
     end
     local action = self.pending_action
     self.pending_action = nil
-    if action then UIManager:nextTick(action) end
+    DialogTransition.after_close(old_region, action, "TypographyDialog")
     return true
 end
 

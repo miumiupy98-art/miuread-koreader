@@ -3,19 +3,17 @@ local PluginSettings=require("miuread.plugin_settings")
 local M={}
 
 local function comment_and_thought_menu(plugin)
-    return {
+    local rows={
         {text="我的想法",callback=function()
             plugin:_show_reader_records("thought",function() plugin:_show_koreader_reader_menu() end)
         end},
         {text="阅读评论",post_text=plugin:_thoughts_enabled_label(),checked_func=function()
             return plugin:_thoughts_enabled()
         end,keep_menu_open=true,callback=function() plugin:_toggle_thoughts_enabled() end},
-        {text="显示划线",post_text=plugin:_marks_enabled_label(),checked_func=function()
-            return plugin:_marks_enabled()
-        end,keep_menu_open=true,callback=function() plugin:_toggle_marks_enabled() end},
-        {text="评论显示设置",sub_item_table_func=function() return plugin:thought_font_settings_menu() end},
-        {text="评论数据管理",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end},
     }
+    rows[#rows+1]={text="评论显示设置",sub_item_table_func=function() return plugin:thought_font_settings_menu() end}
+    rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end}
+    return rows
 end
 
 function M.home(plugin)

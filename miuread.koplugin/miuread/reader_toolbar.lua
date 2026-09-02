@@ -420,7 +420,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
             {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
             {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
             {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
         }
         callbacks = {
             function() self:_activate(header.wifi_callback, "Wi-Fi") end,
@@ -443,7 +443,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
             {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
             {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
             {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
+            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
         }
         callbacks = {
             function() self:_activate(header.wifi_callback, "Wi-Fi") end,

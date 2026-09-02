@@ -211,11 +211,19 @@ local function install_guards()
         local original = Device.outofScreenSaver
         Device.outofScreenSaver = function(self, source, ...)
             record_power("wake", source)
-            if state().active then
-                -- This is a native Amazon powerd wake. Drop only the hold; live
-                -- download/finalizer task markers remain so a later user sleep
-                -- can enter a fresh hold session.
+            local s = state()
+            local had_finalizer = s.tasks.reader_finalizer == true
+            if s.active then
+                -- A real user wake is a hard lifecycle boundary. Keep a genuine
+                -- download marker, but never carry a reader finalizer into the
+                -- next awake/suspend generation.
                 leave_hold("native_wake:" .. source_name(source, "wake"), true)
+            end
+            if had_finalizer then
+                s.tasks.reader_finalizer = nil
+                logger.info("[MiuRead][KindleHold] reader finalizer cleared on native wake",
+                    "source=", tostring(source_name(source, "wake")),
+                    "download=", tostring(s.tasks.download == true))
             end
             return original(self, source, ...)
         end
@@ -324,10 +332,16 @@ function M.after_suspend()
 end
 
 function M.on_resume_event()
-    if state().active then
+    local s=state()
+    if s.active then
         -- Defensive cleanup for Resume variants that do not pass through
         -- outofScreenSaver. Never suppress a real Resume.
         leave_hold("resume_event", true)
+    end
+    if s.tasks.reader_finalizer==true then
+        s.tasks.reader_finalizer=nil
+        logger.info("[MiuRead][KindleHold] reader finalizer cleared on resume event",
+            "download=",tostring(s.tasks.download==true))
     end
     return "normal"
 end

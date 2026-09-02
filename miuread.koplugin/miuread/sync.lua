@@ -400,6 +400,7 @@ function Sync:new(reader, api, store, host, async, identity_async)
         reading_time_session_id=nil, reading_time_segment_id=nil,
         resume_after_finalizer=false,
         progress_write_fence=false, progress_write_fence_seq=0,
+        writer_wait_generation=0, quiescing=false,
         precise_position_cache={}, precise_due_refreshed=0,
         record_generation=0, record_retry_task=nil, record_checked_path=nil,
         time_enabled=(store:preferences().sync or {}).time_enabled==true,
@@ -959,11 +960,11 @@ function Sync:_prepare_progress_catalog(callback)
             end
         end
 
-        if value.cookies_changed and type(value.cookies) == "table" then
+        if value.cookies_changed or value.wr_ticket_changed or value.wr_wrpa_changed then
             local latest_auth = self.store:auth()
-            latest_auth.cookies = value.cookies
-            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket end
-            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa end
+            if value.cookies_changed and type(value.cookies)=="table" then latest_auth.cookies = U.copy(value.cookies) end
+            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket or "" end
+            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa or "" end
             local saved_auth,save_error=self.store:save_auth(latest_auth,{expected_revision=auth_revision_snapshot})
             if saved_auth~=true then
                 logger.warn("[MiuRead][ProgressMap] stale worker credential update ignored",U.first_line(save_error or "",120))
@@ -2395,11 +2396,11 @@ function Sync:upload(elapsed, callback, options)
         local value = result.value
         local legacy_context = value.legacy_context or legacy_book
         local position = value.position or self:position(record, ratio, chapters)
-        if value.cookies_changed and type(value.cookies) == "table" then
+        if value.cookies_changed or value.wr_ticket_changed or value.wr_wrpa_changed then
             local latest_auth = self.store:auth()
-            latest_auth.cookies = value.cookies
-            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket end
-            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa end
+            if value.cookies_changed and type(value.cookies)=="table" then latest_auth.cookies = U.copy(value.cookies) end
+            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket or "" end
+            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa or "" end
             local saved_auth,save_error=self.store:save_auth(latest_auth,{expected_revision=auth_revision_snapshot})
             if saved_auth~=true then
                 logger.warn("[MiuRead][ReadReport] stale worker credential update ignored",U.first_line(save_error or "",120))
@@ -3144,6 +3145,54 @@ function Sync:_load_daemon_context()
     end
 end
 
+-- The long-lived reporter may receive rotated WeRead cookies/tickets in a
+-- normal response. Accept only updates that still belong to the exact parent
+-- login session/revision/account. Store:save_auth provides the final CAS guard,
+-- so a late worker can never overwrite a newer QR login.
+function Sync:_adopt_daemon_credential_update(status,current_auth,current_revision)
+    status=type(status)=="table" and status or {}
+    if not (status.cookies_changed or status.wr_ticket_changed or status.wr_wrpa_changed) then
+        return false,current_revision
+    end
+    local candidate=U.copy(current_auth or self.store:auth())
+    local fields={}
+    if status.cookies_changed then
+        if type(status.cookies)=="table" then
+            candidate.cookies=U.copy(status.cookies)
+            fields[#fields+1]="cookies"
+        else
+            logger.warn("[MiuRead][ReadReport] background cookie update ignored", "reason=missing_cookie_table")
+        end
+    end
+    if status.wr_ticket_changed then
+        candidate.wr_ticket=status.wr_ticket or ""
+        fields[#fields+1]="wr_ticket"
+    end
+    if status.wr_wrpa_changed then
+        candidate.wr_wrpa=status.wr_wrpa or ""
+        fields[#fields+1]="wr_wrpa"
+    end
+    if #fields==0 then return false,current_revision end
+    local saved,save_error=self.store:save_auth(candidate,{expected_revision=current_revision})
+    if saved~=true then
+        logger.warn("[MiuRead][ReadReport] stale background credential update ignored",
+            "revision=",tostring(current_revision),
+            "error=",U.first_line(save_error or "",120))
+        return false,current_revision
+    end
+    local updated=self.store:auth()
+    local new_revision=math.max(0,tonumber(updated.auth_revision or 0) or 0)
+    if new_revision==current_revision then
+        logger.info("[MiuRead][ReadReport] background credential update already current",
+            "revision=",tostring(new_revision),"fields=",table.concat(fields,","))
+        return false,new_revision
+    end
+    logger.info("[MiuRead][ReadReport] background credential update adopted",
+        "from_revision=",tostring(current_revision),"to_revision=",tostring(new_revision),
+        "fields=",table.concat(fields,","))
+    return true,new_revision
+end
+
 function Sync:_import_daemon_status(force)
     local daemon = self.daemon
     if not daemon then return end
@@ -3159,13 +3208,24 @@ function Sync:_import_daemon_status(force)
     local current_session=tostring(auth.login_session_id or "")
     local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local current_vid=tostring(account.vid or "")
+    local status_session=tostring(status.login_session_id or "")
+    local status_revision=math.max(0,tonumber(status.auth_revision or 0) or 0)
+    local status_vid=tostring(status.account_vid or "")
     if current_session=="" or current_vid==""
-        or tostring(status.login_session_id or "")~=current_session
-        or math.max(0,tonumber(status.auth_revision or 0) or 0)~=current_revision
-        or tostring(status.account_vid or "")~=current_vid then
-        logger.warn("[MiuRead][ReadReport] stale login status ignored",
-            "status_session=",tostring(status.login_session_id or ""),
-            "current_session=",current_session)
+        or status_session~=current_session
+        or status_revision~=current_revision
+        or status_vid~=current_vid then
+        local reasons={}
+        if current_session=="" then reasons[#reasons+1]="current_session_empty" end
+        if current_vid=="" then reasons[#reasons+1]="current_vid_empty" end
+        if status_session~=current_session then reasons[#reasons+1]="session" end
+        if status_revision~=current_revision then reasons[#reasons+1]="revision" end
+        if status_vid~=current_vid then reasons[#reasons+1]="vid" end
+        logger.info("[MiuRead][ReadReport] stale login status ignored",
+            "reason=",table.concat(reasons,","),
+            "status_session=",status_session,"current_session=",current_session,
+            "status_revision=",tostring(status_revision),"current_revision=",tostring(current_revision),
+            "status_vid=",status_vid,"current_vid=",current_vid)
         return
     end
 
@@ -3255,13 +3315,9 @@ function Sync:_import_daemon_status(force)
         self.last_stage = status.accepted and "兼容上传链路已确认" or "后台上传失败"
     end
 
+    local credential_adopted=false
     if status.cookies_changed or status.wr_ticket_changed or status.wr_wrpa_changed then
-        -- The long-lived service is not an authentication authority. It may use
-        -- response cookies inside its own current job, but it is never allowed
-        -- to overwrite the parent's durable credentials. Renewal/relogin is
-        -- serialized by the parent and then pushed back as a new job revision.
-        logger.info("[MiuRead][ReadReport] background credential update kept local",
-            "revision=",tostring(status.auth_revision or 0))
+        credential_adopted=self:_adopt_daemon_credential_update(status,auth,current_revision)==true
     end
 
     if status.accepted then
@@ -3385,7 +3441,10 @@ function Sync:_import_daemon_status(force)
                 "kind=",error_kind,"retry_delay=",tostring(status.retry_delay or 0),
                 "failures=",tostring(self.consecutive_failures),"repair=",tostring(repair_required),
                 "error=",self.last_error)
-            if error_kind=="authentication" and not repair_required then
+            if error_kind=="authentication" and credential_adopted and not repair_required then
+                logger.info("[MiuRead][ReadReport] authentication retry will use rotated credentials",
+                    "book=",status_book_id)
+            elseif error_kind=="authentication" and not repair_required then
                 self:_recover_auth_once("read_report",self.last_error,function(ok_recover)
                     if ok_recover and not self.suspended and self:record() then self:start("auth_recovered") end
                 end,false)
@@ -3413,6 +3472,17 @@ function Sync:_import_daemon_status(force)
         end
         self:_persist_daemon_session(true, status_book_id ~= "" and status_book_id or nil)
         if final_flush and stamp then self.store:mark_read_report_consumed(stamp) end
+    end
+
+    if credential_adopted and daemon.active==true and not final_flush and not self.suspended then
+        local restarted,restart_error=self:_start_daemon("credential_rotated")
+        if restarted then
+            logger.info("[MiuRead][ReadReport] rotated credentials pushed to service",
+                "book=",status_book_id)
+        else
+            logger.warn("[MiuRead][ReadReport] rotated credentials saved; service refresh deferred",
+                "book=",status_book_id,"reason=",tostring(restart_error or "unavailable"))
+        end
     end
 end
 
@@ -3741,16 +3811,31 @@ function Sync:writer_barrier_result(seq)
     return type(daemon.writer_barrier_result)=="table" and U.copy(daemon.writer_barrier_result) or nil
 end
 
+function Sync:cancel_writer_barrier_waits(reason)
+    self.writer_wait_generation=(tonumber(self.writer_wait_generation) or 0)+1
+    logger.info("[MiuRead][ReadReport] writer barrier waits invalidated",
+        "generation=",tostring(self.writer_wait_generation),
+        "reason=",tostring(reason or "cancelled"))
+    return self.writer_wait_generation
+end
+
 function Sync:wait_writer_barrier(seq,callback,timeout)
     callback=type(callback)=="function" and callback or function() end
     seq=tonumber(seq or 0) or 0
     if seq<=0 or self:writer_barrier_done(seq) then callback(true,self:writer_barrier_result(seq)); return true end
     local started=os.time()
     timeout=math.max(2,tonumber(timeout) or 12)
+    local wait_generation=tonumber(self.writer_wait_generation) or 0
     local done=false
     local poll
     poll=function()
         if done then return end
+        if wait_generation~=(tonumber(self.writer_wait_generation) or 0) then
+            done=true
+            logger.info("[MiuRead][ReadReport] writer barrier wait cancelled",
+                "seq=",tostring(seq),"generation=",tostring(wait_generation))
+            return
+        end
         if self:writer_barrier_done(seq) then
             done=true
             callback(true,self:writer_barrier_result(seq))
@@ -3846,6 +3931,13 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
 end
 
 function Sync:start(reason)
+    if self.quiescing==true then
+        self.state="stopped"
+        self.last_stage="KOReader 正在退出"
+        logger.info("[MiuRead][ReadReport] start ignored","reason=exit_quiesce",
+            "requested=",tostring(reason or "start"))
+        return false,"KOReader 正在退出"
+    end
     self.last_activity = os.time()
     if (self.host and (self.host._reading_end_barrier_active==true
             or self.host._reading_end_sync_active==true))
@@ -4019,6 +4111,7 @@ function Sync:_resolve_reader_record(generation,attempt)
 end
 
 function Sync:on_reader_ready()
+    self.quiescing=false
     self:_import_daemon_status(true)
     if self.host and (self.host._reading_end_barrier_active==true
         or self.host._reading_end_sync_active==true) then
@@ -4139,6 +4232,7 @@ function Sync:on_suspend(options)
 end
 
 function Sync:on_resume(_slept)
+    self.quiescing=false
     self:_import_daemon_status(true)
     self.suspended = false
     self.last_upload = 0
@@ -4161,6 +4255,32 @@ function Sync:resume_after_reading_end()
     self.reading_end_finalized=false
     self:start("resume")
     logger.info("[MiuRead][ReadReport] resumed after interrupted finalizer")
+    return true
+end
+
+function Sync:quiesce_for_exit(reason)
+    reason=tostring(reason or "koreader_exit")
+    self.quiescing=true
+    self:cancel_writer_barrier_waits(reason)
+    self:_cancel_record_retry()
+    if self.identity_async then self.identity_async:cancel(reason) end
+    if self.async then self.async:cancel(reason) end
+    if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
+    if self.session_flush_task then UIManager:unschedule(self.session_flush_task); self.session_flush_task=nil end
+    if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
+    -- Request one final daemon flush if a verified reading session is still
+    -- active, but never wait for it during UIManager teardown. The child has no
+    -- inherited KOReader sockets and will terminate when its parent disappears.
+    if self.daemon and self.daemon.active then
+        pcall(self._stop_daemon_fast,self,reason,nil)
+    end
+    self.busy=false
+    self.progress_hold=false
+    self.resume_after_finalizer=false
+    self.state="stopped"
+    logger.info("[MiuRead][ReadReport] exit quiesce complete",
+        "reason=",reason,
+        "daemon=",tostring(self.daemon and self.daemon.pid or "-"))
     return true
 end
 
