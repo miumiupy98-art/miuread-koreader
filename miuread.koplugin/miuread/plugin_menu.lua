@@ -7,18 +7,14 @@ local function comment_and_thought_menu(plugin)
         {text="我的想法",callback=function()
             plugin:_show_reader_records("thought",function() plugin:_show_koreader_reader_menu() end)
         end},
+        {text=plugin:_current_chapter_comment_action_label(),post_text=plugin:_current_chapter_comment_action_status(),
+            callback=function() plugin:fetch_current_chapter_comments() end},
         {text="阅读评论",post_text=plugin:_thoughts_enabled_label(),checked_func=function()
             return plugin:_thoughts_enabled()
-        end,callback=function() plugin:_toggle_thoughts_enabled() end},
+        end,keep_menu_open=true,callback=function() plugin:_toggle_thoughts_enabled() end},
     }
-    local current=plugin:_current_book_record()
-    if current and current.book and plugin.comment_controller then
-        rows[#rows+1]={text="本书评论数据",sub_item_table_func=function()
-            return plugin.comment_controller:menu_rows(current.book,current.record)
-        end}
-    end
     rows[#rows+1]={text="评论显示设置",sub_item_table_func=function() return plugin:thought_font_settings_menu() end}
-    rows[#rows+1]={text="旧评论数据迁移",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end}
+    rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end}
     return rows
 end
 

@@ -99,8 +99,6 @@ local function fetch_coord_html(reader, record, anchor, options)
         book_id = tostring(book.book_id or book.bookId or ""),
         title = book.title,
         author = book.author,
-        version = version,
-        bookVersion = version,
     }
     if book_arg.bookId == "" then return nil, nil, "book_id_missing" end
 
@@ -118,25 +116,23 @@ local function fetch_coord_html(reader, record, anchor, options)
     return coord_html, false
 end
 
--- Read or fetch the immutable WeRead chapter XHTML used by server ranges.
--- Independent comments use the same source-coordinate cache as progress and
--- annotation mapping without modifying the generated EPUB.
-function M.chapterSource(reader, book_id, uid, version, options)
-    options = type(options) == "table" and options or {}
-    local record = {
-        book = {
-            book_id = tostring(book_id or ""), bookId = tostring(book_id or ""),
-            version = tonumber(version) or 0, bookVersion = tonumber(version) or 0,
-            title = tostring(options.book_title or ""), author = tostring(options.book_author or ""),
-        },
-    }
+function M.chapterCoordHtml(reader, record, chapter, options)
+    record = type(record) == "table" and record or {}
+    chapter = type(chapter) == "table" and chapter or {}
+    local book = type(record.book) == "table" and record.book or {}
+    local nested = type(record.record) == "table" and record.record or {}
+    local uid = chapter_uid(chapter)
+    if uid == "" then uid = scalar(chapter.chapter_uid or chapter.chapterUid or chapter.uid) end
+    if uid == "" then return nil, nil, "chapter_uid_missing" end
     local anchor = {
-        chapter_uid = tostring(uid or ""),
-        chapter_index = tonumber(options.chapter_index) or 0,
-        chapter_title = tostring(options.chapter_title or ""),
-        book_version = tonumber(version) or 0,
+        chapter_uid = uid,
+        chapter_index = chapter_index(chapter, 0),
+        chapter_title = scalar(chapter.title or chapter.chapterTitle or chapter.chapter_title),
+        book_version = tonumber(chapter.book_version or chapter.bookVersion
+            or book.version or book.bookVersion or book.book_version
+            or nested.book_version or nested.bookVersion) or 0,
     }
-    return fetch_coord_html(reader, record, anchor, {cache_only = options.cache_only == true})
+    return fetch_coord_html(reader, record, anchor, options)
 end
 
 function M.cacheChapter(reader, book_id, uid, version, coord_html)
