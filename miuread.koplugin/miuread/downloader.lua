@@ -1687,6 +1687,38 @@ function Downloader:book(input, opt, progress)
     local function process_one(chapter, index, retry_round)
         if opt.cancelled and opt.cancelled() then error("download cancelled") end
         respect_reader_priority("chapter")
+
+        -- Full-book downloads are sustained background crawls, not interactive
+        -- page turns. Keep small books reasonably quick, but progressively
+        -- lower the request cadence once a task has already consumed dozens of
+        -- chapters. This changes only the isolated download worker's default
+        -- WeRead pacing; API calls with stricter endpoint-specific intervals
+        -- (notably annotation-agent requests) keep their own larger minimum.
+        if self.http then
+            local min_chapters=math.max(2,tonumber(Config.DOWNLOAD_CONTENT_PACING_MIN_CHAPTERS) or 8)
+            local interval=.45
+            local lane="short"
+            if expected>=min_chapters and opt.prefetch~=true then
+                interval=math.max(.35,tonumber(Config.DOWNLOAD_CONTENT_REQUEST_INTERVAL) or .60)
+                local long_after=math.max(1,tonumber(Config.DOWNLOAD_CONTENT_LONG_AFTER_CHAPTERS) or 40)
+                local very_long_after=math.max(long_after+1,tonumber(Config.DOWNLOAD_CONTENT_VERY_LONG_AFTER_CHAPTERS) or 120)
+                lane="normal"
+                if index>very_long_after then
+                    interval=math.max(interval,tonumber(Config.DOWNLOAD_CONTENT_VERY_LONG_REQUEST_INTERVAL) or 1.00)
+                    lane="very_long"
+                elseif index>long_after then
+                    interval=math.max(interval,tonumber(Config.DOWNLOAD_CONTENT_LONG_REQUEST_INTERVAL) or .80)
+                    lane="long"
+                end
+            end
+            local previous=tonumber(self.http.min_weread_interval) or 0
+            if math.abs(previous-interval)>.01 then
+                self.http.min_weread_interval=interval
+                logger.info("[MiuRead][DownloadPacer] request cadence updated",
+                    "lane=",lane,"chapter=",tostring(index),"total=",tostring(expected),
+                    "min_interval=",tostring(interval))
+            end
+        end
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
         local body, style, new_assets, coord_body

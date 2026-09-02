@@ -10,6 +10,32 @@ local SuspendWorkLease = require("miuread.suspend_work_lease")
 local PseudoLockscreen = require("miuread.pseudo_lockscreen")
 local lfs = require("libs/libkoreader-lfs")
 local SubprocessHygiene = require("miuread.subprocess_hygiene")
+local ok_socket, socket = pcall(require, "socket")
+
+local function short_sleep(seconds)
+    seconds=math.max(0,tonumber(seconds) or 0)
+    if seconds<=0 then return end
+    if ok_socket and socket and type(socket.sleep)=="function" then
+        socket.sleep(seconds)
+        return
+    end
+    -- Exit quiesce is rare, but still avoid a hot busy-loop if LuaSocket is not
+    -- available on an unusual port. usleep is present on KOReader's Unix-like
+    -- targets; failure simply falls through to the next liveness check.
+    local ok_ffi,ffi=pcall(require,"ffi")
+    if ok_ffi and ffi then
+        pcall(ffi.cdef,"int usleep(unsigned int usec);")
+        pcall(function() ffi.C.usleep(math.floor(seconds*1000000)) end)
+    end
+end
+
+local function wall_now()
+    if ok_socket and socket and type(socket.gettime)=="function" then
+        local ok,value=pcall(socket.gettime)
+        if ok and tonumber(value) then return tonumber(value) end
+    end
+    return os.time()
+end
 
 local DownloadTask = {}
 DownloadTask.__index = DownloadTask
@@ -1270,6 +1296,150 @@ function DownloadTask:request_hibernate(reason)
     return false,"write_failed"
 end
 
+-- KOReader's Exit event is broadcast to every window-level widget and does not
+-- stop when one handler returns true. By the time Plugin:onExit/onRestart runs,
+-- an external/native quit therefore cannot use the normal asynchronous
+-- "request hibernate, poll later, maybe cancel exit" flow. This method creates a
+-- bounded synchronous teardown boundary: first ask the child to checkpoint and
+-- hibernate, then request cancellation, and finally terminate only if the child
+-- still survives. Completed chapter checkpoints are never deleted here.
+function DownloadTask:quiesce_for_exit(reason, timeout)
+    reason=tostring(reason or "koreader_exit")
+    if self.hibernated then
+        return true,"hibernated",self:descriptor()
+    end
+
+    local job=self.job
+    local descriptor=job or self:_control_descriptor()
+    if type(descriptor)~="table" then return true,"idle" end
+    if descriptor.hibernated==true then return true,"hibernated",descriptor end
+
+    local pid=tonumber(descriptor.pid)
+    if not pid or pid<=1 then return true,"no_process" end
+    local hibernate_path=tostring(descriptor.hibernate_path or "")
+    local result_path=tostring(descriptor.result_path or "")
+    local cancel_path=tostring(descriptor.cancel_path or "")
+    local requested=false
+    if job and self.job==job then
+        requested=self:request_hibernate(reason)==true
+    elseif hibernate_path~="" then
+        requested=U.atomic_write(hibernate_path,Json.encode({reason=reason,requested_at=os.time()}),true)==true
+    end
+    logger.warn("[MiuRead][DownloadExit] quiesce begin",
+        "reason=",reason,"pid=",tostring(pid),"stage=",tostring(self:stage()),
+        "hibernate=",tostring(requested))
+
+    local function ended()
+        local done_ok,done=pcall(FFIUtil.isSubProcessDone,pid,false)
+        local alive=process_exists(pid)
+        return (done_ok and done==true) or alive==false,alive
+    end
+    local function cleanup_shared_controls()
+        for _,path in ipairs({descriptor.progress_path,descriptor.result_path,descriptor.recovery_path,
+            descriptor.cancel_path,descriptor.pause_path,descriptor.pause_ack_path,descriptor.hibernate_path,
+            descriptor.network_path,descriptor.worker_settings_path}) do
+            if tostring(path or "")~="" then os.remove(path) end
+        end
+        os.remove(self.owner_path)
+        PseudoLockscreen.set_download_active(false)
+        self:_clear_lockscreen_network("koreader_exit_shared")
+        self:_release_awake()
+        pcall(PseudoLockscreen.background_task_done,"download_exit_shared")
+    end
+    local function consume_ready()
+        local ready=result_path~="" and read_json(result_path) or nil
+        local is_done=ended()
+        if not is_done then return nil end
+        if ready and ready.hibernated==true then
+            if job and self.job==job then
+                self:_read_progress(job)
+                self:_handle_hibernated(job,ready)
+                return true,"hibernated",self:descriptor()
+            end
+            local parked={
+                hibernated=true,hibernate_reason=tostring(ready.reason or reason),
+                stage=tostring(ready.stage or "unknown"),started_at=descriptor.started_at,
+                restart_count=tonumber(descriptor.restart_count) or 0,
+                stall_restart_count=tonumber(descriptor.stall_restart_count) or 0,
+            }
+            cleanup_shared_controls()
+            return true,"hibernated_shared",parked
+        end
+        if ready then
+            -- The download happened to finish while Exit was waiting. Keep its
+            -- result/control files for next-launch recovery instead of running
+            -- on_done here (which could open UI or start a queued download while
+            -- KOReader is already tearing down).
+            if job and self.job==job then self:_read_progress(job) end
+            PseudoLockscreen.set_download_active(false)
+            self:_clear_lockscreen_network("download_completed_at_exit")
+            self:_release_awake()
+            pcall(PseudoLockscreen.background_task_done,"download_completed_at_exit")
+            return true,"completed_pending",descriptor
+        end
+        if job and self.job==job then
+            job.on_done=nil
+            self:_finish(job,"下载已取消")
+        else
+            cleanup_shared_controls()
+        end
+        return false,"interrupted",{stage=tostring(self:stage()),pid=pid}
+    end
+
+    local deadline=wall_now()+math.max(.25,tonumber(timeout) or tonumber(Config.DOWNLOAD_EXIT_QUIESCE_SECONDS) or 3)
+    while wall_now()<deadline do
+        local ok,mode,detail=consume_ready()
+        if ok~=nil then
+            logger.info("[MiuRead][DownloadExit] quiesce checkpoint",
+                "mode=",tostring(mode),"pid=",tostring(pid))
+            return ok,mode,detail
+        end
+        short_sleep(.05)
+    end
+
+    -- A worker can be inside a socket request and miss the hibernate marker for
+    -- several seconds. Cancellation makes every subsequent HTTP/pause check
+    -- abort without starting another request. Give it one final short grace
+    -- period before enforcing process teardown.
+    if cancel_path~="" then pcall(U.atomic_write,cancel_path,"1",true) end
+    local cancel_deadline=wall_now()+math.max(.10,tonumber(Config.DOWNLOAD_EXIT_CANCEL_GRACE_SECONDS) or .8)
+    while wall_now()<cancel_deadline do
+        local ok,mode,detail=consume_ready()
+        if ok~=nil then
+            logger.info("[MiuRead][DownloadExit] quiesce after cancel",
+                "mode=",tostring(mode),"pid=",tostring(pid))
+            return ok,mode,detail
+        end
+        short_sleep(.05)
+    end
+
+    local is_done=ended()
+    if not is_done then
+        pcall(FFIUtil.terminateSubProcess,pid)
+        short_sleep(.12)
+        local still_done,alive=ended()
+        if not still_done and alive~=false then
+            pcall(signal_worker,pid,9)
+            short_sleep(.08)
+        end
+    end
+
+    if job and self.job==job then
+        -- Exit owns the lifecycle from here; do not let a completion callback
+        -- reopen dialogs or start queued work while KOReader is tearing down.
+        job.on_done=nil
+        self:_finish(job,"下载已取消")
+    else
+        -- Shared descriptor fallback (e.g. a FileManager/ReaderUI instance
+        -- handoff). Remove only transient worker controls; the per-book chapter
+        -- cache lives elsewhere and remains resumable.
+        cleanup_shared_controls()
+    end
+    logger.warn("[MiuRead][DownloadExit] worker stopped at exit boundary",
+        "reason=",reason,"pid=",tostring(pid),"stage=",tostring(self:stage()))
+    return false,"forced_stop",{stage=tostring(self:stage()),pid=pid}
+end
+
 function DownloadTask:resume_hibernated(reason)
     local h=self.hibernated
     if not h then return false,"not_hibernated" end
@@ -2027,7 +2197,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     end
                 end
                 http.cancelled = clean_options.cancelled
-                http.rate_limit_retries = 3
+                http.rate_limit_retries = math.max(0,tonumber(Config.DOWNLOAD_RATE_LIMIT_RETRIES) or 0)
                 http.min_weread_interval = 0.45
                 http.on_rate_limit = function(remaining, attempt, maximum, code)
                     emit{

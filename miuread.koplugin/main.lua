@@ -12258,7 +12258,75 @@ function Plugin:show_home_quick_panel(more_expanded)
     return true
 end
 
+function Plugin:_quiesce_download_for_exit(reason)
+    reason=tostring(reason or "KOReader exit")
+    local task=self.download_task
+    if not task then return true,"idle" end
+    local persisted=self.store:download_state()
+    local persisted_active=(persisted.status=="active" or persisted.status=="prefetch")
+        and type(persisted.task)=="table" and persisted.task.hibernated~=true
+    if not task:busy() and not persisted_active then return true,"idle" end
+
+    local ok,mode,detail=task:quiesce_for_exit(reason,Config.DOWNLOAD_EXIT_QUIESCE_SECONDS)
+    local runtime=self._download_runtime
+    local passive=runtime and type(runtime.options)=="table" and runtime.options.prefetch==true
+        and runtime.prefetch_required~=true
+
+    if mode=="hibernated" or mode=="hibernated_shared" or mode=="completed_pending" then
+        local descriptor=(mode=="hibernated_shared" and type(detail)=="table" and detail)
+            or (task and task:descriptor()) or (type(detail)=="table" and detail) or nil
+        if runtime then
+            runtime.task=U.copy(descriptor)
+            runtime.last_state=U.copy(runtime.last_state or {})
+            runtime.last_state.stage=mode=="completed_pending" and "done" or "hibernated"
+            runtime.last_state.hibernate_reason=mode=="completed_pending" and nil or reason
+            runtime.last_state.message=mode=="completed_pending"
+                and "下载已完成，重启 KOReader 后整理结果" or "KOReader 退出前已保存下载断点"
+            self:_write_download_state(passive and "prefetch" or "active",
+                self:_active_download_payload(runtime,runtime.last_state),true)
+        else
+            local state=self.store:download_state()
+            if state.status=="active" or state.status=="prefetch" then
+                state.task=U.copy(descriptor)
+                state.stage=mode=="completed_pending" and "done" or "hibernated"
+                state.hibernate_reason=mode=="completed_pending" and nil or reason
+                state.message=mode=="completed_pending"
+                    and "下载已完成，重启 KOReader 后整理结果" or "KOReader 退出前已保存下载断点"
+                state.updated_at=os.time()
+                self.store:save_download_state(state)
+            end
+        end
+    elseif ok~=true and (mode=="forced_stop" or mode=="interrupted") then
+        -- The child did not reach a cooperative checkpoint inside the short
+        -- external-exit window. The per-book cache is still intact, but never
+        -- persist its now-dead PID as an active worker.
+        if passive then
+            self.store:clear_download_state()
+        else
+            local state=runtime and self:_active_download_payload(runtime,runtime.last_state or {})
+                or U.copy(self.store:download_state() or {})
+            state.task=nil
+            state.stage="interrupted"
+            state.error="KOReader 退出时已停止后台下载；已完成章节和断点均已保留，可继续下载。"
+            state.message=state.error
+            state.updated_at=os.time()
+            state.status="interrupted"
+            self.store:save_download_state(state)
+        end
+        if runtime then runtime.task=nil end
+    end
+    logger.info("[MiuRead][DownloadExit] quiesce complete",
+        "reason=",reason,"ok=",tostring(ok==true),"mode=",tostring(mode or "unknown"))
+    return ok,mode
+end
+
 function Plugin:_begin_koreader_exit(reason)
+    -- Native/KOReader Exit and Restart are broadcast lifecycle events: once the
+    -- broadcast starts we cannot reliably cancel it from this plugin. Close the
+    -- download process first so Kindle launcher handoff never inherits a live
+    -- worker with a large Lua heap. The normal MiuRead quit button reaches this
+    -- point only after its longer user-visible hibernation flow has completed.
+    self:_quiesce_download_for_exit(reason or "KOReader exit")
     Orientation.release_session(reason or "KOReader exit")
     self:_cancel_interactive_network(reason or "KOReader exit")
     self:_quiesce_reader_background_for_exit(reason or "KOReader exit")
