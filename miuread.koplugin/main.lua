@@ -900,6 +900,9 @@ function Plugin:init()
     self._thought_prewarm_task=nil
     self._thought_prewarm_generation=0
     self._thought_prewarm_key=nil
+    self.runtime_thought_overlay=require("miuread.runtime_thought_overlay"):new(self)
+    self._runtime_thought_refresh_task=nil
+    self._runtime_thought_refresh_generation=0
     -- Update manifest/package network I/O must never occupy the UI loop.
     -- Installation itself stays foreground because it replaces the live plugin tree.
     self.updater_async=Async:new(self.store,{poll_interval=.30,allow_android=true,disable_fallback=true})
@@ -13122,19 +13125,21 @@ function Plugin:_set_thoughts_enabled(enabled)
     -- the stylesheet here makes the underline visibility follow this switch
     -- immediately without rewriting the EPUB or deleting any local data.
     self:_apply_annotation_mark_style(enabled and "comments enabled" or "comments disabled")
+    if self.runtime_thought_overlay then self.runtime_thought_overlay:setEnabled(enabled) end
+    if enabled then self:_schedule_runtime_thought_refresh(.08,false) end
 
     local current=self.sync and self.sync.current or nil
     local record=current and current.record or {}
     local variant=tostring(current and (current.variant or record.variant) or "")
     local annotation_book=current and (record.annotation_requested==true or variant:find("notes",1,true))
     if enabled then
-        if annotation_book then self:_setup_thought_tap() end
+        if annotation_book then self:_setup_thought_tap() else self:_update_thought_tap_state() end
         if changed then self:toast("阅读评论已开启",1.5) end
     else
         self:_close_active_thought_popup("comments disabled")
-        -- Keep the MiuRead internal-link guard installed. Hiding comments must
-        -- not hand #miuthought links back to KOReader as invalid external links.
-        if annotation_book then self:_setup_thought_tap() end
+        -- Existing annotation books keep the internal-link guard so hidden
+        -- #miuthought links never fall through to KOReader as external links.
+        if annotation_book then self:_setup_thought_tap() else self:_update_thought_tap_state() end
         if changed then self:toast("阅读评论已关闭，划线和评论数据不会删除",2) end
     end
     return true
@@ -13373,6 +13378,10 @@ function Plugin:_show_reader_comment_center(back_callback)
             local chapter_count=(scope.book_id~="" and scope.chapter_uid~="")
                 and self:_thought_favorite_count({book_id=scope.book_id,chapter_uid=scope.chapter_uid}) or 0
             local content_rows={
+                {icon="comment",label=self:_current_chapter_comment_action_label(),value=self:_current_chapter_comment_action_status(),
+                    enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
+                        self:fetch_current_chapter_comments()
+                    end},
                 {icon="bookmark",label="本章评论收藏",value=scope.chapter_uid~="" and (tostring(chapter_count).." 条") or "当前章节不可识别",
                     enabled=scope.book_id~="" and scope.chapter_uid~="",arrow=true,callback=function()
                         self:show_thought_favorites{
@@ -25312,6 +25321,252 @@ function Plugin:_current_thought_favorite_scope()
     return scope
 end
 
+function Plugin:_thought_chapter_row(rows,wanted_uid)
+    wanted_uid=tostring(wanted_uid or "")
+    if wanted_uid=="" or type(rows)~="table" then return nil end
+    for index,chapter in ipairs(rows) do
+        if type(chapter)=="table" then
+            local uid=tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or chapter.chapterId or "")
+            if uid==wanted_uid then
+                local copy=U.copy(chapter)
+                copy._miuread_index=index
+                return copy
+            end
+        end
+    end
+    return nil
+end
+
+function Plugin:_current_chapter_comment_context()
+    if not self:_reader_session_is_weread() then return nil,"not_weread" end
+    local current=self:_current_book_record()
+    if not (current and current.book) then return nil,"book_missing" end
+    local book=current.book or {}
+    local record=current.record or {}
+    local book_id=tostring(book.book_id or book.bookId or "")
+    if book_id=="" then return nil,"book_id_missing" end
+
+    local uid=tostring(record.chapter_uid or record.chapterUid or "")
+    if self.sync and type(self.sync.local_position)=="function" then
+        local ok,position=pcall(self.sync.local_position,self.sync)
+        if ok and type(position)=="table" and tostring(position.chapter_uid or "")~="" then
+            uid=tostring(position.chapter_uid)
+        end
+    end
+    if uid=="" then return nil,"chapter_uid_missing" end
+
+    local chapter=self:_thought_chapter_row(record.chapter_map,uid)
+        or self:_thought_chapter_row(book.catalog,uid)
+    if not chapter and self.sync and type(self.sync.chapter_catalog_context)=="function" then
+        local ok,catalog=pcall(self.sync.chapter_catalog_context,self.sync,current)
+        if ok and type(catalog)=="table" then chapter=self:_thought_chapter_row(catalog.chapters,uid) end
+    end
+    chapter=chapter or {uid=uid,chapterUid=uid,chapterIdx=0,index=0,title=""}
+    chapter.uid=uid
+    chapter.chapterUid=uid
+    chapter.chapter_uid=uid
+    chapter.chapterIdx=tonumber(chapter.chapterIdx or chapter.chapter_idx or chapter.index or chapter._miuread_index) or 0
+    chapter.index=tonumber(chapter.index or chapter.chapterIdx) or 0
+    chapter.book_version=tonumber(chapter.book_version or chapter.bookVersion
+        or book.version or book.bookVersion or book.book_version
+        or record.book_version or record.bookVersion) or 0
+
+    local variant=tostring(current.variant or record.variant or "")
+    local embedded=record.annotation_requested==true or variant:find("notes",1,true)~=nil
+    return {
+        current=current,
+        book_id=book_id,
+        book_title=U.trim(tostring(book.title or book.name or "")),
+        chapter_uid=uid,
+        chapter=chapter,
+        chapter_title=U.trim(tostring(chapter.title or chapter.name or chapter.chapterTitle or "")),
+        book_version=chapter.book_version,
+        embedded=embedded,
+    }
+end
+
+function Plugin:_current_chapter_comment_cache_status()
+    local ctx,err=self:_current_chapter_comment_context()
+    if not ctx then return false,0,0,nil,err end
+    local groups,load_err=Thoughts.load(self.store,ctx.book_id,ctx.chapter_uid)
+    if groups==nil then return false,0,0,ctx,load_err end
+    local comments=0
+    for _,group in ipairs(groups) do comments=comments+#(type(group.texts)=="table" and group.texts or {}) end
+    return true,#groups,comments,ctx,nil
+end
+
+function Plugin:_current_chapter_comment_action_label()
+    local cached=self:_current_chapter_comment_cache_status()
+    return cached and "更新本章评论" or "获取本章评论"
+end
+
+function Plugin:_current_chapter_comment_action_status()
+    local cached,groups,comments,ctx=self:_current_chapter_comment_cache_status()
+    if not ctx then return "当前章节不可识别" end
+    if not cached then return "未获取" end
+    if comments>0 then return tostring(comments).." 条评论" end
+    return "已获取 · 暂无评论"
+end
+
+function Plugin:_ensure_runtime_thought_overlay()
+    if not self.runtime_thought_overlay then self.runtime_thought_overlay=require("miuread.runtime_thought_overlay"):new(self) end
+    self.runtime_thought_overlay:setEnabled(self:_thoughts_enabled())
+    local ok,err=self.runtime_thought_overlay:install(self.ui)
+    if not ok then logger.warn("[MiuRead][RuntimeThought] overlay unavailable",tostring(err)) end
+    return ok and self.runtime_thought_overlay or nil
+end
+
+function Plugin:_update_thought_tap_state()
+    local ctx=self:_current_chapter_comment_context()
+    local overlay=self.runtime_thought_overlay
+    local runtime_active=ctx and ctx.embedded~=true and self:_thoughts_enabled()
+        and overlay and overlay:hasEntries()
+    if ctx and (ctx.embedded==true or runtime_active) then
+        self:_setup_thought_tap()
+    else
+        self:_teardown_thought_tap()
+    end
+end
+
+function Plugin:_refresh_runtime_thoughts_for_current_chapter(force)
+    local overlay=self:_ensure_runtime_thought_overlay()
+    if not overlay then return false,"overlay_unavailable" end
+    overlay:setEnabled(self:_thoughts_enabled())
+    local ctx,ctx_err=self:_current_chapter_comment_context()
+    if not ctx then overlay:clear(); self:_update_thought_tap_state(); return false,ctx_err end
+    if ctx.embedded then overlay:clear(); self:_update_thought_tap_state(); return false,"embedded_comments" end
+    if not self:_thoughts_enabled() then self:_update_thought_tap_state(); return false,"comments_disabled" end
+
+    if force==true or not overlay:isPreparedFor(ctx.book_id,ctx.chapter_uid) then
+        local groups=Thoughts.load(self.store,ctx.book_id,ctx.chapter_uid)
+        if groups==nil then overlay:clear(); self:_update_thought_tap_state(); return false,"comments_not_cached" end
+        local coord_html,_,coord_err=require("miuread.source_position").chapterCoordHtml(self.reader,ctx.current,ctx.chapter,{cache_only=true})
+        if not coord_html then
+            overlay:clear(); self:_update_thought_tap_state()
+            return false,tostring(coord_err or "coord_cache_missing")
+        end
+        local prepared,prepare_err=overlay:prepare(ctx.book_id,ctx.chapter_uid,coord_html,groups)
+        if not prepared then self:_update_thought_tap_state(); return false,prepare_err end
+    end
+    overlay:refreshVisible()
+    self:_update_thought_tap_state()
+    return true
+end
+
+function Plugin:_schedule_runtime_thought_refresh(delay,force)
+    self._runtime_thought_refresh_generation=(tonumber(self._runtime_thought_refresh_generation) or 0)+1
+    local generation=self._runtime_thought_refresh_generation
+    if self._runtime_thought_refresh_task then
+        UIManager:unschedule(self._runtime_thought_refresh_task)
+        self._runtime_thought_refresh_task=nil
+    end
+    local task
+    task=function()
+        if self._runtime_thought_refresh_task~=task or generation~=self._runtime_thought_refresh_generation then return end
+        self._runtime_thought_refresh_task=nil
+        if not (self.ui and self.ui.document) or reader_close_active() then return end
+        local ok,err=pcall(self._refresh_runtime_thoughts_for_current_chapter,self,force==true)
+        if not ok then logger.warn("[MiuRead][RuntimeThought] refresh failed",tostring(err)) end
+    end
+    self._runtime_thought_refresh_task=task
+    UIManager:scheduleIn(math.max(.05,tonumber(delay) or .35),task)
+    return true
+end
+
+function Plugin:_thought_fetch_error(result)
+    result=type(result)=="table" and result or {}
+    if type(result.errors)=="table" and #result.errors>0 then return U.first_line(result.errors[1],120) end
+    return tostring(result.error_kind or "评论请求未完整完成")
+end
+
+function Plugin:fetch_current_chapter_comments()
+    local ctx,ctx_err=self:_current_chapter_comment_context()
+    if not ctx then
+        self:info(ctx_err=="not_weread" and "当前不是微信读书书籍。" or "当前章节暂时无法识别。")
+        return false
+    end
+    if type(self.require_login)=="function" and self:require_login()==false then return false end
+
+    local existing_coord=require("miuread.source_position").chapterCoordHtml(self.reader,ctx.current,ctx.chapter,{cache_only=true})
+    local need_coord=ctx.embedded~=true and not existing_coord
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local book_snapshot=U.copy(ctx.current.book or {})
+    local chapter_snapshot=U.copy(ctx.chapter or {})
+    local book_id,chapter_uid=ctx.book_id,ctx.chapter_uid
+    local book_version=ctx.book_version
+    local key="chapter-comments:"..book_id..":"..chapter_uid
+
+    return self:_run_interactive_network(key,"chapter-comments",function()
+        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_http=Http:new(child_store)
+        local child_reader=Reader:new(child_http,child_store)
+        local child_api=Api:new(child_http,child_store,child_reader)
+        local child_annotations=Annotations:new(child_api)
+        local fetched=child_annotations:fetch_chapter(book_id,chapter_uid,nil,{force_refresh=true})
+        local out={
+            complete=fetched.complete==true,
+            review_groups=type(fetched.review_groups)=="table" and fetched.review_groups or {},
+            thought_count=tonumber(fetched.thought_count) or 0,
+            thought_entry_count=tonumber(fetched.thought_entry_count) or 0,
+            underline_count=tonumber(fetched.underline_count) or 0,
+            error_kind=fetched.error_kind,
+            errors=type(fetched.errors)=="table" and fetched.errors or {},
+        }
+        if out.complete and need_coord then
+            local book_arg={
+                bookId=tostring(book_snapshot.book_id or book_snapshot.bookId or book_id),
+                book_id=tostring(book_snapshot.book_id or book_snapshot.bookId or book_id),
+                title=book_snapshot.title,author=book_snapshot.author,
+            }
+            local chapter_arg=U.copy(chapter_snapshot)
+            chapter_arg.uid=chapter_uid; chapter_arg.chapterUid=chapter_uid
+            local ok,downloaded,_,_,state=pcall(child_reader.chapter,child_reader,book_arg,chapter_arg,"epub",{images=false})
+            if ok then
+                local html=type(state)=="table" and tostring(state.coord_html or "") or ""
+                if html=="" then html=tostring(downloaded or "") end
+                if html~="" then out.coord_html=html end
+            else
+                out.coord_error=U.first_line(downloaded,120)
+            end
+        end
+        local child_auth,auth_changed=child_store:snapshot()
+        out.auth_snapshot={auth=child_auth,changed=auth_changed==true}
+        return out
+    end,function(result)
+        if not (type(result)=="table" and result.ok==true and type(result.value)=="table") then
+            self:info("本章评论获取失败，已有评论缓存未改变。\n"..U.first_line(result and result.error or "unknown",120))
+            return
+        end
+        local payload=result.value
+        self:_apply_interactive_auth(payload.auth_snapshot)
+        if payload.complete~=true then
+            self:info("本章评论获取未完整完成，已有评论缓存未改变。\n"..self:_thought_fetch_error(payload))
+            return
+        end
+        local coord_ready=existing_coord and true or false
+        if payload.coord_html then
+            local cached,cache_err=require("miuread.source_position").cacheChapter(self.reader,book_id,chapter_uid,book_version,payload.coord_html)
+            coord_ready=cached==true
+            if not cached then logger.warn("[MiuRead][RuntimeThought] source cache write failed",tostring(cache_err)) end
+        end
+        local saved,save_err=Thoughts.save(self.store,book_id,chapter_uid,payload.review_groups)
+        if saved==nil then
+            self:info("评论已获取，但本地保存失败：\n"..U.first_line(save_err or "unknown",120))
+            return
+        end
+        local comment_count=tonumber(payload.thought_entry_count) or 0
+        if ctx.embedded~=true and coord_ready then self:_schedule_runtime_thought_refresh(.08,true) end
+        if ctx.embedded~=true and comment_count>0 and not coord_ready then
+            self:info("本章评论已保存，但当前章定位数据获取失败，暂时无法显示评论虚线。\n正文和已有评论缓存均未改变。")
+        elseif comment_count>0 then
+            self:toast("本章评论已更新："..tostring(comment_count).." 条",2.5)
+        else
+            self:toast("本章评论已更新，暂时没有可显示的评论",2.5)
+        end
+    end,{status_title="获取本章评论",status_text="正在读取微信读书评论…",status_seconds=2,timeout=80})
+end
+
 function Plugin:_thought_favorite_sort_label(sort)
     sort=tostring(sort or "saved")
     if sort=="created" then return "评论时间" end
@@ -25805,6 +26060,11 @@ function Plugin:_on_thought_tap(ges)
         logger.info("[MiuRead][ReaderGesture] stale reader tap suppressed")
         return true
     end
+    local runtime=self.runtime_thought_overlay and self.runtime_thought_overlay:hitTest(ges and ges.pos) or nil
+    if runtime then
+        if self:_thought_edge_page_turn(ges) then return true end
+        return self:_show_thought_href(Thoughts.href(runtime.book_id,runtime.chapter_uid,runtime.range))
+    end
     local link
     if self.ui and self.ui.link and self.ui.link.getLinkFromGes then
         local ok,value=pcall(self.ui.link.getLinkFromGes,self.ui.link,ges)
@@ -25970,6 +26230,8 @@ function Plugin:on_sync_record_ready(current)
         if record.annotation_requested==true or variant:find("notes",1,true) then
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("sync record ready")
+        else
+            self:_schedule_runtime_thought_refresh(.12,true)
         end
         -- ReaderReady already records the file immediately in LuaSettings
         -- memory. Once Sync resolves the canonical book id, backfill that id
@@ -26119,6 +26381,12 @@ function Plugin:_prepare_reader_disappearance(reason)
         if self.annotation_async then self.annotation_async:cancel(reason or "reader disappeared") end
     end
     self._repair_prompt_open=false
+    if self._runtime_thought_refresh_task then
+        UIManager:unschedule(self._runtime_thought_refresh_task)
+        self._runtime_thought_refresh_task=nil
+    end
+    self._runtime_thought_refresh_generation=(tonumber(self._runtime_thought_refresh_generation) or 0)+1
+    if self.runtime_thought_overlay then self.runtime_thought_overlay:detach() end
     self:_teardown_thought_tap()
     self._progress_prompted_book_id=nil
     self._progress_check_running=false
@@ -26504,6 +26772,8 @@ function Plugin:onReaderReady()
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("reader ready")
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
+        elseif record and self:_reader_session_is_weread() then
+            self:_schedule_runtime_thought_refresh(.18,true)
         end
         local pending=HOME_SESSION.pending_annotation_jump
         if type(pending)=="table" then
@@ -26687,6 +26957,7 @@ function Plugin:onSetDimensions()
             self:_sync_reader_toolbar_hooks("reader geometry committed")
             local reader=self:_active_reader_ui()
             UIManager:setDirty(reader or nil,"full")
+            self:_schedule_runtime_thought_refresh(.18,true)
         end
         logger.info("[MiuRead][Rotation] committed",
             "generation=",tostring(generation),"coalesced=",tostring(math.max(1,(tonumber(self._reader_dimension_event_count) or event_count)-event_count+1)),
@@ -26715,6 +26986,7 @@ function Plugin:onPageUpdate(page)
     if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
+        self:_schedule_runtime_thought_refresh(.62,false)
     end
 end
 function Plugin:_annotation_sync_preferences()
