@@ -108,6 +108,10 @@ function M.update_about(plugin)
     return rows
 end
 
+function M.extensions(plugin)
+    return ExtensionCenter.menu(plugin)
+end
+
 function M.menu(plugin)
     return {
         {text="账号与同步",post_text=plugin:progress_sync_label(),sub_item_table_func=function() return M.account_sync(plugin) end},
@@ -116,7 +120,7 @@ function M.menu(plugin)
         {text="公众号阅读",sub_item_table_func=function() return plugin:mp_settings_menu() end},
         {text="阅读界面",post_text=plugin:_reader_toolbar_setting_summary(),sub_item_table_func=function() return plugin:reader_quick_panel_settings_menu() end},
         {text="性能与兼容性",post_text=plugin:_performance_mode_label(),sub_item_table_func=function() return M.performance(plugin) end},
-        {text="扩展",post_text="觅阅扩展中心",sub_item_table_func=function() return ExtensionCenter.menu(plugin) end},
+        {text="扩展",post_text="觅阅扩展中心",sub_item_table_func=function() return M.extensions(plugin) end},
         {text="更新与关于",sub_item_table_func=function() return M.update_about(plugin) end},
         {text="运行模式",post_text=plugin:_home_mode_label(),sub_item_table_func=function() return plugin:home_mode_menu() end},
     }

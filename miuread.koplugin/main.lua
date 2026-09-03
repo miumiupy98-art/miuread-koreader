@@ -9267,6 +9267,7 @@ function Plugin:_show_home_settings_center()
         {text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
         {text="评论、划线与想法",post_text="评论收藏、显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
         {text="时间与时区",post_text="时间来源与地区显示",sub_item_table_func=function() return self:time_display_settings_menu() end},
+        {text="扩展",post_text="觅阅扩展中心",sub_item_table_func=function() return PluginSettings.extensions(self) end},
         {text="更新与关于",post_text="版本 更新通道与说明",sub_item_table_func=function() return PluginSettings.update_about(self) end},
         {text="工具与维护",post_text="修复 清理与诊断",sub_item_table_func=function() return self:maintenance_menu() end},
     },{page_size=6})
@@ -9285,6 +9286,9 @@ function Plugin:_show_home_settings_popup(anchor)
         end},
         {icon="◷",label="时间与时区",detail="时间来源与地区显示",callback=function()
             self:_show_standalone_menu("时间与时区",self:time_display_settings_menu(),{anchor=anchor})
+        end},
+        {icon="＋",label="扩展",detail="觅阅扩展中心",callback=function()
+            self:_show_standalone_menu("觅阅扩展中心",PluginSettings.extensions(self),{anchor=anchor})
         end},
         {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function()
             self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor})
@@ -9450,6 +9454,7 @@ function Plugin:_home_action_function_actions(key,anchor)
         {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor}) end},
         {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
         {icon="⇅",label="同步",detail="进度 时间与批注同步",callback=function() self:_show_standalone_menu("同步",self:sync_settings_menu(),{anchor=anchor}) end},
+        {icon="＋",label="扩展",detail="觅阅扩展中心",callback=function() self:_show_standalone_menu("觅阅扩展中心",PluginSettings.extensions(self),{anchor=anchor}) end},
         {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor}) end},
         {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor}) end},
     } end
@@ -24486,6 +24491,7 @@ function Plugin:settings_menu()
     rows[#rows+1]={text="时间与时区",post_text=TimeZone.label((self:_time_preferences())),sub_item_table_func=function() return self:time_display_settings_menu() end}
     rows[#rows+1]={text="性能与兼容性",post_text=self:_performance_mode_label(),sub_item_table_func=function() return self:performance_settings_menu() end}
     rows[#rows+1]={text="公众号阅读",sub_item_table_func=function() return self:mp_settings_menu() end}
+    rows[#rows+1]={text="扩展",post_text="觅阅扩展中心",sub_item_table_func=function() return PluginSettings.extensions(self) end}
     rows[#rows+1]={text="更新与关于",sub_item_table_func=function() return PluginSettings.update_about(self) end}
     rows[#rows+1]={text="工具与维护",sub_item_table_func=function() return self:maintenance_menu() end}
     return rows

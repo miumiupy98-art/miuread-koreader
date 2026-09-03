@@ -1,17 +1,16 @@
 {
-  "version": "5.7.0-beta.1",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 5.7.0-beta.1 \u5185\u6d4b\u7248",
+  "version": "5.7.0-beta.2",
+  "name": "觅阅 · 微信读书助手 5.7.0-beta.2 内测版",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.2/miuread-v5.7.0-beta.2-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip"
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.2/miuread-v5.7.0-beta.2-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.2/miuread-v5.7.0-beta.2-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.2/miuread-v5.7.0-beta.2-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.2/miuread-v5.7.0-beta.2-full.zip"
   ],
-  "size": 1856953,
-  "sha256": "5c56f6c6b5cf9d6cdcf9b6663b19d5a4f495d6df5b5797814cefed06bdb64b9f",
-  "summary": "\u65b0\u589e\u89c5\u9605\u6269\u5c55\u4e2d\u5fc3\uff1a\u652f\u6301\u4e2d\u6587\u7cbe\u9009\u3001\u5206\u7c7b\u3001GitHub \u641c\u7d22\u3001\u5df2\u5b89\u88c5\u8bc6\u522b\u53ca\u63d2\u4ef6\u5b89\u88c5/\u66f4\u65b0/\u5378\u8f7d\uff1b\u5b89\u88c5\u524d\u68c0\u67e5\u7ed3\u6784\uff0c\u66f4\u65b0\u5931\u8d25\u81ea\u52a8\u6062\u590d\u65e7\u7248\u672c\u3002",
-  "notes": "\u65b0\u589e\u89c5\u9605\u6269\u5c55\u4e2d\u5fc3\uff1a\u652f\u6301\u4e2d\u6587\u7cbe\u9009\u3001\u5206\u7c7b\u3001GitHub \u641c\u7d22\u3001\u5df2\u5b89\u88c5\u8bc6\u522b\u53ca\u63d2\u4ef6\u5b89\u88c5/\u66f4\u65b0/\u5378\u8f7d\uff1b\u5b89\u88c5\u524d\u68c0\u67e5\u7ed3\u6784\uff0c\u66f4\u65b0\u5931\u8d25\u81ea\u52a8\u6062\u590d\u65e7\u7248\u672c\u3002"
+  "size": 1858790,
+  "sha256": "11cb07cfa45bfa2f7435a68a65a5545efb9a322f3a37a41a57228f84ef2ba91c",
+  "notes": "修复觅阅设置快捷气泡缺少扩展入口；扩展下载增加 curl 回退，插件 ZIP 优先使用 KOReader Archiver 解压，并补充安装阶段日志与回滚诊断。"
 }

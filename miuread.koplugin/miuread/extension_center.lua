@@ -7,7 +7,9 @@ local ConfirmBox=require("ui/widget/confirmbox")
 local Menu=require("ui/widget/menu")
 local Config=require("miuread.config")
 local U=require("miuread.util")
+local Json=require("miuread.json")
 local logger=require("logger")
+local archiver_ok,Archiver=pcall(require,"ffi/archiver")
 
 local M={}
 
@@ -180,6 +182,28 @@ local function repo_for_installed(plugin,dir)
     return type(value)=="table" and value.repo or nil
 end
 
+local function log_url(url)
+    if type(U.redact_url)=="function" then return U.redact_url(url) end
+    return tostring(url or "")
+end
+
+local function curl_download_file(url,path,options)
+    options=options or {}
+    local connect_timeout=math.max(2,math.floor(tonumber(options.connect_timeout) or 15))
+    local total_timeout=math.max(connect_timeout,math.floor(tonumber(options.total_timeout) or 180))
+    os.remove(path)
+    local cmd="curl -L --fail --silent --show-error --connect-timeout "..tostring(connect_timeout)
+        .." --max-time "..tostring(total_timeout)
+    for _,header in ipairs(options.headers or {}) do
+        cmd=cmd.." -H "..U.shell_quote(tostring(header))
+    end
+    cmd=cmd.." -o "..U.shell_quote(path).." "..U.shell_quote(url).." 2>/dev/null"
+    local ok=command_ok(os.execute(cmd))
+    local size=U.file_size(path) or 0
+    if not ok or size<=0 then os.remove(path); return false end
+    return true,size
+end
+
 local function github_json(plugin,url)
     local ok,result=pcall(function()
         return plugin.http:get_json(url,{
@@ -187,9 +211,28 @@ local function github_json(plugin,url)
             timeout={6,18},
         })
     end)
-    if not ok then return nil,tostring(result) end
-    if type(result)~="table" then return nil,"GitHub 返回了无法识别的数据" end
-    return result
+    if ok and type(result)=="table" then return result end
+
+    local lua_error=tostring(result or "GitHub 返回了无法识别的数据")
+    logger.warn("[MiuRead][Extensions] metadata Lua route failed",log_url(url),lua_error)
+    local target=plugin.store.temp_dir.."/extension-json-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))..".json"
+    logger.info("[MiuRead][Extensions] metadata curl fallback",log_url(url))
+    local curl_ok=curl_download_file(url,target,{
+        connect_timeout=8,total_timeout=30,
+        headers={"Accept: application/vnd.github+json","User-Agent: MiuRead-ExtensionCenter"},
+    })
+    if not curl_ok then
+        return nil,lua_error
+    end
+    local raw=U.read_file(target,true)
+    os.remove(target)
+    if not raw or raw=="" then return nil,"GitHub curl 返回空数据" end
+    local decoded_ok,decoded=pcall(Json.decode,raw)
+    if not decoded_ok or type(decoded)~="table" then
+        return nil,"GitHub curl 返回了无法识别的数据"
+    end
+    logger.info("[MiuRead][Extensions] metadata curl success",log_url(url),"bytes=",tostring(#raw))
+    return decoded
 end
 
 local function github_repo(plugin,repo)
@@ -266,19 +309,103 @@ local function download_package(plugin,url,label)
     local errors={}
     for _,candidate in ipairs(github_package_urls(url)) do
         os.remove(target)
+        logger.info("[MiuRead][Extensions] package download start","route=lua","url=",log_url(candidate))
         local ok,result=pcall(function()
             return plugin.http:download_to_file(candidate,target,{
                 auth=false,retries=1,redirects=10,timeout={15,150},integrity_attempts=2,
             })
         end)
         if ok and U.file_exists(target) and (U.file_size(target) or 0)>0 then
+            logger.info("[MiuRead][Extensions] package download success","route=lua","bytes=",tostring(U.file_size(target) or 0),"url=",log_url(candidate))
             return target,candidate
         end
-        errors[#errors+1]=tostring(result)
-        logger.warn("[MiuRead][Extensions] package route failed",candidate,tostring(result))
+        local lua_error=tostring(result or "Lua 下载失败")
+        errors[#errors+1]=lua_error
+        logger.warn("[MiuRead][Extensions] package Lua route failed",log_url(candidate),lua_error)
+
+        os.remove(target)
+        logger.info("[MiuRead][Extensions] package curl fallback",log_url(candidate))
+        local curl_ok,curl_size=curl_download_file(candidate,target,{connect_timeout=20,total_timeout=180})
+        if curl_ok then
+            logger.info("[MiuRead][Extensions] package download success","route=curl","bytes=",tostring(curl_size or 0),"url=",log_url(candidate))
+            return target,candidate
+        end
+        errors[#errors+1]="curl download failed: "..log_url(candidate)
+        logger.warn("[MiuRead][Extensions] package curl route failed",log_url(candidate))
     end
     os.remove(target)
     return nil,errors[#errors] or "下载失败"
+end
+
+local function open_archiver(path)
+    if not archiver_ok or type(Archiver)~="table" or type(Archiver.Reader)~="table" then
+        return nil,"KOReader Archiver 不可用"
+    end
+    local ok,reader=pcall(function() return Archiver.Reader:new() end)
+    if not ok or not reader then return nil,"无法创建 KOReader Archiver" end
+    local opened_ok,opened=pcall(function() return reader:open(path) end)
+    if not opened_ok or not opened then
+        pcall(function() reader:close() end)
+        return nil,"KOReader Archiver 无法打开 ZIP"
+    end
+    return reader
+end
+
+local function close_archiver(reader)
+    if reader then pcall(function() reader:close() end) end
+end
+
+local function validate_archive_path(name)
+    name=tostring(name or "")
+    if name=="" then return nil,"ZIP 包含空路径" end
+    if name:sub(1,1)=="/" or name:find("\\",1,true) or name:find("%z") then
+        return nil,"ZIP 包含不安全路径"
+    end
+    for part in name:gmatch("[^/]+") do
+        if part==".." or part=="." then return nil,"ZIP 包含目录穿越路径" end
+    end
+    return true
+end
+
+local function inspect_archiver(reader)
+    local entries,files=0,0
+    local ok,err=pcall(function()
+        for entry in reader:iterate() do
+            entries=entries+1
+            if entries>MAX_ARCHIVE_ENTRIES then error("ZIP 文件数量过多") end
+            local safe,path_error=validate_archive_path(entry.path)
+            if not safe then error(path_error) end
+            local mode=tostring(entry.mode or "")
+            if mode:lower():find("link",1,true) then error("插件包包含符号链接") end
+            if mode=="file" then files=files+1 end
+        end
+    end)
+    if not ok then return nil,tostring(err):gsub("^.-:%d+:%s*","") end
+    if entries==0 or files==0 then return nil,"ZIP 中没有可安装文件" end
+    return {entries=entries,files=files}
+end
+
+local function extract_with_archiver(reader,unpacked)
+    local files,bytes=0,0
+    local ok,err=pcall(function()
+        for entry in reader:iterate() do
+            if tostring(entry.mode or "")=="file" then
+                local safe,path_error=validate_archive_path(entry.path)
+                if not safe then error(path_error) end
+                local dest=unpacked.."/"..entry.path
+                local parent=dirname(dest)
+                U.mkdir(parent)
+                local extracted=reader:extractToPath(entry.path,dest)
+                if not extracted then error("解压插件文件失败："..tostring(entry.path)) end
+                files=files+1
+                bytes=bytes+(tonumber(lfs.attributes(dest,"size")) or 0)
+                if files>MAX_PLUGIN_FILES then error("插件文件数量过多") end
+                if bytes>MAX_PLUGIN_BYTES then error("插件解压后体积过大") end
+            end
+        end
+    end)
+    if not ok then return nil,tostring(err):gsub("^.-:%d+:%s*","") end
+    return {files=files,bytes=bytes}
 end
 
 local function zip_entries(path)
@@ -399,12 +526,27 @@ local function normalized_plugin_identity(value)
 end
 
 local function install_archive(plugin,repo,zip_path,source_url,version_hint)
-    local entries,entry_error=zip_entries(zip_path)
-    if not entries then os.remove(zip_path); return nil,entry_error end
-    local declared_size=zip_declared_size(zip_path)
-    if declared_size and declared_size>MAX_PLUGIN_BYTES then
-        os.remove(zip_path)
-        return nil,"插件解压体积超过安全上限"
+    logger.info("[MiuRead][Extensions] install stage","stage=archive_open","repo=",repo,"bytes=",tostring(U.file_size(zip_path) or 0))
+    local reader,archiver_error=open_archiver(zip_path)
+    local use_archiver=reader~=nil
+    if use_archiver then
+        local inspected,inspect_error=inspect_archiver(reader)
+        if not inspected then
+            close_archiver(reader)
+            os.remove(zip_path)
+            logger.warn("[MiuRead][Extensions] install failed","stage=archive_validate","repo=",repo,"error=",tostring(inspect_error))
+            return nil,inspect_error
+        end
+        logger.info("[MiuRead][Extensions] archive validated","backend=archiver","entries=",tostring(inspected.entries),"files=",tostring(inspected.files))
+    else
+        logger.warn("[MiuRead][Extensions] KOReader Archiver unavailable; using unzip fallback",tostring(archiver_error))
+        local entries,entry_error=zip_entries(zip_path)
+        if not entries then os.remove(zip_path); return nil,entry_error end
+        local declared_size=zip_declared_size(zip_path)
+        if declared_size and declared_size>MAX_PLUGIN_BYTES then
+            os.remove(zip_path)
+            return nil,"插件解压体积超过安全上限"
+        end
     end
 
     local stamp=tostring(os.time()).."-"..tostring(math.random(1000,9999))
@@ -412,20 +554,33 @@ local function install_archive(plugin,repo,zip_path,source_url,version_hint)
     local unpacked=stage.."/unpacked"
     U.remove_tree(stage)
     U.mkdir(unpacked)
-    local function fail(message)
+    local function fail(message,failed_stage)
+        close_archiver(reader); reader=nil
         U.remove_tree(stage)
         os.remove(zip_path)
+        logger.warn("[MiuRead][Extensions] install failed","stage=",tostring(failed_stage or "unknown"),"repo=",repo,"error=",tostring(message))
         return nil,message
     end
 
-    local rc=os.execute("unzip -q "..U.shell_quote(zip_path).." -d "..U.shell_quote(unpacked).." 2>/dev/null")
-    if not command_ok(rc) then return fail("解压插件失败") end
-    local stats,stats_error=tree_stats(unpacked)
-    if not stats then return fail(stats_error) end
+    local stats,stats_error
+    if use_archiver then
+        logger.info("[MiuRead][Extensions] install stage","stage=extract","backend=archiver","repo=",repo)
+        stats,stats_error=extract_with_archiver(reader,unpacked)
+        close_archiver(reader); reader=nil
+        if not stats then return fail(stats_error,"extract") end
+    else
+        logger.info("[MiuRead][Extensions] install stage","stage=extract","backend=unzip","repo=",repo)
+        local rc=os.execute("unzip -q "..U.shell_quote(zip_path).." -d "..U.shell_quote(unpacked).." 2>/dev/null")
+        if not command_ok(rc) then return fail("解压插件失败","extract") end
+        stats,stats_error=tree_stats(unpacked)
+        if not stats then return fail(stats_error,"extract_validate") end
+    end
+    logger.info("[MiuRead][Extensions] extract complete","repo=",repo,"files=",tostring(stats.files),"bytes=",tostring(stats.bytes),"backend=",use_archiver and "archiver" or "unzip")
 
     local incoming,target_name=choose_plugin_root(unpacked,repo)
-    if not incoming then return fail(target_name) end
-    if target_name=="miuread.koplugin" then return fail("扩展中心不能覆盖觅阅自身") end
+    if not incoming then return fail(target_name,"plugin_detect") end
+    if target_name=="miuread.koplugin" then return fail("扩展中心不能覆盖觅阅自身","plugin_detect") end
+    logger.info("[MiuRead][Extensions] plugin detected","repo=",repo,"dir=",target_name)
 
     local existing=find_installed_by_dir(target_name)
     local target_root=existing and existing.root or default_plugin_root()
@@ -434,12 +589,12 @@ local function install_archive(plugin,repo,zip_path,source_url,version_hint)
 
     if lfs.attributes(target,"mode")=="directory" then
         if not U.file_exists(target.."/main.lua") or not U.file_exists(target.."/_meta.lua") then
-            return fail("目标目录已存在，但不是完整 KOReader 插件；为避免覆盖其他文件，已停止安装")
+            return fail("目标目录已存在，但不是完整 KOReader 插件；为避免覆盖其他文件，已停止安装","collision_check")
         end
         local installed_record=records(plugin)[target_name]
         local installed_repo=type(installed_record)=="table" and tostring(installed_record.repo or "") or ""
         if installed_repo~="" and installed_repo~=repo then
-            return fail("目标目录已由另一个 GitHub 仓库管理，已拒绝覆盖")
+            return fail("目标目录已由另一个 GitHub 仓库管理，已拒绝覆盖","collision_check")
         end
         if installed_repo=="" then
             local incoming_meta=read_meta(incoming)
@@ -447,46 +602,51 @@ local function install_archive(plugin,repo,zip_path,source_url,version_hint)
             local incoming_id=normalized_plugin_identity(incoming_meta.identity)
             local current_id=normalized_plugin_identity(current_meta.identity)
             if incoming_id~="" and current_id~="" and incoming_id~=current_id then
-                return fail("目标目录中已存在名称不同的插件，已拒绝覆盖")
+                return fail("目标目录中已存在名称不同的插件，已拒绝覆盖","collision_check")
             end
         end
+        logger.info("[MiuRead][Extensions] install stage","stage=backup","repo=",repo,"dir=",target_name)
         local copied,copy_error=U.copy_tree(target,backup)
-        if not copied then return fail("备份旧插件失败："..tostring(copy_error)) end
+        if not copied then return fail("备份旧插件失败："..tostring(copy_error),"backup") end
     end
 
-    local function rollback(message)
+    local function rollback(message,failed_stage)
+        logger.warn("[MiuRead][Extensions] rollback start","repo=",repo,"dir=",target_name,"stage=",tostring(failed_stage or "write"),"error=",tostring(message))
         U.remove_tree(target)
         if lfs.attributes(backup,"mode")=="directory" then
             local restored,restore_error=U.copy_tree(backup,target)
             if not restored then
                 U.remove_tree(stage)
                 os.remove(zip_path)
+                logger.warn("[MiuRead][Extensions] rollback failed","repo=",repo,"error=",tostring(restore_error))
                 return nil,tostring(message).."；旧版本恢复失败："..tostring(restore_error)
             end
         end
         U.remove_tree(stage)
         os.remove(zip_path)
+        logger.info("[MiuRead][Extensions] rollback complete","repo=",repo,"dir=",target_name)
         return nil,tostring(message).."；已恢复旧版本"
     end
 
+    logger.info("[MiuRead][Extensions] install stage","stage=write","repo=",repo,"dir=",target_name)
     if lfs.attributes(target,"mode")=="directory" then
         local removed,remove_error=U.remove_tree(target)
-        if not removed then return fail("无法替换旧插件："..tostring(remove_error)) end
+        if not removed then return fail("无法替换旧插件："..tostring(remove_error),"write_prepare") end
     end
     local copied,copy_error=U.copy_tree(incoming,target)
-    if not copied then return rollback("安装插件失败："..tostring(copy_error)) end
+    if not copied then return rollback("安装插件失败："..tostring(copy_error),"write") end
     if not U.file_exists(target.."/main.lua") or not U.file_exists(target.."/_meta.lua") then
-        return rollback("安装后的插件结构不完整")
+        return rollback("安装后的插件结构不完整","post_validate")
     end
     local installed_stats,installed_stats_error=tree_stats(target)
-    if not installed_stats then return rollback(installed_stats_error) end
+    if not installed_stats then return rollback(installed_stats_error,"post_validate") end
 
     local meta=read_meta(target)
     remember_install(plugin,repo,target_name,meta.version~="" and meta.version or version_hint,source_url)
     U.remove_tree(stage)
     os.remove(zip_path)
     logger.info("[MiuRead][Extensions] installed",repo,target_name,
-        "files=",tostring(stats.files),"bytes=",tostring(stats.bytes),"version=",tostring(meta.version))
+        "files=",tostring(installed_stats.files),"bytes=",tostring(installed_stats.bytes),"version=",tostring(meta.version),"backend=",use_archiver and "archiver" or "unzip")
     return {
         dir=target_name,path=target,version=meta.version,
         files=installed_stats.files,bytes=installed_stats.bytes,
@@ -728,7 +888,7 @@ end
 
 local function center_about(plugin)
     plugin:info(
-        "觅阅扩展中心 · 5.7.0-beta.1\n\n"
+        "觅阅扩展中心 · 5.7.0-beta.2\n\n"
         .."第一版直接使用 GitHub 的 KOReader 社区生态作为扩展来源，并提供中文精选入口。\n\n"
         .."安装包会先下载到临时目录，检查 ZIP 路径、插件结构和体积后才写入 plugins。更新现有插件时会先备份，写入失败自动恢复。\n\n"
         .."普通第三方插件仍由插件自己管理账号和设置。安装、更新或卸载后请完整重启 KOReader。"

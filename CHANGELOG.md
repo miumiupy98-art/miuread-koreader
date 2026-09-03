@@ -1,3 +1,12 @@
+## 5.7.0-beta.2
+
+- 修复觅阅桌面主页快捷栏中“觅阅设置”的真实入口缺少“扩展”：主页快捷项点击后使用的是独立管理气泡，现已把“扩展 / 觅阅扩展中心”接入该气泡；扩展中心仍不占用主页六个快捷位。
+- 修复 Kindle 上扩展包容易下载失败：GitHub Release、tag/branch ZIP 与镜像地址均先尝试现有 Lua HTTPS，失败后自动使用与觅阅 OTA 一致的 curl 回退，不再因 Lua TLS/连接失败直接终止。
+- GitHub 仓库信息、Release 信息与社区搜索增加 curl JSON 回退；Lua API 请求失败时仍可继续读取公开 GitHub 元数据，并记录实际使用的网络通路。
+- 插件 ZIP 解压优先改用 KOReader 自带 `ffi/archiver`，逐项检查路径并逐文件写入临时目录；无 Archiver 的旧环境才回退系统 unzip。继续保留文件数量、总体积、目录穿越、符号链接、main.lua/_meta.lua 与同名目录冲突检查。
+- 扩展安装日志补充 metadata、download、archive、extract、plugin_detect、backup、write、rollback 等阶段；更新旧插件仍先备份，写入或安装后校验失败时恢复旧版本。
+- 不修改微信读书下载、同步、阅读、评论、本地书、锁屏与休眠逻辑。
+
 ## 5.7.0-beta.1
 
 - 新增“觅阅设置 → 扩展 → 觅阅扩展中心”，暂不占用觅阅桌面入口。
