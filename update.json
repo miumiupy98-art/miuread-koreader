@@ -1,17 +1,17 @@
 {
-  "version": "4.3.0",
-  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 4.3.0",
-  "channel": "stable",
+  "version": "5.7.0-beta.1",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 5.7.0-beta.1 \u5185\u6d4b\u7248",
+  "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.3.0/miuread-v4.3.0-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.3.0/miuread-v4.3.0-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.3.0/miuread-v4.3.0-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.3.0/miuread-v4.3.0-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v4.3.0/miuread-v4.3.0-full.zip"
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.7.0-beta.1/miuread-v5.7.0-beta.1-full.zip"
   ],
-  "size": 617481,
-  "sha256": "260b4783385698421412888a502e250b30867d5b35ea3cb3920a143710db495e",
-  "summary": "\u754c\u9762 \u91cd\u505a\u4e3b\u9875\u3001\u9605\u8bfb\u63a7\u5236\u4e2d\u5fc3\u4e0e\u8bbe\u7f6e\u9875\uff0c\u7edf\u4e00\u56fe\u6807\u3001\u5b57\u53f7\u3001\u95f4\u8ddd\u548c\u5feb\u6377\u5165\u53e3\uff0c\u63d0\u5347\u7535\u5b50\u58a8\u6c34\u5c4f\u53ef\u8bfb\u6027\u3002\n\u540c\u6b65 \u65b0\u589e\u672c\u5730\u4e66\u7b7e\u3001\u5212\u7ebf\u4e0e\u60f3\u6cd5\u624b\u52a8\u540c\u6b65\u5230\u5fae\u4fe1\u8bfb\u4e66\u4e91\u7aef\uff0c\u5e76\u52a0\u5165\u7ae0\u8282\u3001\u7248\u672c\u4e0e range \u53cc\u5411\u6821\u9a8c\u3002\n\u6027\u80fd \u51cf\u5c11\u9605\u8bfb\u8fc7\u7a0b\u78c1\u76d8\u5199\u5165\u548c\u540e\u53f0\u4efb\u52a1\u62a2\u5360\uff0c\u4f18\u5316\u4e3b\u9875\u8fd4\u56de\u3001\u4e0b\u6ed1\u5de5\u5177\u680f\u3001\u8bc4\u8bba\u4e0e\u5c01\u9762\u5904\u7406\u7684\u54cd\u5e94\u3002\n\u7a33\u5b9a \u4fee\u590d\u540e\u53f0\u4e0b\u8f7d\u6b8b\u7559\u65b9\u6846\u3001\u4e0b\u8f7d\u7a97\u53e3\u65e0\u6cd5\u91cd\u5f00\u3001\u81ea\u52a8\u65cb\u8f6c\u3001\u957f\u65f6\u95f4\u5f85\u673a\u6062\u590d...",
-  "notes": "\u754c\u9762 \u91cd\u505a\u4e3b\u9875\u3001\u9605\u8bfb\u63a7\u5236\u4e2d\u5fc3\u4e0e\u8bbe\u7f6e\u9875\uff0c\u7edf\u4e00\u56fe\u6807\u3001\u5b57\u53f7\u3001\u95f4\u8ddd\u548c\u5feb\u6377\u5165\u53e3\uff0c\u63d0\u5347\u7535\u5b50\u58a8\u6c34\u5c4f\u53ef\u8bfb\u6027\u3002\n\u540c\u6b65 \u65b0\u589e\u672c\u5730\u4e66\u7b7e\u3001\u5212\u7ebf\u4e0e\u60f3\u6cd5\u624b\u52a8\u540c\u6b65\u5230\u5fae\u4fe1\u8bfb\u4e66\u4e91\u7aef\uff0c\u5e76\u52a0\u5165\u7ae0\u8282\u3001\u7248\u672c\u4e0e range \u53cc\u5411\u6821\u9a8c\u3002\n\u6027\u80fd \u51cf\u5c11\u9605\u8bfb\u8fc7\u7a0b\u78c1\u76d8\u5199\u5165\u548c\u540e\u53f0\u4efb\u52a1\u62a2\u5360\uff0c\u4f18\u5316\u4e3b\u9875\u8fd4\u56de\u3001\u4e0b\u6ed1\u5de5\u5177\u680f\u3001\u8bc4\u8bba\u4e0e\u5c01\u9762\u5904\u7406\u7684\u54cd\u5e94\u3002\n\u7a33\u5b9a \u4fee\u590d\u540e\u53f0\u4e0b\u8f7d\u6b8b\u7559\u65b9\u6846\u3001\u4e0b\u8f7d\u7a97\u53e3\u65e0\u6cd5\u91cd\u5f00\u3001\u81ea\u52a8\u65cb\u8f6c\u3001\u957f\u65f6\u95f4\u5f85\u673a\u6062\u590d..."
+  "size": 1856953,
+  "sha256": "5c56f6c6b5cf9d6cdcf9b6663b19d5a4f495d6df5b5797814cefed06bdb64b9f",
+  "summary": "\u65b0\u589e\u89c5\u9605\u6269\u5c55\u4e2d\u5fc3\uff1a\u652f\u6301\u4e2d\u6587\u7cbe\u9009\u3001\u5206\u7c7b\u3001GitHub \u641c\u7d22\u3001\u5df2\u5b89\u88c5\u8bc6\u522b\u53ca\u63d2\u4ef6\u5b89\u88c5/\u66f4\u65b0/\u5378\u8f7d\uff1b\u5b89\u88c5\u524d\u68c0\u67e5\u7ed3\u6784\uff0c\u66f4\u65b0\u5931\u8d25\u81ea\u52a8\u6062\u590d\u65e7\u7248\u672c\u3002",
+  "notes": "\u65b0\u589e\u89c5\u9605\u6269\u5c55\u4e2d\u5fc3\uff1a\u652f\u6301\u4e2d\u6587\u7cbe\u9009\u3001\u5206\u7c7b\u3001GitHub \u641c\u7d22\u3001\u5df2\u5b89\u88c5\u8bc6\u522b\u53ca\u63d2\u4ef6\u5b89\u88c5/\u66f4\u65b0/\u5378\u8f7d\uff1b\u5b89\u88c5\u524d\u68c0\u67e5\u7ed3\u6784\uff0c\u66f4\u65b0\u5931\u8d25\u81ea\u52a8\u6062\u590d\u65e7\u7248\u672c\u3002"
 }
