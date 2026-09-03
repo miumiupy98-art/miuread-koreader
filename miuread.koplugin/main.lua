@@ -96,7 +96,6 @@ local ReaderTypographyDialog=require("miuread.reader_typography_dialog")
 local ReaderTocDialog=require("miuread.reader_toc_dialog")
 local ReaderFrontlightDialog=require("miuread.reader_frontlight_dialog")
 local DataMigration=require("miuread.data_migration")
-local MigrationProgress=require("miuread.migration_progress")
 local DownloadDatabase=require("miuread.download_database")
 local StatusToast=require("miuread.status_toast")
 local BookExcerptDialog=require("miuread.book_excerpt_dialog")
@@ -123,55 +122,24 @@ local unpack_args=unpack or table.unpack
 local SHELF_CACHE_TTL=15*60
 local SHELF_DIRECT_CACHE_TTL=6*60*60
 local COVER_GUARD_WINDOW=6*60*60
-local HOME_LOCAL_CACHE_TTL=tonumber(Config.HOME_LOCAL_SHELF_TTL_SECONDS) or 60*60
 local HOME_SHELF_REFRESH_TTL=tonumber(Config.HOME_REMOTE_SHELF_TTL_SECONDS) or 30*60
 local HOME_REMOTE_AUTO_RETRY=5*60
 local HOME_SECTION_ORDER={"account","generated","local","mp"}
-local HOME_QUICK_ITEM_LEGACY_ORDER={"wifi","frontlight","refresh_shelf","full_refresh","settings","koreader_menu","downloads","sync","night","rotate","sleep","restart","quit"}
-local HOME_QUICK_ITEM_LEGACY_DEFAULT={wifi=true,frontlight=true,refresh_shelf=true,full_refresh=true,settings=true,koreader_menu=true,downloads=true,sync=true,night=false,rotate=false,sleep=true,restart=false,quit=false}
 
 -- 3.5 separates the always-visible home actions from the pull-down control
 -- center. Defaults intentionally avoid duplicates, while both areas remain
 -- fully configurable.
-local HOME_ACTION_ITEM_V1_ORDER={"refresh","search","downloads","sync","frontlight","miuread_settings","all_books","history","file_manager","screenshot"}
-local HOME_ACTION_ITEM_V1_DEFAULT={refresh=true,search=true,downloads=true,sync=true,frontlight=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
-local HOME_ACTION_ITEM_V2_ORDER={"refresh","search","downloads","sync","sleep","miuread_settings","frontlight","all_books","history","file_manager","screenshot"}
-local HOME_ACTION_ITEM_V2_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,frontlight=false,all_books=false,history=false,file_manager=false,screenshot=false}
 -- Frontlight is no longer a homepage shortcut candidate. It lives only in the
 -- pull-down direct-control section (and the reader controls).
-local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"}
-local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false}
-local HOME_ACTION_LAYOUT_VERSION=3
-local HOME_PANEL_ITEM_V1_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","frontlight","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
-local HOME_PANEL_ITEM_V1_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,frontlight=false,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
-local HOME_PANEL_ITEM_V2_ORDER={"wifi","rotate","screenshot","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep","full_refresh"}
-local HOME_PANEL_ITEM_V2_DEFAULT={wifi=true,rotate=true,screenshot=true,koreader_settings=true,return_koreader=true,quit=true,sync=false,miuread_settings=false,downloads=false,restart=false,sleep=false,full_refresh=false}
+local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sleep","extensions","miuread_settings","sync","all_books","history","file_manager","screenshot"}
+local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sleep=true,extensions=true,miuread_settings=true,sync=false,all_books=false,history=false,file_manager=false,screenshot=false}
+local HOME_ACTION_LAYOUT_VERSION=5
 -- The pull-down row can use eight slots. Bluetooth is conditional on a
 -- working platform backend. Capability is probed once per KOReader session;
 -- opening the pull-down never performs a Bluetooth system query.
-local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false}
-local HOME_PANEL_LAYOUT_VERSION=3
-local READER_QUICK_ITEM_LEGACY_ORDER={"home","toc","progress","font","typeset","sync","current_book","downloads","full_refresh","koreader_menu","sleep","more"}
-local READER_QUICK_ITEM_LEGACY_DEFAULT={home=true,toc=true,progress=true,font=true,typeset=true,sync=true,current_book=true,downloads=false,full_refresh=false,koreader_menu=false,sleep=false,more=true}
-local READER_QUICK_ITEM_V2_ORDER={"home","toc","progress","font","sync","more","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
-local READER_QUICK_ITEM_V2_DEFAULT={home=true,toc=true,progress=true,font=true,sync=true,more=true,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false}
-local READER_QUICK_ITEM_V3_ORDER={"home","toc","progress","font","frontlight","sync","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
-local READER_QUICK_ITEM_V3_DEFAULT={home=true,toc=true,progress=true,font=true,frontlight=true,sync=true,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false}
-local READER_QUICK_ITEM_ORDER={"toc","progress","font","frontlight","sync","comment_font","page_display","typeset","current_book","downloads","full_refresh","koreader_menu","sleep"}
-local READER_QUICK_ITEM_DEFAULT={toc=true,progress=true,font=true,frontlight=true,sync=true,comment_font=true,page_display=false,typeset=false,current_book=false,downloads=false,full_refresh=false,koreader_menu=false,sleep=false}
-local function quick_boolean_layout_matches(actual,expected,order)
-    if type(actual)~="table" then return false end
-    for _,key in ipairs(order or {}) do
-        if (actual[key]==true)~=(expected[key]==true) then return false end
-    end
-    return true
-end
-local function quick_order_matches(actual,expected)
-    if type(actual)~="table" or #actual~=#expected then return false end
-    for index,key in ipairs(expected) do if actual[index]~=key then return false end end
-    return true
-end
+local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","sleep","koreader_settings","return_koreader","quit","restart"}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,sleep=true,koreader_settings=true,return_koreader=true,quit=false,restart=false}
+local HOME_PANEL_LAYOUT_VERSION=4
 -- ReaderUI and FileManager create separate plugin instances. Keep navigation
 -- state in _G so opening/closing a document does not lose its MiuRead origin.
 local HOME_SESSION=rawget(_G,"__MIUREAD_HOME_SESSION")
@@ -990,7 +958,6 @@ function Plugin:init()
     self._home_start_generation=0
     self._home_reader_transition=false
     self._desktop_frozen=false
-    self._home_legacy_cover_index=nil
     self._home_metadata_generation=0
     self._home_cover_generation=0
     self._home_sections=nil
@@ -1097,7 +1064,6 @@ function Plugin:init()
     end
 
     self:_schedule_bluetooth_startup_probe(1.8)
-    UIManager:scheduleIn(3.0,function() self:_cleanup_legacy_lockscreen_derivatives() end)
     UIManager:scheduleIn(4.0,function()
         if self.updater then self.updater:cleanup_idle() end
     end)
@@ -1916,7 +1882,6 @@ function Plugin:current_book_menu()
         {text="下载章节",sub_item_table_func=function() return self:current_book_download_menu(b) end},
         {text="重新生成",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
         {text="管理本地文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
-        {text="评论数据与显示",sub_item_table_func=function() return self:book_repair_settings_menu() end},
     }
 end
 
@@ -2959,30 +2924,11 @@ function Plugin:show_shelf(mp_mode,force_remote,section)
 end
 
 
-function Plugin:_cleanup_legacy_lockscreen_derivatives()
-    if not self.store then return end
-    local lockscreen_direct_version=tonumber(self.store:get("lockscreen_direct_version",0)) or 0
-    if lockscreen_direct_version>=1 then return end
-    local ok,err=pcall(function()
-        U.remove_tree(self.store.data_dir.."/lockscreen")
-        U.remove_tree(self.store.data_dir.."/lockscreen-source")
-        self.store:set("lockscreen_direct_version",1)
-    end)
-    if ok then
-        logger.info("[MiuRead][Lockscreen] legacy derivative cache removed after startup")
-    else
-        logger.warn("[MiuRead][Lockscreen] deferred legacy cache cleanup failed",tostring(err))
-    end
-end
-
 function Plugin:_schedule_bluetooth_startup_probe(delay)
     if self._bluetooth_startup_probe_scheduled then return end
     self._bluetooth_startup_probe_scheduled=true
     local cached=Bluetooth.peek()
-    if cached.known==true then
-        self:_bluetooth_migrate_panel(cached)
-        return
-    end
+    if cached.known==true then return end
     delay=tonumber(delay) or 1.8
     logger.info("[MiuRead][Bluetooth] startup probe deferred","delay=",tostring(delay))
     UIManager:scheduleIn(delay,function()
@@ -3000,7 +2946,6 @@ function Plugin:_schedule_bluetooth_startup_probe(delay)
                 return
             end
             local state=Bluetooth.adopt(result.value)
-            self:_bluetooth_migrate_panel(state)
             if HomeView.is_shown() and not self:_active_reader_ui() then
                 HomeView.update_header{bluetooth_visible=state.supported==true,bluetooth_text=self:_home_bluetooth_text()}
             end
@@ -3012,39 +2957,6 @@ function Plugin:_schedule_bluetooth_startup_probe(delay)
             logger.warn("[MiuRead][Bluetooth] unable to start deferred probe",tostring(err))
         end
     end)
-end
-
-function Plugin:_bluetooth_migrate_panel(state)
-    state=type(state)=="table" and state or Bluetooth.peek()
-    if state.supported~=true or not self.store then return end
-    local preferences=self.store:preferences()
-    preferences.home_ui=type(preferences.home_ui)=="table" and preferences.home_ui or {}
-    local home=preferences.home_ui
-    if (tonumber(home.bluetooth_shortcut_version) or 0)>=1 then return end
-    home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
-    home.panel_order=type(home.panel_order)=="table" and home.panel_order or U.copy(HOME_PANEL_ITEM_ORDER)
-    -- beta.6 added Bluetooth as opt-in for customized layouts before the real
-    -- backend existed. Turn it on once now that the capability is confirmed;
-    -- after this migration an explicit user disable is preserved.
-    home.panel_items.bluetooth=true
-    local normalized,seen={},{}
-    local inserted=false
-    for _,key in ipairs(home.panel_order) do
-        if key~="bluetooth" and HOME_PANEL_ITEM_DEFAULT[key]~=nil and not seen[key] then
-            seen[key]=true
-            normalized[#normalized+1]=key
-            if key=="wifi" then normalized[#normalized+1]="bluetooth"; inserted=true end
-        end
-    end
-    if not inserted then table.insert(normalized,1,"bluetooth") end
-    for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do
-        if key~="bluetooth" and not seen[key] then seen[key]=true; normalized[#normalized+1]=key end
-    end
-    home.panel_order=normalized
-    home.bluetooth_shortcut_version=1
-    self.store:save_preferences(preferences)
-    logger.info("[MiuRead][Bluetooth] toolbar entry enabled after capability probe",
-        "backend=",tostring(state.backend or "unknown"))
 end
 
 function Plugin:_bluetooth_state(force)
@@ -3168,44 +3080,7 @@ function Plugin:_home_preferences()
     local home=preferences.home_ui
     local changed=false
     if home.enabled==nil then home.enabled=true; changed=true end
-    local old_layout_version=tonumber(home.layout_version) or 0
-    if old_layout_version<20 then
-        home.layout_version=20
-        home.layout_style=home.layout_style=="compact" and "compact" or "desk"
-        -- Keep the selected mode and page positions while upgrading the home
-        -- structure. Removed experimental widget fields are no longer read.
-        home.widgets=nil
-        home.preset=nil
-        home.goal_minutes=nil
-        home.swipe_quick=nil
-        home.initial_page=nil
-        changed=true
-    end
-    if old_layout_version<23 then
-        home.layout_version=23
-        changed=true
-    end
-    if old_layout_version<24 then
-        home.layout_version=24
-        if home.show_weread_stats==nil then home.show_weread_stats=true end
-        if home.show_local_stats==nil then home.show_local_stats=true end
-        changed=true
-    end
-    if (tonumber(home.performance_defaults_version) or 0)<1 then
-        -- Historical performance defaults are no longer allowed to change a
-        -- feature switch during ordinary startup. The current local-library
-        -- policy is normalized below from the user's saved choice.
-        home.performance_defaults_version=1
-        changed=true
-    end
-    if (tonumber(home.network_metadata_defaults_version) or 0)<2 then
-        -- beta.35 repairs the historical beta.8 default once. After a user
-        -- explicitly changes this switch, future upgrades must preserve it.
-        if home.network_metadata_user_set~=true then home.network_metadata=true end
-        home.network_metadata_defaults_version=2
-        if home.network_metadata_user_set~=true then home.network_metadata_user_set=false end
-        changed=true
-    end
+    if tonumber(home.layout_version)~=26 then home.layout_version=26; changed=true end
     if home.layout_style~="compact" and home.layout_style~="desk" then
         home.layout_style="desk"
         changed=true
@@ -3235,15 +3110,6 @@ function Plugin:_home_preferences()
                 or path=="/storage/emulated/0" or path=="/sdcard"
         end
         local entry=usable(home.local_entry_root)
-        if not entry and (tonumber(home.local_entry_version) or 0)<1 then
-            entry=usable(home.local_root)
-            if not entry then
-                for _,root in ipairs(type(home.local_roots)=="table" and home.local_roots or {}) do
-                    entry=usable(type(root)=="table" and root.path or root)
-                    if entry then break end
-                end
-            end
-        end
         if entry and automatic_boundary(entry) then entry=nil end
         home.local_entry_root=entry or ""
         home.local_entry_user_set=entry~=nil
@@ -3278,6 +3144,23 @@ function Plugin:_home_preferences()
     for _,section in ipairs(HOME_SECTION_ORDER) do
         if home.visible_sections[section]==nil then home.visible_sections[section]=true; changed=true end
     end
+    if home.status_card_enabled==nil then home.status_card_enabled=true; changed=true end
+    if type(home.status_items)~="table" then home.status_items={}; changed=true end
+    local status_defaults={wifi=true,battery=true,sync=true,bluetooth=false,downloads=false}
+    local status_order={"wifi","battery","sync","bluetooth","downloads"}
+    for _,key in ipairs(status_order) do
+        if home.status_items[key]==nil then home.status_items[key]=status_defaults[key]; changed=true end
+    end
+    if type(home.status_order)~="table" then home.status_order={}; changed=true end
+    local status_seen,status_normalized={},{}
+    for _,key in ipairs(home.status_order) do
+        if status_defaults[key]~=nil and not status_seen[key] then status_seen[key]=true; status_normalized[#status_normalized+1]=key end
+    end
+    for _,key in ipairs(status_order) do if not status_seen[key] then status_seen[key]=true; status_normalized[#status_normalized+1]=key end end
+    if table.concat(status_normalized,"|")~=table.concat(home.status_order,"|") then changed=true end
+    home.status_order=status_normalized
+    local stats_slots={none=true,weread_today=true,weread_week=true,weread_month=true,local_today=true,local_week=true,local_month=true}
+    if not stats_slots[tostring(home.stats_slot or "")] then home.stats_slot="weread_month"; changed=true end
     if type(home.source_order)~="table" then home.source_order={}; changed=true end
     local source_seen,source_order={},{}
     for _,section in ipairs(home.source_order) do
@@ -3315,88 +3198,8 @@ function Plugin:_home_preferences()
         if table.concat(normalized,"|")~=table.concat(home[order_key],"|") then changed=true end
         home[order_key]=normalized
     end
-    -- Home action layout v3 permanently removes frontlight from the homepage
-    -- shortcut candidate set. It also repairs the beta.20 order where Sleep was
-    -- inserted before an old Frontlight entry and pushed MiuRead Settings out
-    -- of the six visible slots. User customizations are preserved otherwise.
-    if (tonumber(home.action_layout_version) or 0)<HOME_ACTION_LAYOUT_VERSION then
-        home.action_items=type(home.action_items)=="table" and home.action_items or {}
-        home.action_order=type(home.action_order)=="table" and home.action_order or U.copy(HOME_ACTION_ITEM_V1_ORDER)
-        local old_v1_recommended=quick_boolean_layout_matches(home.action_items,HOME_ACTION_ITEM_V1_DEFAULT,HOME_ACTION_ITEM_V1_ORDER)
-            and quick_order_matches(home.action_order,HOME_ACTION_ITEM_V1_ORDER)
-        local old_v2_recommended=quick_boolean_layout_matches(home.action_items,HOME_ACTION_ITEM_V2_DEFAULT,HOME_ACTION_ITEM_V2_ORDER)
-            and quick_order_matches(home.action_order,HOME_ACTION_ITEM_V2_ORDER)
-        local had_frontlight=home.action_items.frontlight==true
-        if home.action_items.sleep==nil then
-            home.action_items.sleep=(had_frontlight and Device:canSuspend()==true) or false
-        end
-        if old_v1_recommended or old_v2_recommended then
-            home.action_items.sleep=Device:canSuspend()==true
-            home.action_items.miuread_settings=true
-        end
-        home.action_items.frontlight=nil
-
-        local seen,cleaned={},{}
-        for _,name in ipairs(home.action_order) do
-            if name~="frontlight" and HOME_ACTION_ITEM_DEFAULT[name]~=nil and not seen[name] then
-                seen[name]=true
-                cleaned[#cleaned+1]=name
-            end
-        end
-        local function insert_after(after_key,key)
-            if seen[key] then return end
-            local out,inserted={},false
-            for _,name in ipairs(cleaned) do
-                out[#out+1]=name
-                if name==after_key then out[#out+1]=key; inserted=true end
-            end
-            if not inserted then out[#out+1]=key end
-            cleaned=out; seen[key]=true
-        end
-        insert_after("sync","sleep")
-        insert_after("sleep","miuread_settings")
-        for _,key in ipairs(HOME_ACTION_ITEM_ORDER) do
-            if not seen[key] then seen[key]=true; cleaned[#cleaned+1]=key end
-        end
-        home.action_order=cleaned
-        home.action_layout_version=HOME_ACTION_LAYOUT_VERSION
-        changed=true
-    end
     normalize_quick_group("action_items","action_order","action_layout_version",HOME_ACTION_LAYOUT_VERSION,HOME_ACTION_ITEM_ORDER,HOME_ACTION_ITEM_DEFAULT)
-    -- Never reintroduce the retired homepage-frontlight key from merged legacy
-    -- preferences. Direct frontlight control is rendered by HomeQuickPanel.
     if home.action_items.frontlight~=nil then home.action_items.frontlight=nil; changed=true end
-    -- Pull-down layout v3 expands the control strip from six to eight slots.
-    -- Old recommended layouts move to the new recommendation. Customized
-    -- layouts keep their choices and receive Bluetooth as an opt-in candidate.
-    if (tonumber(home.panel_layout_version) or 0)<HOME_PANEL_LAYOUT_VERSION then
-        home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
-        home.panel_order=type(home.panel_order)=="table" and home.panel_order or U.copy(HOME_PANEL_ITEM_V1_ORDER)
-        local old_v1_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V1_DEFAULT,HOME_PANEL_ITEM_V1_ORDER)
-            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V1_ORDER)
-        local old_v2_recommended=quick_boolean_layout_matches(home.panel_items,HOME_PANEL_ITEM_V2_DEFAULT,HOME_PANEL_ITEM_V2_ORDER)
-            and quick_order_matches(home.panel_order,HOME_PANEL_ITEM_V2_ORDER)
-        if old_v1_recommended or old_v2_recommended then
-            home.panel_items={}
-            for _,key in ipairs(HOME_PANEL_ITEM_ORDER) do home.panel_items[key]=HOME_PANEL_ITEM_DEFAULT[key]==true end
-            home.panel_order=U.copy(HOME_PANEL_ITEM_ORDER)
-        else
-            home.panel_items.frontlight=nil
-            if home.panel_items.bluetooth==nil then home.panel_items.bluetooth=false end
-            local seen,kept={},{}
-            for _,name in ipairs(home.panel_order) do
-                if name~="frontlight" and HOME_PANEL_ITEM_DEFAULT[name]~=nil and not seen[name] then
-                    seen[name]=true; kept[#kept+1]=name
-                end
-            end
-            for _,name in ipairs(HOME_PANEL_ITEM_ORDER) do
-                if not seen[name] then seen[name]=true; kept[#kept+1]=name end
-            end
-            home.panel_order=kept
-        end
-        home.panel_layout_version=HOME_PANEL_LAYOUT_VERSION
-        changed=true
-    end
     normalize_quick_group("panel_items","panel_order","panel_layout_version",HOME_PANEL_LAYOUT_VERSION,HOME_PANEL_ITEM_ORDER,HOME_PANEL_ITEM_DEFAULT)
     -- Unsupported hardware controls disappear instead of leaving dead slots.
     if not Device:canSuspend() then
@@ -3423,8 +3226,7 @@ function Plugin:_home_preferences()
         home.lockscreen_last_native_style=(home.lockscreen_style=="fit" or home.lockscreen_style=="fill") and home.lockscreen_style or "frame"
         changed=true
     end
-    -- Legacy scan roots are intentionally left byte-for-byte compatible for
-    -- rollback. Only normalize the new browser entry used by beta.13.
+    -- Only the current local-library browser entry is persisted.
     local normalized_entry=LocalLibrary.normalize(home.local_entry_root or "")
     if normalized_entry~=tostring(home.local_entry_root or "") then
         home.local_entry_root=normalized_entry
@@ -4086,6 +3888,7 @@ function Plugin:_home_refresh_header_now(force_device,force_sync)
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label(force_sync==true),
         battery_text=self:_home_battery_text(),
+        download_text=self:_home_download_status_text(),
     }
 end
 
@@ -4098,7 +3901,7 @@ function Plugin:_home_schedule_clock()
     end
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
     HomeData.quick_power_state(true)
-    HomeView.update_header{battery_text=self:_home_battery_text()}
+    HomeView.update_header{battery_text=self:_home_battery_text(),sync_text=self:_home_sync_status_label(),download_text=self:_home_download_status_text()}
     HomeView.update_dashboard{
         clock_text=self:_display_time("%H:%M"),
         date_text=self:_home_date_text(),
@@ -4116,7 +3919,7 @@ function Plugin:_home_schedule_clock()
             -- changed, so a stable battery percentage costs no extra e-ink
             -- refresh and never reloads the shelf.
             HomeData.quick_power_state(true)
-            HomeView.update_header{battery_text=self:_home_battery_text()}
+            HomeView.update_header{battery_text=self:_home_battery_text(),sync_text=self:_home_sync_status_label(),download_text=self:_home_download_status_text()}
             HomeView.update_dashboard{
                 clock_text=self:_display_time("%H:%M"),
                 date_text=self:_home_date_text(),
@@ -5272,59 +5075,6 @@ function Plugin:_home_cover_input_stamp(inputs)
     return table.concat(parts,"+")
 end
 
-function Plugin:_home_legacy_rendered_cover(render_dir,book_id)
-    render_dir=tostring(render_dir or "")
-    book_id=tostring(book_id or "")
-    if render_dir=="" or book_id=="" then return nil end
-    local cache=self._home_legacy_cover_index
-    if type(cache)~="table" or cache.dir~=render_dir then
-        cache={dir=render_dir,by_id={}}
-        if lfs.attributes(render_dir,"mode")=="directory" then
-            for name in lfs.dir(render_dir) do
-                if name~="." and name~=".." then
-                    local key=name:match("^(.-)%-home2%-%d+x%d+%.png$")
-                    if key then
-                        local path=render_dir.."/"..name
-                        local entry=cache.by_id[key]
-                        if type(entry)~="table" then entry={best=nil,best_mtime=-1,paths={}}; cache.by_id[key]=entry end
-                        entry.paths[#entry.paths+1]=path
-                        local mt=tonumber(lfs.attributes(path,"modification") or 0) or 0
-                        if not entry.best or mt>=tonumber(entry.best_mtime or -1) then
-                            entry.best=path
-                            entry.best_mtime=mt
-                        end
-                    end
-                end
-            end
-        end
-        self._home_legacy_cover_index=cache
-    end
-    local entry=cache.by_id and cache.by_id[U.id_name(book_id)] or nil
-    local path=type(entry)=="table" and entry.best or entry
-    if path and lfs.attributes(path,"mode")=="file" and (tonumber(U.file_size(path) or 0) or 0)>0 then
-        return path
-    end
-    return nil
-end
-
-function Plugin:_home_remove_legacy_rendered_cover(book_id,path)
-    path=tostring(path or "")
-    if path=="" or not path:find("%-home2%-") then return false end
-    local key=U.id_name(tostring(book_id or ""))
-    local cache=self._home_legacy_cover_index
-    local entry=type(cache)=="table" and type(cache.by_id)=="table" and cache.by_id[key] or nil
-    local paths=type(entry)=="table" and entry.paths or {path}
-    local removed=false
-    for _,old_path in ipairs(paths or {}) do
-        old_path=tostring(old_path or "")
-        if old_path:find("%-home2%-") and lfs.attributes(old_path,"mode")=="file" then
-            removed=os.remove(old_path)==true or removed
-        end
-    end
-    if type(cache)=="table" and type(cache.by_id)=="table" then cache.by_id[key]=nil end
-    return removed
-end
-
 function Plugin:_home_schedule_cover_derivatives(books)
     local page_generation=tonumber(self._home_visible_page_generation) or 0
     if self._download_runtime~=nil then return false end
@@ -5375,7 +5125,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
                     if file~="" and U.file_exists(file) and not source_seen[file] then inputs[#inputs+1]=file end
                     local home_target=render_dir.."/"..U.id_name(id).."-home3-"..tostring(thumb_w).."x"..tostring(thumb_h)..".png"
                     local home_fresh=self:_home_cover_target_fresh(home_target,inputs)
-                    local legacy_path=not home_fresh and self:_home_legacy_rendered_cover(render_dir,id) or nil
                     items[#items+1]={
                         id=id,
                         sources=sources,
@@ -5384,7 +5133,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
                         file=file,
                         source_dir=source_dir,
                         home_target=home_target,
-                        legacy_path=legacy_path,
                         home_w=thumb_w,home_h=thumb_h,
                         home_fresh=home_fresh,
                     }
@@ -5405,14 +5153,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
         if item.home_fresh then
             fresh_count=fresh_count+1
             local changed,is_hero,sections=self:_home_apply_rendered_cover_path(item.id,item.home_target)
-            fast_changed=fast_changed or changed
-            fast_hero_changed=fast_hero_changed or is_hero
-            if changed then fast_ids[item.id]=true end
-            for section in pairs(sections or {}) do fast_sections[section]=true end
-        elseif item.legacy_path then
-            -- Keep beta.21's sharper home2 thumbnail visible while home3 is
-            -- generated lazily. Never blank the shelf just to migrate caches.
-            local changed,is_hero,sections=self:_home_apply_rendered_cover_path(item.id,item.legacy_path)
             fast_changed=fast_changed or changed
             fast_hero_changed=fast_hero_changed or is_hero
             if changed then fast_ids[item.id]=true end
@@ -5503,7 +5243,7 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 if not CoverRender.is_fresh(home_path,source) then
                     home_path=CoverRender.render_home(source,item.home_target,item.home_w,item.home_h)
                 end
-                out[#out+1]={id=item.id,home_path=home_path,source=source,legacy_path=item.legacy_path}
+                out[#out+1]={id=item.id,home_path=home_path,source=source}
             end
         end
         return out
@@ -5559,12 +5299,6 @@ function Plugin:_home_schedule_cover_derivatives(books)
                 hero_changed=hero_changed or is_hero
                 if changed then changed_ids[entry.id]=true end
                 for section in pairs(sections or {}) do changed_sections[section]=true end
-                if entry.legacy_path and entry.legacy_path~=entry.home_path
-                    and self:_home_remove_legacy_rendered_cover(entry.id,entry.legacy_path) then
-                    logger.info("[MiuRead][DesktopPerf] cover migrated",
-                        "book=",tostring(entry.id),"from=home2","to=home3",
-                        "w=",tostring(thumb_w),"h=",tostring(thumb_h))
-                end
             end
         end
         if any_changed and HomeView.is_shown() and not self:_active_reader_ui() then
@@ -5923,13 +5657,13 @@ function Plugin:home_source_settings_menu()
 end
 
 local HOME_ACTION_LABELS={
-    refresh="更新",search="搜索",downloads="下载",sync="同步",sleep="休眠",
-    miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
+    refresh="刷新",search="搜索",downloads="下载",sleep="休眠",sync="同步",extensions="扩展",
+    miuread_settings="设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
     wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
-    return_koreader="返回 KOReader",quit="退出 KO",frontlight="前光",sync="同步",
-    miuread_settings="觅阅设置",downloads="下载",restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
+    return_koreader="返回 KOReader",quit="退出 KO",frontlight="前光",
+    restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
 }
 
 function Plugin:_home_toggle_group_item(group,key)
@@ -6086,12 +5820,108 @@ function Plugin:show_home_customization(anchor)
     return self:_show_standalone_menu("主页自定义",self:home_customization_menu(),{anchor=anchor})
 end
 
-local READER_QUICK_LABELS={
-    toc="目录",progress="阅读进度",font="字体排版",frontlight="前光",sync="阅读同步",
-    comment_font="评论显示",page_display="页面显示",home="觅阅书架",typeset="高级排版",
-    current_book="当前书籍",downloads="下载管理",full_refresh="全屏刷新",
-    koreader_menu="KOReader 高级菜单",sleep="休眠",
-}
+local HOME_STATUS_LABELS={time="时间",date="日期",wifi="Wi-Fi",battery="电量",sync="同步",bluetooth="蓝牙",downloads="下载"}
+local HOME_STATUS_ORDER={"time","date","wifi","battery","sync","bluetooth","downloads"}
+
+function Plugin:_home_status_available(key)
+    if key=="bluetooth" then return self:_bluetooth_supported()==true end
+    return HOME_STATUS_LABELS[key]~=nil
+end
+
+function Plugin:_home_status_label(home)
+    home=type(home)=="table" and home or self:_home_preferences()
+    if home.status_card_enabled==false then return "已隐藏" end
+    local labels={}
+    for _,key in ipairs(home.status_order or HOME_STATUS_ORDER) do
+        if home.status_items and home.status_items[key]==true and self:_home_status_available(key) then
+            labels[#labels+1]=HOME_STATUS_LABELS[key]
+        end
+    end
+    return #labels>0 and table.concat(labels," · ") or "已隐藏"
+end
+
+function Plugin:_set_home_status_card_enabled(enabled)
+    local home,preferences=self:_home_preferences()
+    home.status_card_enabled=enabled==true
+    self:_save_home_preferences(home,preferences)
+    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+end
+
+function Plugin:_toggle_home_status_item(key)
+    if not HOME_STATUS_LABELS[key] or not self:_home_status_available(key) then return false end
+    local home,preferences=self:_home_preferences()
+    home.status_items=type(home.status_items)=="table" and home.status_items or {}
+    home.status_items[key]=home.status_items[key]~=true
+    self:_save_home_preferences(home,preferences)
+    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+    return true
+end
+
+function Plugin:_move_home_status_item(key,delta)
+    local home,preferences=self:_home_preferences()
+    local order=U.copy(home.status_order or HOME_STATUS_ORDER)
+    local index
+    for i,name in ipairs(order) do if name==key then index=i; break end end
+    if not index then return false end
+    local target=index+(tonumber(delta) or 0)
+    if target<1 or target>#order then return false end
+    order[index],order[target]=order[target],order[index]
+    home.status_order=order
+    self:_save_home_preferences(home,preferences)
+    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+    return true
+end
+
+function Plugin:home_status_order_menu()
+    local home=self:_home_preferences()
+    local rows={}
+    for index,key in ipairs(home.status_order or HOME_STATUS_ORDER) do
+        local item_key,item_index=key,index
+        if self:_home_status_available(item_key) then
+            rows[#rows+1]={text=HOME_STATUS_LABELS[item_key] or item_key,post_text=tostring(item_index),sub_item_table_func=function()
+                local current=self:_home_preferences().status_order or HOME_STATUS_ORDER
+                local current_index
+                for i,name in ipairs(current) do if name==item_key then current_index=i; break end end
+                current_index=current_index or item_index
+                return {
+                    {text="上移",enabled_func=function() return current_index>1 end,callback=function() self:_move_home_status_item(item_key,-1) end},
+                    {text="下移",enabled_func=function() return current_index<#current end,callback=function() self:_move_home_status_item(item_key,1) end},
+                }
+            end}
+        end
+    end
+    return rows
+end
+
+function Plugin:home_status_card_settings_menu()
+    local home=self:_home_preferences()
+    local rows={
+        {text="显示状态信息带",post_text="最近阅读卡片底部显示",checked_func=function() return self:_home_preferences().status_card_enabled~=false end,
+            keep_menu_open=true,callback=function() self:_set_home_status_card_enabled(self:_home_preferences().status_card_enabled==false) end},
+    }
+    for _,key in ipairs(home.status_order or HOME_STATUS_ORDER) do
+        local item_key=key
+        if self:_home_status_available(item_key) then
+            rows[#rows+1]={text=HOME_STATUS_LABELS[item_key],checked_func=function()
+                local current=self:_home_preferences(); return current.status_card_enabled~=false and current.status_items[item_key]==true
+            end,enabled_func=function() return self:_home_preferences().status_card_enabled~=false end,
+            keep_menu_open=true,callback=function() self:_toggle_home_status_item(item_key) end}
+        end
+    end
+    rows[#rows+1]={text="调整显示顺序",enabled_func=function() return self:_home_preferences().status_card_enabled~=false end,
+        sub_item_table_func=function() return self:home_status_order_menu() end}
+    rows[#rows+1]={text="恢复推荐状态",post_text="时间 · 日期 · Wi-Fi · 电量 · 同步",callback=function()
+        local current,preferences=self:_home_preferences()
+        current.status_card_enabled=true
+        current.status_items={time=true,date=true,wifi=true,battery=true,sync=true,bluetooth=false,downloads=false}
+        current.status_order=U.copy(HOME_STATUS_ORDER)
+        self:_save_home_preferences(current,preferences)
+        if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+        self:toast("主页状态信息已恢复推荐设置",2)
+    end}
+    return rows
+end
+
 
 function Plugin:_reader_preferences()
     local preferences=self.store:preferences()
@@ -6109,12 +5939,7 @@ function Plugin:_reader_preferences()
     if type(reader.recent_actions)~="table" or #reader.recent_actions>0 then reader.recent_actions={}; changed=true end
     if reader.edge_guard_enabled==nil then reader.edge_guard_enabled=true; changed=true end
     local edge_percent=tonumber(reader.edge_guard_percent)
-    -- beta.13 removes the legacy 5% guard and extends the usable range to 30%.
-    -- Preserve every valid existing choice; only migrate the retired 5% value.
-    if edge_percent==5 then
-        reader.edge_guard_percent=10
-        changed=true
-    elseif edge_percent~=10 and edge_percent~=15 and edge_percent~=20
+    if edge_percent~=10 and edge_percent~=15 and edge_percent~=20
         and edge_percent~=25 and edge_percent~=30 then
         reader.edge_guard_percent=15
         changed=true
@@ -6238,29 +6063,6 @@ function Plugin:_set_notice_enabled(key,enabled)
     self.store:save_preferences(p)
 end
 
-local NOTICE_LABELS={
-    reader_download="阅读时下载提醒",low_battery="低电量下载提醒",low_storage="存储空间提醒",
-    full_refresh="全屏刷新说明",library_scan="批量书籍检查提醒",
-    repair_while_reading="阅读中修复提醒",mode_switch="运行模式切换说明",mode_environment="进入模式说明",
-}
-
-function Plugin:notice_settings_menu()
-    local order={"reader_download","low_battery","low_storage","full_refresh","library_scan","repair_while_reading","mode_switch","mode_environment"}
-    local rows={}
-    for _,key in ipairs(order) do
-        local notice_key=key
-        rows[#rows+1]={text=NOTICE_LABELS[notice_key] or notice_key,checked_func=function() return self:_notice_enabled(notice_key) end,keep_menu_open=true,callback=function()
-            self:_set_notice_enabled(notice_key,not self:_notice_enabled(notice_key))
-        end}
-    end
-    rows[#rows+1]={text="恢复全部使用提醒",callback=function()
-        for _,key in ipairs(order) do self:_set_notice_enabled(key,true) end
-        self:toast("使用提醒已恢复")
-    end}
-    rows[#rows+1]={text="数据删除与覆盖确认",post_text="始终保留",enabled=false}
-    return rows
-end
-
 function Plugin:download_reader_policy_menu()
     local choices={{"ask","每次询问（推荐）"},{"allow","允许阅读时后台下载"},{"after_reading","退出阅读后再下载"}}
     local rows={}
@@ -6349,17 +6151,6 @@ function Plugin:_show_download_ipv4_suggestion(runtime,state)
         },
     }
     UIManager:show(dialog)
-end
-
-function Plugin:show_home_layout_dialog()
-    local home=self:_home_preferences()
-    local function choose(style)
-        self:_set_home_layout(style)
-    end
-    return self:_show_standalone_menu("页面布局",{
-        {text="标准布局",radio=true,checked_func=function() return home.layout_style~="compact" end,callback=function() choose("desk") end},
-        {text="紧凑布局",radio=true,checked_func=function() return home.layout_style=="compact" end,callback=function() choose("compact") end},
-    })
 end
 
 function Plugin:_home_close_to_native_now(show_notice,after_open)
@@ -7180,6 +6971,16 @@ function Plugin:_home_battery_text()
         return tostring(math.floor(tonumber(device.battery)+.5)).."%"
     end
     return "--%"
+end
+
+function Plugin:_home_download_status_text()
+    local state=self:_download_state()
+    local status=tostring(state.status or "")
+    if status=="failed" then return "失败" end
+    if status=="active" then return tostring(self:_download_percent(state)).."%" end
+    local queue=self.store:download_queue()
+    if #queue>0 then return "排队 "..tostring(#queue) end
+    return "无任务"
 end
 
 function Plugin:_schedule_home_startup(delay)
@@ -9195,74 +8996,8 @@ end
 
 
 
-function Plugin:_show_home_download_popup(anchor)
-    ActionSheet.show{
-        cache_key="home_download",
-        anchor=anchor,
-        preferred_direction="below",
-        title="下载",
-        subtitle=self:_download_menu_text(),
-        actions={
-            {icon="⇩",label="下载任务",detail="查看进度 排队和失败重试",callback=function() self:show_downloads() end},
-            {icon="⚙",label="下载设置",detail="下载策略 目录与提醒",callback=function()
-                self:_show_standalone_menu("下载设置",self:download_settings_menu())
-            end},
-        },
-        footer_action={label="存储清理",callback=function() self:show_download_cleanup_dialog() end},
-    }
-end
-
-function Plugin:_show_home_sync_popup(anchor)
-    local summary=self:_home_sync_summary()
-    local subtitle=self:_home_sync_status_label()
-    if summary.total>0 then
-        subtitle=subtitle.."  ·  进度 "..tostring(summary.progress)
-            .."  时间 "..tostring(summary.time)
-            .."  划线 "..tostring(summary.highlight)
-            .."  想法 "..tostring(summary.thought)
-    end
-    local actions={}
-    if (tonumber(summary.annotation_action_required or 0) or 0)>0 then
-        actions[#actions+1]={icon="warning",label="批注待确认",
-            detail=tostring(summary.annotation_action_required).." 条 · 查看具体书籍和原因",
-            callback=function() self:show_annotation_sync_issues() end}
-    end
-    actions[#actions+1]={icon="⇅",label="同步未完成内容",detail="进度与批注",callback=function() self:_sync_home_pending() end}
-    actions[#actions+1]={icon="i",label="查看同步详情",detail="阅读时间、进度和批注状态",callback=function() self:show_sync_status(false) end}
-    actions[#actions+1]={icon="⚙",label="自动同步设置",detail="时间 进度 批注",callback=function()
-        self:_show_standalone_menu("自动同步设置",self:sync_settings_menu())
-    end}
-    ActionSheet.show{
-        cache_key="home_sync",
-        anchor=anchor,
-        preferred_direction="below",
-        title="同步",
-        subtitle=subtitle,
-        actions=actions,
-        wide_last=true,
-    }
-end
-
-function Plugin:_show_home_search_popup(anchor)
-    ActionSheet.show{
-        cache_key="home_search",
-        anchor=anchor,
-        preferred_direction="below",
-        width_ratio=.62,
-        title="搜索",
-        subtitle="微信书库、我的书籍与批注分开搜索",
-        actions={
-            {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
-            {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
-            {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
-            {icon="bookmark",label="评论收藏",detail="离线查看已收藏的微信读书评论",callback=function() self:show_thought_favorites() end},
-        },
-    }
-end
-
-
 function Plugin:_show_home_settings_center()
-    return self:_show_standalone_menu("觅阅设置",{
+    return self:_show_standalone_menu("设置",{
         {text="首页与书架",post_text="布局 书架与快捷入口",sub_item_table_func=function() return self:display_settings_menu() end},
         {text="阅读界面",post_text="显示与快捷控制",sub_item_table_func=function() return self:reader_quick_panel_settings_menu() end},
         {text="评论、划线与想法",post_text="评论收藏、显示与本地批注",sub_item_table_func=function() return PluginSettings.comments(self) end},
@@ -9272,39 +9007,6 @@ function Plugin:_show_home_settings_center()
         {text="工具与维护",post_text="修复 清理与诊断",sub_item_table_func=function() return self:maintenance_menu() end},
     },{page_size=6})
 end
-
-function Plugin:_show_home_settings_popup(anchor)
-    local actions={
-        {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function()
-            self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor})
-        end},
-        {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function()
-            self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor})
-        end},
-        {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function()
-            self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor})
-        end},
-        {icon="◷",label="时间与时区",detail="时间来源与地区显示",callback=function()
-            self:_show_standalone_menu("时间与时区",self:time_display_settings_menu(),{anchor=anchor})
-        end},
-        {icon="＋",label="扩展",detail="觅阅扩展中心",callback=function()
-            self:_show_standalone_menu("觅阅扩展中心",PluginSettings.extensions(self),{anchor=anchor})
-        end},
-        {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function()
-            self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor})
-        end},
-        {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function()
-            self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor})
-        end},
-    }
-    return ActionSheet.show{
-        cache_key="home_settings",
-        anchor=anchor,preferred_direction="below",width_ratio=.78,columns=2,
-        title="觅阅设置",subtitle="常用设置与维护",actions=actions,
-    }
-end
-
-
 
 function Plugin:_show_home_file_manager_popup(anchor)
     ActionSheet.show{
@@ -9319,43 +9021,6 @@ function Plugin:_show_home_file_manager_popup(anchor)
 end
 
 
-function Plugin:_home_visible_action_neighbor(key,direction)
-    local home=self:_home_preferences()
-    local order=home.action_order or HOME_ACTION_ITEM_ORDER
-    local items=home.action_items or {}
-    local index
-    for i,name in ipairs(order) do if name==key then index=i; break end end
-    if not index then return nil end
-    local step=direction<0 and -1 or 1
-    local i=index+step
-    while i>=1 and i<=#order do
-        if items[order[i]]==true then return order[i] end
-        i=i+step
-    end
-    return nil
-end
-
-function Plugin:_home_move_visible_action(key,direction)
-    local home,preferences=self:_home_preferences()
-    local order=home.action_order or U.copy(HOME_ACTION_ITEM_ORDER)
-    local items=home.action_items or {}
-    local index,target
-    for i,name in ipairs(order) do if name==key then index=i; break end end
-    if not index then return false end
-    local step=direction<0 and -1 or 1
-    local i=index+step
-    while i>=1 and i<=#order do
-        if items[order[i]]==true then target=i; break end
-        i=i+step
-    end
-    if not target then return false end
-    order[index],order[target]=order[target],order[index]
-    home.action_order=order
-    self:_save_home_preferences(home,preferences)
-    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
-    return true
-end
-
 function Plugin:_show_home_quick_notice(anchor,title,subtitle,delay)
     return ActionSheet.show{
         anchor=anchor,preferred_direction="below",width_ratio=.48,
@@ -9363,100 +9028,34 @@ function Plugin:_show_home_quick_notice(anchor,title,subtitle,delay)
     }
 end
 
-function Plugin:_home_replace_action_item(from_key,to_key)
-    if from_key==to_key then return true end
-    local home,preferences=self:_home_preferences()
-    local items=home.action_items or {}
-    if items[to_key]==true then return false end
-    local order=home.action_order or U.copy(HOME_ACTION_ITEM_ORDER)
-    local from_i,to_i
-    for i,name in ipairs(order) do
-        if name==from_key then from_i=i end
-        if name==to_key then to_i=i end
-    end
-    if not from_i or not to_i then return false end
-    order[from_i],order[to_i]=order[to_i],order[from_i]
-    items[from_key]=false; items[to_key]=true
-    home.action_items=items; home.action_order=order
-    self:_save_home_preferences(home,preferences)
-    if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
-    return true
-end
-
-function Plugin:_show_home_action_replace_popup(key,anchor)
-    local home=self:_home_preferences()
-    local actions={}
-    for _,candidate in ipairs(home.action_order or HOME_ACTION_ITEM_ORDER) do
-        if candidate~=key and home.action_items[candidate]~=true then
-            if candidate~="sleep" or Device:canSuspend() then
-                local target=candidate
-                actions[#actions+1]={icon="↔",label=HOME_ACTION_LABELS[target] or target,detail="替换当前快捷项",callback=function()
-                    self:_home_replace_action_item(key,target)
-                end}
-            end
-        end
-    end
-    return ActionSheet.show{
-        anchor=anchor,preferred_direction="below",width_ratio=.70,title="更换快捷项",subtitle="替换后保持当前位置",
-        actions=actions,
-    }
-end
-
 function Plugin:_home_action_function_actions(key,anchor)
     if key=="refresh" then return {
-        {icon="↻",label="更新当前栏目",detail="只检查当前看到的内容",callback=function() self:_home_manual_refresh() end},
-        {icon="i",label="更新当前书籍",detail="后台更新最近阅读书籍的资料与封面",callback=function()
-            local hero=self._home_hero
-            if not hero then self:toast("当前没有可更新的书籍",2); return end
-            if hero.source=="local" or hero.local_file==true then
-                self:_home_refresh_one_book_metadata(hero,true)
-            else
-                self:_home_refresh_current_network_metadata(hero)
-            end
-        end},
-        {icon="☁",label="更新微信书架",detail="重新获取微信书架变化",callback=function() self:_home_refresh_remote(true,true) end},
-        {icon="⌕",label="刷新最近阅读",detail="重新读取 KOReader 最近阅读",callback=function() self:_home_refresh_recent_history(true) end},
-        {icon="▣",label="刷新整个主页",detail="核对已有状态并整页更新一次",callback=function() self:_home_refresh_whole_page() end},
+        {icon="↻",label="刷新当前栏目",detail="刷新当前正在查看的内容",callback=function() self:_home_manual_refresh() end},
+        {icon="▣",label="刷新整个主页",detail="重新读取主页当前状态",callback=function() self:_home_refresh_whole_page() end},
     } end
     if key=="search" then return {
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
-        {icon="▦",label="搜索微信书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
+        {icon="▦",label="搜索我的书架",detail="只搜索已加入微信读书书架的书",callback=function() self:show_home_search_dialog("weread_shelf") end},
         {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
-        {icon="bookmark",label="评论收藏",detail="离线查看已收藏评论",callback=function() self:show_thought_favorites() end},
-        {icon="◷",label="阅读历史",detail="查看最近阅读记录",callback=function() self:show_home_reading_history() end},
-        {icon="▤",label="本地书库",detail="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
-        {icon="◎",label="公众号",detail="切换到公众号书架",callback=function() self:_set_home_section("mp") end},
     } end
     if key=="downloads" then return {
-        {icon="⇩",label="下载任务",detail="进度 排队与失败重试",callback=function() self:show_downloads() end},
-        {icon="⚙",label="下载设置",detail="策略 目录与提醒",callback=function() self:_show_standalone_menu("下载设置",self:download_settings_menu(),{anchor=anchor}) end},
-        {icon="⌫",label="存储清理",detail="清理临时文件与失效缓存",callback=function() self:show_download_cleanup_dialog() end},
+        {icon="⇩",label="下载任务",detail="进度、排队与失败重试",callback=function() self:show_downloads() end},
+        {icon="⚙",label="下载设置",detail="下载策略与目录",callback=function() self:_show_standalone_menu("下载设置",self:download_settings_menu(),{anchor=anchor}) end},
+    } end
+    if key=="sleep" then return {
+        {icon="sleep",label="立即休眠",detail=self:_sleep_action_detail(),callback=function() self:_home_sleep() end},
+        {icon="restart",label="重启 KOReader",detail="保存当前状态后重新启动 KOReader",callback=function() self:_restart_koreader() end},
+        {icon="power-off",label="退出 KOReader",detail="返回设备原生界面",callback=function() self:_quit_koreader(false,anchor) end},
     } end
     if key=="sync" then return {
-        {icon="⇅",label="立即同步",detail="处理当前待同步内容",callback=function() self:_sync_home_pending() end},
-        {icon="i",label="同步详情",detail="查看各类数据状态",callback=function() self:show_sync_status(false) end},
-        {icon="✚",label="重新处理失败项目",detail="重新确认失败或未确认的本地记录",callback=function() self:_reprocess_home_sync_failures() end},
-        {icon="⚙",label="自动同步设置",detail="时间 进度 批注",callback=function() self:_show_standalone_menu("自动同步设置",self:sync_settings_menu(),{anchor=anchor}) end},
+        {icon="i",label="同步状态",detail="查看阅读时间、进度和批注",callback=function() self:show_sync_status(false) end},
+        {icon="⚙",label="同步设置",detail="阅读时间、进度与批注同步",callback=function() self:_show_standalone_menu("同步设置",self:sync_settings_menu(),{anchor=anchor}) end},
     } end
-    if key=="sleep" then
-        local rows={
-            {icon="◐",label="休眠",detail=self:_sleep_action_detail(),callback=function() self:_home_sleep() end},
-            {icon="←",label="返回 KOReader",detail="离开觅阅桌面",callback=function() self:_home_close_to_native(true) end},
-            {icon="↺",label="重启 KOReader",detail="保存状态后重新启动",callback=function() self:_show_home_power_confirm(anchor,"重启 KOReader？","阅读状态会先保存。","重启",function() self:_restart_koreader("home power bubble") end) end},
-            {icon="⏻",label="退出 KOReader",detail="返回 Kindle 原生环境",callback=function() self:_show_home_power_confirm(anchor,"退出 KOReader？","当前阅读和设置会先保存。","退出",function() self:_quit_koreader(true) end) end},
-        }
-        if type(Device.canReboot)=="function" and Device:canReboot() then rows[#rows+1]={icon="↻",label="重启设备",detail="重新启动 Kindle",callback=function() self:_home_reboot_device(anchor) end} end
-        if type(Device.canPowerOff)=="function" and Device:canPowerOff() then rows[#rows+1]={icon="■",label="关闭设备",detail="完全关闭 Kindle",danger=true,callback=function() self:_home_poweroff_device(anchor) end} end
-        return rows
-    end
+    if key=="extensions" then return {
+        {icon="plus",label="打开扩展中心",detail="发现、安装、更新与卸载插件",callback=function() self:_show_standalone_menu("觅阅扩展中心",PluginSettings.extensions(self),{anchor=anchor}) end},
+    } end
     if key=="miuread_settings" then return {
-        {icon="▦",label="首页与书架",detail="布局 书架与快捷入口",callback=function() self:_show_standalone_menu("首页与书架",self:display_settings_menu(),{anchor=anchor}) end},
-        {icon="Aa",label="阅读界面",detail="显示与快捷控制",callback=function() self:_show_standalone_menu("阅读界面",self:reader_quick_panel_settings_menu(),{anchor=anchor}) end},
-        {icon="pencil",icon_key="pencil",label="评论与批注",detail="评论 划线与想法",callback=function() self:_show_standalone_menu("评论、划线与想法",PluginSettings.comments(self),{anchor=anchor}) end},
-        {icon="⇅",label="同步",detail="进度 时间与批注同步",callback=function() self:_show_standalone_menu("同步",self:sync_settings_menu(),{anchor=anchor}) end},
-        {icon="＋",label="扩展",detail="觅阅扩展中心",callback=function() self:_show_standalone_menu("觅阅扩展中心",PluginSettings.extensions(self),{anchor=anchor}) end},
-        {icon="↺",label="更新与关于",detail="版本 更新通道与说明",callback=function() self:_show_standalone_menu("更新与关于",PluginSettings.update_about(self),{anchor=anchor}) end},
-        {icon="⚙",label="工具与维护",detail="修复 清理与诊断",callback=function() self:_show_standalone_menu("工具与维护",self:maintenance_menu(),{anchor=anchor}) end},
+        {icon="⚙",label="打开设置",detail="进入当前设置中心",callback=function() self:_show_home_settings_center() end},
     } end
     if key=="all_books" then return {
         {icon="▦",label="全部书籍",detail="打开完整书架",callback=function() self:show_home_all_books() end},
@@ -9476,21 +9075,12 @@ function Plugin:_home_action_function_actions(key,anchor)
     return {}
 end
 
-function Plugin:_show_home_action_manage_popup(key,label,anchor)
-    local can_left=self:_home_visible_action_neighbor(key,-1)~=nil
-    local can_right=self:_home_visible_action_neighbor(key,1)~=nil
+function Plugin:_show_home_action_function_popup(key,label,anchor)
     local actions=self:_home_action_function_actions(key,anchor)
-    local manage={
-        {label="← 左移",enabled=can_left,callback=function() self:_home_move_visible_action(key,-1) end},
-        {label="更换",callback=function() self:_show_home_action_replace_popup(key,anchor) end},
-        {label="隐藏",callback=function() self:_home_toggle_group_item("action",key) end},
-        {label="右移 →",enabled=can_right,callback=function() self:_home_move_visible_action(key,1) end},
-    }
+    if #actions==0 then return false end
     return ActionSheet.show{
-        cache_key="home_action_manage_"..tostring(key),
-        anchor=anchor,preferred_direction="below",width_ratio=.80,
-        title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),subtitle="选择功能 · 可在下方调整快捷项",
-        actions=actions,wide_last=(#actions%2==1),footer_actions=manage,
+        cache_key="home_action_functions_"..tostring(key),anchor=anchor,preferred_direction="below",width_ratio=.66,
+        title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),subtitle="更多操作",actions=actions,wide_last=(#actions%2==1),
     }
 end
 
@@ -9706,28 +9296,28 @@ function Plugin:_home_action_entries()
     elseif sync_summary.total>0 then sync_badge=sync_summary.total>99 and "99+" or tostring(sync_summary.total) end
 
     local definitions={
-        refresh={icon="↻",icon_key="refresh",label="更新",callback=function()
-            self:_home_manual_refresh()
-        end},
-        search={icon="⌕",icon_key="search",label="搜索",callback=function(anchor) self:_show_home_search_popup(anchor) end},
-        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function(anchor) self:_show_home_download_popup(anchor) end},
+        refresh={icon="↻",icon_key="refresh",label="刷新",callback=function() self:_home_manual_refresh() end},
+        search={icon="⌕",icon_key="search",label="搜索",callback=function() self:search_dialog("搜索微信读书") end},
+        downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function() self:show_downloads() end},
+        sleep={icon="◐",icon_key="sleep",label="休眠",callback=function() self:_home_sleep() end},
         sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
             self:_sync_home_pending(); self:_show_home_quick_notice(anchor,"正在同步","未完成内容已提交")
         end},
-        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function(anchor) self:_show_home_settings_popup(anchor) end},
+        extensions={icon="＋",icon_key="plus",label="扩展",callback=function(anchor)
+            self:_show_standalone_menu("觅阅扩展中心",PluginSettings.extensions(self),{anchor=anchor})
+        end},
+        miuread_settings={icon="⚙",icon_key="settings",label="设置",callback=function() self:_show_home_settings_center() end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
         history={icon="◷",label="阅读历史",callback=function() self:show_home_reading_history() end},
         file_manager={icon="▤",label="文件管理",callback=function(anchor) self:_show_home_file_manager_popup(anchor) end},
         screenshot={icon="▣",label="截图",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
     }
-    if Device:canSuspend() then definitions.sleep={icon="◐",icon_key="sleep",label="休眠",callback=function() self:_home_sleep() end} end
     for key,entry in pairs(definitions) do
-        local item_key=key; local item_label=entry.label
-        -- Home shortcuts no longer hide functionality behind a long press.
-        -- A normal tap opens the former full/management menu; the pull-down
-        -- quick panel keeps its own tap + hold behavior unchanged.
-        entry.callback=function(anchor) self:_show_home_action_manage_popup(item_key,item_label,anchor) end
-        entry.hold_callback=nil
+        local item_key,item_label=key,entry.label
+        local secondary=self:_home_action_function_actions(item_key,nil)
+        if #secondary>1 or item_key=="refresh" or item_key=="search" or item_key=="downloads" or item_key=="sleep" or item_key=="sync" then
+            entry.hold_callback=function(anchor) self:_show_home_action_function_popup(item_key,item_label,anchor) end
+        end
     end
     local entries,used={},{}
     for _,key in ipairs(home.action_order or HOME_ACTION_ITEM_ORDER) do
@@ -9738,7 +9328,6 @@ function Plugin:_home_action_entries()
     end
     return entries
 end
-
 
 
 function Plugin:_home_alerts()
@@ -11085,14 +10674,6 @@ function Plugin:_open_local_library_mode(mode)
     return self:show_local_browser(path,{path=path,name="本地书库"},{},false,nil,false,mode)
 end
 
-function Plugin:_open_local_library_folders()
-    return self:_open_local_library_mode("folders")
-end
-
-function Plugin:_open_local_library_all_books()
-    return self:_open_local_library_mode("books")
-end
-
 function Plugin:show_home_local_library(rows)
     return self:_open_local_library_mode(self:_home_local_shelf_mode())
 end
@@ -11118,56 +10699,60 @@ function Plugin:_home_bluetooth_text()
     return state.enabled==true and "已开启" or "已关闭"
 end
 
-function Plugin:_home_stats_visibility(home)
+local HOME_STATS_SLOT_LABELS={
+    none="不显示",weread_today="微信读书 · 今日",weread_week="微信读书 · 本周",weread_month="微信读书 · 本月",
+    local_today="本地阅读 · 今日",local_week="本地阅读 · 本周",local_month="本地阅读 · 本月",
+}
+local HOME_STATS_SLOT_ORDER={"weread_today","weread_week","weread_month","local_today","local_week","local_month","none"}
+
+function Plugin:_home_stats_slot(home)
     home=type(home)=="table" and home or self:_home_preferences()
-    return home.show_weread_stats~=false,home.show_local_stats~=false
+    local slot=tostring(home.stats_slot or "weread_month")
+    return HOME_STATS_SLOT_LABELS[slot] and slot or "weread_month"
+end
+
+function Plugin:_home_stats_visibility(home)
+    local slot=self:_home_stats_slot(home)
+    return slot:match("^weread_")~=nil,slot:match("^local_")~=nil
 end
 
 function Plugin:_home_stats_visibility_label(home)
-    local show_weread,show_local=self:_home_stats_visibility(home)
-    if show_weread and show_local then return "微信读书 + 本地阅读" end
-    if show_weread then return "仅微信读书" end
-    if show_local then return "仅本地阅读" end
-    return "已隐藏"
+    local slot=self:_home_stats_slot(home)
+    return HOME_STATS_SLOT_LABELS[slot] or "微信读书 · 本月"
 end
 
-function Plugin:_set_home_stats_visibility(kind,enabled)
-    if kind~="weread" and kind~="local" then return false end
+function Plugin:_set_home_stats_slot(slot)
+    slot=tostring(slot or "none")
+    if not HOME_STATS_SLOT_LABELS[slot] then return false end
     local home,preferences=self:_home_preferences()
-    local key=kind=="weread" and "show_weread_stats" or "show_local_stats"
-    enabled=enabled==true
-    if home[key]==enabled then return false end
-    home[key]=enabled
-    home.layout_version=24
+    if self:_home_stats_slot(home)==slot then return false end
+    home.stats_slot=slot
+    home.layout_version=26
     self:_home_unschedule_task("_home_stats_refresh_task")
     self:_home_unschedule_task("_home_stats_apply_task")
     local saved,err=self:_save_home_preferences(home,preferences)
     if saved~=true then
-        logger.warn("[MiuRead][HomeStats] visibility save failed",tostring(err or "unknown"))
+        logger.warn("[MiuRead][HomeStats] slot save failed",tostring(err or "unknown"))
         self:info("主页阅读统计设置没有保存成功，请稍后重试。")
         return false
     end
-    local label=kind=="weread" and "微信读书统计" or "本地阅读统计"
-    self:_refresh_home_view(label..(enabled and "已显示" or "已隐藏"),"content")
+    self:_refresh_home_view("主页阅读统计："..tostring(HOME_STATS_SLOT_LABELS[slot]),"content")
     return true
 end
 
 function Plugin:home_stats_settings_menu()
-    return {
-        {text="显示微信读书统计",post_text="隐藏后主页不再刷新微信读书统计",checked_func=function()
-            return self:_home_preferences().show_weread_stats~=false
-        end,keep_menu_open=true,callback=function()
-            local home=self:_home_preferences()
-            self:_set_home_stats_visibility("weread",home.show_weread_stats==false)
-        end},
-        {text="显示本地阅读统计",post_text="隐藏后主页不再读取本地阅读统计",checked_func=function()
-            return self:_home_preferences().show_local_stats~=false
-        end,keep_menu_open=true,callback=function()
-            local home=self:_home_preferences()
-            self:_set_home_stats_visibility("local",home.show_local_stats==false)
-        end},
-        {text="布局规则",post_text="只显示一个时自动扩展；全部隐藏时放大时间卡",enabled=false},
-    }
+    local rows={}
+    for _,slot in ipairs(HOME_STATS_SLOT_ORDER) do
+        local item=slot
+        rows[#rows+1]={
+            text=HOME_STATS_SLOT_LABELS[item],
+            checked_func=function() return self:_home_stats_slot()==item end,
+            keep_menu_open=true,
+            callback=function() self:_set_home_stats_slot(item) end,
+        }
+    end
+    rows[#rows+1]={text="说明",post_text="主页只显示一个统计摘要；点击摘要查看完整统计",enabled=false}
+    return rows
 end
 
 function Plugin:_home_weread_stats_account_key()
@@ -11232,6 +10817,56 @@ function Plugin:_home_local_stats_card(data)
     }
 end
 
+
+function Plugin:_home_stats_slot_data(home,weread_cache,local_data)
+    local slot=self:_home_stats_slot(home)
+    if slot=="none" then return nil end
+    local source,period=slot:match("^(weread)_(.+)$")
+    if not source then source,period=slot:match("^(local)_(.+)$") end
+    local title=HOME_STATS_SLOT_LABELS[slot] or "阅读统计"
+    if source=="weread" then
+        local cache=type(weread_cache)=="table" and weread_cache or self:_home_weread_stats_cache()
+        local weekly=type(cache.weekly)=="table" and cache.weekly or {}
+        local monthly=type(cache.monthly)=="table" and cache.monthly or {}
+        if period=="today" then
+            local seconds=tonumber(weekly.today_seconds)
+            return {kind="weread",period="today",title=title,available=seconds~=nil,total_seconds=seconds or 0,
+                today_seconds=seconds or 0,read_days=(seconds or 0)>0 and 1 or 0,daily=HomeData.week_rows(weekly.daily,os.time()),threshold=1,
+                message=self:logged_in() and "正在获取今日阅读数据…" or "登录后显示阅读数据"}
+        end
+        local data=period=="month" and monthly or weekly
+        if tonumber(data.total_seconds)==nil then
+            return {kind="weread",period=period,title=title,available=false,message=self:logged_in() and "正在获取阅读数据…" or "登录后显示阅读数据",daily={},threshold=1}
+        end
+        return {kind="weread",period=period,title=title,available=true,total_seconds=tonumber(data.total_seconds) or 0,
+            today_seconds=tonumber(data.today_seconds) or 0,average_seconds=tonumber(data.day_average_seconds) or 0,
+            read_days=tonumber(data.read_days) or 0,daily=type(data.daily)=="table" and data.daily or {},threshold=1}
+    end
+    local data=type(local_data)=="table" and local_data or nil
+    if not data then return {kind="local",period=period,title=title,available=false,message="暂无本地阅读数据",daily={},threshold=1} end
+    if period=="today" then
+        local seconds=tonumber(data.today_seconds) or 0
+        return {kind="local",period="today",title=title,available=true,total_seconds=seconds,today_seconds=seconds,
+            today_pages=tonumber(data.today_pages) or 0,read_days=seconds>0 and 1 or 0,daily=type(data.daily)=="table" and data.daily or {},threshold=1}
+    end
+    if period=="month" then
+        local periods=type(data.periods)=="table" and data.periods or {}
+        local monthly=type(periods.monthly)=="table" and periods.monthly or nil
+        if monthly then
+            return {kind="local",period="month",title=title,available=true,total_seconds=tonumber(monthly.total_seconds) or 0,
+                read_days=tonumber(monthly.read_days) or 0,average_seconds=tonumber(monthly.day_average_seconds) or 0,
+                today_seconds=tonumber(data.today_seconds) or 0,today_pages=tonumber(data.today_pages) or 0,
+                daily=type(monthly.daily)=="table" and monthly.daily or {},threshold=1}
+        end
+        return {kind="local",period="month",title=title,available=true,total_seconds=tonumber(data.month_seconds) or 0,
+            today_seconds=tonumber(data.today_seconds) or 0,today_pages=tonumber(data.today_pages) or 0,daily={},threshold=1}
+    end
+    return {kind="local",period="week",title=title,available=true,total_seconds=tonumber(data.week_seconds) or 0,
+        today_seconds=tonumber(data.today_seconds) or 0,today_pages=tonumber(data.today_pages) or 0,
+        average_seconds=tonumber(data.day_average_seconds) or 0,read_days=tonumber(data.read_days) or 0,
+        daily=HomeData.week_rows(data.daily,os.time()),threshold=1}
+end
+
 function Plugin:_schedule_home_stats_idle_refresh(delay)
     self:_home_unschedule_task("_home_stats_refresh_task")
     local task
@@ -11288,7 +10923,8 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
             local out={}
             if need_local then
                 local HomeDataChild=require("miuread.home_data")
-                out.local_stats=HomeDataChild.reading_stats(true,false)
+                local selected_slot=self:_home_stats_slot()
+                out.local_stats=HomeDataChild.reading_stats(true,selected_slot=="local_month")
             end
             if online and need_weekly then
                 out.weekly=HomeData.weread_summary(self.api:reading_stats("weekly",0,{no_auth_recovery=true}),os.time(),"weekly")
@@ -11337,7 +10973,11 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
                     self.store:set_deferred("home_weread_stats_cache",current)
                     if show_weread_now then update.weread_stats=self:_home_weread_stats_card(current) end
                 end
-                if next(update)~=nil then HomeView.update_dashboard(update) end
+                if next(update)~=nil then
+                    local current_home=self:_home_preferences()
+                    update.stats_slot_data=self:_home_stats_slot_data(current_home,self:_home_weread_stats_cache(),self._home_local_stats_cache)
+                    HomeView.update_dashboard(update)
+                end
                 logger.info("[MiuRead][HomeStats] idle refresh applied",
                     "local=",tostring(need_local),"weekly=",tostring(type(value.weekly)=="table"),
                     "monthly=",tostring(type(value.monthly)=="table"))
@@ -11469,7 +11109,7 @@ function Plugin:_show_home_local_stats()
         end,
     })
     if HomeView.is_shown() then
-        HomeView.update_dashboard{local_stats=self:_home_local_stats_card(data)}
+        HomeView.update_dashboard{local_stats=self:_home_local_stats_card(data),stats_slot_data=self:_home_stats_slot_data(self:_home_preferences(),self:_home_weread_stats_cache(),data)}
     end
     return dialog
 end
@@ -11564,7 +11204,7 @@ function Plugin:_schedule_home_weread_stats_refresh(force)
         self.store:set("home_weread_stats_cache",current)
         if HomeView.is_shown() and not self:_active_reader_ui()
             and HOME_SESSION.suspended~=true and self._miuread_suspended~=true then
-            HomeView.update_dashboard{weread_stats=self:_home_weread_stats_card(current)}
+            HomeView.update_dashboard{weread_stats=self:_home_weread_stats_card(current),stats_slot_data=self:_home_stats_slot_data(self:_home_preferences(),current,self._home_local_stats_cache)}
         end
         logger.info("[MiuRead][HomeStats] WeRead refreshed",
             "weekly=",tostring(type(result.value.weekly)=="table"),
@@ -12113,7 +11753,6 @@ function Plugin:maintenance_menu()
         {text="书籍修复",post_text="完整性与旧评论数据",sub_item_table_func=function()
             return {
                 {text="检查下载完整性",callback=function() self:scan_downloaded_books_for_integrity_repair() end},
-                {text="评论数据迁移",sub_item_table_func=function() return self:book_repair_settings_menu() end},
             }
         end},
         {text="存储清理",post_text="临时文件 缓存与旧记录",callback=function() self:show_download_cleanup_dialog() end},
@@ -12194,11 +11833,6 @@ function Plugin:show_home_quick_panel(more_expanded)
         koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
         return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
         quit={icon="⏻",icon_key="power",label="退出 KO",detail="",callback=function() self:_quit_koreader() end},
-        sync={icon="⇅",icon_key="sync",label="同步",detail=sync_label,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
-        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_home_settings_center() end},
-        downloads={icon="⇩",icon_key="download",label="下载",detail=download_detail,
-            callback=function(anchor) self:_show_home_download_popup(anchor) end,
-            hold_callback=function() self:show_downloads() end},
         restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader() end},
         full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
     }
@@ -12428,15 +12062,6 @@ function Plugin:show_home_menu()
     if not self:_home_enabled() then return self:_show_standalone_menu("插件设置",PluginSettings.menu(self)) end
     return self:_show_standalone_menu("觅阅菜单",self:settings_menu())
 end
-
-function Plugin:home_preview_menu()
-    return {
-        {text="打开觅阅菜单",callback=function() self:show_home_menu() end},
-        {text="切换到插件模式",callback=function() self:_set_home_mode(false) end},
-        {text="KOReader 文件管理器",callback=function() self:_home_close_to_native() end},
-    }
-end
-
 
 function Plugin:_mark_reader_busy(seconds,share_report)
     local path=tostring(self._reader_busy_path or "")
@@ -13208,12 +12833,8 @@ function Plugin:_set_thoughts_enabled(enabled)
     enabled=enabled~=false
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     local changed=(p.thoughts.enabled~=false)~=enabled
-    local legacy_marks=p.thoughts.show_marks~=nil
     p.thoughts.enabled=enabled
-    -- show_marks was a beta.6/beta.7 compatibility field. Keep it absent from
-    -- current preferences so "阅读评论" remains the only source of truth.
-    p.thoughts.show_marks=nil
-    if changed or legacy_marks then self:_save_ui_preferences(p,"thoughts_enabled") end
+    if changed then self:_save_ui_preferences(p,"thoughts_enabled") end
 
     -- WeRead marks and their comments are one presentation feature. Applying
     -- the stylesheet here makes the underline visibility follow this switch
@@ -13250,10 +12871,6 @@ end
 -- these compatibility helpers no longer own or persist a second preference.
 function Plugin:_marks_enabled()
     return self:_thoughts_enabled()
-end
-
-function Plugin:_marks_enabled_label()
-    return self:_thoughts_enabled_label()
 end
 
 function Plugin:_annotation_mark_hide_css()
@@ -13345,22 +12962,10 @@ function Plugin:_sync_reader_annotation_mark_style(reason)
     return self:_apply_annotation_mark_style(reason)
 end
 
-function Plugin:_set_marks_enabled(enabled)
-    -- Compatibility entry point for older callbacks. There is no independent
-    -- mark state from beta.8 onward.
-    return self:_set_thoughts_enabled(enabled)
-end
-
-function Plugin:_toggle_marks_enabled()
-    return self:_toggle_thoughts_enabled()
-end
-
 function Plugin:_thought_font_size_value(prefs)
     prefs=prefs or (self.store:preferences().thoughts or {})
-    local numeric=tonumber(prefs.font_size)
-    if numeric then return math.max(12,math.min(48,math.floor(numeric+.5))) end
-    local legacy={small=18,standard=22,large=26,xlarge=30}
-    return legacy[tostring(prefs.font or "standard")] or 22
+    local numeric=tonumber(prefs.font_size) or 22
+    return math.max(12,math.min(48,math.floor(numeric+.5)))
 end
 
 function Plugin:_thought_font_size_label()
@@ -13371,9 +12976,6 @@ function Plugin:_set_thought_font_size(value,quiet)
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
     local target=math.max(12,math.min(48,math.floor((tonumber(value) or self:_thought_font_size_value(p.thoughts))+.5)))
     p.thoughts.font_size=target
-    -- Keep the legacy field readable for one compatibility cycle, but the
-    -- continuous numeric value is authoritative from beta.8 onward.
-    p.thoughts.font=nil
     self:_save_ui_preferences(p,"thought_font_size")
     self:_refresh_thought_display(p.thoughts)
     if quiet~=true then self:toast("评论字号："..tostring(target),1.2) end
@@ -13440,7 +13042,7 @@ function Plugin:_show_reader_comment_settings(back_callback)
             return {
                 {label="恢复默认",callback=function()
                     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
-                    p.thoughts.font_size=22; p.thoughts.font=nil; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
+                    p.thoughts.font_size=22; p.thoughts.font_face=""; p.thoughts.follow_body_font=false
                     self:_save_ui_preferences(p,"thought_font_reset")
                     self:_refresh_thought_display(p.thoughts)
                     self:toast("评论显示已恢复默认",1.5)
@@ -14353,14 +13955,7 @@ function Plugin:_show_reader_annotation_panel(back_callback)
                 },
             }}
             if not weread then return sections end
-            sections[#sections+1]=self:annotation_sync_diagnostic_only() and {title="批注坐标诊断 · beta.11",rows={
-                {icon="warning",label="云端批注写入",value="已暂停 · 防止错误 range",value_bold=true,enabled=false},
-                {icon="diagnostics",label="生成本书坐标诊断",value="导出 raw / coord / range",value_bold=true,callback=function()
-                    self:sync_local_annotations_now()
-                end},
-                {label="诊断内容",value="含已同步与待同步本地批注",enabled=false},
-                {label="文件位置",value="books/<bookId>/annotation-coordinate-diagnostics",enabled=false},
-            }} or {title="微信读书同步",rows={
+            sections[#sections+1]={title="微信读书同步",rows={
                 {icon="upload",label="立即同步本书批注",value="上传 删除 云端对账",value_bold=true,callback=function()
                     self:sync_local_annotations_now()
                 end},
@@ -15588,10 +15183,6 @@ function Plugin:_reader_quick_definitions()
         end},
         sync={key="sync",icon="sync",label="同步",callback=function() self:_show_reader_sync_panel(function() self:show_reader_quick_panel() end) end},
     }
-end
-
-function Plugin:show_reader_more_panel()
-    return self:show_reader_control_center("reading")
 end
 
 function Plugin:_reader_quick_panel_options()
@@ -16892,13 +16483,19 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label(),
         battery_text=self:_home_battery_text(),
+        download_text=self:_home_download_status_text(),
         account_name=self:_home_account_name(),
         clock_text=self:_display_time("%H:%M"),
+        status_card_enabled=home.status_card_enabled~=false,
+        status_items=U.copy(home.status_items or {}),
+        status_order=U.copy(home.status_order or HOME_STATUS_ORDER),
         date_text=self:_home_date_text(),
         weread_stats=self:_home_weread_stats_card(weread_reading_cache),
         local_stats=self:_home_local_stats_card(local_reading_stats),
-        show_weread_stats=home.show_weread_stats~=false,
-        show_local_stats=home.show_local_stats~=false,
+        stats_slot=self:_home_stats_slot(home),
+        stats_slot_data=self:_home_stats_slot_data(home,weread_reading_cache,local_reading_stats),
+        show_weread_stats=self:_home_stats_slot(home):match("^weread_")~=nil,
+        show_local_stats=self:_home_stats_slot(home):match("^local_")~=nil,
         layout_style=home.layout_style,
         display_size=home.display_size,
         hero=hero,
@@ -16918,12 +16515,21 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         screensaver_file=screensaver_file,
         screensaver_book_file=normalized_reader_file(hero and hero.file or nil),
         on_quick_panel=function() self:show_home_quick_panel() end,
+        on_time=function(anchor) self:_show_standalone_menu("时间与时区",self:time_display_settings_menu(),{anchor=anchor}) end,
+        on_wifi=function() self:_home_wifi_settings() end,
+        on_battery=function() self:show_home_quick_panel() end,
         on_sync=function() self:_home_open_sync_status() end,
-        on_bluetooth=function() self:_bluetooth_toggle() end,
+        on_bluetooth=function() self:_bluetooth_show_devices() end,
+        on_downloads=function() self:show_downloads() end,
         on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
         on_account=function() self:_home_leave_and_run("account status",function() self:show_account_status() end) end,
         on_weread_stats=function() self:_show_home_weread_stats() end,
         on_local_stats=function() self:_show_home_local_stats() end,
+        on_stats_slot=function()
+            local slot=self:_home_stats_slot(home)
+            if slot:match("^local_") then return self:_show_home_local_stats() end
+            if slot:match("^weread_") then return self:_show_home_weread_stats() end
+        end,
         on_menu=function() self:show_home_menu() end,
         on_back=function() return self:_home_handle_back() end,
         on_empty_account=function() self:_home_open_section(active) end,
@@ -18217,12 +17823,6 @@ function Plugin:_update_open_shelf_download_status(book_id,status)
     if changed and type(view.updateItems)=="function" then pcall(view.updateItems,view,nil,true) end
     return changed
 end
-local DOWNLOAD_STAGE_LABELS={
-    prepare="准备下载",catalog="读取目录",resume="恢复断点",content="下载正文",
-    underlines="获取划线",thoughts="获取想法",footnotes="处理脚注",
-    images="处理图片",package="生成 EPUB",restart="断点恢复",waiting_network="等待网络",done="下载完成",error="下载失败",
-    cancelled="下载已取消",hibernated="安全休眠",
-}
 function Plugin:_download_dialog_is_shown(runtime)
     runtime=runtime or self._download_runtime
     local dialog=runtime and runtime.dialog or nil
@@ -19398,7 +18998,6 @@ function Plugin:chapter_menu(b,ch)
         local record=entry.record
         if record then
             local label=DownloadResult.variant_label(entry.label,record)
-            if record.prefetch==true then label=label.." · 预下载" end
             items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
         end
     end
@@ -19589,19 +19188,6 @@ function Plugin:_chapter_prefetch_status(context)
         return runtime.prefetch_required==true and "正在进入" or "正在准备"
     end
     return "点击下载并打开"
-end
-
-function Plugin:_consume_opened_prefetch(path,book,record,kind)
-    if type(record)~="table" or record.prefetch~=true then return false end
-    local book_id=tostring(book and (book.book_id or book.bookId) or "")
-    local uid=tostring(record.chapter_uid or "")
-    kind=tostring(kind or record.variant or "")
-    if book_id=="" or uid=="" or (kind~="clean" and kind~="notes") then return false end
-    local consumed=self.store:mark_chapter_prefetch_consumed(book_id,uid,kind)
-    if consumed then
-        logger.info("[MiuRead][Prefetch] consumed","book=",book_id,"chapter=",uid,"file=",tostring(path or ""))
-    end
-    return consumed
 end
 
 function Plugin:_promote_hidden_prefetch(ctx)
@@ -20486,7 +20072,6 @@ function Plugin:_download_book_labels(b)
         for _,r in pairs(row or {}) do
             if r.file and U.file_exists(r.file) then
                 chapter_count=chapter_count+1
-                if r.prefetch==true then prefetch_count=prefetch_count+1 end
             end
         end
     end
@@ -20571,13 +20156,13 @@ function Plugin:_clear_prefetched_chapters(book_id,title)
     self.store:reload(); self.store:prune_missing_files()
     local entries,paths,kept=self:_prefetch_cleanup_candidates(book_id)
     if #entries==0 then
-        self:toast(kept>0 and "当前正在阅读的旧版预下载章节已保留" or "没有可清理的下一章预读取缓存")
+        self:toast(kept>0 and "当前正在阅读的预读取缓存已保留" or "没有可清理的下一章预读取缓存")
         return
     end
     local scope=book_id and ("《"..tostring(title or book_id).."》") or "全部书籍"
     local extra=kept>0 and "\n\n当前正在阅读的章节会自动保留。" or ""
     UIManager:show(ConfirmBox:new{
-        text="清理"..scope.."的下一章预读取缓存？\n\n删除系统自动准备、尚未实际打开的隐藏缓存；同时兼容清理旧版本留下的自动预下载章节。用户主动下载和已经读过的章节会保留。"..extra,
+        text="清理"..scope.."的下一章预读取缓存？\n\n删除系统自动准备、尚未实际打开的隐藏缓存。用户主动下载和已经读过的章节会保留。"..extra,
         ok_text="清理",
         cancel_text="取消",
         ok_callback=function()
@@ -20586,13 +20171,8 @@ function Plugin:_clear_prefetched_chapters(book_id,title)
                 done_text="下一章预读取缓存已清理",
                 commit=function()
                     for _,entry in ipairs(entries) do
-                        if entry.hidden==true and type(self.store.forget_hidden_prefetch)=="function" then
+                        if type(self.store.forget_hidden_prefetch)=="function" then
                             self.store:forget_hidden_prefetch(entry.book_id,entry.uid,entry.kind,false)
-                        else
-                            local record=self.store:chapter_variant(entry.book_id,entry.uid,entry.kind)
-                            if type(record)=="table" and record.prefetch==true then
-                                self.store:forget_chapter(entry.book_id,entry.uid,entry.kind)
-                            end
                         end
                     end
                     self.store:prune_missing_files()
@@ -20611,7 +20191,7 @@ function Plugin:show_download_cleanup_dialog()
             subtitle="不会删除书籍 划线 想法 阅读记录或已完成下载",
             actions={
                 {icon="⌫",label="下载临时文件",detail="清理断点和失败任务残留",callback=function() self:_clear_download_residue() end},
-                {icon="⇥",label="下一章预读取缓存",detail=tostring(self.store:prefetched_chapter_count()).." 个 · 含旧版自动预下载",callback=function() self:_clear_prefetched_chapters() end},
+                {icon="⇥",label="下一章预读取缓存",detail=tostring(self.store:prefetched_chapter_count()).." 个",callback=function() self:_clear_prefetched_chapters() end},
                 {icon="▧",label="失效封面缓存",detail="需要时会自动重新生成",callback=function() self:_clear_cover_cache() end},
             },
             footer_action={label="取消",callback=function() end},
@@ -20708,7 +20288,6 @@ function Plugin:downloaded_chapters_menu(book_id)
             local r=row and row[kind]
             if r and r.file and U.file_exists(r.file) then
                 local variant_label=DownloadResult.variant_label(self:_variant_label(kind),r)
-                if r.prefetch==true then variant_label=variant_label.." · 旧版自动预下载" end
                 labels[#labels+1]=variant_label
                 title=title or r.title
             end
@@ -20863,17 +20442,6 @@ function Plugin:toggle_annotation_close_upload()
     self:status_toast("结束阅读时上传批注",p.annotation_sync.close_upload_enabled and "已开启" or "已关闭",3)
 end
 
-function Plugin:_sync_error_notice_enabled()
-    return (self.store:preferences().sync or {}).error_notice_enabled~=false
-end
-
-function Plugin:toggle_sync_error_notice()
-    local p=self.store:preferences(); p.sync=p.sync or {}
-    p.sync.error_notice_enabled=not (p.sync.error_notice_enabled~=false)
-    self:_save_ui_preferences(p,"sync_error_notice")
-    self:status_toast("同步异常提醒",p.sync.error_notice_enabled and "已开启" or "已关闭",3)
-end
-
 function Plugin:_time_first_success_notice_enabled()
     return (self.store:preferences().sync or {}).time_first_success_notice_enabled~=false
 end
@@ -20886,12 +20454,6 @@ end
 
 function Plugin:_sync_success_notice_enabled()
     return (self.store:preferences().sync or {}).success_notice_enabled~=false
-end
-function Plugin:toggle_sync_success_notice()
-    local p=self.store:preferences(); p.sync=p.sync or {}
-    p.sync.success_notice_enabled=not (p.sync.success_notice_enabled~=false)
-    self:_save_ui_preferences(p,"sync_success_notice")
-    self:status_toast("同步成功提醒",p.sync.success_notice_enabled and "已开启" or "已关闭",3)
 end
 function Plugin:_show_auto_sync_success(text)
     if self._sync_success_notified==true or not self:_sync_success_notice_enabled() then return end
@@ -21369,6 +20931,7 @@ function Plugin:_home_sync_summary(force)
     -- counters are cheap; annotation counters come from an asynchronously
     -- refreshed snapshot.
     local sessions=self:_persisted_sessions()
+    local library=self:_persisted_library()
     local progress,time_count,progress_failed,progress_unconfirmed=0,0,0,0
     local progress_active,progress_waiting,progress_waiting_network=0,0,0
     local auth_required,repair_required=(self:logged_in() and 0 or 1),0
@@ -21377,14 +20940,16 @@ function Plugin:_home_sync_summary(force)
         verifying_upload=true,deferred=true,verification_required=true,remote_jump_unconfirmed=true,
     }
     local now=os.time()
-    for _,session in pairs(sessions) do
+    for id,session in pairs(sessions) do
         if type(session)=="table" then
             local state=tostring(session.progress_sync_state or "")
-            if session.sync_repair_required==true then repair_required=repair_required+1 end
+            local has_book_record=type(library[tostring(id)])=="table"
+            if session.sync_repair_required==true and has_book_record then repair_required=repair_required+1 end
             local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
             local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
             local verified_seq=tonumber(session.progress_verified_sequence or 0) or 0
             if pending and pending_seq>0 and verified_seq>=pending_seq then pending=nil end
+            if pending and not has_book_record then pending=nil end
             local replayable=self:_progress_snapshot_replayable(pending)
             local worker_age=now-(tonumber(session.progress_worker_updated_at or 0) or 0)
             local worker_alive=session.progress_worker_active==true and worker_age>=0 and worker_age<=90
@@ -21395,7 +20960,7 @@ function Plugin:_home_sync_summary(force)
             -- snapshot is not actionable and must never reappear as "待同步".
             -- Only a live worker may surface without a snapshot; all retryable
             -- work must carry the exact chapter/co snapshot that can be replayed.
-            local live_without_snapshot=worker_alive
+            local live_without_snapshot=has_book_record and worker_alive
                 and (state=="uploading" or state=="retrying" or state=="verifying_upload")
             if pending_progress_states[state] and (pending or live_without_snapshot) then progress=progress+1 end
             if pending then
@@ -21418,7 +20983,7 @@ function Plugin:_home_sync_summary(force)
             elseif live_without_snapshot then
                 progress_active=progress_active+1
             end
-            if tonumber(session.pending_report_seconds or 0)>0 then time_count=time_count+1 end
+            if has_book_record and tonumber(session.pending_report_seconds or 0)>0 then time_count=time_count+1 end
         end
     end
     local annotations=type(self._annotation_summary_cache)=="table" and self._annotation_summary_cache or {}
@@ -21513,7 +21078,7 @@ function Plugin:_progress_sync_issue_items()
             local pending_seq=pending_progress and (tonumber(pending_progress.progress_sequence or 0) or 0) or 0
             local verified_seq=tonumber(session.progress_verified_sequence or 0) or 0
             if pending_progress and pending_seq>0 and verified_seq>=pending_seq then pending_progress=nil end
-            if pending_states[state] and pending_progress then
+            if pending_states[state] and pending_progress and type(library[tostring(id)])=="table" then
                 local replayable,replay_reason=self:_progress_snapshot_replayable(pending_progress)
                 local worker_age=now-(tonumber(session.progress_worker_updated_at or 0) or 0)
                 local worker_alive=session.progress_worker_active==true and worker_age>=0 and worker_age<=90
@@ -23211,25 +22776,6 @@ function Plugin:_current_book_record()
     if b then return {book=b,record=rec,variant=variant,path=path} end
 end
 
-function Plugin:redownload_current()
-    local r=self:_current_book_record()
-    if not r or not r.book then self:info(_("No matching MiuRead book is open.")); return end
-    local b={bookId=r.book.book_id,title=r.book.title,author=r.book.author,cover=r.book.cover}
-    local dialog
-    local buttons={}
-    buttons[#buttons+1]={{text="生成纯净版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=false},false) end}}
-    buttons[#buttons+1]={{text="生成划线与想法版",callback=function() UIManager:close(dialog); self:choose_download_mode(b,{annotations=true},false) end}}
-    buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
-    dialog=ButtonDialog:new{title="重新生成《"..tostring(b.title or "本书").."》",title_align="center",buttons=buttons}
-    UIManager:show(dialog)
-end
-function Plugin:_repair_preferences()
-    local preferences=self.store:preferences()
-    preferences.repair=type(preferences.repair)=="table" and preferences.repair or {}
-    if preferences.repair.auto_check==nil then preferences.repair.auto_check=true end
-    return preferences.repair,preferences
-end
-
 function Plugin:_repair_context(current)
     if type(current)=="table" and current.book then
         return {
@@ -23251,230 +22797,44 @@ function Plugin:_repair_context(current)
     }
 end
 
-function Plugin:_repair_state()
-    local state=self.store:get("book_repair_state",{})
-    return type(state)=="table" and state or {}
-end
-
-function Plugin:_save_repair_state(book_id,row)
-    local state=self:_repair_state()
-    state[tostring(book_id or "")]=row
-    self.store:set("book_repair_state",state)
-end
-
-function Plugin:_record_repair_history(result,status)
-    local history=self.store:get("book_repair_history",{})
-    if type(history)~="table" then history={} end
-    table.insert(history,1,{
-        at=os.time(),
-        title=tostring(result and result.title or "书籍"),
-        book_id=tostring(result and result.book_id or ""),
-        status=tostring(status or ((result and result.ok) and "已完成" or "失败")),
-    })
-    while #history>20 do table.remove(history) end
-    self.store:set("book_repair_history",history)
-end
-
-function Plugin:_repair_message(report)
-    local lines={"检测到本书仍有旧版 JSON 想法与评论数据。"}
-    lines[#lines+1]=""
-    lines[#lines+1]="迁移后将直接使用 SQLite，旧评论索引不再需要。"
-    lines[#lines+1]="迁移不会重新下载书籍，也不会改动 EPUB 正文。"
-    if tonumber(report and report.pending or 0)>0 then
-        lines[#lines+1]=""
-        lines[#lines+1]="待迁移章节："..tostring(report.pending)
-    end
-    return table.concat(lines,"\n")
-end
-
-function Plugin:_close_migration_progress(token)
-    if token and self._migration_token~=token then return end
-    if self._migration_progress_poll then
-        UIManager:unschedule(self._migration_progress_poll)
-        self._migration_progress_poll=nil
-    end
-    if self._migration_progress_delay then
-        UIManager:unschedule(self._migration_progress_delay)
-        self._migration_progress_delay=nil
-    end
-    if self._migration_progress_widget then
-        self._migration_progress_widget:close()
-        self._migration_progress_widget=nil
-    end
-    local active_token=self._migration_token
-    if active_token then DownloadDatabase.clear_task(DownloadDatabase.runtime_path(self.store),active_token) end
-    self._migration_token=nil
-end
-
-function Plugin:_schedule_migration_progress(token,title)
-    self:_close_migration_progress()
-    self._migration_token=token
-    local path=DownloadDatabase.runtime_path(self.store)
-    local function poll()
-        if self._migration_token~=token then return end
-        local state=DownloadDatabase.get_task_value(path,token,"migration_progress",nil)
-        if self._migration_progress_widget and type(state)=="table" then
-            self._migration_progress_widget:set_state(state)
-        end
-        if self.repair_async and self.repair_async:busy() then
-            self._migration_progress_poll=poll
-            UIManager:scheduleIn(.7,poll)
-        end
-    end
-    local delay
-    delay=function()
-        if self._migration_token~=token or not (self.repair_async and self.repair_async:busy()) then return end
-        self._migration_progress_delay=nil
-        local widget=MigrationProgress:new{
-            title="正在迁移《"..tostring(title or "当前书籍").."》",
-            on_cancel=function()
-                DownloadDatabase.set_cancelled(path,token,true)
-            end,
-        }
-        self._migration_progress_widget=widget
-        widget:show()
-        local state=DownloadDatabase.get_task_value(path,token,"migration_progress",nil)
-        if type(state)=="table" then widget:set_state(state) end
-        poll()
-    end
-    self._migration_progress_delay=delay
-    UIManager:scheduleIn(1.0,delay)
-end
-
-function Plugin:_run_book_repair(context,report,force)
-    context=context or self:_repair_context()
-    if not context or not context.book then self:info("当前没有可迁移的觅阅书籍"); return false end
-    if self.repair_async and self.repair_async:busy() then self:toast("已有迁移任务正在进行"); return false end
-    if type(report)~="table" then
-        local repair=self.book_repair
-        self:toast("正在检查本书旧评论数据",2)
-        local started,err=self.repair_async:run("book-migration-check",function()
-            return repair:inspect(context)
-        end,function(result)
-            if not result or result.ok~=true or type(result.value)~="table" then
-                self:info("检查失败：\n"..tostring(result and result.error or "未知原因")); return
-            end
-            self:_run_book_repair(context,result.value,force)
-        end,120)
-        if not started then self:info("无法开始检查：\n"..tostring(err or "未知原因")) end
-        return started
-    end
-    if #(report.issues or {})==0 then
-        self:info("当前书籍已经使用 SQLite，无需迁移。")
-        return true
-    end
-    local title=tostring((context.book or {}).title or context.title or "当前书籍")
-    local token="migration-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))
-    local path=DownloadDatabase.runtime_path(self.store)
-    DownloadDatabase.clear_task(path,token)
-    self:_schedule_migration_progress(token,title)
-    local repair=self.book_repair
-    local started,err=self.repair_async:run("book-data-migration",function()
-        return repair:migrate(context,report,{
-            force=force==true,
-            archive_legacy=false,
-            progress=function(state)
-                DownloadDatabase.set_task_value(path,token,"migration_progress",state)
-            end,
-            cancelled=function()
-                return DownloadDatabase.is_cancelled(path,token)
-            end,
-        })
-    end,function(result)
-        self:_close_migration_progress(token)
-        if not result or result.ok~=true or type(result.value)~="table" then
-            local message=tostring(result and result.error or "迁移任务未完成")
-            self:_record_repair_history({title=title,book_id=(context.book or {}).book_id},"失败")
-            self:info("迁移失败：\n"..message)
-            return
-        end
-        local value=result.value
-        local status=value.cancelled and "已停止" or (value.ok and "已完成" or "部分失败")
-        self:_record_repair_history(value,status)
-        self:_save_repair_state(value.book_id,{
-            signature=value.signature,
-            status=value.ok and "fixed" or (value.cancelled and "pending" or "failed"),
-            checked_at=os.time(),
-        })
-        Thoughts.clear_memory_cache()
-        if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
-            pcall(ThoughtNativePopup.clear_cache)
-        end
-        if value.cancelled then
-            self:info("迁移已停止。已完成的章节会保留，下次可继续。")
-        elseif value.ok then
-            self:info("迁移完成。\n\n已处理 "..tostring(value.processed or 0).." 个章节、新迁移 "
-                ..tostring(value.comments or 0).." 条评论。以后将直接使用 SQLite。")
-        else
-            self:info("部分章节迁移失败，成功数据已保留，可稍后继续迁移。")
-        end
-    end,900)
-    if not started then
-        self:_close_migration_progress(token)
-        self:info("无法开始迁移：\n"..tostring(err or "未知原因"))
-        return false
-    end
-    return true
-end
-
-function Plugin:_show_book_repair_prompt(context,report)
-    if self._repair_prompt_open then return end
-    self._repair_prompt_open=true
-    local book_id=tostring(report and report.book_id or ((context.book or {}).book_id or ""))
-    local signature=tostring(report and report.signature or self.book_repair:signature(context))
-    local dialog
-    dialog=ButtonDialog:new{title=self:_repair_message(report),title_align="center",buttons={
-        {{text="立即迁移",callback=function()
-            UIManager:close(dialog); self._repair_prompt_open=false
-            self:_run_book_repair(context,report,false)
-        end}},
-        {{text="稍后处理",callback=function()
-            UIManager:close(dialog); self._repair_prompt_open=false
-        end}},
-        {{text="本书不再自动提示",callback=function()
-            UIManager:close(dialog); self._repair_prompt_open=false
-            self:_save_repair_state(book_id,{signature=signature,status="ignored",checked_at=os.time()})
-        end}},
-    }}
-    UIManager:show(dialog)
-end
-
 function Plugin:_schedule_current_book_repair_check(current,urgent)
-    local prefs=self:_repair_preferences()
-    if prefs.auto_check==false then return false end
     local context=self:_repair_context(current)
     if not context or not context.book then return false end
     local book_id=tostring((context.book or {}).book_id or (context.book or {}).bookId or "")
-    if book_id=="" then return false end
-    local previous=self:_repair_state()[book_id]
-    if urgent~=true and type(previous)=="table"
-        and (previous.status=="ok" or previous.status=="fixed" or previous.status=="ignored")
-        and os.time()-(tonumber(previous.checked_at) or 0)<7*24*60*60 then
-        return false
-    end
-    if self.repair_async and self.repair_async:busy() then return false end
+    if book_id=="" or (self.repair_async and self.repair_async:busy()) then return false end
     local repair=self.book_repair
     local delay=urgent==true and .05 or 1.4
     UIManager:scheduleIn(delay,function()
-        local active=self:_current_document_path()
-        if tostring(active or "")~=tostring(context.path or "") then return end
+        if tostring(self:_current_document_path() or "")~=tostring(context.path or "") then return end
         if self.repair_async:busy() then return end
-        local started=self.repair_async:run("book-migration-check",function()
-            return repair:inspect(context)
+        local started=self.repair_async:run("legacy-comment-import",function()
+            local report=repair:inspect(context)
+            if type(report)~="table" or #(report.issues or {})==0 then
+                return {needed=false,ok=true}
+            end
+            local migrated=repair:migrate(context,report,{force=false})
+            return {needed=true,ok=migrated and migrated.ok==true,result=migrated}
         end,function(result)
-            if not result or result.ok~=true or type(result.value)~="table" then return end
-            local report=result.value
-            if tostring(self:_current_document_path() or "")~=tostring(context.path or "") then return end
-            if #(report.issues or {})==0 then
-                self:_save_repair_state(book_id,{signature=report.signature,status="ok",checked_at=os.time()})
+            if not result or result.ok~=true or type(result.value)~="table" then
+                logger.warn("[MiuRead][Migration] legacy comment import failed",
+                    tostring(result and result.error or "unknown"))
                 return
             end
-            local row=self:_repair_state()[book_id]
-            if urgent~=true and type(row)=="table" and tostring(row.signature or "")==tostring(report.signature or "")
-                and row.status=="ignored" then return end
-            self:_show_book_repair_prompt(context,report)
-        end,120)
-        if not started then logger.dbg("[MiuRead][Migration] check deferred") end
+            local value=result.value
+            if value.needed~=true then return end
+            if value.ok==true then
+                Thoughts.clear_memory_cache()
+                if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
+                    pcall(ThoughtNativePopup.clear_cache)
+                end
+                logger.info("[MiuRead][Migration] legacy comments imported once",
+                    "book=",book_id,"comments=",tostring(value.result and value.result.comments or 0))
+            else
+                logger.warn("[MiuRead][Migration] legacy comments partially imported",
+                    "book=",book_id)
+            end
+        end,300)
+        if not started then logger.dbg("[MiuRead][Migration] legacy import deferred") end
     end)
     return true
 end
@@ -23627,12 +22987,6 @@ function Plugin:_repair_downloaded_book(book_ref,confirmed)
     end,false)
 end
 
-function Plugin:repair_current_book()
-    local current=self:_current_book_record()
-    if not current or not current.book then self:info("请先打开一本觅阅书籍") return false end
-    return self:_repair_downloaded_book(current.book.book_id)
-end
-
 function Plugin:check_and_repair_current()
     local current=self:_current_book_record()
     if not current or not current.book then self:info("请先打开一本觅阅书籍") return false end
@@ -23694,173 +23048,6 @@ function Plugin:scan_downloaded_books_for_integrity_repair()
     return true
 end
 
-function Plugin:migrate_current_book_comments(confirmed)
-    local context=self:_repair_context()
-    if not context then self:info("请先打开一本觅阅书籍"); return end
-    if confirmed~=true and self:_active_reader_ui() and self:_notice_enabled("repair_while_reading") then
-        local dialog
-        dialog=ButtonDialog:new{title="迁移会读取本书旧评论数据。大书可能短暂变慢，但不会重新下载正文。",title_align="center",buttons={
-            {{text="继续迁移",callback=function() UIManager:close(dialog); self:migrate_current_book_comments(true) end}},
-            {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("repair_while_reading",false); self:migrate_current_book_comments(true) end}},
-            {{text="稍后处理",callback=function() UIManager:close(dialog) end}},
-        }}
-        UIManager:show(dialog)
-        return
-    end
-    self:_run_book_repair(context,nil,true)
-end
-
-function Plugin:scan_downloaded_books_for_repair(confirmed)
-    if confirmed~=true and self:_notice_enabled("library_scan") then
-        self:_confirm_library_scan(function() self:scan_downloaded_books_for_repair(true) end)
-        return
-    end
-    if self.repair_async:busy() then self:toast("已有检查或迁移任务正在进行"); return end
-    self:toast("正在检查已下载书籍",2)
-    local repair=self.book_repair
-    local started,err=self.repair_async:run("scan-book-migration",function()
-        return repair:scan_downloaded()
-    end,function(result)
-        if not result or result.ok~=true or type(result.value)~="table" then
-            self:info("检查失败：\n"..tostring(result and result.error or "未知原因")); return
-        end
-        local scan=result.value
-        if tonumber(scan.affected or 0)==0 then
-            self:info("检查完成，没有发现需要迁移的已下载书籍。")
-            return
-        end
-        UIManager:show(ConfirmBox:new{
-            text="发现 "..tostring(scan.affected).." 本书仍有旧版评论数据。\n\n是否全部迁移到 SQLite？",
-            ok_text="全部迁移",cancel_text="暂不处理",
-            ok_callback=function()
-                if self.repair_async:busy() then self:toast("已有迁移任务正在进行"); return end
-                local token="migration-batch-"..tostring(os.time()).."-"..tostring(math.random(10000,99999))
-                local path=DownloadDatabase.runtime_path(self.store)
-                DownloadDatabase.clear_task(path,token)
-                self:_schedule_migration_progress(token,"已下载书籍评论")
-                local ok_start,error_start=self.repair_async:run("migrate-downloaded-books",function()
-                    local output={checked=0,migrated=0,failed=0,cancelled=false,details={},groups=0,comments=0}
-                    local total_chapters=0
-                    for _,row in ipairs(scan.contexts or {}) do
-                        total_chapters=total_chapters+#((row.report or {}).files or {})
-                    end
-                    local completed=0
-                    for _,row in ipairs(scan.contexts or {}) do
-                        if DownloadDatabase.is_cancelled(path,token) then output.cancelled=true; break end
-                        local book_title=tostring(((row.context or {}).book or {}).title or (row.context or {}).title or "书籍")
-                        local value=repair:migrate(row.context,row.report,{
-                            archive_legacy=false,
-                            cancelled=function() return DownloadDatabase.is_cancelled(path,token) end,
-                            progress=function(state)
-                                state=type(state)=="table" and state or {}
-                                DownloadDatabase.set_task_value(path,token,"migration_progress",{
-                                    current=completed+(tonumber(state.current) or 0),
-                                    total=total_chapters,
-                                    chapter=book_title.." · "..tostring(state.chapter or ""),
-                                    groups=output.groups+(tonumber(state.groups) or 0),
-                                    comments=output.comments+(tonumber(state.comments) or 0),
-                                    percent=total_chapters>0 and (completed+(tonumber(state.current) or 0))/total_chapters or 1,
-                                })
-                            end,
-                        })
-                        output.checked=output.checked+1
-                        output.groups=output.groups+(tonumber(value.groups) or 0)
-                        output.comments=output.comments+(tonumber(value.comments) or 0)
-                        completed=completed+#((row.report or {}).files or {})
-                        if value.cancelled then output.cancelled=true end
-                        if value.ok then output.migrated=output.migrated+1 else output.failed=output.failed+1 end
-                        output.details[#output.details+1]=value
-                        if output.cancelled then break end
-                    end
-                    output.ok=output.failed==0 and output.cancelled~=true
-                    return output
-                end,function(fixed)
-                    self:_close_migration_progress(token)
-                    if not fixed or fixed.ok~=true or type(fixed.value)~="table" then
-                        self:info("批量迁移失败：\n"..tostring(fixed and fixed.error or "未知原因")); return
-                    end
-                    local value=fixed.value
-                    local status=value.cancelled and "已停止" or (value.ok and "已完成" or "部分失败")
-                    self:_record_repair_history({title="批量迁移",book_id=""},status)
-                    if value.cancelled then
-                        self:info("批量迁移已停止。已完成的数据会保留，下次可继续。")
-                    elseif value.ok then
-                        self:info("全部迁移完成。\n\n新迁移 "..tostring(value.comments or 0).." 条评论。")
-                    else
-                        self:info("部分书籍迁移失败，可稍后重试。")
-                    end
-                end,1800)
-                if not ok_start then
-                    self:_close_migration_progress(token)
-                    self:info("无法开始批量迁移：\n"..tostring(error_start or "未知原因"))
-                end
-            end,
-        })
-    end,240)
-    if not started then self:info("无法开始检查：\n"..tostring(err or "未知原因")) end
-end
-
-function Plugin:clear_invalid_comment_indexes()
-    if self.repair_async:busy() then self:toast("已有检查或迁移任务正在进行"); return end
-    local repair=self.book_repair
-    local started,err=self.repair_async:run("clear-legacy-comment-data",function()
-        return repair:remove_verified_legacy_downloaded()
-    end,function(result)
-        if result and result.ok==true then
-            self:info("已清理 "..tostring(result.value or 0).." 本书的旧 JSON 备份。SQLite 数据不会受到影响。")
-        else
-            self:info("清理失败：\n"..tostring(result and result.error or "未知原因"))
-        end
-    end,300)
-    if not started then self:info("无法开始清理：\n"..tostring(err or "未知原因")) end
-end
-
-function Plugin:show_repair_history()
-    local history=self.store:get("book_repair_history",{})
-    local items={}
-    for _,row in ipairs(type(history)=="table" and history or {}) do
-        items[#items+1]={text=tostring(row.title or "书籍"),
-            post_text=self:_display_time("%m-%d %H:%M",tonumber(row.at) or os.time()).." · "..tostring(row.status or ""),enabled=false}
-    end
-    if #items==0 then items[1]={text="还没有迁移记录",enabled=false} end
-    self:list("迁移记录",items)
-end
-
-function Plugin:_confirm_library_scan(callback)
-    if not self:_notice_enabled("library_scan") then callback(); return true end
-    local dialog
-    dialog=ButtonDialog:new{title="批量检查已下载书籍可能暂时增加耗电，并使主页响应变慢。",title_align="center",buttons={
-        {{text="开始检查",callback=function() UIManager:close(dialog); callback() end}},
-        {{text="开始并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("library_scan",false); callback() end}},
-        {{text="取消",callback=function() UIManager:close(dialog) end}},
-    }}
-    UIManager:show(dialog)
-    return true
-end
-
-function Plugin:book_repair_settings_menu()
-    return {
-        {text="打开书籍时检查旧评论数据",checked_func=function()
-            return (self.store:preferences().repair or {}).auto_check~=false
-        end,keep_menu_open=true,callback=function()
-            local p=self.store:preferences(); p.repair=p.repair or {}
-            p.repair.auto_check=p.repair.auto_check==false
-            self.store:save_preferences(p)
-        end},
-        {text="迁移当前书籍评论",callback=function() self:migrate_current_book_comments() end},
-        {text="扫描所有待迁移书籍",callback=function() self:scan_downloaded_books_for_repair() end},
-        {text="重置本地书封面缓存",callback=function()
-            self:_home_reset_local_metadata(); self:_home_scan_local(true,false); self:toast("本地书封面缓存已重置",2)
-        end},
-        {text="清理已验证的旧 JSON 备份",callback=function() self:clear_invalid_comment_indexes() end},
-        {text="迁移记录",callback=function() self:show_repair_history() end},
-        {text="重置迁移提示状态",callback=function()
-            self.store:set("book_repair_state",{})
-            self:toast("已重置评论迁移提示状态")
-        end},
-    }
-end
-
 function Plugin:_toggle_preference(key)
     local p=self.store:preferences(); p[key]=not p[key]; self.store:save_preferences(p)
 end
@@ -23876,7 +23063,6 @@ function Plugin:_toggle_home_network_metadata()
     local home,preferences=self:_home_preferences()
     home.network_metadata=home.network_metadata==false
     home.network_metadata_user_set=true
-    home.network_metadata_defaults_version=2
     self:_save_home_preferences(home,preferences)
     if home.network_metadata and self._home_hero then
         self:_home_schedule_network_metadata(self._home_hero,true,true,nil,true)
@@ -24024,32 +23210,6 @@ function Plugin:_set_home_lockscreen_style(style)
     self:_home_update_lockscreen_session(self._home_hero)
     self:toast("锁屏封面："..self:_home_lockscreen_style_label(home),1.5)
     return true
-end
-
-function Plugin:_inkstain_settings_items()
-    local instance=self:_inkstain_instance()
-    if not instance then
-        return {{text=self:_inkstain_available() and "墨痕已安装，但当前未加载" or "墨痕壁纸插件未安装",enabled=false}}
-    end
-    -- InkStain 3.5.5 already builds its complete settings tree in addToMainMenu.
-    -- Ask the plugin for that tree instead of copying any of its options here.
-    if type(instance.getSettingsMenu)=="function" then
-        local ok,items=pcall(instance.getSettingsMenu,instance)
-        if ok and type(items)=="table" then return items end
-    end
-    if type(instance.addToMainMenu)=="function" then
-        local holder={}
-        local ok=pcall(instance.addToMainMenu,instance,holder)
-        local entry=ok and holder.inkstain_wallpaper or nil
-        if type(entry)=="table" then
-            if type(entry.sub_item_table_func)=="function" then
-                local ok_items,items=pcall(entry.sub_item_table_func)
-                if ok_items and type(items)=="table" then return items end
-            end
-            if type(entry.sub_item_table)=="table" then return entry.sub_item_table end
-        end
-    end
-    return {{text="当前墨痕版本无法从觅阅打开完整设置",post_text="请从 KOReader 插件菜单进入",enabled=false}}
 end
 
 function Plugin:_inkstain_open_settings()
@@ -24232,6 +23392,7 @@ function Plugin:display_settings_menu()
         {text="觅阅显示大小",post_text=size_labels[home.display_size] or "标准",sub_item_table_func=function() return self:home_display_size_menu() end},
         {text="觅阅界面字体",post_text=self:_home_ui_font_label(home),sub_item_table_func=function() return self:home_ui_font_menu() end},
         {text="主页阅读统计",post_text=self:_home_stats_visibility_label(home),sub_item_table_func=function() return self:home_stats_settings_menu() end},
+        {text="主页状态信息",post_text=self:_home_status_label(home),sub_item_table_func=function() return self:home_status_card_settings_menu() end},
         {text="首页书架来源",post_text="选择显示项目",sub_item_table_func=function() return self:home_source_settings_menu() end},
         {text="微信书架范围",post_text=self:_shelf_filter_label(),sub_item_table_func=function() return self:shelf_filter_settings_menu() end},
         {text="本地书库",post_text=self:_home_root()=="" and "未设置" or ((home.local_shelf_show_folders==true and home.local_shelf_show_books==true) and "文件夹 + 全部书籍"
@@ -24447,22 +23608,6 @@ function Plugin:mp_settings_menu()
         {text="公众号缓存管理",sub_item_table_func=function() return self:mp_global_cache_menu() end},
     }
 end
-function Plugin:account_sync_settings_menu()
-    -- Keep desktop mode and plugin mode on the same settings source.  beta.7
-    -- had a second desktop-only menu here, so the annotation-sync controls
-    -- added in plugin_settings.lua were invisible from the desktop UI.
-    return PluginSettings.account_sync(self)
-end
-
-function Plugin:more_settings_menu()
-    return {
-        {text="提醒与确认",sub_item_table_func=function() return self:notice_settings_menu() end},
-        {text="评论数据迁移",sub_item_table_func=function() return self:book_repair_settings_menu() end},
-        {text="更新设置",sub_item_table_func=function() return self:update_settings_menu() end},
-        {text="关于觅阅",callback=self:safe("about",function() self:show_about() end)},
-    }
-end
-
 function Plugin:_download_settings_summary()
     local state=self:_download_state()
     local queue=self.store:download_queue()
@@ -26272,7 +25417,7 @@ function Plugin:_prepare_reader_disappearance(reason)
     end
     self:_cancel_network_waits()
     self:_cancel_interactive_network(reason or "reader disappeared")
-    if self.repair_async and self.repair_async.job and self.repair_async.job.label=="book-migration-check" then
+    if self.repair_async and self.repair_async.job and self.repair_async.job.label=="legacy-comment-import" then
         self.repair_async:cancel(reason or "reader disappeared")
         if self.annotation_async then self.annotation_async:cancel(reason or "reader disappeared") end
     end
@@ -26654,7 +25799,6 @@ function Plugin:onReaderReady()
             if self:_reader_session_is_weread() then
                 book,record,variant=self.store:file_record_fast(path,false)
                 if not book then book,record,variant=self.store:identify_file(path,false) end
-                if record then self:_consume_opened_prefetch(path,book,record,variant) end
             end
             self:_record_recent_read(path,book,record)
         end
@@ -27279,29 +26423,6 @@ function Plugin:_reading_end_before_action(reason,after,action)
     return true
 end
 
-function Plugin:annotation_sync_diagnostic_only()
-    return Config.ANNOTATION_COORD_DIAGNOSTIC_ONLY == true
-end
-
-function Plugin:annotation_sync_enabled()
-    local prefs=self:_annotation_sync_preferences()
-    return prefs.enabled==true
-end
-
-function Plugin:toggle_annotation_sync()
-    local prefs,all=self:_annotation_sync_preferences()
-    prefs.enabled=prefs.enabled~=true
-    all.annotation_sync=prefs
-    self.store:save_preferences(all)
-    logger.info("[MiuRead][AnnotationSync] enabled changed",
-        "enabled=",tostring(prefs.enabled==true),"mode=manual")
-    if prefs.enabled then
-        self:toast("本地批注云同步已开启；当前为手动上传",2.5)
-    else
-        self:toast("本地批注云同步已关闭",2)
-    end
-    return prefs.enabled
-end
 
 function Plugin:annotation_sync_visibility_label()
     local prefs=self:_annotation_sync_preferences()
@@ -27375,7 +26496,7 @@ function Plugin:show_local_annotation_sync_status()
 end
 
 function Plugin:sync_local_annotations_now(force_diagnostic)
-    local diagnostic_only=force_diagnostic==true or self:annotation_sync_diagnostic_only()
+    local diagnostic_only=force_diagnostic==true
     logger.info("[MiuRead][AnnotationSync] manual sync requested",
         diagnostic_only and "mode=coordinate_diagnostic" or "mode=manual", "explicit=true")
     if not self:logged_in() then self:info("请先登录微信读书账号。") return false end

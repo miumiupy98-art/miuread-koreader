@@ -12,7 +12,6 @@ local function comment_and_thought_menu(plugin)
         end,keep_menu_open=true,callback=function() plugin:_toggle_thoughts_enabled() end},
     }
     rows[#rows+1]={text="评论显示设置",sub_item_table_func=function() return plugin:thought_font_settings_menu() end}
-    rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return PluginSettings.comment_data(plugin) end}
     return rows
 end
 

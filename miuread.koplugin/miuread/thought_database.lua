@@ -4,7 +4,7 @@ local lfs = require("libs/libkoreader-lfs")
 
 local ThoughtDatabase = {}
 
-ThoughtDatabase.SCHEMA_VERSION = 2
+ThoughtDatabase.SCHEMA_VERSION = 3
 ThoughtDatabase.FILE_NAME = "thoughts.sqlite3"
 
 local function chapter_key(value)
@@ -52,14 +52,6 @@ local function initialize(conn)
             ON thought_comments(review_id);
         CREATE INDEX IF NOT EXISTS idx_thought_comment_created
             ON thought_comments(created);
-        CREATE TABLE IF NOT EXISTS thought_migration (
-            source_path TEXT PRIMARY KEY,
-            source_signature TEXT NOT NULL,
-            chapter_uid TEXT NOT NULL,
-            group_count INTEGER NOT NULL DEFAULT 0,
-            comment_count INTEGER NOT NULL DEFAULT 0,
-            migrated_at INTEGER NOT NULL DEFAULT 0
-        );
         INSERT OR IGNORE INTO thought_chapters(chapter_uid, group_count, comment_count, updated_at)
         SELECT g.chapter_uid,
                COUNT(*),
@@ -67,11 +59,10 @@ local function initialize(conn)
                0
           FROM thought_groups g
          GROUP BY g.chapter_uid;
-        INSERT OR IGNORE INTO thought_chapters(chapter_uid, group_count, comment_count, updated_at)
-        SELECT chapter_uid, MAX(group_count), MAX(comment_count), MAX(migrated_at)
-          FROM thought_migration
-         GROUP BY chapter_uid;
     ]])
+    -- Migration history is no longer part of the runtime schema. Existing beta databases
+    -- may still contain this table; dropping it does not touch comment/group data.
+    conn:exec("DROP TABLE IF EXISTS thought_migration;")
     SQLiteStore.set_text(conn, "thought_schema_version", tostring(ThoughtDatabase.SCHEMA_VERSION))
 end
 
@@ -171,19 +162,6 @@ local function chapter_counts_conn(conn, chapter_uid)
     }
 end
 
-local function record_migration_conn(conn, source_path, source_signature, chapter_uid, counts)
-    local statement = conn:prepare([[
-        INSERT OR REPLACE INTO thought_migration(
-            source_path, source_signature, chapter_uid, group_count, comment_count, migrated_at
-        ) VALUES(?, ?, ?, ?, ?, ?)
-    ]])
-    statement:bind(tostring(source_path or ""), tostring(source_signature or ""), chapter_key(chapter_uid),
-        tonumber(counts and counts.groups or 0) or 0,
-        tonumber(counts and counts.comments or 0) or 0,
-        os.time()):step()
-    statement:close()
-end
-
 function ThoughtDatabase.path(store, book_id)
     return database_path(store, book_id)
 end
@@ -204,24 +182,16 @@ function ThoughtDatabase.save_chapter(store, book_id, chapter_uid, groups)
     return result
 end
 
-function ThoughtDatabase.migrate_chapter(store, book_id, chapter_uid, groups, source_path, source_signature, expected)
-    local conn = open(store, book_id, false)
-    local ok, result = xpcall(function()
-        return SQLiteStore.transaction(conn, function()
-            local saved = replace_chapter(conn, chapter_uid, groups)
-            local actual = chapter_counts_conn(conn, chapter_uid)
-            local wanted = type(expected) == "table" and expected or saved
-            if actual.groups ~= (tonumber(wanted.groups) or 0)
-                or actual.comments ~= (tonumber(wanted.comments) or 0) then
-                error("迁移后数量不一致")
-            end
-            record_migration_conn(conn, source_path, source_signature, chapter_uid, actual)
-            return actual
-        end)
-    end, debug.traceback)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(result) end
-    return result
+function ThoughtDatabase.chapter_exists(store, book_id, chapter_uid)
+    if not ThoughtDatabase.exists(store, book_id) then return false end
+    local ok, result = pcall(function()
+        local conn = open(store, book_id, true)
+        local statement = conn:prepare("SELECT 1 FROM thought_chapters WHERE chapter_uid = ? LIMIT 1")
+        local row = statement:bind(chapter_key(chapter_uid)):step()
+        statement:close(); conn:close()
+        return row ~= nil
+    end)
+    return ok and result == true
 end
 
 function ThoughtDatabase.load_chapter(store, book_id, chapter_uid)
@@ -364,87 +334,6 @@ function ThoughtDatabase.find(store, book_id, chapter_uid, range)
     return result.group, nil, token
 end
 
-function ThoughtDatabase.chapter_counts(store, book_id, chapter_uid)
-    if not ThoughtDatabase.exists(store, book_id) then return {groups=0, comments=0} end
-    local ok, result = pcall(function()
-        local conn = open(store, book_id, true)
-        local counts = chapter_counts_conn(conn, chapter_uid)
-        conn:close()
-        return counts
-    end)
-    return ok and result or {groups=0, comments=0}
-end
-
-function ThoughtDatabase.record_migration(store, book_id, source_path, source_signature, chapter_uid, counts)
-    local conn = open(store, book_id, false)
-    local ok, err = pcall(record_migration_conn, conn, source_path, source_signature, chapter_uid, counts)
-    pcall(conn.close, conn)
-    if not ok then return nil, tostring(err) end
-    return true
-end
-
-function ThoughtDatabase.migration_record(store, book_id, source_path)
-    if not ThoughtDatabase.exists(store, book_id) then return nil end
-    local ok, result = pcall(function()
-        local conn = open(store, book_id, true)
-        local statement = conn:prepare([[
-            SELECT source_signature, chapter_uid, group_count, comment_count, migrated_at
-              FROM thought_migration WHERE source_path = ? LIMIT 1
-        ]])
-        local row = statement:bind(tostring(source_path or "")):step()
-        statement:close()
-        conn:close()
-        if not row then return nil end
-        return {
-            source_signature=tostring(row[1] or ""), chapter_uid=tostring(row[2] or ""),
-            groups=tonumber(row[3] or 0) or 0, comments=tonumber(row[4] or 0) or 0,
-            migrated_at=tonumber(row[5] or 0) or 0,
-        }
-    end)
-    return ok and result or nil
-end
-
-function ThoughtDatabase.migration_records(store, book_id)
-    if not ThoughtDatabase.exists(store, book_id) then return {} end
-    local ok, result = pcall(function()
-        local conn = open(store, book_id, true)
-        local rows = {}
-        local statement = conn:prepare([[
-            SELECT m.source_path, m.source_signature, m.chapter_uid,
-                   m.group_count, m.comment_count, m.migrated_at,
-                   COALESCE(g.actual_groups, 0),
-                   COALESCE(t.actual_comments, 0),
-                   CASE WHEN c.chapter_uid IS NULL THEN 0 ELSE 1 END
-              FROM thought_migration m
-              LEFT JOIN thought_chapters c ON c.chapter_uid = m.chapter_uid
-              LEFT JOIN (
-                    SELECT chapter_uid, COUNT(*) AS actual_groups
-                      FROM thought_groups GROUP BY chapter_uid
-              ) g ON g.chapter_uid = m.chapter_uid
-              LEFT JOIN (
-                    SELECT chapter_uid, COUNT(*) AS actual_comments
-                      FROM thought_comments GROUP BY chapter_uid
-              ) t ON t.chapter_uid = m.chapter_uid
-        ]])
-        while true do
-            local row = statement:step()
-            if not row then break end
-            rows[tostring(row[1] or "")] = {
-                source_signature=tostring(row[2] or ""), chapter_uid=tostring(row[3] or ""),
-                groups=tonumber(row[4] or 0) or 0, comments=tonumber(row[5] or 0) or 0,
-                migrated_at=tonumber(row[6] or 0) or 0,
-                actual_groups=row[7]~=nil and (tonumber(row[7]) or 0) or nil,
-                actual_comments=row[8]~=nil and (tonumber(row[8]) or 0) or nil,
-                chapter_present=tonumber(row[9] or 0)==1,
-            }
-        end
-        statement:close()
-        conn:close()
-        return rows
-    end)
-    return ok and result or {}
-end
-
 function ThoughtDatabase.integrity(store, book_id)
     local path = database_path(store, book_id)
     local healthy = SQLiteStore.integrity_check(path)
@@ -453,12 +342,12 @@ function ThoughtDatabase.integrity(store, book_id)
         return SQLiteStore.with_connection(path, true, function(conn)
             local required = {
                 thought_chapters=false, thought_groups=false,
-                thought_comments=false, thought_migration=false, kv=false,
+                thought_comments=false, kv=false,
             }
             local statement = conn:prepare([[
                 SELECT name FROM sqlite_master
                  WHERE type = 'table' AND name IN (
-                    'thought_chapters','thought_groups','thought_comments','thought_migration','kv'
+                    'thought_chapters','thought_groups','thought_comments','kv'
                  )
             ]])
             while true do

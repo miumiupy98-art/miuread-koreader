@@ -28,34 +28,7 @@ function M.account_sync(plugin)
     return rows
 end
 
-function M.comment_data(plugin)
-    return {
-        {text="打开书籍时检查旧评论数据",checked_func=function()
-            return (plugin.store:preferences().repair or {}).auto_check~=false
-        end,keep_menu_open=true,callback=function()
-            local p=plugin.store:preferences(); p.repair=p.repair or {}
-            p.repair.auto_check=p.repair.auto_check==false
-            plugin.store:save_preferences(p)
-        end},
-        {text="迁移当前书籍评论",callback=function() plugin:migrate_current_book_comments() end},
-        {text="扫描所有待迁移书籍",callback=function() plugin:scan_downloaded_books_for_repair() end},
-        {text="清理已验证的旧 JSON 备份",callback=function() plugin:clear_invalid_comment_indexes() end},
-        {text="迁移记录",callback=function() plugin:show_repair_history() end},
-        {text="重置迁移提示状态",callback=function()
-            plugin.store:set("book_repair_state",{})
-            plugin:toast("已重置评论迁移提示状态")
-        end},
-    }
-end
-
 function M.annotation_sync(plugin)
-    if plugin:annotation_sync_diagnostic_only() then
-        return {
-            {text="批注坐标诊断（beta.11）",post_text="云端写入已暂停",enabled=false},
-            {text="诊断方式",post_text="打开书籍后在阅读页“批注”中生成",enabled=false},
-            {text="导出内容",post_text="raw.xhtml · coord.xhtml · range-debug.json",enabled=false},
-        }
-    end
     return {
         {text="结束阅读时上传批注",post_text=plugin:_annotation_close_upload_enabled() and "已开启" or "已关闭",checked_func=function() return plugin:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() plugin:toggle_annotation_close_upload() end},
         {text="立即同步本书批注",post_text="阅读页下滑工具栏 · 批注",enabled=false},
@@ -70,16 +43,15 @@ function M.comments(plugin)
     rows[#rows+1]={text="我的评论收藏",post_text=tostring(plugin:_thought_favorite_count()).." 条",callback=function() plugin:show_thought_favorites() end}
     append(rows,plugin:thought_font_settings_menu())
     rows[#rows+1]={text="本地划线与想法",post_text="显示与本地数据",enabled=false}
-    rows[#rows+1]={text="评论数据管理",sub_item_table_func=function() return M.comment_data(plugin) end}
     return rows
 end
 
 function M.notices(plugin)
     local labels={
         reader_download="阅读时下载提醒",low_battery="低电量下载提醒",low_storage="存储空间提醒",
-        repair_while_reading="阅读中修复提醒",mode_switch="运行模式切换说明",mode_environment="进入模式说明",
+        mode_switch="运行模式切换说明",mode_environment="进入模式说明",
     }
-    local order={"reader_download","low_battery","low_storage","repair_while_reading","mode_switch","mode_environment"}
+    local order={"reader_download","low_battery","low_storage","mode_switch","mode_environment"}
     local rows={}
     for _,key in ipairs(order) do
         local notice_key=key

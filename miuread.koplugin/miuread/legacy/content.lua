@@ -55,13 +55,6 @@ function Content.first_readable_chapter(chapters)
     end
 end
 
-function Content.readable_chapters(chapters)
-    local out = {}
-    for _, chapter in ipairs(chapters or {}) do
-        if Content.is_readable_chapter(chapter) then out[#out + 1] = chapter end
-    end
-    return out
-end
 
 function Content.ensure_reader_state(client, book)
     local book_id = book.book_id or book.bookId

@@ -969,7 +969,7 @@ function AnnotationSync:sync_book(book, record, options)
     local book_id = tostring((book and (book.book_id or book.bookId)) or (record and record.book_id) or "")
     if book_id == "" then return {ok=false, error="bookId missing"} end
     local prefs = options.preferences or {}
-    local diagnostic_only = options.diagnostic_only == true or Config.ANNOTATION_COORD_DIAGNOSTIC_ONLY == true
+    local diagnostic_only = options.diagnostic_only == true
     local rows, rows_error
     if diagnostic_only then
         rows, rows_error = LocalDB.list(self.store, book_id, options.limit or 200)

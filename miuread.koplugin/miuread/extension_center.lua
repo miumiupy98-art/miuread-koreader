@@ -888,7 +888,7 @@ end
 
 local function center_about(plugin)
     plugin:info(
-        "觅阅扩展中心 · 5.7.0-beta.2\n\n"
+        "觅阅扩展中心 · 5.7.0-beta.6\n\n"
         .."第一版直接使用 GitHub 的 KOReader 社区生态作为扩展来源，并提供中文精选入口。\n\n"
         .."安装包会先下载到临时目录，检查 ZIP 路径、插件结构和体积后才写入 plugins。更新现有插件时会先备份，写入失败自动恢复。\n\n"
         .."普通第三方插件仍由插件自己管理账号和设置。安装、更新或卸载后请完整重启 KOReader。"

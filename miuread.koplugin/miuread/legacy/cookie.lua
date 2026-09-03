@@ -1,34 +1,5 @@
 local Cookie = {}
 
-function Cookie.parse_cookie_header(header)
-    local cookies = {}
-    if not header or header == "" then
-        return cookies
-    end
-    header = header:gsub("^%s*[Cc]ookie:%s*", "")
-    for part in header:gmatch("([^;]+)") do
-        local key, value = part:match("^%s*([^=]+)=(.-)%s*$")
-        if key and value then
-            cookies[key] = value
-        end
-    end
-    return cookies
-end
-
-function Cookie.extract_from_curl(curl)
-    if not curl or curl == "" then
-        return "", nil
-    end
-
-    local cookie = curl:match("%-H%s+['\"][Cc]ookie:%s*(.-)['\"]")
-        or curl:match("%-b%s+['\"](.-)['\"]")
-        or curl:match("%-%-cookie%s+['\"](.-)['\"]")
-    local data = curl:match("%-%-data%-raw%s+['\"](.-)['\"]")
-        or curl:match("%-%-data%s+['\"](.-)['\"]")
-        or curl:match("%-d%s+['\"](.-)['\"]")
-
-    return cookie or curl, data
-end
 
 function Cookie.to_header(cookies)
     local parts = {}

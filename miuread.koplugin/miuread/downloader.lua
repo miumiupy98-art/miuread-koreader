@@ -413,8 +413,6 @@ local function cache_new(store, book, opt, selected, format)
     local root = store:book_dir(book.bookId) .. "/.miuread-partial-" .. option_key(opt)
     local path = DownloadDatabase.partial_path(root)
     local signature = catalog_signature(selected)
-    local migrated, migration_error = DownloadDatabase.migrate_legacy_partial(root)
-    if migrated == nil then error("无法迁移旧下载断点：" .. tostring(migration_error)) end
     local manifest = DownloadDatabase.load_manifest(root)
     local valid = manifest
         and tonumber(manifest.schema) == CACHE_SCHEMA
