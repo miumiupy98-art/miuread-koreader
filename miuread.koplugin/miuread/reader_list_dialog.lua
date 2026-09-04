@@ -90,7 +90,10 @@ local Dialog = InputContainer:extend{
     name = "miuread_reader_list_dialog",
     _miuread_transient = true,
     _miuread_modal_surface = true,
-    covers_fullscreen = true,
+    -- Full-screen input layer, but only the centered dialog frame is opaque.
+    -- Keeping this false lets UIManager repaint HomeView beneath us and then
+    -- paint this dialog on top instead of treating transparent margins as opaque.
+    covers_fullscreen = false,
     stop_events_propagation = true,
     opts = nil,
     closed = false,
@@ -98,6 +101,8 @@ local Dialog = InputContainer:extend{
     selected_key = nil,
     page = 1,
     expanded_index = nil,
+    stack = nil,
+    _session_panel_h = nil,
 }
 
 function Dialog:handleEvent(event) return InputContainer.handleEvent(self, event) end
@@ -112,6 +117,43 @@ function Dialog:_close(action, cancel_pending)
     self.closed = true
     UIManager:close(self)
     return true
+end
+
+function Dialog:_push(title, items, subtitle)
+    self.stack = type(self.stack) == "table" and self.stack or {}
+    self.stack[#self.stack + 1] = {
+        opts = self.opts, page = self.page, selected_key = self.selected_key,
+        expanded_index = self.expanded_index,
+    }
+    local parent = self.opts or {}
+    self.opts = {
+        title = tostring(title or parent.title or "觅阅"),
+        subtitle = subtitle or "",
+        items = items,
+        page_size = parent.page_size,
+        empty_text = parent.empty_text,
+        on_close = parent.on_close,
+        on_back = parent.on_back,
+    }
+    self.page = 1
+    self.selected_key = ""
+    self.expanded_index = nil
+    self:_rebuild()
+    return true
+end
+
+function Dialog:_pop()
+    if type(self.stack) == "table" and #self.stack > 0 then
+        local frame = table.remove(self.stack)
+        self.opts = frame.opts or self.opts
+        self.page = tonumber(frame.page) or 1
+        self.selected_key = tostring(frame.selected_key or "")
+        self.expanded_index = frame.expanded_index
+        self:_rebuild()
+        return true
+    end
+    local back = self.opts and self.opts.on_back or nil
+    return self:_close(back)
 end
 
 function Dialog:_categories()
@@ -147,6 +189,21 @@ end
 
 function Dialog:_run_item(item, index)
     if not item or item.enabled == false then return true end
+    if type(item.children_provider) == "function" or type(item.children) == "table" then
+        local children=item.children
+        if type(item.children_provider)=="function" then
+            local provider=item.children_provider
+            children=function()
+                local ok,value=xpcall(provider,debug.traceback)
+                if not ok then
+                    logger.warn("[MiuRead][ReaderListDialog] child provider failed",tostring(value))
+                    return {}
+                end
+                return type(value)=="table" and value or {}
+            end
+        end
+        return self:_push(item.child_title or item.label or item.text or "觅阅",children,item.child_subtitle or "")
+    end
     local inline_actions = self:_inline_actions(item)
     if #inline_actions > 0 then
         self.expanded_index = self.expanded_index == index and nil or index
@@ -173,7 +230,8 @@ function Dialog:_row_widget(item, width, height, index)
     local value = tostring(item.value or item.post_text or "")
     local value_w = value ~= "" and math.max(Skin.dp(92, 76, 126), math.floor(width * .30)) or 0
     local inline_actions = self:_inline_actions(item)
-    local arrow = item.arrow ~= false and ((#inline_actions > 0) or (item.callback ~= nil and item.keep_open ~= true))
+    local arrow = item.arrow ~= false and ((#inline_actions > 0) or item.children_provider ~= nil or item.children ~= nil
+        or (item.callback ~= nil and item.keep_open ~= true))
     local arrow_w = arrow and Skin.dp(15, 13, 20) or 0
     local gap = Skin.dp(5, 4, 7)
     local text_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
@@ -325,9 +383,10 @@ end
 function Dialog:_build_content()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     local portrait = sw < sh
-    local outer = Skin.dp(8, 6, 14)
     local pad = Skin.dp(13, 10, 19)
-    local panel_w = sw - outer * 2
+    local panel_ratio = portrait and .82 or .72
+    local panel_w = math.max(Skin.dp(330, 300, 430), math.floor(sw * panel_ratio))
+    panel_w = math.min(panel_w, sw - Skin.dp(36, 28, 54))
     local content_w = panel_w - pad * 2
     local header_h = math.max(Skin.dp(42, 36, 56), math.floor(sh * .041))
     local subtitle = tostring(resolved(self.opts and self.opts.subtitle, "") or "")
@@ -337,20 +396,22 @@ function Dialog:_build_content()
     self.selected_key = tostring(selected and selected.key or "all")
     local tab_h = #categories > 1 and math.max(Skin.dp(37, 32, 49), math.floor(sh * .036)) or 0
     local pager_h_default = Skin.dp(34, 29, 45)
-    local row_h = math.max(Skin.dp(64, 55, 86), math.floor(sh * (portrait and .060 or .084)))
+    local row_h = math.max(Skin.dp(61, 52, 82), math.floor(sh * (portrait and .057 or .080)))
     local action_h = Skin.dp(40, 35, 52)
     local action_gap = Skin.dp(5, 4, 7)
-    local page_size = self:_page_size()
+    local requested_page_size = self:_page_size()
+    local max_h = math.floor(sh * (portrait and .76 or .84))
+    local fixed_h = pad * 2 + header_h + subtitle_h + tab_h + Skin.dp(8, 6, 12)
+    local possible_slots = math.max(2, math.floor((max_h - fixed_h - pager_h_default) / row_h))
+    local page_size = math.max(2, math.min(requested_page_size, possible_slots))
     local items = self:_items(selected)
     local pages = math.max(1, math.ceil(#items / page_size))
     self.page = math.max(1, math.min(pages, tonumber(self.page) or 1))
     local first = (self.page - 1) * page_size + 1
     local last = math.min(#items, first + page_size - 1)
-    -- Keep both the list body and pager footprint stable across every page and
-    -- category. Otherwise a short final page (or a tab without pagination) can
-    -- leave lower rows from the previous state visible after a partial refresh.
-    local visible_slots = 1
-    local has_pager = false
+
+    local visible_slots = math.min(page_size, math.max(1, #items))
+    local has_pager = #items > page_size
     for _, candidate in ipairs(categories) do
         local candidate_items = self:_items(candidate)
         visible_slots = math.max(visible_slots, math.min(page_size, math.max(1, #candidate_items)))
@@ -362,52 +423,58 @@ function Dialog:_build_content()
     end
     local expanded_h = self.expanded_index and (action_gap + action_h) or 0
     local body_h = visible_slots * row_h + expanded_h
-    local max_h = sh - Skin.dp(24, 20, 36)
-    local panel_h = math.min(max_h, pad * 2 + header_h + subtitle_h + tab_h + body_h + pager_h + Skin.dp(8, 6, 12))
+    local requested_h = math.min(max_h, fixed_h + body_h + pager_h)
+    -- Keep one stable white rectangle while navigating inside the same dialog.
+    -- A child page may be shorter than its parent; shrinking a transparent modal
+    -- would leave the parent's pixels behind on e-ink until a full refresh.
+    self._session_panel_h = math.max(tonumber(self._session_panel_h) or 0, requested_h)
+    local panel_h = math.min(max_h, self._session_panel_h)
+    local panel_x = math.floor((sw - panel_w) / 2)
+    local panel_y = math.max(Skin.dp(12, 10, 18), math.floor((sh - panel_h) / 2))
 
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
     self.panel_h = panel_h
-    self.frame_dimen = Geom:new{x = outer, y = 0, w = panel_w, h = panel_h}
+    self.frame_dimen = Geom:new{x = panel_x, y = panel_y, w = panel_w, h = panel_h}
 
     local root = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     root[#root + 1] = OffsetContainer:new{
-        x_off = outer, y_off = 0,
-        Skin.frame(panel_w, panel_h, {bordersize = 0, padding = 0, radius = 0, background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_WHITE},
-            Widget:new{dimen = Geom:new{w = 1, h = 1}}),
-    }
-    root[#root + 1] = OffsetContainer:new{
-        x_off = outer, y_off = panel_h - Skin.line("thin"),
-        LineWidget:new{background = Blitbuffer.COLOR_DARK_GRAY, dimen = Geom:new{w = panel_w, h = Skin.line("thin")}},
+        x_off = panel_x, y_off = panel_y,
+        Skin.frame(panel_w, panel_h, {
+            bordersize = Skin.line("thin"), padding = 0, radius = Skin.dp(7, 6, 10),
+            background = Blitbuffer.COLOR_WHITE, color = Blitbuffer.COLOR_DARK_GRAY,
+        }, Widget:new{dimen = Geom:new{w = 1, h = 1}}),
     }
 
-    local y = pad
+    local y = panel_y + pad
     local side_w = Skin.dp(44, 38, 58)
-    local back = TapBox:new{dimen = Geom:new{w = side_w, h = header_h}, callback = function()
-        self:_close(self.opts and self.opts.on_back or nil)
+    local has_parent = type(self.stack) == "table" and #self.stack > 0
+    local can_back = has_parent or type(self.opts and self.opts.on_back) == "function"
+    local back = TapBox:new{dimen = Geom:new{w = side_w, h = header_h}, enabled = can_back, callback = function()
+        return self:_pop()
     end}
-    back[1] = Ui.icon("back", side_w, header_h, Skin.dp(21, 18, 28), {face = Skin.face("cfont", 20, 26, 17)})
-    local home_action = self.opts and self.opts.on_home or nil
-    local home = TapBox:new{dimen = Geom:new{w = side_w, h = header_h}, enabled = type(home_action) == "function", callback = function()
-        self:_close(home_action)
+    if can_back then
+        back[1] = Ui.icon("back", side_w, header_h, Skin.dp(21, 18, 28), {face = Skin.face("cfont", 20, 26, 17)})
+    else
+        back[1] = Widget:new{dimen = Geom:new{w = side_w, h = header_h}}
+    end
+    local close = TapBox:new{dimen = Geom:new{w = side_w, h = header_h}, callback = function()
+        return self:_close(self.opts and self.opts.on_close or nil, false)
     end}
-    home[1] = Ui.icon("home", side_w, header_h, Skin.dp(20, 17, 27), {
-        face = Skin.face("cfont", 16, 21, 13.5),
-        fgcolor = type(home_action) == "function" and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-    })
+    close[1] = Ui.icon("close", side_w, header_h, Skin.dp(20, 17, 27), {face = Skin.face("cfont", 16, 21, 13.5)})
     root[#root + 1] = OffsetContainer:new{
-        x_off = outer + pad, y_off = y,
+        x_off = panel_x + pad, y_off = y,
         HorizontalGroup:new{
             align = "center",
             back,
-            Ui.textbox(tostring(self.opts.title or "阅读列表"), math.max(1, content_w - side_w * 2), header_h,
+            Ui.textbox(tostring(self.opts.title or "觅阅"), math.max(1, content_w - side_w * 2), header_h,
                 Skin.face("cfont", 16.0, 20.6, 13.4), {bold = true, alignment = "center", halign = "center"}),
-            home,
+            close,
         },
     }
     y = y + header_h
 
     if subtitle_h > 0 then
-        root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y,
+        root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad, y_off = y,
             Ui.textbox(subtitle, content_w, subtitle_h, Skin.face("smallinfofont", 8.7, 11.5, 7.4), {
                 alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY,
             })}
@@ -417,8 +484,8 @@ function Dialog:_build_content()
     if tab_h > 0 then
         local tab_w = math.max(1, math.floor(content_w / #categories))
         for index, category in ipairs(categories) do
-            local x = outer + pad + (index - 1) * tab_w
-            local actual_w = index == #categories and (outer + pad + content_w - x) or tab_w
+            local x = panel_x + pad + (index - 1) * tab_w
+            local actual_w = index == #categories and (panel_x + pad + content_w - x) or tab_w
             root[#root + 1] = OffsetContainer:new{x_off = x, y_off = y,
                 self:_tab_widget(category, actual_w, tab_h, tostring(category.key or "") == self.selected_key)}
         end
@@ -426,24 +493,26 @@ function Dialog:_build_content()
     end
 
     if #items == 0 then
-        root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y,
+        root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad, y_off = y,
             Ui.textbox(tostring(selected and selected.empty_text or self.opts.empty_text or "当前没有内容"), content_w, row_h,
                 Skin.face("cfont", 11.0, 14.8, 9.4), {alignment = "center", halign = "center", fgcolor = Blitbuffer.COLOR_DARK_GRAY})}
-        y = y + row_h
     else
         for index = first, last do
             local item = items[index]
-            root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y, self:_row_widget(item, content_w, row_h, index)}
+            root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad, y_off = y, self:_row_widget(item, content_w, row_h, index)}
             y = y + row_h
             if self.expanded_index == index then
                 y = y + action_gap
-                root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = y,
+                root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad, y_off = y,
                     self:_inline_actions_widget(item, content_w, action_h)}
                 y = y + action_h
             end
             if index < last then
-                root[#root + 1] = OffsetContainer:new{x_off = outer + pad + Skin.dp(4, 3, 6), y_off = y,
-                    Skin.divider(math.max(1, content_w - Skin.dp(8, 6, 12)), Blitbuffer.COLOR_GRAY)}
+                local strong=item.separator==true
+                root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad + Skin.dp(4, 3, 6), y_off = y,
+                    Skin.divider(math.max(1, content_w - Skin.dp(8, 6, 12)),
+                        strong and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
+                        strong and Skin.line("thick") or Skin.line("thin"))}
             end
         end
     end
@@ -452,7 +521,7 @@ function Dialog:_build_content()
         local prev_w = Skin.dp(54, 46, 72)
         local next_w = prev_w
         local page_w = math.max(1, content_w - prev_w - next_w)
-        root[#root + 1] = OffsetContainer:new{x_off = outer + pad, y_off = panel_h - pad - pager_h,
+        root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad, y_off = panel_y + panel_h - pad - pager_h,
             HorizontalGroup:new{
                 align = "center",
                 self:_pager_button("back", prev_w, pager_h, function()
@@ -481,7 +550,7 @@ function Dialog:_rebuild()
             h = math.max(old.y + old.h, self.frame_dimen.y + self.frame_dimen.h) - math.min(old.y, self.frame_dimen.y),
         }
     end
-    UIManager:setDirty(self, function() return "ui", Skin.expand_region(dirty) end)
+    UIManager:setDirty(self, function() return "full", Skin.expand_region(dirty) end)
 end
 
 function Dialog:init()
@@ -489,6 +558,8 @@ function Dialog:init()
     self.selected_key = tostring(self.opts.initial_category or "")
     self.page = tonumber(self.opts.initial_page) or 1
     self.expanded_index = nil
+    self.stack = {}
+    self._session_panel_h = nil
     self:_build_content()
     self.ges_events = {
         TapDismiss = {GestureRange:new{ges = "tap", range = self.dimen}},
@@ -511,9 +582,12 @@ function Dialog:onSwipeDismiss(_, ges)
     if ges and ges.direction == "north" then return self:_close(nil, true) end
     return false
 end
-function Dialog:onClose() return self:_close(self.opts and self.opts.on_back or nil) end
+function Dialog:onClose()
+    if type(self.stack) == "table" and #self.stack > 0 then return self:_pop() end
+    return self:_close(self.opts and self.opts.on_back or nil)
+end
 function Dialog:onShow()
-    UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.frame_dimen) end)
+    UIManager:setDirty(self, function() return "full", Skin.expand_region(self.frame_dimen) end)
 end
 function Dialog:onCloseWidget()
     local region = self.frame_dimen and Skin.expand_region(self.frame_dimen) or nil
@@ -525,6 +599,19 @@ function Dialog:onCloseWidget()
 end
 
 local M = {}
+function M.push(title, items, subtitle)
+    if live_dialog and not live_dialog.closed then
+        return live_dialog:_push(title, items, subtitle)
+    end
+    return false
+end
+function M.refresh()
+    if live_dialog and not live_dialog.closed then
+        live_dialog:_rebuild()
+        return true
+    end
+    return false
+end
 function M.close()
     if live_dialog and not live_dialog.closed then live_dialog:_close(nil, true) end
     live_dialog = nil
@@ -538,7 +625,7 @@ function M.show(opts)
         return nil, tostring(dialog)
     end
     live_dialog = dialog
-    UIManager:show(dialog, "ui", dialog.frame_dimen)
+    UIManager:show(dialog, "full", dialog.frame_dimen)
     return dialog
 end
 return M

@@ -391,7 +391,6 @@ function QuickPanelWidget:_build()
 
     local title_h = UiScale.dp(52, 47, 70)
     local button_h = UiScale.dp(98, 90, 128)
-    local footer_h = (self.opts.on_customize or self.opts.on_tools) and UiScale.dp(48, 43, 64) or 0
     local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(34, 30, 46) or 0
 
     self.panel_h = margin * 2 + title_h + line + gap * 2
@@ -400,7 +399,6 @@ function QuickPanelWidget:_build()
     end
     if status_h > 0 then self.panel_h = self.panel_h + status_h + gap end
     if frontlight_h > 0 then self.panel_h = self.panel_h + line + gap + frontlight_h + gap end
-    if footer_h > 0 then self.panel_h = self.panel_h + line + gap + footer_h end
     self.panel_h = math.min(sh - margin, self.panel_h)
 
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
@@ -546,43 +544,6 @@ function QuickPanelWidget:_build()
         y = y + status_h + gap
     end
 
-    if footer_h > 0 and y + line + gap + footer_h <= self.panel_h then
-        self:_add(children, margin, y, LineWidget:new{
-            background = Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_GRAY,
-            dimen = Geom:new{w = sw - margin * 2, h = line},
-        })
-        y = y + line + gap
-
-        local available_w = sw - margin * 2
-        local has_customize = type(self.opts.on_customize) == "function"
-        local has_tools = type(self.opts.on_tools) == "function"
-        local count = (has_customize and 1 or 0) + (has_tools and 1 or 0)
-        local footer_gap = count > 1 and UiScale.dp(18, 14, 26) or 0
-        local item_w = count > 0 and math.floor((available_w - footer_gap * math.max(0, count - 1)) / count) or available_w
-        local x = margin
-
-        if has_customize then
-            local customize = tappable(item_w, footer_h,
-                fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
-                    Ui.text("自定义", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
-                function(anchor)
-                    if not self:_controls_armed() then return true end
-                    self:_close(function() self.opts.on_customize(anchor) end)
-                end)
-            self:_add(children, x, y, customize)
-            x = x + item_w + footer_gap
-        end
-        if has_tools then
-            local tools = tappable(item_w, footer_h,
-                fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
-                    Ui.text("工具与维护  ›", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
-                function(anchor)
-                    if not self:_controls_armed() then return true end
-                    self:_close(function() self.opts.on_tools(anchor) end)
-                end)
-            self:_add(children, x, y, tools)
-        end
-    end
 
     self:_add(children, 0, self.panel_h - UiScale.line("thick"), LineWidget:new{
         background = Blitbuffer.COLOR_BLACK,
@@ -596,7 +557,6 @@ local function panel_signature(opts)
     local parts={tostring(Screen:getWidth()),tostring(Screen:getHeight()),
         tostring(UiScale.getDisplayMode and UiScale.getDisplayMode() or "standard"),
         tostring(UiScale.getFontName and UiScale.getFontName() or ""),
-        tostring(type(opts.on_customize)=="function"),tostring(type(opts.on_tools)=="function"),
         tostring((opts.status_text and opts.status_text~="") and 1 or 0),
         tostring(type(opts.frontlight)=="table"),
         tostring(type(opts.frontlight)=="table" and type(opts.frontlight.warmth)=="table")}

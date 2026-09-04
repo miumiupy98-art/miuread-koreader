@@ -21,7 +21,7 @@ MiuRead（觅阅 · 微信读书助手）是面向 KOReader 的非官方微信�
 1. 在 GitHub Releases 下载需要的版本。
 2. 解压后将完整的 `miuread.koplugin` 目录放入 KOReader 的插件目录。
 3. 完整重启 KOReader。
-4. 支持双更新通道的版本可在“更新与关于 → 更新通道”中选择正式通道或内测通道。
+4. 支持双更新通道的版本可在“觅阅设置 → 更新与关于 → 更新通道”中选择正式通道或内测通道。
 
 ## Release Process
 

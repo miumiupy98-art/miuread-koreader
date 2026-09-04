@@ -1,5 +1,4 @@
 local SQLiteStore = require("miuread.sqlite_store")
-local Json = require("miuread.json")
 local U = require("miuread.util")
 local lfs = require("libs/libkoreader-lfs")
 
@@ -129,92 +128,9 @@ function DownloadDatabase.get_pause(path, token)
     return DownloadDatabase.get_task_value(path, token, "pause", nil)
 end
 
-function DownloadDatabase.set_cancelled(path, token, cancelled)
-    if cancelled ~= true then return DownloadDatabase.delete_task_value(path, token, "cancel") end
-    return DownloadDatabase.set_task_value(path, token, "cancel", {cancelled=true, updated_at=os.time()})
-end
-
-function DownloadDatabase.is_cancelled(path, token)
-    local value = DownloadDatabase.get_task_value(path, token, "cancel", nil)
-    return type(value) == "table" and value.cancelled == true
-end
-
-function DownloadDatabase.clear_task(path, token)
-    local fields = {"descriptor", "progress", "result", "recovery", "pause", "cancel", "migration_progress"}
-    for _, field in ipairs(fields) do DownloadDatabase.delete_task_value(path, token, field) end
-    return true
-end
-
 function DownloadDatabase.remove_partial(root)
     local path = partial_path(root)
     os.remove(path); os.remove(path .. "-wal"); os.remove(path .. "-shm")
-end
-
-local function read_legacy_json(path)
-    local raw = U.read_file(path, true)
-    if not raw then return nil end
-    local ok, value = pcall(Json.decode, raw)
-    return ok and type(value) == "table" and value or nil
-end
-
-function DownloadDatabase.migrate_legacy_partial(root)
-    local manifest_path = tostring(root or "") .. "/manifest.json"
-    local legacy_manifest = read_legacy_json(manifest_path)
-    local existing_manifest = DownloadDatabase.load_manifest(root)
-    local manifest = type(legacy_manifest) == "table" and legacy_manifest or existing_manifest
-    if type(manifest) ~= "table" then
-        return {migrated=false, existing=DownloadDatabase.partial_exists(root)}
-    end
-
-    local manifest_saved = type(existing_manifest) == "table"
-    if type(legacy_manifest) == "table" then
-        local saved, save_error = DownloadDatabase.save_manifest(root, legacy_manifest)
-        if not saved then return nil, save_error end
-        manifest_saved = true
-    end
-
-    local migrated_assets, migrated_annotations, remaining = 0, 0, 0
-    for uid in pairs(type(manifest.chapters) == "table" and manifest.chapters or {}) do
-        local chapter_dir = tostring(root) .. "/chapters/" .. U.id_name(uid)
-        local assets_path = chapter_dir .. "/assets.json"
-        local assets = read_legacy_json(assets_path)
-        if type(assets) == "table" then
-            local ok_assets = DownloadDatabase.save_assets(root, uid, assets)
-            if ok_assets then
-                os.remove(assets_path)
-                migrated_assets = migrated_assets + 1
-            else
-                remaining = remaining + 1
-            end
-        end
-        local annotation_dir = chapter_dir .. "/annotations"
-        if lfs.attributes(annotation_dir, "mode") == "directory" then
-            for name in lfs.dir(annotation_dir) do
-                if name:match("%.json$") then
-                    local path = annotation_dir .. "/" .. name
-                    local snapshot = read_legacy_json(path)
-                    local account_key = name:gsub("%.json$", "")
-                    if type(snapshot) == "table" then
-                        local ok_annotation = DownloadDatabase.save_annotation(root, uid, account_key, snapshot)
-                        if ok_annotation then
-                            os.remove(path)
-                            migrated_annotations = migrated_annotations + 1
-                        else
-                            remaining = remaining + 1
-                        end
-                    else
-                        remaining = remaining + 1
-                    end
-                end
-            end
-        end
-    end
-    if manifest_saved then os.remove(manifest_path) end
-    return {
-        migrated=type(legacy_manifest) == "table" or migrated_assets > 0 or migrated_annotations > 0,
-        existing=type(existing_manifest) == "table",
-        assets=migrated_assets, annotations=migrated_annotations, remaining=remaining,
-    }
 end
 
 local function account_hash(value)

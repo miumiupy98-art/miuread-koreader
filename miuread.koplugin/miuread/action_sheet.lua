@@ -1,5 +1,6 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local ButtonDialog = require("ui/widget/buttondialog")
+local InfoMessage = require("ui/widget/infomessage")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local Geom = require("ui/geometry")
@@ -18,6 +19,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local TransientGuard = require("miuread.transient_guard")
+local DialogTransition = require("miuread.dialog_transition")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
 local U = require("miuread.util")
@@ -110,7 +112,11 @@ local SheetWidget = InputContainer:extend{
     name = "miuread_action_sheet",
     _miuread_transient = true,
     _miuread_modal_surface = true,
-    covers_fullscreen = true,
+    -- This widget captures input over the whole screen, but only paints the
+    -- floating bubble. It must not claim to cover the framebuffer, otherwise
+    -- UIManager may skip repainting the HomeView underneath during close/refresh
+    -- races and leave the bubble border/pointer behind on e-ink screens.
+    covers_fullscreen = false,
     stop_events_propagation = true,
     opts = nil,
     dimen = nil,
@@ -492,7 +498,7 @@ function SheetWidget:onBack() return self:_close() end
 function SheetWidget:onScreenResize() return self:_close() end
 function SheetWidget:onRotation() return self:_close() end
 function SheetWidget:onShow()
-    UIManager:setDirty(self, function() return "ui", self.bubble_dimen or self.panel_dimen end)
+    UIManager:setDirty(self, function() return "full", self.bubble_dimen or self.panel_dimen end)
     local delay=tonumber(self.opts and self.opts.auto_close)
     if delay and delay>0 then
         self._auto_close_callback=function()
@@ -510,13 +516,12 @@ function SheetWidget:onCloseWidget()
     local action = self.pending_action
     self.pending_action = nil
     if live_sheet == self then live_sheet = nil end
-    if region then UIManager:setDirty(nil, function() return "ui", region end) end
-    if action then
-        UIManager:scheduleIn(.04, function()
-            local ok, err = pcall(action)
-            if not ok then logger.warn("[MiuRead][ActionSheet] action failed", tostring(err)) end
-        end)
-    end
+    -- CloseWidget fires before UIManager removes this sheet from the stack.
+    -- Repaint the newly exposed HomeView on the next UI turn, then run the
+    -- selected action, and repaint the old bubble region once more afterwards.
+    -- This prevents the Home section refresh triggered by source selection from
+    -- painting inside the old bubble while its frame/pointer remains on screen.
+    DialogTransition.after_close(region, action, "ActionSheet")
 end
 
 local function show_fallback(opts, reason)
@@ -608,10 +613,26 @@ function ActionSheet.show(opts)
     TransientGuard.close_all()
     ActionSheet.close()
     opts = opts or {}
+    local visible_count=0
+    for _,action in ipairs(type(opts.actions)=="table" and opts.actions or {}) do
+        if type(action)=="table" and action.hidden~=true then visible_count=visible_count+1 end
+    end
+    local has_footer=type(opts.footer_action)=="table"
+        or (type(opts.footer_actions)=="table" and #opts.footer_actions>0)
+        or opts.show_close==true
+    local is_notice=tonumber(opts.auto_close) and tonumber(opts.auto_close)>0
+    if visible_count==0 and not has_footer and not is_notice then
+        logger.warn("[MiuRead][ActionSheet] empty action set suppressed")
+        local message=InfoMessage:new{text="当前没有可用操作",timeout=2}
+        message._miuread_transient=true
+        message._miuread_modal_surface=true
+        UIManager:show(message)
+        return message
+    end
     local ok, sheet = pcall(SheetWidget.new, SheetWidget, {opts = opts})
     if not ok or not sheet then return show_fallback(opts, sheet) end
     live_sheet = sheet
-    local shown, show_err = pcall(UIManager.show, UIManager, sheet, "ui", sheet.bubble_dimen or sheet.panel_dimen)
+    local shown, show_err = pcall(UIManager.show, UIManager, sheet, "full", sheet.bubble_dimen or sheet.panel_dimen)
     if not shown then
         live_sheet = nil
         return show_fallback(opts, show_err)

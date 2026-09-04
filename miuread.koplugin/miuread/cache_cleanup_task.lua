@@ -93,6 +93,9 @@ local function is_download_temp_name(name)
         or name:match("^download%-recovery%-.+%.json$") ~= nil
         or name:match("^download%-pause%-.+%.json$") ~= nil
         or name:match("^download%-cancel%-.+") ~= nil
+        or name:match("^extension%-.+%.zip$") ~= nil
+        or name:match("^extension%-json%-.+%.json$") ~= nil
+        or name:match("^extension%-stage%-.+") ~= nil
 end
 
 local function validate_delete_path(path, policy)
@@ -123,7 +126,7 @@ local function validate_delete_path(path, policy)
                 or name:match("%.miuread%-linkbak$")) then
             return true
         end
-        return false, "不在下载残留白名单中"
+        return false, "不在临时文件残留白名单中"
     end
 
     if mode == "cover_cache" then

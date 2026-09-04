@@ -124,27 +124,6 @@ function WeRead.web_app_id(user_agent)
     return "wb" .. table.concat(prefix) .. "h" .. tostring(hash)
 end
 
-function WeRead.make_content_params(book_id, chapter_uid, psvts, opts)
-    opts = opts or {}
-    local ct = opts.ct or os.time()
-    if WeRead.e(ct) == psvts then
-        ct = ct + 1
-    end
-
-    local params = {
-        b = WeRead.e(book_id),
-        c = WeRead.e(chapter_uid),
-        r = tostring(math.random(0, 9999) ^ 2),
-        ct = tostring(ct),
-        ps = psvts,
-        pc = WeRead.e(ct),
-        sc = opts.sc or 1,
-        prevChapter = false,
-        st = opts.style and 1 or 0,
-    }
-    params.s = WeRead.sign(WeRead.sorted_query(params))
-    return params
-end
 
 function WeRead.make_read_payload(opts)
     local now = opts.now or os.time()
@@ -177,10 +156,6 @@ function WeRead.make_read_payload(opts)
     return params
 end
 
-function WeRead.is_mp_book(book_id)
-    local id=tostring(book_id or "")
-    return id:sub(1, 7) == "MP_WXS_" or id:lower()=="mpbook"
-end
 
 function WeRead.reader_url(book_id, chapter_uid)
     local url = "https://weread.qq.com/web/reader/" .. WeRead.e(book_id)
@@ -190,16 +165,5 @@ function WeRead.reader_url(book_id, chapter_uid)
     return url
 end
 
-function WeRead.mp_reader_url(book_id)
-    return "https://weread.qq.com/web/mp/reader/" .. WeRead.e(book_id)
-end
-
---- Upgrade WeRead CDN cover URLs to the higher-resolution t9 token.
-function WeRead.normalize_cover_url(url)
-    if type(url) ~= "string" or url == "" then
-        return url
-    end
-    return url:gsub("/t%d+_", "/t9_")
-end
 
 return WeRead

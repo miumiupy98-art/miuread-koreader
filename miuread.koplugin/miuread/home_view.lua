@@ -246,24 +246,23 @@ local function progress_bar(width, height, progress)
     return row
 end
 
-local function section_header(title, width, height, on_more)
-    -- Keep the full-shelf function without letting a large “全部” label steal
-    -- cover space. The grid icon opens the same 4-column full-screen shelf.
-    local right_w = on_more and math.max(UiScale.dp(38, 34, 56), math.floor(width * .075)) or 0
-    local left_w = width - right_w
-    local row = HorizontalGroup:new{
-        align = "center",
-        LeftContainer:new{dimen = Geom:new{w = left_w, h = height}, TextWidget:new{
-            text = tostring(title or ""),
-            face = face("cfont", 15, 19),
-            bold = true,
-        }},
-    }
+local function section_header(title, width, height, on_more, on_source, filter_label)
+    local right_w = on_more and math.max(UiScale.dp(68, 58, 92), math.floor(width * .14)) or 0
+    local gap = on_more and UiScale.dp(4, 3, 7) or 0
+    local left_w = math.max(1, width - right_w - gap)
+    local label = tostring(title or "") .. (on_source and " ▾" or "")
+    local left_text = fixed_frame(left_w, height, {bordersize=0, background=Blitbuffer.COLOR_WHITE},
+        LeftContainer:new{dimen=Geom:new{w=left_w,h=height}, TextWidget:new{
+            text=label, face=face("smallinfofont",10.5,14.5), bold=false,
+        }})
+    local row = HorizontalGroup:new{align = "center"}
+    if on_source then row[#row + 1] = tappable(left_w, height, left_text, on_source)
+    else row[#row + 1] = left_text end
     if on_more then
-        table.insert(row, tappable(right_w, height,
-            Ui.icon("grid", right_w, height, UiScale.dp(21, 18, 28), {
-                face = UiScale.iconFace("cfont", 16, 22, 13),
-            }), on_more))
+        row[#row + 1] = HorizontalSpan:new{width=gap}
+        row[#row + 1] = tappable(right_w, height,
+            fixed_frame(right_w, height, {bordersize=0, background=Blitbuffer.COLOR_WHITE},
+                Ui.text(tostring(filter_label or "筛选"),right_w,height,face("smallinfofont",10.5,14.5),{bold=true})), on_more)
     end
     return row
 end
@@ -368,12 +367,18 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     local recent_line = U.trim(tostring(book.last_read_text or ""))
 
     local source_line
-    if book.source == "local" or book.local_file == true then
-        source_line = "本地阅读"
-    elseif tostring(book.source or "") == "mp" then
+    local unified_source = tostring(book.unified_source or book.external_source or book.source or "")
+    if unified_source == "fanqie" then
+        source_line = "番茄小说"
+    elseif unified_source == "zlibrary" or unified_source == "z-lib" then
+        source_line = "Z-Library"
+    elseif unified_source == "wechat_mp" or unified_source == "wechat_mp_article"
+        or unified_source == "mp" or unified_source == "mp_article" then
         source_line = "公众号"
+    elseif unified_source == "local" or book.local_file == true then
+        source_line = "本地书"
     else
-        source_line = "微信书架"
+        source_line = "微信读书"
     end
 
     local info_lines = {}
@@ -513,7 +518,7 @@ local function welcome_card(width, height, callback)
             TextWidget:new{text = "开始阅读", face = UiScale.iconFace("cfont", 18, 24), bold = true},
             VerticalSpan:new{height = UiScale.dp(7, 5, 10)},
             TextWidget:new{
-                text = "从微信书架选择一本书",
+                text = "从书架选择一本内容",
                 face = face("smallinfofont", 11, 14),
                 fgcolor = Blitbuffer.COLOR_BLACK,
             },
@@ -1028,12 +1033,12 @@ function HomeWidget:_build_header(children, m)
     }},nil)
 
     -- The final cell owns the remainder and no trailing span is painted outside
-    -- the safe inset. This is what keeps “更多” away from the bezel.
+    -- the safe inset. This is what keeps “工具” away from the bezel.
     local menu_w=last_w
     header[#header+1]=tappable(menu_w,m.header_h,
         fixed_frame(menu_w,m.header_h,{bordersize=0,background=Blitbuffer.COLOR_WHITE},
-            Ui.text("更多",menu_w,m.header_h,face("smallinfofont",10.8,14.8),{bold=true})),function()
-        logger.info("[MiuRead][Home] more menu tapped")
+            Ui.text("工具",menu_w,m.header_h,face("smallinfofont",10.8,14.8),{bold=true})),function()
+        logger.info("[MiuRead][Home] tools menu tapped")
         if self.opts and self.opts.on_menu then self.opts.on_menu()
         elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
     end)
@@ -1378,7 +1383,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                 sy = sy + subtabs_h + math.max(2, math.floor(gap * .25))
             end
             if section_h > 0 then
-                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, nil))
+                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label))
                 sy = sy + section_h + math.max(2, math.floor(gap * .25))
             end
             local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
@@ -1482,7 +1487,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         y = y + subtabs_h + math.max(2, math.floor(gap * .25))
     end
     if section_h > 0 and y + section_h < bottom then
-        self:_add(children, x, y, section_header(title, w, section_h, nil))
+        self:_add(children, x, y, section_header(title, w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label))
         y = y + section_h + math.max(2, math.floor(gap * .25))
     end
     local footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
@@ -1596,7 +1601,7 @@ function HomeWidget:_mark_dirty(kind, previous_region)
         local right=math.min(Screen:getWidth(),(region.x or 0)+(region.w or 1)+safety)
         local bottom=math.min(Screen:getHeight(),(region.y or 0)+(region.h or 1)+safety)
         region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
-        UIManager:setDirty(self, function() return "ui", region end)
+        UIManager:setDirty(self, function() return kind == "section" and "full" or "ui", region end)
     else
         UIManager:setDirty(self, "full")
     end
@@ -1747,7 +1752,10 @@ function HomeWidget:updateSection(opts)
     self.opts.on_open_book = opts.on_open_book or self.opts.on_open_book
     self.opts.on_hold_book = opts.on_hold_book or self.opts.on_hold_book
     self.opts.home_actions = opts.home_actions or self.opts.home_actions
-    self.opts.on_shelf_all = opts.on_shelf_all or self.opts.on_shelf_all
+    if opts.on_shelf_all ~= nil then self.opts.on_shelf_all = opts.on_shelf_all end
+    if opts.on_shelf_filter ~= nil then self.opts.on_shelf_filter = opts.on_shelf_filter end
+    if opts.on_shelf_source ~= nil then self.opts.on_shelf_source = opts.on_shelf_source end
+    if opts.shelf_filter_label ~= nil then self.opts.shelf_filter_label = opts.shelf_filter_label end
     self.opts.on_shelf_page = opts.on_shelf_page or self.opts.on_shelf_page
     self.opts.shelf_page = opts.shelf_page or self.opts.shelf_page
     self.opts.shelf_pages = opts.shelf_pages or self.opts.shelf_pages
