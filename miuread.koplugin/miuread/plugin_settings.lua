@@ -1,5 +1,4 @@
 local ExtensionCenter=require("miuread.extension_center")
-local NativePlugins=require("miuread.native_plugins")
 local Device=require("device")
 local M={}
 
@@ -78,11 +77,6 @@ local function home_page_settings(plugin)
     return {
         {text="页面布局",post_text=(home.layout_style=="compact" and "紧凑布局" or "标准布局"),sub_item_table_func=function() return plugin:home_layout_settings_menu() end},
         {text="主页阅读统计",post_text=plugin:_home_stats_visibility_label(home),sub_item_table_func=function() return plugin:home_stats_settings_menu() end},
-        {text="统一书架",post_text="书架 · 本机 · 最近",sub_item_table_func=function() return {
-            {text="书架筛选",post_text="来源 类型 本机状态与排序",sub_item_table_func=function() return plugin:_home_library_filter_menu("shelf") end},
-            {text="本机筛选",post_text="来源 类型与排序",sub_item_table_func=function() return plugin:_home_library_filter_menu("device") end},
-            {text="本地书库",post_text=plugin:_local_library_root_label(),sub_item_table_func=function() return plugin:local_library_preferences_menu() end},
-        } end},
         {text="显示书架封面",checked_func=function() return plugin.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() plugin:_toggle_preference("shelf_covers") end},
         {text="网络补全图书信息",post_text="只补充缺失资料",checked_func=function() return plugin:_home_preferences().network_metadata~=false end,keep_menu_open=true,callback=function() plugin:_toggle_home_network_metadata() end},
     }
@@ -107,11 +101,17 @@ local function lockscreen_settings(plugin)
     }
 end
 
+local function reader_toolbar_row(plugin)
+    return {text="觅阅阅读工具栏",post_text=plugin:_reader_toolbar_setting_summary(),
+        checked_func=function() return plugin:_reader_toolbar_enabled() end,keep_menu_open=true,
+        callback=function() plugin:_set_reader_toolbar_enabled(not plugin:_reader_toolbar_enabled()) end}
+end
+
 function M.home_interface(plugin)
     return {
         {text="主页",post_text="布局与内容",sub_item_table_func=function() return home_page_settings(plugin) end},
         {text="快捷工具",post_text="主页 + 下滑工具栏",sub_item_table_func=function() return plugin:home_customization_menu() end},
-        {text="阅读界面",post_text=plugin:_reader_toolbar_setting_summary(),sub_item_table_func=function() return plugin:reader_quick_panel_settings_menu() end},
+        reader_toolbar_row(plugin),
         {text="字体与显示",post_text="大小 字体与时间",sub_item_table_func=function() return display_typography_settings(plugin) end},
         {text="锁屏与封面",post_text=plugin:_home_lockscreen_style_label(plugin:_home_preferences()),sub_item_table_func=function() return lockscreen_settings(plugin) end},
     }
@@ -119,8 +119,8 @@ end
 
 function M.plugins_extensions(plugin)
     return {
-        {text="觅阅扩展中心",post_text="发现 安装 更新与卸载",sub_item_table_func=function() return ExtensionCenter.menu(plugin) end},
-        {text="已安装插件",post_text=tostring(NativePlugins.count()),sub_item_table_func=function() return NativePlugins.menu(plugin) end},
+        {text="查找扩展",post_text="搜索与社区热门",sub_item_table_func=function() return ExtensionCenter.discovery_menu(plugin) end},
+        {text="我的插件",post_text=tostring(ExtensionCenter.installed_count(plugin)),sub_item_table_func=function() return ExtensionCenter.installed_menu(plugin) end},
     }
 end
 
@@ -185,8 +185,12 @@ function M.menu(plugin)
     }
     if plugin:_home_enabled() then
         rows[#rows+1]={text="首页与界面",post_text="主页 书架与快捷工具",sub_item_table_func=function() return M.home_interface(plugin) end}
+    else
+        -- 插件模式没有觅阅主页，但阅读工具栏仍是独立可用功能。
+        -- 保留直接开关，避免移除“阅读界面”子菜单后失去设置入口。
+        rows[#rows+1]=reader_toolbar_row(plugin)
     end
-    rows[#rows+1]={text="插件与扩展",post_text="扩展中心与已安装插件",sub_item_table_func=function() return M.plugins_extensions(plugin) end}
+    rows[#rows+1]={text="插件与扩展",post_text="查找扩展与我的插件",sub_item_table_func=function() return M.plugins_extensions(plugin) end}
     rows[#rows+1]={text="设备与 KOReader",post_text="设备控制与原生入口",sub_item_table_func=function() return M.device_koreader(plugin) end}
     rows[#rows+1]={text="系统与维护",post_text="诊断 修复 性能与更新",sub_item_table_func=function() return M.system_maintenance(plugin) end}
     rows[#rows+1]={text="关于觅阅",post_text=tostring(plugin.version),sub_item_table_func=function() return M.about(plugin) end}

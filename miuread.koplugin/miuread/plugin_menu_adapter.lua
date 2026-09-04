@@ -154,24 +154,43 @@ end
 
 function M.menu_items(instance)
     if type(instance) ~= "table" or type(instance.addToMainMenu) ~= "function" then return nil end
-    local map = {}
+
+    -- Most KOReader plugins register entries with assignments such as
+    -- menu_items.foo = {...}. Capture those writes so MiuRead can preserve the
+    -- author's registration order instead of alphabetically re-sorting it.
+    -- A small fallback pass still includes plugins that deliberately use rawset.
+    local map, insertion_order, seen = {}, {}, {}
+    setmetatable(map, {
+        __newindex = function(t, key, value)
+            if rawget(t, key) == nil and not seen[key] then
+                seen[key] = true
+                insertion_order[#insertion_order + 1] = key
+            end
+            rawset(t, key, value)
+        end,
+    })
     local ok, err = xpcall(function() return instance:addToMainMenu(map) end, debug.traceback)
     if not ok then
         logger.warn("[MiuRead][PluginMenuAdapter] addToMainMenu failed", tostring(err))
         return nil, err
     end
-    local collected = {}
-    for key, item in pairs(map) do
-        if type(item) == "table" then collected[#collected + 1] = {key = tostring(key or ""), item = item} end
-    end
-    table.sort(collected, function(a, b)
-        local at = trim(a.item.text or a.key)
-        local bt = trim(b.item.text or b.key)
-        if at == bt then return a.key < b.key end
-        return at:lower() < bt:lower()
-    end)
+
     local out = {}
-    for _, entry in ipairs(collected) do out[#out + 1] = entry.item end
+    for _, key in ipairs(insertion_order) do
+        local item = rawget(map, key)
+        if type(item) == "table" then out[#out + 1] = item end
+    end
+    local fallback = {}
+    for key, item in pairs(map) do
+        if type(item) == "table" and not seen[key] then fallback[#fallback + 1] = {key=key,item=item} end
+    end
+    table.sort(fallback, function(a,b)
+        if type(a.key)=="number" and type(b.key)=="number" then return a.key<b.key end
+        if type(a.key)=="number" then return true end
+        if type(b.key)=="number" then return false end
+        return tostring(a.key)<tostring(b.key)
+    end)
+    for _, entry in ipairs(fallback) do out[#out + 1] = entry.item end
     return out
 end
 

@@ -246,7 +246,7 @@ local function progress_bar(width, height, progress)
     return row
 end
 
-local function section_header(title, width, height, on_more, on_source)
+local function section_header(title, width, height, on_more, on_source, filter_label)
     local right_w = on_more and math.max(UiScale.dp(68, 58, 92), math.floor(width * .14)) or 0
     local gap = on_more and UiScale.dp(4, 3, 7) or 0
     local left_w = math.max(1, width - right_w - gap)
@@ -262,7 +262,7 @@ local function section_header(title, width, height, on_more, on_source)
         row[#row + 1] = HorizontalSpan:new{width=gap}
         row[#row + 1] = tappable(right_w, height,
             fixed_frame(right_w, height, {bordersize=0, background=Blitbuffer.COLOR_WHITE},
-                Ui.text("筛选",right_w,height,face("smallinfofont",10.5,14.5),{bold=true})), on_more)
+                Ui.text(tostring(filter_label or "筛选"),right_w,height,face("smallinfofont",10.5,14.5),{bold=true})), on_more)
     end
     return row
 end
@@ -376,7 +376,7 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
         or unified_source == "mp" or unified_source == "mp_article" then
         source_line = "公众号"
     elseif unified_source == "local" or book.local_file == true then
-        source_line = "本地导入"
+        source_line = "本地书"
     else
         source_line = "微信读书"
     end
@@ -1383,7 +1383,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                 sy = sy + subtabs_h + math.max(2, math.floor(gap * .25))
             end
             if section_h > 0 then
-                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source))
+                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label))
                 sy = sy + section_h + math.max(2, math.floor(gap * .25))
             end
             local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
@@ -1487,7 +1487,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         y = y + subtabs_h + math.max(2, math.floor(gap * .25))
     end
     if section_h > 0 and y + section_h < bottom then
-        self:_add(children, x, y, section_header(title, w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source))
+        self:_add(children, x, y, section_header(title, w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label))
         y = y + section_h + math.max(2, math.floor(gap * .25))
     end
     local footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
@@ -1755,6 +1755,7 @@ function HomeWidget:updateSection(opts)
     if opts.on_shelf_all ~= nil then self.opts.on_shelf_all = opts.on_shelf_all end
     if opts.on_shelf_filter ~= nil then self.opts.on_shelf_filter = opts.on_shelf_filter end
     if opts.on_shelf_source ~= nil then self.opts.on_shelf_source = opts.on_shelf_source end
+    if opts.shelf_filter_label ~= nil then self.opts.shelf_filter_label = opts.shelf_filter_label end
     self.opts.on_shelf_page = opts.on_shelf_page or self.opts.on_shelf_page
     self.opts.shelf_page = opts.shelf_page or self.opts.shelf_page
     self.opts.shelf_pages = opts.shelf_pages or self.opts.shelf_pages

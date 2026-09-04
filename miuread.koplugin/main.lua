@@ -127,7 +127,6 @@ local COVER_GUARD_WINDOW=6*60*60
 local HOME_SHELF_REFRESH_TTL=tonumber(Config.HOME_REMOTE_SHELF_TTL_SECONDS) or 30*60
 local HOME_REMOTE_AUTO_RETRY=5*60
 local HOME_SECTION_ORDER={"shelf","device","recent"}
-local HOME_LIBRARY_SOURCE_KEYS={"all","weread","fanqie","wechat_mp","zlibrary","local"}
 
 -- 3.5 separates the always-visible home actions from the pull-down control
 -- center. Defaults intentionally avoid duplicates, while both areas remain
@@ -3597,7 +3596,7 @@ function Plugin:_show_mode_intro()
         }
     else
         dialog=ButtonDialog:new{
-            title="当前使用：插件模式\n\n插件模式默认保留 KOReader 的主页和阅读界面，适合使用 KOReader 原界面，或搭配其他美化 UI 和美化补丁。觅阅阅读工具栏可在‘插件设置 → 阅读界面’中单独开启，默认关闭。\n\n微信书架、搜索、下载、评论、同步、修复和公众号等觅阅功能仍可使用。\n\n如果希望使用觅阅完整主页和阅读快捷界面，可以恢复觅阅桌面。恢复前建议先禁用或删除其他美化 UI 和相关补丁。",
+            title="当前使用：插件模式\n\n插件模式默认保留 KOReader 的主页和阅读界面，适合使用 KOReader 原界面，或搭配其他美化 UI 和美化补丁。觅阅阅读工具栏可在觅阅设置首页直接开启，默认关闭。\n\n微信书架、搜索、下载、评论、同步、修复和公众号等觅阅功能仍可使用。\n\n如果希望使用觅阅完整主页和阅读快捷界面，可以恢复觅阅桌面。恢复前建议先禁用或删除其他美化 UI 和相关补丁。",
             title_align="center",
             buttons={
                 {{text="继续使用插件模式",callback=function() UIManager:close(dialog); self:_ack_mode_intro() end}},
@@ -4849,6 +4848,7 @@ function Plugin:_home_apply_section(section)
         on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
         home_actions=self:_home_action_entries(),
         on_shelf_filter=(section=="shelf" or section=="device") and function() self:_show_home_library_filter(section) end or false,
+        shelf_filter_label=(section=="shelf" or section=="device") and self:_home_library_filter_label(section) or "筛选",
         on_shelf_source=(section=="shelf" or section=="device") and function(anchor) self:_show_home_library_source_picker(section,anchor) end or false,
         on_shelf_all=false,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
@@ -6781,7 +6781,7 @@ end
 
 function Plugin:_home_local_empty_text()
     if self:_home_root()=="" then
-        return "请先设置书籍和分类所在文件夹\n\n位置：觅阅设置 → 首页与界面 → 统一书架 → 本地书库\n\n点击这里去设置"
+        return "请先设置书籍和分类所在文件夹\n\n位置：觅阅设置 → 阅读与书库 → 本地书库\n\n点击这里去设置"
     end
     if self._home_local_inline_loading==true then return "正在读取本地书库…" end
     return "这个文件夹中暂无可显示的本地书"
@@ -7222,13 +7222,32 @@ function Plugin:_home_set_library_filter(section,key,value)
 end
 
 function Plugin:_home_reset_library_filter(section)
-    local _,home,preferences=self:_home_library_filter_state(section)
-    home.library_filters[section]={source="all",kind="all",locality="all",sort="recent"}
+    local state,home,preferences=self:_home_library_filter_state(section)
+    -- “清除筛选”只清除真正会隐藏内容的条件。来源有独立入口，
+    -- 排序是长期浏览习惯，两者都不应被一起重置。
+    home.library_filters[section]={
+        source=tostring(state.source or "all"),
+        kind="all",locality="all",
+        sort=tostring(state.sort or "recent"),
+    }
     home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
     home.page_by_section[section]=1
     self:_save_home_preferences(home,preferences)
     if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
     return true
+end
+
+function Plugin:_home_library_filter_count(section)
+    local state=self:_home_library_filter_state(section)
+    local count=0
+    if tostring(state.kind or "all")~="all" then count=count+1 end
+    if section=="shelf" and tostring(state.locality or "all")~="all" then count=count+1 end
+    return count
+end
+
+function Plugin:_home_library_filter_label(section)
+    local count=self:_home_library_filter_count(section)
+    return count>0 and ("筛选 "..tostring(count)) or "筛选"
 end
 
 function Plugin:_home_weread_source_state()
@@ -7261,23 +7280,48 @@ function Plugin:_home_source_status_label(source)
         if state.fanqie.installed==true then return "未登录" end
     end
     if source=="zlibrary" and type(state.zlibrary)=="table" and state.zlibrary.installed==true then
-        return tostring(tonumber(state.zlibrary.count) or 0).." 本本机文件"
+        return "已安装"
     end
     return ""
 end
 
-function Plugin:_home_library_source_count(section,source)
+function Plugin:_home_library_source_counts(section)
     section=section=="device" and "device" or "shelf"
     local raw=self._home_unified_raw and self._home_unified_raw[section] or {}
     local state=self:_home_library_filter_state(section)
-    local probe=U.copy(state)
-    probe.source=tostring(source or "all")
-    return #UnifiedLibrary.apply(raw,probe,section)
+    local counts={all=0}
+    -- Count source matches in one pass while honoring the other active filters.
+    for _,row in ipairs(type(raw)=="table" and raw or {}) do
+        local kind=UnifiedLibrary.content_type(row)
+        local kind_ok=tostring(state.kind or "all")=="all" or kind==state.kind
+        local local_ok=tostring(state.locality or "all")=="all"
+            or (state.locality=="available" and row.local_available==true)
+            or (state.locality=="remote" and row.local_available~=true)
+        if kind_ok and (section~="device" or row.local_available==true) and local_ok then
+            local source=UnifiedLibrary.canonical_source(row)
+            counts.all=counts.all+1
+            counts[source]=(counts[source] or 0)+1
+        end
+    end
+    return counts
+end
+
+function Plugin:_home_library_source_keys(section,counts)
+    section=section=="device" and "device" or "shelf"
+    counts=type(counts)=="table" and counts or self:_home_library_source_counts(section)
+    local keys={"all","weread","wechat_mp","local"}
+    local external=self._home_unified_external_state or {}
+    local fanqie=type(external.fanqie)=="table" and external.fanqie or {}
+    local zlibrary=type(external.zlibrary)=="table" and external.zlibrary or {}
+    if fanqie.installed==true or (tonumber(counts.fanqie) or 0)>0 then keys[#keys+1]="fanqie" end
+    if zlibrary.installed==true or (tonumber(counts.zlibrary) or 0)>0 then keys[#keys+1]="zlibrary" end
+    local rank={all=0,weread=1,fanqie=2,wechat_mp=3,zlibrary=4,["local"]=5}
+    table.sort(keys,function(a,b) return (rank[a] or 99)<(rank[b] or 99) end)
+    return keys
 end
 
 function Plugin:_home_library_filter_menu(section)
     section=section=="device" and "device" or "shelf"
-    local source_labels=UnifiedLibrary.source_labels()
     local type_labels=UnifiedLibrary.type_labels()
     local local_labels=UnifiedLibrary.local_labels()
     local sort_labels=UnifiedLibrary.sort_labels()
@@ -7285,14 +7329,8 @@ function Plugin:_home_library_filter_menu(section)
         local out={}
         for _,value in ipairs(keys) do
             local choice=value
-            local suffix=""
-            if field=="source" and choice~="all" then
-                local status=self:_home_source_status_label(choice)
-                if status~="" then suffix=" · "..status end
-            end
             out[#out+1]={
-                text=(labels[choice] or choice)..suffix,
-                radio=true,
+                text=labels[choice] or choice,radio=true,
                 checked_func=function() return tostring(self:_home_library_filter_state(section)[field] or "all")==choice end,
                 callback=function() self:_home_set_library_filter(section,field,choice) end,
             }
@@ -7301,9 +7339,6 @@ function Plugin:_home_library_filter_menu(section)
     end
     local state=self:_home_library_filter_state(section)
     local rows={
-        {text="来源",post_text=source_labels[state.source] or state.source,sub_item_table_func=function()
-            return radio_menu("source",HOME_LIBRARY_SOURCE_KEYS,source_labels)
-        end},
         {text="内容类型",post_text=type_labels[state.kind] or state.kind,sub_item_table_func=function()
             return radio_menu("kind",{"all","book","article"},type_labels)
         end},
@@ -7316,17 +7351,8 @@ function Plugin:_home_library_filter_menu(section)
     rows[#rows+1]={text="排序",post_text=sort_labels[state.sort] or state.sort,sub_item_table_func=function()
         return radio_menu("sort",{"recent","added","title","author"},sort_labels)
     end}
-    rows[#rows+1]={text="清除筛选",callback=function() self:_home_reset_library_filter(section) end}
-    if section=="device" then
-        rows[#rows+1]={text="本机内容管理",sub_item_table_func=function()
-            return {
-                {text="文件夹浏览",callback=function()
-                    if self:_home_root()=="" then self:local_library_directory_dialog() else self:show_home_local_library() end
-                end},
-                {text="重新扫描本地书",callback=function() self:_home_scan_local(true) end},
-                {text="本地书库设置",sub_item_table_func=function() return self:local_library_preferences_menu() end},
-            }
-        end}
+    if self:_home_library_filter_count(section)>0 then
+        rows[#rows+1]={text="清除筛选",callback=function() self:_home_reset_library_filter(section) end}
     end
     return rows
 end
@@ -7340,10 +7366,11 @@ function Plugin:_show_home_library_source_picker(section,anchor)
     section=section=="device" and "device" or "shelf"
     local labels=UnifiedLibrary.source_labels()
     local state=self:_home_library_filter_state(section)
+    local counts=self:_home_library_source_counts(section)
     local actions={}
-    for _,source in ipairs(HOME_LIBRARY_SOURCE_KEYS) do
+    for _,source in ipairs(self:_home_library_source_keys(section,counts)) do
         local choice=source
-        local count=self:_home_library_source_count(section,choice)
+        local count=tonumber(counts[choice]) or 0
         local selected=tostring(state.source or "all")==choice
         local detail=tostring(count).." 项"
         if choice~="all" then
@@ -7901,7 +7928,7 @@ end
 function Plugin:_home_source_text(book)
     if not book then return "" end
     local source=UnifiedLibrary.canonical_source(book)
-    local labels={weread="微信读书",fanqie="番茄小说",zlibrary="Z-Library",["local"]="本地导入",wechat_mp="公众号"}
+    local labels={weread="微信读书",fanqie="番茄小说",zlibrary="Z-Library",["local"]="本地书",wechat_mp="公众号"}
     local label=labels[source] or "本机内容"
     local format=tostring(book.format or ""):upper()
     if book.local_available==true and format~="" then return label.." · "..format end
@@ -8224,7 +8251,7 @@ end
 
 function Plugin:_home_all_books_option_dialog()
     local state=self:_home_all_books_state()
-    local source_labels={all="全部来源",weread="微信读书",fanqie="番茄小说",zlibrary="Z-Library",["local"]="本地导入",wechat_mp="公众号"}
+    local source_labels={all="全部来源",weread="微信读书",fanqie="番茄小说",zlibrary="Z-Library",["local"]="本地书",wechat_mp="公众号"}
     local status_labels={all="全部状态",reading="阅读中",unread="尚未开始",finished="已读完",["local"]="本机已有",failed="异常"}
     local sort_labels={recent="最近阅读",added="最近加入",title="按书名",author="按作者"}
 
@@ -8245,9 +8272,21 @@ function Plugin:_home_all_books_option_dialog()
         return rows
     end
 
-    return self:_show_standalone_menu("筛选与排序",{
+    local present={}
+    for _,book in ipairs(self:_home_all_rows()) do
+        local source=UnifiedLibrary.canonical_source(book)
+        if source~="" then present[source]=true end
+    end
+    local external=self._home_unified_external_state or {}
+    local source_choices={"all","weread","wechat_mp","local"}
+    if present.fanqie or (type(external.fanqie)=="table" and external.fanqie.installed==true) then source_choices[#source_choices+1]="fanqie" end
+    if present.zlibrary or (type(external.zlibrary)=="table" and external.zlibrary.installed==true) then source_choices[#source_choices+1]="zlibrary" end
+    local rank={all=0,weread=1,fanqie=2,wechat_mp=3,zlibrary=4,["local"]=5}
+    table.sort(source_choices,function(a,b) return (rank[a] or 99)<(rank[b] or 99) end)
+
+    local rows={
         {text="来源",post_text=source_labels[state.source],sub_item_table_func=function()
-            return choice_rows("source",{"all","weread","fanqie","zlibrary","local","wechat_mp"},source_labels)
+            return choice_rows("source",source_choices,source_labels)
         end},
         {text="状态",post_text=status_labels[state.status],sub_item_table_func=function()
             return choice_rows("status",{"all","reading","unread","finished","local","failed"},status_labels)
@@ -8255,12 +8294,16 @@ function Plugin:_home_all_books_option_dialog()
         {text="排序",post_text=sort_labels[state.sort],sub_item_table_func=function()
             return choice_rows("sort",{"recent","added","title","author"},sort_labels)
         end},
-        {text="恢复默认",post_text="全部来源 · 全部状态 · 最近阅读",callback=function()
-            self._home_all_books_options={source="all",status="all",sort="recent"}
+    }
+    if state.source~="all" or state.status~="all" then
+        rows[#rows+1]={text="清除筛选",post_text="保留当前排序",callback=function()
+            local current=self:_home_all_books_state()
+            self._home_all_books_options={source="all",status="all",sort=tostring(current.sort or "recent")}
             self:_home_close_full_shelf()
             UIManager:scheduleIn(.05,function() self:show_home_all_books() end)
-        end},
-    })
+        end}
+    end
+    return self:_show_standalone_menu("筛选与排序",rows)
 end
 
 function Plugin:show_home_all_books()
@@ -16376,6 +16419,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
         home_actions=self:_home_action_entries(),
         on_shelf_filter=(active=="shelf" or active=="device") and function() self:_show_home_library_filter(active) end or false,
+        shelf_filter_label=(active=="shelf" or active=="device") and self:_home_library_filter_label(active) or "筛选",
         on_shelf_source=(active=="shelf" or active=="device") and function(anchor) self:_show_home_library_source_picker(active,anchor) end or false,
         on_shelf_all=false,
         on_shelf_page=function(delta) self:_home_change_page(delta) end,
@@ -19580,6 +19624,9 @@ local function is_download_temp_name(name)
         or name:match("^download%-recovery%-.+%.json$")
         or name:match("^download%-pause%-.+%.json$")
         or name:match("^download%-cancel%-.+")
+        or name:match("^extension%-.+%.zip$")
+        or name:match("^extension%-json%-.+%.json$")
+        or name:match("^extension%-stage%-.+")
 end
 local function is_epub_residue_name(name)
     name=tostring(name or "")
@@ -19957,8 +20004,8 @@ end
 function Plugin:_clear_download_residue()
     if self:_cache_action_blocked() then return end
     local paths=self:_download_residue_paths()
-    UIManager:show(ConfirmBox:new{text="清理全部下载断点和失败任务留下的临时文件？\n\n不会删除已生成 EPUB、想法与章节数据、待安装文件和封面。",ok_callback=function()
-        self:_run_cache_cleanup(paths,{progress_text="正在清理下载断点与临时文件……",done_text="下载断点与临时文件已清理",operation="清理下载断点与临时文件",policy={mode="download_residue"},commit=function()
+    UIManager:show(ConfirmBox:new{text="清理下载断点、失败任务和扩展安装留下的临时文件？\n\n不会删除已完成书籍、已安装插件、想法、章节数据或封面。",ok_callback=function()
+        self:_run_cache_cleanup(paths,{progress_text="正在清理临时文件……",done_text="临时文件已清理",operation="清理临时文件",policy={mode="download_residue"},commit=function()
             U.mkdir(self.store.temp_dir); self.store:prune_missing_files()
             local state=self.store:download_state()
             if state.status=="failed" or state.status=="interrupted" then self.store:clear_download_state() end
@@ -20027,7 +20074,7 @@ function Plugin:show_download_cleanup_dialog()
             title="存储清理",
             subtitle="不会删除书籍 划线 想法 阅读记录或已完成下载",
             actions={
-                {icon="⌫",label="下载临时文件",detail="清理断点和失败任务残留",callback=function() self:_clear_download_residue() end},
+                {icon="⌫",label="临时文件",detail="清理下载断点、失败任务与扩展安装残留",callback=function() self:_clear_download_residue() end},
                 {icon="⇥",label="下一章预读取缓存",detail=tostring(self.store:prefetched_chapter_count()).." 个",callback=function() self:_clear_prefetched_chapters() end},
                 {icon="▧",label="失效封面缓存",detail="需要时会自动重新生成",callback=function() self:_clear_cover_cache() end},
             },
@@ -20036,7 +20083,7 @@ function Plugin:show_download_cleanup_dialog()
     end
     local dialog
     dialog=ButtonDialog:new{title="清理下载与缓存",title_align="center",buttons={
-        {{text="清理下载断点与临时文件",callback=function() UIManager:close(dialog); self:_clear_download_residue() end}},
+        {{text="清理临时文件",callback=function() UIManager:close(dialog); self:_clear_download_residue() end}},
         {{text="清理下一章预读取缓存（"..tostring(self.store:prefetched_chapter_count()).."）",callback=function() UIManager:close(dialog); self:_clear_prefetched_chapters() end}},
         {{text="清理封面缓存",callback=function() UIManager:close(dialog); self:_clear_cover_cache() end}},
         {{text="取消",callback=function() UIManager:close(dialog) end}},
@@ -22954,7 +23001,7 @@ function Plugin:local_library_directory_dialog()
     if current=="" or lfs.attributes(current,"mode")~="directory" then current=self:_home_device_storage_root() end
     if current=="" then current="/" end
     local chooser=PathChooser:new{
-        title="选择书籍和分类所在文件夹",
+        title="选择书籍和分类所在文件夹（包含子文件夹）",
         select_directory=true,select_file=false,show_files=false,path=current,
         onConfirm=function(path)
             local ok,normalized=self:_validate_local_library_root(path)
@@ -22983,7 +23030,6 @@ end
 function Plugin:local_library_preferences_menu()
     return {
         {text="书籍和分类所在文件夹",post_text=self:_local_library_root_label(),callback=function() self:local_library_directory_dialog() end},
-        {text="扫描范围",post_text="设置文件夹及其子文件夹",enabled=false},
     }
 end
 

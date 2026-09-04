@@ -217,10 +217,31 @@ local function fanqie_cache_state(cache_dir, book)
     return total > 0 and count >= total, count, total
 end
 
+local function user_plugin_installed(dir_name)
+    dir_name=trim(dir_name)
+    if dir_name=="" then return false end
+    local roots,seen={},{ }
+    local function add(root)
+        root=norm_path(root)
+        if root~="" and not seen[root] then seen[root]=true; roots[#roots+1]=root end
+    end
+    add("plugins")
+    add(DataStorage:getDataDir().."/plugins")
+    local extra=G_reader_settings and G_reader_settings:readSetting("extra_plugin_paths") or nil
+    if type(extra)=="string" then extra={extra} end
+    if type(extra)=="table" then for _,root in ipairs(extra) do add(root) end end
+    for _,root in ipairs(roots) do
+        local path=root.."/"..dir_name
+        if lfs.attributes(path,"mode")=="directory" and file_exists(path.."/main.lua") then return true end
+    end
+    return false
+end
+
 local function fanqie_rows()
     local settings_path = DataStorage:getSettingsDir() .. "/fanqie.lua"
     local instance = PluginLoader:getPluginInstance("fanqie")
     local installed = instance ~= nil or lfs.attributes(settings_path, "mode") == "file"
+        or user_plugin_installed("fanqie.koplugin")
     if not installed then return {}, {installed=false} end
 
     local cookies, download_dir = {}, ""
@@ -366,9 +387,11 @@ local function external_rows()
     local fanqie, fanqie_state = fanqie_rows()
     local zdir = zlibrary_download_dir()
     local zrows, ztruncated = zlibrary_scan_rows(zdir)
+    local zinstalled=zdir~="" or PluginLoader:getPluginInstance("zlibrary")~=nil
+        or user_plugin_installed("zlibrary.koplugin")
     return {fanqie=fanqie, zlibrary=zrows}, {
         fanqie=fanqie_state,
-        zlibrary={installed=zdir~="", download_dir=zdir, count=#zrows, truncated=ztruncated},
+        zlibrary={installed=zinstalled, download_dir=zdir, count=#zrows, truncated=ztruncated},
     }
 end
 
@@ -503,7 +526,7 @@ end
 
 local SOURCE_LABELS = {
     all="全部来源", weread="微信读书", fanqie="番茄小说", zlibrary="Z-Library",
-    ["local"]="本地导入", wechat_mp="公众号",
+    ["local"]="本地书", wechat_mp="公众号",
 }
 local TYPE_LABELS = {all="全部内容", book="书籍", article="文章"}
 local LOCAL_LABELS = {all="全部", available="本机已有", remote="尚未下载"}
@@ -520,7 +543,7 @@ function M.available_sources(rows)
         local source = canonical_source(row)
         if source ~= "" and not seen[source] then seen[source] = true; out[#out + 1] = source end
     end
-    local rank={weread=1,fanqie=2,zlibrary=3,["local"]=4,wechat_mp=5}
+    local rank={weread=1,fanqie=2,wechat_mp=3,zlibrary=4,["local"]=5}
     table.sort(out,function(a,b)
         if a=="all" then return true end
         if b=="all" then return false end

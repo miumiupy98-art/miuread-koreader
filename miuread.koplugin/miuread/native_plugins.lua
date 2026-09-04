@@ -214,10 +214,48 @@ local function entry_for(owner,record)
 
     return {
         text=label,
-        post_text=version~="" and version or "无菜单入口",
+        post_text=version~="" and version or "原生菜单",
         callback=function()
-            unavailable_message(owner,module,err and "读取插件原生菜单失败" or "这个插件没有注册可直接进入的菜单")
+            -- Never let MiuRead's adapter become a dead end. If a plugin cannot
+            -- be represented safely here, hand control back to KOReader's own
+            -- plugin/menu entry instead of hiding the plugin's remaining UI.
+            if owner and type(owner._show_native_koreader_menu)=="function" then
+                owner:_show_native_koreader_menu()
+                return
+            end
+            unavailable_message(owner,module,err and "读取插件菜单失败" or "这个插件没有注册可直接进入的菜单")
         end,
+    }
+end
+
+function M.label(record_or_module)
+    local module=type(record_or_module)=="table" and (record_or_module.module or record_or_module) or nil
+    return plugin_label(module)
+end
+
+function M.version(record_or_module)
+    local module=type(record_or_module)=="table" and (record_or_module.module or record_or_module) or nil
+    return plugin_version(module)
+end
+
+function M.module_name(record_or_module)
+    local module=type(record_or_module)=="table" and (record_or_module.module or record_or_module) or nil
+    return trim(module and module.name or "")
+end
+
+function M.entry(owner,record)
+    if type(record)~="table" or type(record.module)~="table" then return nil end
+    return entry_for(owner,record)
+end
+
+function M.settings_entry(owner,record)
+    if type(record)~="table" or record.enabled~=true or type(record.module)~="table" then return nil end
+    local module=record.module
+    local instance=runtime_instance(owner,module)
+    if not instance or type(instance.openSettings)~="function" then return nil end
+    return {
+        text="插件设置",
+        callback=function() open_plugin_settings(owner,module,instance) end,
     }
 end
 
@@ -235,7 +273,7 @@ function M.menu(owner)
         out[#out+1]=entry_for(owner,record)
     end
     if #out==0 then
-        out[1]={text="暂无用户插件",post_text="可从觅阅扩展中心安装",enabled=false}
+        out[1]={text="暂无用户插件",post_text="可从“查找扩展”安装",enabled=false}
     end
     return out
 end
