@@ -55,6 +55,8 @@ local DownloadResult=require("miuread.download_result")
 local BookIntegrity=require("miuread.book_integrity")
 local EpubInstaller=require("miuread.epub_installer")
 local CacheCleanupTask=require("miuread.cache_cleanup_task")
+local BookDeleteService=require("miuread.book_delete_service")
+local BookLocalFilesDialog=require("miuread.book_local_files_dialog")
 local MemoryMode=require("miuread.memory_mode")
 local PerformanceMode=require("miuread.performance_mode")
 local RuntimePressure=require("miuread.runtime_pressure")
@@ -101,7 +103,6 @@ local DataMigration=require("miuread.data_migration")
 local DownloadDatabase=require("miuread.download_database")
 local StatusToast=require("miuread.status_toast")
 local BookExcerptDialog=require("miuread.book_excerpt_dialog")
-local HighlightMenu=require("miuread.highlight_menu")
 local ReaderTransitionGuard=require("miuread.reader_transition_guard")
 local PluginMenu=require("miuread.plugin_menu")
 local PluginSettings=require("miuread.plugin_settings")
@@ -687,6 +688,7 @@ function Plugin:init()
     logger.info("[MiuRead][Startup] begin","version=",tostring(Config.VERSION))
     logger.info("[MiuRead][Startup] store begin")
     self.store=Store:new()
+    self.book_delete_service=BookDeleteService:new(self)
     logger.info("[MiuRead][Startup] store ready")
 
     -- OTA safety must run before Bluetooth, cache cleanup, network setup or any
@@ -1877,6 +1879,7 @@ function Plugin:current_book_menu()
             return {
                 {text="本地文件",post_text=name~="" and name or "当前书籍",enabled=false},
                 {text="格式",post_text=ext and string.upper(ext) or "未知",enabled=false},
+                {text="本机文件",callback=function() BookLocalFilesDialog.open_local(self,{file=path,title=name}) end},
                 {text="KOReader 阅读菜单",post_text="排版、文档与原生功能",callback=function() self:_show_koreader_reader_menu() end},
             }
         end
@@ -1887,7 +1890,7 @@ function Plugin:current_book_menu()
         {text="书籍详情",callback=function() self:book_details(b) end},
         {text="下载章节",sub_item_table_func=function() return self:current_book_download_menu(b) end},
         {text="重新生成",sub_item_table_func=function() return self:current_book_rebuild_menu(b) end},
-        {text="管理本地文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end},
+        {text="本机文件",callback=function() BookLocalFilesDialog.open_generated(self,tostring(b.bookId)) end},
     }
 end
 
@@ -4871,7 +4874,8 @@ function Plugin:_home_apply_section(section)
         shelf_pages=total_pages,
         empty_text=selected.empty,
         on_open_book=function(book,anchor,ges) self:_home_open_book(book,anchor,ges) end,
-        on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
+        -- Home shelf books intentionally have no long-press action. All book
+        -- actions remain discoverable from the normal tap menu.
         home_actions=self:_home_action_entries(),
         on_shelf_filter=(section=="shelf" or section=="device") and function() self:_show_home_library_filter(section) end or false,
         shelf_filter_label=(section=="shelf" or section=="device") and self:_home_library_filter_label(section) or "筛选",
@@ -7429,27 +7433,6 @@ function Plugin:_show_home_library_source_picker(section,anchor)
     }
 end
 
-function Plugin:_home_toggle_library_membership(book)
-    if type(book)~="table" then return false end
-    local key=UnifiedLibrary.membership_key(book)
-    if key=="" then return false end
-    local home,preferences=self:_home_preferences()
-    home.library_membership=type(home.library_membership)=="table" and home.library_membership or {}
-    local adding=home.library_membership[key]~=true
-    home.library_membership[key]=adding and true or nil
-    self:_save_home_preferences(home,preferences)
-    self:_refresh_home_view(adding and "已加入书架" or "已移出书架","content")
-    return true
-end
-
-function Plugin:_home_can_toggle_library_membership(book)
-    local source=UnifiedLibrary.canonical_source(book)
-    if source=="local" or source=="zlibrary" or source=="wechat_mp" then return true end
-    -- FanQie's online account shelf remains owned by the plugin. Once the
-    -- account is logged out, a fully cached book may still be kept/removed
-    -- from MiuRead's local shelf independently.
-    return source=="fanqie" and book and book.local_available==true and book.remote_shelf~=true
-end
 
 function Plugin:_home_unified_sections(account_rows,generated_rows,local_rows,mp_articles,recent_local_rows,home)
     local weread_state=self:_home_weread_source_state()
@@ -8031,27 +8014,33 @@ end
 function Plugin:_home_variant_download_action(target,annotations,context)
     context=context or self:_home_variant_download_context(target and (target.bookId or target.book_id),annotations)
     local variant_name=annotations==true and "划线与想法版" or "纯净版"
-    local installed=context.installed~=nil
+    local book_id=tostring(target and (target.bookId or target.book_id) or "")
+    local installed=context.installed~=nil and context.installed.file and U.file_exists(context.installed.file)
     local task=context.task
     local repair=context.repair
     local label,detail,callback
 
     if task and task.status=="active" then
         local percent=self:_download_percent(task.state)
-        label=(installed and ("更新"..variant_name.."中 ") or (variant_name.."下载中 "))..tostring(percent).."%"
+        label=variant_name.."（下载中 "..tostring(percent).."%）"
         detail="点击查看当前下载进度"
         callback=function() self:show_downloads() end
+    elseif installed then
+        -- A readable local copy stays simply "已下载" even if a previous
+        -- re-download left a recoverable checkpoint. The shelf menu describes
+        -- what is usable now, not an update lifecycle.
+        label=variant_name.."（已下载）"
+        detail="打开、重新下载或查看本机版本"
+        callback=function() BookLocalFilesDialog.open_variant(self,book_id,annotations==true and "notes" or "clean") end
     elseif task or repair then
-        label=(installed and "继续更新" or "继续下载")..variant_name
-        detail="上次任务未完成，已保留可恢复断点"
+        label=variant_name.."（继续下载）"
+        detail="上次任务未完成，点击继续"
         local options=U.copy((task and task.options) or (repair and repair.options) or {annotations=annotations==true})
         options.annotations=annotations==true
         callback=function() self:choose_download_mode(target,options,false) end
     else
-        label=(installed and "更新" or "下载")..variant_name
-        detail=annotations==true
-            and (installed and "重新获取正文、划线与想法" or "生成包含微信读书划线与想法的完整版本")
-            or (installed and "重新生成完整纯净版" or "生成不含划线与想法的完整版本")
+        label=variant_name.."（未下载）"
+        detail=annotations==true and "下载包含微信读书划线与想法的完整版本" or "下载完整纯净版"
         callback=function() self:choose_download_mode(target,{annotations=annotations==true},false) end
     end
 
@@ -9063,83 +9052,6 @@ function Plugin:_home_action_function_actions(key,anchor)
     return {}
 end
 
-function Plugin:_home_book_delete_state(book)
-    local book_id=tostring(book and (book.bookId or book.book_id) or "")
-    if book_id=="" then return nil end
-    self.store:reload()
-    self.store:prune_missing_files()
-    local stored=self.store:book(book_id)
-    if not stored then return {book_id=book_id,variants={},chapter_count=0,has_partial=false} end
-    local kinds={"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}
-    local variants={}
-    local preferred=self:_preferred_record(book_id)
-    local preferred_file=preferred and tostring(preferred.file or "") or ""
-    local current_kind=nil
-    for _,kind in ipairs(kinds) do
-        local record=stored.variants and stored.variants[kind]
-        if record and record.file and U.file_exists(record.file) then
-            local row={kind=kind,label=self:_variant_label(kind),record=record}
-            variants[#variants+1]=row
-            if preferred_file~="" and tostring(record.file)==preferred_file then current_kind=kind end
-        end
-    end
-    if not current_kind and variants[1] then current_kind=variants[1].kind end
-    local _,chapter_count=self:_download_book_labels(U.merge(stored,{book_id=book_id}))
-    return {
-        book_id=book_id,
-        stored=stored,
-        variants=variants,
-        current_kind=current_kind,
-        chapter_count=tonumber(chapter_count) or 0,
-        has_partial=#(BookIntegrity.partial_repairs(self.store,book_id) or {})>0,
-        has_cache=self.store:book_has_partial_cache(book_id)==true,
-    }
-end
-
-function Plugin:_show_home_delete_book_popup(book,anchor)
-    local state=self:_home_book_delete_state(book)
-    if not state then self:info("这本书没有可删除的本地记录") return false end
-    local current_label="未识别"
-    for _,row in ipairs(state.variants or {}) do
-        if row.kind==state.current_kind then current_label=row.label; break end
-    end
-    local installed={}
-    for _,row in ipairs(state.variants or {}) do installed[#installed+1]=row.label end
-    if state.chapter_count>0 then installed[#installed+1]="单章文件" end
-    if state.has_partial then installed[#installed+1]="未完成断点" end
-    if #installed==0 and state.has_cache then installed[#installed+1]="下载缓存" end
-    if #installed==0 then self:info("这本书没有可删除的本地版本") return false end
-    local subtitle="ⓘ 当前版本："..current_label
-    if #installed>1 then subtitle=subtitle.." · 本地共 "..tostring(#installed).." 类文件" end
-    local actions={}
-    if state.current_kind then
-        actions[#actions+1]={
-            icon="⌫",label="删除当前版本",detail=current_label.." · 仅删除这个 EPUB",danger=true,
-            callback=function() self:_confirm_delete_variant(state.book_id,state.current_kind,book.title) end,
-        }
-    end
-    if #installed>1 or not state.current_kind then
-        actions[#actions+1]={
-            icon="!",label="删除全部本地版本",detail="同时清理本机评论、记录与缓存",danger=true,
-            callback=function() self:_confirm_delete_book_downloads(state.book_id,book.title) end,
-        }
-    end
-    actions[#actions+1]={
-        icon="i",label="查看已下载版本",detail=table.concat(installed,"、"),
-        callback=function() self:downloaded_book_menu(state.book_id) end,
-    }
-    ActionSheet.show{
-        anchor=anchor,
-        preferred_direction="above",
-        width_ratio=.66,
-        title="删除书籍 · "..tostring(book.title or "书籍"),
-        subtitle=subtitle,
-        actions=actions,wide_last=(#actions%2==1),
-        footer_action={label="取消",callback=function() end},
-    }
-    return true
-end
-
 function Plugin:_show_home_local_book_more(book,anchor)
     ActionSheet.show{
         anchor=anchor,preferred_direction="above",width_ratio=.62,
@@ -9166,15 +9078,6 @@ function Plugin:_home_hold_book(book,anchor)
         local fanqie_actions={
             {icon="book",label="打开番茄",detail="使用番茄插件原生书籍菜单",callback=function() UnifiedLibrary.open_external(self,book) end},
         }
-        if self:_home_can_toggle_library_membership(book) then
-            local in_shelf=book.in_shelf==true
-            fanqie_actions[#fanqie_actions+1]={
-                icon=in_shelf and "−" or "+",
-                label=in_shelf and "移出书架" or "加入书架",
-                detail=in_shelf and "只移出觅阅书架，不删除番茄缓存" or "把这本已缓存书保留在觅阅书架",
-                callback=function() self:_home_toggle_library_membership(book) end,
-            }
-        end
         fanqie_actions[#fanqie_actions+1]={icon="i",label="来源信息",detail=book.remote_shelf==true and "番茄账号书架缓存" or "番茄本机完整缓存",callback=function() self:info("来源：番茄小说\n状态："..tostring(book.source_state or "缓存书架")) end}
         ActionSheet.show{
             anchor=anchor,preferred_direction="above",width_ratio=.62,
@@ -9216,16 +9119,8 @@ function Plugin:_home_hold_book(book,anchor)
         if path_mode=="directory" then return self:show_local_browser(book.file or book.path,{path=LocalLibrary.normalize(self:_home_root()),name="本地书库"},{},false,nil,true) end
         local local_actions={
             {icon="book",label="阅读",detail="直接打开本机内容",callback=function() self:_home_open_book(book,nil,nil,true) end},
+            {icon="▤",label="本机文件",detail="查看或删除这个本地文件",callback=function() BookLocalFilesDialog.open_local(self,book) end},
         }
-        if self:_home_can_toggle_library_membership(book) then
-            local in_shelf=book.in_shelf==true
-            local_actions[#local_actions+1]={
-                icon=in_shelf and "−" or "+",
-                label=in_shelf and "移出书架" or "加入书架",
-                detail=in_shelf and "只移出书架，不删除本机文件" or "保留在“我的书架”中",
-                callback=function() self:_home_toggle_library_membership(book) end,
-            }
-        end
         local_actions[#local_actions+1]={icon="i",label="查看详情",detail="文件、进度和图书信息",callback=function() self:_home_local_book_details(book) end}
         local_actions[#local_actions+1]={icon="↻",label="更新书籍信息",detail="重新提取并尝试网络补全",callback=function() self:_home_refresh_one_book_metadata(book,true) end}
         local_actions[#local_actions+1]={icon="▤",label="KOReader 管理",detail="文件、文件夹与分类交给 KOReader",callback=function() self:_show_home_local_book_more(book,anchor) end}
@@ -9241,8 +9136,8 @@ function Plugin:_home_hold_book(book,anchor)
     local target=U.copy(book)
     self:_home_attach_local_record(target)
     local record=id~="" and self:_preferred_record(id) or nil
-    local available=record and record.file and U.file_exists(record.file)
-    local raw_cache=id~="" and self.store:book_has_partial_cache(id)==true
+    local local_summary=id~="" and self.book_delete_service:summary(id) or {has_local=false,chapter_count=0}
+    local available=local_summary.has_local==true and record and record.file and U.file_exists(record.file)
     local actions={}
 
     if available then
@@ -9265,27 +9160,27 @@ function Plugin:_home_hold_book(book,anchor)
     local chapter_detail="选择单章、连续章节或指定范围"
     local chapter_callback=function() self:chapters(target) end
     if chapter_task and tostring(download_state.status or "")=="active" then
-        chapter_label="章节下载中 "..tostring(self:_download_percent(download_state)).."%"
+        chapter_label="按章节下载（下载中 "..tostring(self:_download_percent(download_state)).."%）"
         chapter_detail="点击查看当前章节下载任务"
         chapter_callback=function() self:show_downloads() end
+    elseif tonumber(local_summary.downloaded_chapter_count or local_summary.chapter_count or 0)>0 then
+        local downloaded_chapters=tonumber(local_summary.downloaded_chapter_count or local_summary.chapter_count or 0) or 0
+        chapter_label="按章节下载（已下载 "..tostring(downloaded_chapters).." 章）"
     end
     actions[#actions+1]={icon="▤",label=chapter_label,detail=chapter_detail,callback=chapter_callback}
-    actions[#actions+1]={icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end}
-
-    -- Keep raw caches manageable, but never call them a broken download unless
-    -- BookIntegrity has identified real unfinished work for a concrete variant.
-    if available or self:_book_has_cache(id) or raw_cache then
-        actions[#actions+1]={icon="⌫",label="删除下载",detail="选择删除当前或全部本地版本",danger=true,callback=function()
-            self:_show_home_delete_book_popup(target,anchor)
+    if local_summary.has_local==true then
+        actions[#actions+1]={icon="▤",label="本机文件",detail="查看或删除已下载内容",callback=function()
+            BookLocalFilesDialog.open_generated(self,id)
         end}
     end
+    actions[#actions+1]={icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end}
     ActionSheet.show{
         anchor=anchor,
         preferred_direction="above",
         width_ratio=.72,
         title=tostring(target.title or "书籍"),
         subtitle=U.trim(tostring(target.author or ""))~="" and tostring(target.author)
-            or (available and "已下载" or "尚未下载"),
+            or (local_summary.has_local==true and "已有本机内容" or "尚未下载"),
         actions=actions,wide_last=(#actions%2==1),
     }
     return true
@@ -9461,6 +9356,10 @@ function Plugin:_home_store_directory_snapshot(path,snapshot)
     cache.dirs[path]=snapshot
     cache.updated_at=os.time()
     self.store:set("home_local_directory_cache_v5",cache)
+    if self.book_delete_service then
+        local pruned=self.book_delete_service:prune_missing_local_references()
+        if pruned>0 then logger.info("[MiuRead][LocalLibrary] stale local references pruned","count=",tostring(pruned)) end
+    end
     logger.info("[MiuRead][LocalLibrary] snapshot committed",
         "path=",path,"books=",tostring(#(snapshot.books or {})),
         "folders=",tostring(#(snapshot.folders or {})),
@@ -13608,7 +13507,7 @@ function Plugin:_install_book_excerpt_highlight_action()
     local host=self
     local ok,err=pcall(highlight.addToHighlightDialog,highlight,"04_miuread_book_excerpt",function(this)
         return {
-            text="书摘卡片",
+            text="书摘",
             show_in_highlight_dialog_func=function()
                 return this.selected_text and U.trim(tostring(this.selected_text.text or ""))~=""
             end,
@@ -16460,7 +16359,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         on_back=function() return self:_home_handle_back() end,
         on_empty_account=function() self:_home_open_section(active) end,
         on_open_book=function(book,anchor,ges) self:_home_open_book(book,anchor,ges) end,
-        on_hold_book=function(book,anchor) self:_home_hold_book(book,anchor) end,
+        -- Home shelf books intentionally have no long-press action. All book
+        -- actions remain discoverable from the normal tap menu.
         home_actions=self:_home_action_entries(),
         on_shelf_filter=(active=="shelf" or active=="device") and function() self:_show_home_library_filter(active) end or false,
         shelf_filter_label=(active=="shelf" or active=="device") and self:_home_library_filter_label(active) or "筛选",
@@ -17246,7 +17146,7 @@ function Plugin:_preferred_record(book_id)
     local fallback
     if not b then return nil end
     local function consider(record)
-        if type(record)~="table" or not record.file then return end
+        if type(record)~="table" or not record.file or not U.file_exists(record.file) then return end
         if tostring(record.file)==last or tostring(record.original_file or "")==last then fallback=record; return true end
         if not fallback then fallback=record end
     end
@@ -17563,8 +17463,9 @@ function Plugin:book_menu(b)
     if self:_has_range_variant(b.bookId) then
         items[#items+1]={text="扩展已有章节版",sub_item_table_func=function() return self:range_extend_menu(b) end}
     end
-    if self:_book_has_cache(b.bookId) or self.store:book_has_partial_cache(b.bookId) then
-        items[#items+1]={text="管理本书文件",callback=function() self:downloaded_book_menu(tostring(b.bookId)) end}
+    local local_summary=self.book_delete_service:summary(tostring(b.bookId))
+    if local_summary.has_local==true then
+        items[#items+1]={text="本机文件",callback=function() BookLocalFilesDialog.open_generated(self,tostring(b.bookId)) end}
     end
     items[#items+1]={text="书籍详情",callback=function() self:book_details(b) end}
     self:list(b.title,items)
@@ -18912,7 +18813,7 @@ function Plugin:chapters(b)
         self:list("章节下载 · "..tostring(b.title or "未命名"),items,"没有可用章节")
     end,{context=context,status_text="正在后台读取章节目录…"})
 end
-function Plugin:chapter_menu(b,ch)
+function Plugin:chapter_menu(b,ch,local_manage)
     local uid=tostring(ch.chapterUid or ch.uid or "")
     local clean=self.store:chapter_variant(b.bookId,uid,"clean")
     local notes=self.store:chapter_variant(b.bookId,uid,"notes")
@@ -18926,8 +18827,13 @@ function Plugin:chapter_menu(b,ch)
             items[#items+1]={text="阅读"..label,callback=function() self:open_file(record.file) end}
         end
     end
-    items[#items+1]={text=(clean or notes) and "更新本章" or "下载本章",callback=function() self:choose_download(b,nil,true,uid) end}
-    if clean or notes then items[#items+1]={text="删除本章文件",callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or uid) end} end
+    items[#items+1]={text=(clean or notes) and "重新下载本章" or "下载本章",callback=function() self:choose_download(b,nil,true,uid) end}
+    -- Delete is intentionally exposed only from 本机文件 → 已下载章节.
+    -- The ordinary 按章节下载 flow remains a download surface, not a second
+    -- hidden delete entrance.
+    if local_manage==true and (clean or notes) then
+        items[#items+1]={text="删除本章文件",callback=function() self:_confirm_delete_chapter_cache(b.bookId,uid,ch.title or uid) end}
+    end
     self:list(ch.title or uid,items)
 end
 
@@ -19732,7 +19638,7 @@ function Plugin:_storage_categories()
 end
 function Plugin:_run_cache_cleanup(paths,options)
     options=options or {}
-    if self:_cache_action_blocked() then return end
+    if self:_cache_action_blocked() then return false end
     local unique,seen={},{}
     for _,path in ipairs(paths or {}) do
         path=tostring(path or "")
@@ -19768,7 +19674,7 @@ function Plugin:_run_cache_cleanup(paths,options)
             end
             U.mkdir(self.store.cache_books_dir); U.mkdir(self.store.covers_dir); U.mkdir(self.store.temp_dir)
             self.store:save_cleanup_result(result)
-            self:_refresh_local_files()
+            if options.refresh_local_files~=false then self:_refresh_local_files() end
 
             local freed=tonumber(result.freed_bytes or 0) or 0
             local removed=tonumber(result.removed or 0) or 0
@@ -19791,7 +19697,11 @@ function Plugin:_run_cache_cleanup(paths,options)
                 if freed>0 then message=message.."\n已释放："..human_size(freed) end
                 message=message.."\n"..U.first_line(err,260)
             end
-            self:toast(message,4)
+            if type(options.on_complete)=="function" then
+                local callback_ok,callback_err=xpcall(function() options.on_complete(result,commit_ok,message) end,debug.traceback)
+                if not callback_ok then logger.err("[MiuRead][CacheCleanup] on_complete failed",tostring(callback_err)) end
+            end
+            if options.silent_result~=true then self:toast(message,4) end
             if options.refresh~=false then UIManager:scheduleIn(.30,function() self:show_downloads() end) end
         end,debug.traceback)
         if not ok then
@@ -19800,55 +19710,313 @@ function Plugin:_run_cache_cleanup(paths,options)
             pcall(function() self:info("清理任务已经结束，但结果显示失败。请重启 KOReader 后检查存储占用。") end)
         end
     end
-    if #unique==0 then finish({ok=true,removed=0,missing=0,freed_bytes=0,errors={}}); return end
+    if #unique==0 then finish({ok=true,removed=0,missing=0,freed_bytes=0,errors={}}); return true end
     local ok,err=self.cache_cleanup_task:start(unique,finish,options.policy)
     if not ok then
         close_progress()
         self:info("无法开始清理：\n"..tostring(err))
-        UIManager:scheduleIn(.15,function() self:show_downloads() end)
+        if options.refresh~=false then UIManager:scheduleIn(.15,function() self:show_downloads() end) end
+        return false
     end
+    return true
+end
+
+
+function Plugin:_book_delete_runtime_cleanup(plan)
+    plan=type(plan)=="table" and plan or {}
+    -- Keep the global Home bridge synchronized with the persisted source of
+    -- truth after every delete. This prevents a removed path from surviving in
+    -- another plugin instance until the next full Home rebuild.
+    local recent=self.store:recent_reads()
+    HOME_SESSION.recent_reads_bridge={version=1,items=U.copy(type(recent)=="table" and recent.items or {})}
+    local authoritative=self.store:get("recent_read_state",{version=2,seq=0,current=nil})
+    HOME_SESSION.recent_authoritative_state=type(authoritative)=="table" and U.copy(authoritative) or {version=2,seq=0,current=nil}
+    local current=type(HOME_SESSION.recent_authoritative_state.current)=="table"
+        and HOME_SESSION.recent_authoritative_state.current or nil
+    HOME_SESSION.recent_read_snapshot=current and U.copy(current) or nil
+    HOME_SESSION.recent_read_dirty=true
+    self._home_recent_read_dirty=true
+    self._home_sync_summary_cache=nil
+    self._home_sync_summary_cache_at=nil
+    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+    self._home_visible_metadata_targets={}
+
+    local book_id=tostring(plan.book_id or "")
+    if book_id~="" then
+        if self._cover_index_pending then self._cover_index_pending[book_id]=nil end
+        if type(self._book_repair_pending)=="table" then self._book_repair_pending[book_id]=nil end
+        if self._home_hero and tostring(self._home_hero.bookId or self._home_hero.book_id or "")==book_id
+            and tostring(plan.scope or "")=="book" then
+            self._home_hero=nil
+        end
+    end
+    Thoughts.clear_memory_cache()
+    if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then pcall(ThoughtNativePopup.clear_cache) end
+    return true
+end
+
+function Plugin:_emit_book_local_content_changed(book_id,path)
+    HOME_SESSION.recent_read_dirty=true
+    self._home_recent_read_dirty=true
+    self._home_sync_summary_cache=nil
+    self._home_sync_summary_cache_at=nil
+    UIManager:broadcastEvent(Event:new("BookLocalContentChanged",tostring(book_id or ""),tostring(path or "")))
+    if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("content") end
+    return true
+end
+
+function Plugin:onBookLocalContentChanged(book_id,path)
+    HOME_SESSION.recent_read_dirty=true
+    self._home_recent_read_dirty=true
+    self._home_sync_summary_cache=nil
+    self._home_sync_summary_cache_at=nil
+    self._home_metadata_generation=(tonumber(self._home_metadata_generation) or 0)+1
+    if HomeView.is_shown() and not self:_active_reader_ui() then self:_notify_home_data_changed("content") end
+    return true
+end
+
+function Plugin:_book_delete_pending_summary(book_id)
+    book_id=tostring(book_id or "")
+    local out={progress=0,annotations=0,total=0,progress_item=nil,annotation_summary=nil}
+    if book_id=="" then return out end
+    for _,item in ipairs(self:_progress_sync_issue_items()) do
+        if tostring(item.book_id or "")==book_id then
+            out.progress=1
+            out.progress_item=item
+            break
+        end
+    end
+    local summary=LocalAnnotationDatabase.summary_fast(self.store,book_id)
+    if type(summary)=="table" then
+        out.annotation_summary=summary
+        out.annotations=(tonumber(summary.pending or 0) or 0)
+            +(tonumber(summary.delete_pending or 0) or 0)
+            +(tonumber(summary.action_required or 0) or 0)
+    end
+    out.total=out.progress+out.annotations
+    return out
+end
+
+function Plugin:_sync_progress_before_book_delete(book_id,on_done)
+    on_done=type(on_done)=="function" and on_done or function() end
+    local item
+    for _,candidate in ipairs(self:_progress_sync_issue_items()) do
+        if tostring(candidate.book_id or "")==tostring(book_id or "") then item=candidate; break end
+    end
+    if not item then on_done(true); return true end
+
+    local function after_verify(ok,err)
+        if ok then
+            local remaining
+            for _,candidate in ipairs(self:_progress_sync_issue_items()) do
+                if tostring(candidate.book_id or "")==tostring(book_id or "") then remaining=candidate; break end
+            end
+            if not remaining then on_done(true); return end
+            item=remaining
+        end
+        if item and item.can_resubmit==true then
+            local started=self:_resubmit_saved_progress(item,function(resubmitted,resubmit_err)
+                if not resubmitted then on_done(false,resubmit_err or err or "阅读进度仍未同步") return end
+                local still_pending=false
+                for _,candidate in ipairs(self:_progress_sync_issue_items()) do
+                    if tostring(candidate.book_id or "")==tostring(book_id or "") then still_pending=true; break end
+                end
+                on_done(not still_pending,still_pending and "阅读进度仍在等待云端确认" or nil)
+            end)
+            if not started then on_done(false,"阅读进度同步任务正在运行") end
+            return
+        end
+        on_done(false,err or "阅读进度仍待确认")
+    end
+
+    if item.can_verify==true then
+        local started=self:_retry_saved_progress_verification(item,after_verify)
+        if not started then on_done(false,"阅读进度确认任务正在运行") end
+        return started
+    end
+    if item.can_resubmit==true then
+        after_verify(false,"阅读进度需要重新提交")
+        return true
+    end
+    on_done(false,"阅读进度需要先打开本书确认，无法自动同步")
+    return false
+end
+
+function Plugin:_sync_annotations_before_book_delete(book_id,on_done)
+    on_done=type(on_done)=="function" and on_done or function() end
+    local summary=LocalAnnotationDatabase.summary_fast(self.store,book_id)
+    local pending=type(summary)=="table" and ((tonumber(summary.pending or 0) or 0)
+        +(tonumber(summary.delete_pending or 0) or 0)+(tonumber(summary.action_required or 0) or 0)) or 0
+    if pending<=0 then on_done(true); return true end
+    if not self.annotation_async or self.annotation_async:busy() then on_done(false,"本地批注同步任务正在运行") return false end
+    local book=self.store:book(book_id)
+    local record=self:_preferred_record(book_id)
+    if type(book)~="table" or type(record)~="table" or not (record.file and U.file_exists(record.file)) then
+        on_done(false,"缺少可用于同步批注的本机书籍版本")
+        return false
+    end
+    local prefs=U.copy(self:_annotation_sync_preferences())
+    local service=self.annotation_sync
+    local started,err=self.annotation_async:run("annotation-sync-before-delete",function()
+        return service:sync_book(U.copy(book),U.copy(record),{preferences=prefs,limit=200})
+    end,function(worker_result)
+        if not worker_result or worker_result.ok~=true then
+            on_done(false,worker_result and worker_result.error or "批注同步后台任务失败")
+            return
+        end
+        local result=worker_result.value or {}
+        if result.ok==false then on_done(false,result.error or "批注同步失败"); return end
+        local latest=LocalAnnotationDatabase.summary_fast(self.store,book_id)
+        local remains=type(latest)=="table" and ((tonumber(latest.pending or 0) or 0)
+            +(tonumber(latest.delete_pending or 0) or 0)+(tonumber(latest.action_required or 0) or 0)) or 0
+        if remains>0 then on_done(false,"仍有 "..tostring(remains).." 条批注需要处理") else on_done(true) end
+    end)
+    if not started then on_done(false,tostring(err or "无法开始批注同步")) end
+    return started
+end
+
+function Plugin:_sync_book_before_delete(book_id,on_done)
+    on_done=type(on_done)=="function" and on_done or function() end
+    if not self:logged_in() then on_done(false,"请先登录微信读书账号") return false end
+    if self:_network_radio_hint()==false then on_done(false,"当前 Wi-Fi 未开启") return false end
+    self:_sync_progress_before_book_delete(book_id,function(progress_ok,progress_err)
+        if not progress_ok then on_done(false,progress_err); return end
+        self:_sync_annotations_before_book_delete(book_id,function(annotation_ok,annotation_err)
+            if not annotation_ok then on_done(false,annotation_err); return end
+            local pending=self:_book_delete_pending_summary(book_id)
+            if pending.total>0 then on_done(false,"仍有未同步内容，请处理后再删除") else on_done(true) end
+        end)
+    end)
+    return true
+end
+
+function Plugin:_book_delete_preflight(book_id,on_continue)
+    on_continue=type(on_continue)=="function" and on_continue or function() end
+    local pending=self:_book_delete_pending_summary(book_id)
+    if pending.total<=0 then on_continue(); return true end
+    local parts={}
+    if pending.progress>0 then parts[#parts+1]="阅读进度 1 项" end
+    if pending.annotations>0 then parts[#parts+1]="批注/想法 "..tostring(pending.annotations).." 项" end
+    local dialog
+    dialog=ButtonDialog:new{
+        title="本书还有未同步内容\n"..table.concat(parts," · "),title_align="center",buttons={
+            {{text="先同步",callback=function()
+                UIManager:close(dialog)
+                self:status_toast("删除本机内容","正在先同步未完成内容…",3)
+                self:_sync_book_before_delete(book_id,function(ok,err)
+                    if not ok then
+                        self:info("同步尚未完成，本次没有删除任何内容。\n\n"..tostring(err or "请稍后重试"))
+                        return
+                    end
+                    self:toast("同步完成",2)
+                    UIManager:scheduleIn(.10,on_continue)
+                end)
+            end}},
+            {{text="仍然删除",callback=function() UIManager:close(dialog); on_continue() end}},
+            {{text="取消",callback=function() UIManager:close(dialog) end}},
+        },
+    }
+    UIManager:show(dialog)
+    return true
+end
+
+function Plugin:_execute_book_delete_plan(plan,done_text)
+    plan=type(plan)=="table" and plan or {}
+    local service=self.book_delete_service
+    if not service then self:info("删除服务尚未初始化，请重启 KOReader。") return false end
+    local allowed=U.copy(plan.paths or {})
+    local total_freed=0
+    local function finish_final(check,second_result)
+        self:_emit_book_local_content_changed(plan.book_id,plan.local_path)
+        if check and check.ok==true then
+            local message=tostring(done_text or "本机内容已删除")
+            if total_freed>0 then message=message.."\n释放空间："..human_size(total_freed) end
+            self:toast(message,4)
+            return
+        end
+        local details={"删除已经执行，但仍检测到残留："}
+        if check then
+            if #(check.paths or {})>0 then details[#details+1]="文件/目录："..tostring(#check.paths) end
+            if #(check.refs or {})>0 then details[#details+1]="记录引用："..tostring(#check.refs) end
+            if check.paths and check.paths[1] then details[#details+1]="首项："..tostring(check.paths[1]) end
+        elseif second_result and second_result.error then details[#details+1]=U.first_line(second_result.error,220) end
+        self:info(table.concat(details,"\n"))
+    end
+    local function second_pass(check)
+        local retry_paths=U.copy(check.paths or {})
+        if #retry_paths==0 then
+            local committed,commit_err=xpcall(function() service:commit(plan) end,debug.traceback)
+            if not committed then logger.err("[MiuRead][BookDelete] retry commit failed",tostring(commit_err)) end
+            finish_final(service:verify(plan))
+            return
+        end
+        self:_run_cache_cleanup(retry_paths,{
+            progress_text="正在复查并清理残留……",done_text=done_text,
+            policy={mode="book_delete",allowed_paths=allowed},operation="删除残留复查",
+            commit=function() service:commit(plan) end,success_even_if_empty=true,
+            refresh=false,silent_result=true,refresh_local_files=false,
+            on_complete=function(result,commit_ok)
+                total_freed=total_freed+(tonumber(result and result.freed_bytes or 0) or 0)
+                local latest=service:verify(plan)
+                if result and result.ok==true and commit_ok==true then finish_final(latest,result)
+                else finish_final(latest,result) end
+            end,
+        })
+    end
+    local started=self:_run_cache_cleanup(plan.paths or {},{
+        progress_text="正在删除本机内容……",done_text=done_text,
+        policy={mode="book_delete",allowed_paths=allowed},operation="统一删除本机内容",
+        commit=function() service:commit(plan) end,success_even_if_empty=true,
+        refresh=false,silent_result=true,refresh_local_files=false,
+        on_complete=function(result,commit_ok)
+            total_freed=total_freed+(tonumber(result and result.freed_bytes or 0) or 0)
+            local check=service:verify(plan)
+            if result and result.ok==true and commit_ok==true and check.ok==true then finish_final(check,result)
+            else second_pass(check) end
+        end,
+    })
+    return started
 end
 
 function Plugin:_confirm_delete_variant(book_id,kind,title)
     if self:_cache_action_blocked() then return end
+    local plan=self.book_delete_service:plan_variant(book_id,kind)
     local record=self.store:variant(book_id,kind)
-    if not (record and record.file and U.file_exists(record.file)) then self.store:forget_variant(book_id,kind); self:toast("该版本已经不存在"); self:show_downloads(); return end
-    local label=self:_variant_label(kind)
+    if not (record and record.file and U.file_exists(record.file)) then
+        self.book_delete_service:commit(plan)
+        self:toast("该版本已经不存在")
+        self:_emit_book_local_content_changed(book_id)
+        return
+    end
+    if self.book_delete_service:is_currently_open(plan) then
+        self:info("当前版本正在阅读中，请先退出或切换到其他版本再删除。")
+        return
+    end
+    local label=self.book_delete_service:variant_label(kind)
     UIManager:show(ConfirmBox:new{
-        text="删除《"..tostring(title or book_id).."》的"..label.."？\n\n只删除这个 EPUB，其他版本和下载断点会保留。",
-        ok_callback=function()
-            local paths=self.store:variant_paths(book_id,kind)
-            self:_run_cache_cleanup(paths,{
-                progress_text="正在删除"..label.."……",
-                done_text=label.."已删除",
-                commit=function() self.store:forget_variant(book_id,kind) end,
-                policy={mode="variant_delete"},operation="删除单个 EPUB",
-            })
-        end,
+        text="删除《"..tostring(title or book_id).."》的"..label.."？\n\n将同时清理这个版本对应的 KOReader 本机阅读数据；其他已下载版本和微信读书云端内容不会受到影响。",
+        ok_text="删除",cancel_text="取消",
+        ok_callback=function() self:_execute_book_delete_plan(plan,label.."已删除") end,
     })
 end
 
 function Plugin:_confirm_delete_chapter_cache(book_id,uid,title)
     if self:_cache_action_blocked() then return end
-    local paths=self.store:chapter_paths(book_id,uid)
-    if #paths==0 then self.store:forget_chapter_all(book_id,uid); self:toast("本章文件已经不存在"); return end
-    local current=normalized_reader_file(self:_current_document_path())
-    for _,path in ipairs(paths) do
-        if current and current==normalized_reader_file(path) then
-            self:info("当前章节正在阅读中，请先退出或切换到其他章节再删除。")
-            return
-        end
+    local plan=self.book_delete_service:plan_chapter(book_id,uid)
+    if #plan.documents==0 then
+        self.book_delete_service:commit(plan)
+        self:toast("本章文件已经不存在")
+        self:_emit_book_local_content_changed(book_id)
+        return
+    end
+    if self.book_delete_service:is_currently_open(plan) then
+        self:info("当前章节正在阅读中，请先退出或切换到其他章节再删除。")
+        return
     end
     UIManager:show(ConfirmBox:new{
-        text="删除“"..tostring(title or uid).."”的全部单章文件？",
-        ok_callback=function()
-            self:_run_cache_cleanup(self.store:chapter_paths(book_id,uid),{
-                progress_text="正在删除本章文件……",
-                done_text="本章文件已删除",
-                commit=function() self.store:forget_chapter_all(book_id,uid) end,
-                policy={mode="chapter_delete"},operation="删除单章 EPUB",
-            })
-        end,
+        text="删除“"..tostring(title or uid).."”的全部本机章节文件？\n\n对应的 KOReader 本机阅读数据也会一并清理。",
+        ok_text="删除",cancel_text="取消",
+        ok_callback=function() self:_execute_book_delete_plan(plan,"本章文件已删除") end,
     })
 end
 
@@ -19868,111 +20036,47 @@ function Plugin:_confirm_clear_partial_cache(book_id,title)
         end,
     })
 end
-local function add_complete_delete_path(paths,seen,path)
-    path=tostring(path or ""):gsub("\\","/"):gsub("/+","/")
-    if #path>1 then path=path:gsub("/$","") end
-    if path~="" and not seen[path] then seen[path]=true; paths[#paths+1]=path end
-end
-
-function Plugin:_complete_book_delete_plan(book_id)
-    book_id=tostring(book_id or "")
-    local paths,seen,documents={},{},{}
-    local function add(path) add_complete_delete_path(paths,seen,path) end
-    local function add_document(path)
-        path=tostring(path or "")
-        if path=="" then return end
-        documents[#documents+1]=path
-        add(path)
-        local ok,DocSettings=pcall(require,"docsettings")
-        if ok and DocSettings then
-            local settings=DocSettings:open(path)
-            if settings then
-                add(settings:getSidecarDir(path,"doc"))
-                add(settings:getSidecarDir(path,"dir"))
-                if DocSettings.isHashLocationEnabled and DocSettings.isHashLocationEnabled() then
-                    add(settings:getSidecarDir(path,"hash"))
-                end
-                add(settings:getHistoryPath(path))
-            end
-        end
-    end
-
-    local function add_record(record)
-        if type(record)~="table" then return end
-        add_document(record.file)
-        add_document(record.original_file)
-        add_document(record.pending_file)
-    end
-    local book=self.store:book(book_id)
-    if book then
-        for _,record in pairs(book.variants or {}) do add_record(record) end
-        for _,row in pairs(book.chapters or {}) do
-            for _,record in pairs(row or {}) do add_record(record) end
-        end
-    end
-    add(self.store:book_cache_path(book_id))
-    add(self.store:cover_path(book_id))
-    local cover_index=self.store:get("cover_index",{})
-    add(cover_index[book_id])
-    for _,row in ipairs(self.store:pending_installs()) do
-        if tostring(row.book_id or "")==book_id then
-            add_document(row.file)
-            add_document(row.pending_file)
-        end
-    end
-    local state=self.store:download_state()
-    local state_id=tostring(state.book_id or (state.book and (state.book.bookId or state.book.book_id)) or "")
-    if state_id==book_id then
-        add_document(state.file); add_document(state.original_file); add_document(state.pending_file)
-    end
-    return paths,documents
-end
-
-function Plugin:_commit_complete_book_delete(book_id,documents)
-    book_id=tostring(book_id or "")
-    local ok_history,history=pcall(require,"readhistory")
-    if ok_history and history and type(history.removeItemByPath)=="function" then
-        for _,path in ipairs(documents or {}) do pcall(history.removeItemByPath,history,path) end
-    end
-    self.store:forget_book_local_state(book_id)
-    if self._cover_index_pending then self._cover_index_pending[book_id]=nil end
-    local repair_pending=self._book_repair_pending
-    if type(repair_pending)=="table" then repair_pending[book_id]=nil end
-    Thoughts.clear_memory_cache()
-    if ThoughtNativePopup and type(ThoughtNativePopup.clear_cache)=="function" then
-        pcall(ThoughtNativePopup.clear_cache)
-    end
-    self.store:prune_missing_files()
-    self:_notify_home_data_changed("content")
-end
-
 function Plugin:_confirm_delete_book_downloads(book_id,title)
     if self:_cache_action_blocked() then return end
     book_id=tostring(book_id or "")
-    local paths,documents=self:_complete_book_delete_plan(book_id)
-    local current=tostring(self:_current_document_path() or "")
-    for _,path in ipairs(documents) do
-        if current~="" and current==tostring(path) then
-            self:info("请先退出正在阅读的《"..tostring(title or book_id).."》，再删除这本书。")
-            return
-        end
+    local service=self.book_delete_service
+    local summary=service:summary(book_id)
+    if summary.has_local~=true then
+        self:toast("这本书没有本机可阅读内容")
+        return
     end
-    UIManager:show(ConfirmBox:new{
-        text="删除《"..tostring(title or book_id).."》？\n\n将删除本机中的全部版本、单章文件（包括自动预下载）、下载断点、封面、想法与评论缓存、阅读记录和本书设置。删除后无法恢复，重新阅读需要再次下载。\n\n微信读书云端书架、进度、划线和想法不会受到影响。",
-        ok_text="删除全部",
-        cancel_text="取消",
-        ok_callback=function()
-            self:_run_cache_cleanup(paths,{
-                progress_text="正在完整删除本书……",
-                done_text="本书及全部本机相关内容已删除",
-                commit=function() self:_commit_complete_book_delete(book_id,documents) end,
-                policy={mode="book_delete",allowed_paths=U.copy(paths)},
-                operation="完整删除本书",
-                success_even_if_empty=true,
-            })
-        end,
-    })
+    local plan=service:plan_book(book_id)
+    if service:is_currently_open(plan) then
+        self:info("请先退出正在阅读的《"..tostring(title or book_id).."》，再删除本机内容。")
+        return
+    end
+
+    local function show_confirm()
+        -- Rebuild the plan immediately before confirmation so a just-finished
+        -- background download cannot escape the delete whitelist.
+        summary=service:summary(book_id)
+        plan=service:plan_book(book_id)
+        if summary.has_local~=true then self:toast("这本书已经没有本机可阅读内容"); return end
+        local lines={"删除《"..tostring(title or book_id).."》的全部本机内容？","","将删除："}
+        for _,variant in ipairs(summary.variants or {}) do
+            lines[#lines+1]=tostring(variant.label).."  "..human_size(variant.size)
+        end
+        if tonumber(summary.chapter_count or 0)>0 then
+            lines[#lines+1]="已下载章节  "..tostring(summary.chapter_count).." 章 · "..human_size(summary.chapter_bytes)
+        end
+        lines[#lines+1]="对应的 KOReader 本机阅读数据"
+        lines[#lines+1]=""
+        lines[#lines+1]="预计释放约 "..human_size(plan.estimated_bytes or summary.total_bytes)
+        lines[#lines+1]=""
+        lines[#lines+1]="不会影响微信读书云端书架、云端进度、云端划线和想法。"
+        UIManager:show(ConfirmBox:new{
+            text=table.concat(lines,"\n"),ok_text="删除",cancel_text="取消",
+            ok_callback=function() self:_execute_book_delete_plan(plan,"本机内容已删除") end,
+        })
+    end
+    return self:_book_delete_preflight(book_id,show_confirm)
 end
+
 function Plugin:_annotation_retry_options(kind,record,chapter_uid)
     record=type(record)=="table" and record or {}
     local opt={annotations=true}
@@ -19997,11 +20101,11 @@ function Plugin:_download_book_labels(b)
     end
     local chapter_count,prefetch_count=0,0
     for _,row in pairs(b.chapters or {}) do
+        local readable=false
         for _,r in pairs(row or {}) do
-            if r.file and U.file_exists(r.file) then
-                chapter_count=chapter_count+1
-            end
+            if r.file and U.file_exists(r.file) then readable=true; break end
         end
+        if readable then chapter_count=chapter_count+1 end
     end
     if type(self.store.hidden_prefetch_entries)=="function" then
         prefetch_count=prefetch_count+#self.store:hidden_prefetch_entries(b.book_id or b.bookId)
@@ -20232,67 +20336,15 @@ function Plugin:downloaded_chapters_menu(book_id)
     local book={bookId=book_id,title=b.title,author=b.author,cover=b.cover}
     for _,entry in ipairs(rows) do
         local chapter={chapterUid=entry.uid,title=entry.title}
-        items[#items+1]={text=entry.title,post_text=table.concat(entry.labels," · "),callback=function() self:chapter_menu(book,chapter) end}
+        items[#items+1]={text=entry.title,post_text=table.concat(entry.labels," · "),callback=function() self:chapter_menu(book,chapter,true) end}
     end
-    self:list("单章文件 · "..tostring(b.title or book_id),items,"没有单章文件")
+    self:list("已下载章节 · "..tostring(b.title or book_id),items,"没有已下载章节")
 end
 
 function Plugin:downloaded_book_menu(book_ref)
-    local book_id=type(book_ref)=="table" and tostring(book_ref.book_id or book_ref.bookId) or tostring(book_ref)
-    self.store:reload(); self.store:prune_missing_files()
-    local b=self.store:book(book_id)
-    if not b then self:toast("下载记录已不存在"); self:show_downloads(); return end
-    local items={}
-    local variants={}
-    for _,kind in ipairs({"clean","notes","range_clean","range_notes","preview_clean","preview_notes"}) do
-        local r=b.variants and b.variants[kind]
-        if r and r.file and U.file_exists(r.file) then
-            local label=DownloadResult.variant_label(self:_variant_label(kind),r)
-            variants[#variants+1]={kind=kind,file=r.file,label=label,record=r}
-        end
-    end
-    if #variants>0 then
-        items[#items+1]={text="可阅读版本",enabled=false}
-        for _,variant in ipairs(variants) do
-            local kind_key=variant.kind; local file=variant.file; local label=variant.label; local record=variant.record
-            items[#items+1]={text="阅读"..label,post_text="EPUB",callback=function() self:open_file(file) end}
-            items[#items+1]={text="删除"..label,post_text="仅删除该版本",callback=function() self:_confirm_delete_variant(book_id,kind_key,b.title) end}
-        end
-    end
-    local _,chapter_count,prefetch_count=self:_download_book_labels(U.merge(b,{book_id=book_id}))
-    local has_cache=self.store:book_has_partial_cache(book_id)
-    local repairable=#(BookIntegrity.partial_repairs(self.store,book_id) or {})
-    if chapter_count>0 or has_cache then
-        items[#items+1]={text=repairable>0 and "单章与断点" or "单章与缓存",enabled=false}
-        if chapter_count>0 then
-            local chapter_post=tostring(chapter_count).." 个"
-            if prefetch_count>0 then chapter_post=chapter_post.." · 预读取 "..tostring(prefetch_count) end
-            items[#items+1]={text="单章文件",post_text=chapter_post,callback=function() self:downloaded_chapters_menu(book_id) end}
-            if prefetch_count>0 then
-                items[#items+1]={text="清理本书预读取缓存",post_text=tostring(prefetch_count).." 个",callback=function() self:_clear_prefetched_chapters(book_id,b.title) end}
-            end
-        end
-        if has_cache then
-            if repairable>0 then
-                items[#items+1]={text="继续未完成下载",post_text=tostring(repairable).." 个可恢复断点",callback=function() self:_repair_downloaded_book(book_id) end}
-            end
-            items[#items+1]={text=repairable>0 and "清理下载断点与缓存" or "清理下载缓存",post_text="保留已生成 EPUB",callback=function() self:_confirm_clear_partial_cache(book_id,b.title) end}
-        end
-    end
-    if #variants>0 or chapter_count>0 or has_cache then
-        items[#items+1]={text="本书管理",enabled=false}
-        items[#items+1]={text="删除这本书",post_text="同时删除本机想法、评论与记录",callback=function() self:_confirm_delete_book_downloads(book_id,b.title) end}
-    end
-    if #items==0 then self:toast("本书没有可管理的下载内容"); self:show_downloads(); return end
-    if self._download_book_menu then pcall(function() UIManager:close(self._download_book_menu) end) end
-    if HomeView.is_shown() and not self:_active_reader_ui() then
-        self._download_book_menu=nil
-        return self:_show_miuread_menu(b.title or book_id,items,{page_size=7,on_back=function() self:show_downloads() end})
-    end
-    local menu=Menu:new{title=b.title or book_id,item_table=items,is_borderless=true,title_bar_fm_style=true}
-    self._download_book_menu=menu
-    UIManager:show(menu)
+    return BookLocalFilesDialog.open_generated(self,book_ref)
 end
+
 function Plugin:progress_upload_mode()
     local prefs=self.store:preferences().sync or {}
     local mode=tostring(prefs.progress_mode or "")
@@ -25636,14 +25688,11 @@ function Plugin:onReaderReady()
         if not (self.ui and self.ui.document)
             or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session
             or reader_close_active() then return end
+        -- Keep KOReader's native selection/highlight dialog intact. MiuRead only
+        -- contributes the "书摘" action through ReaderHighlight's public hook,
+        -- so actions registered by KOReader and third-party plugins remain on the
+        -- original first-level menu without an extra MiuRead wrapper.
         self:_install_book_excerpt_highlight_action()
-        local highlight=self.ui and self.ui.highlight or nil
-        if highlight then
-            local ok,installed,reason=pcall(HighlightMenu.install,highlight)
-            if not ok or installed~=true then
-                logger.warn("[MiuRead][HighlightMenu] install failed",tostring(ok and reason or installed))
-            end
-        end
         self:_sync_reader_toolbar_hooks("reader ready")
         if continuous_switch then
             -- Keep the shared switch target around briefly so the old ReaderUI
