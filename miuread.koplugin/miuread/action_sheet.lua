@@ -19,6 +19,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local TransientGuard = require("miuread.transient_guard")
+local DialogTransition = require("miuread.dialog_transition")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
 local U = require("miuread.util")
@@ -111,7 +112,11 @@ local SheetWidget = InputContainer:extend{
     name = "miuread_action_sheet",
     _miuread_transient = true,
     _miuread_modal_surface = true,
-    covers_fullscreen = true,
+    -- This widget captures input over the whole screen, but only paints the
+    -- floating bubble. It must not claim to cover the framebuffer, otherwise
+    -- UIManager may skip repainting the HomeView underneath during close/refresh
+    -- races and leave the bubble border/pointer behind on e-ink screens.
+    covers_fullscreen = false,
     stop_events_propagation = true,
     opts = nil,
     dimen = nil,
@@ -511,13 +516,12 @@ function SheetWidget:onCloseWidget()
     local action = self.pending_action
     self.pending_action = nil
     if live_sheet == self then live_sheet = nil end
-    if region then UIManager:setDirty(nil, function() return "full", region end) end
-    if action then
-        UIManager:scheduleIn(.04, function()
-            local ok, err = pcall(action)
-            if not ok then logger.warn("[MiuRead][ActionSheet] action failed", tostring(err)) end
-        end)
-    end
+    -- CloseWidget fires before UIManager removes this sheet from the stack.
+    -- Repaint the newly exposed HomeView on the next UI turn, then run the
+    -- selected action, and repaint the old bubble region once more afterwards.
+    -- This prevents the Home section refresh triggered by source selection from
+    -- painting inside the old bubble while its frame/pointer remains on screen.
+    DialogTransition.after_close(region, action, "ActionSheet")
 end
 
 local function show_fallback(opts, reason)

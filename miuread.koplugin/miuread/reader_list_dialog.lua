@@ -90,7 +90,10 @@ local Dialog = InputContainer:extend{
     name = "miuread_reader_list_dialog",
     _miuread_transient = true,
     _miuread_modal_surface = true,
-    covers_fullscreen = true,
+    -- Full-screen input layer, but only the centered dialog frame is opaque.
+    -- Keeping this false lets UIManager repaint HomeView beneath us and then
+    -- paint this dialog on top instead of treating transparent margins as opaque.
+    covers_fullscreen = false,
     stop_events_propagation = true,
     opts = nil,
     closed = false,

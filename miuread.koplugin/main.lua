@@ -3881,6 +3881,11 @@ end
 
 function Plugin:_home_refresh_header_now(force_device,force_sync)
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
+    if self:_home_modal_surface_active() then
+        self:_home_defer_refresh_kind("header")
+        self:_home_resume_visible_work_after_idle()
+        return false
+    end
     if force_device==true then HomeData.quick_device_state(true) end
     return HomeView.update_header{
         account_name=self:_home_account_name(),
@@ -3914,16 +3919,17 @@ function Plugin:_home_schedule_clock()
             return
         end
         if self._home_suspended~=true and HOME_SESSION.suspended~=true and not self:_active_reader_ui() then
-            -- Reading the KOReader power device is cheap and does not redraw by
-            -- itself. HomeView invalidates only the tiny fields that actually
-            -- changed, so a stable battery percentage costs no extra e-ink
-            -- refresh and never reloads the shelf.
-            HomeData.quick_power_state(true)
-            HomeView.update_header{battery_text=self:_home_battery_text()}
-            HomeView.update_dashboard{
-                clock_text=self:_display_time("%H:%M"),
-                date_text=self:_home_date_text(),
-            }
+            -- Do not repaint HomeView while a transparent MiuRead modal is on
+            -- top. A minute/battery tick can otherwise race with an ActionSheet
+            -- and partially replace its contents on e-ink devices.
+            if not self:_home_modal_surface_active() then
+                HomeData.quick_power_state(true)
+                HomeView.update_header{battery_text=self:_home_battery_text()}
+                HomeView.update_dashboard{
+                    clock_text=self:_display_time("%H:%M"),
+                    date_text=self:_home_date_text(),
+                }
+            end
         end
         local now=os.time()
         UIManager:scheduleIn(math.max(10,60-(now%60)+.12),task)
@@ -4371,15 +4377,31 @@ end
 
 function Plugin:_refresh_home_view(message,refresh_kind)
     if message and message~="" then self:toast(message,2) end
+    local kind=refresh_kind or "content"
     if self:_home_background_blocked() then
-        self:_home_defer_refresh_kind(refresh_kind or "content")
-        logger.info("[MiuRead][Resume] home rebuild deferred",tostring(refresh_kind or "content"))
+        self:_home_defer_refresh_kind(kind)
+        logger.info("[MiuRead][Resume] home rebuild deferred",tostring(kind))
+        return false
+    end
+    -- HomeView is visible below several transparent modal surfaces. Never let a
+    -- direct content refresh repaint beneath one of them; queue the requested
+    -- refresh and resume it only after the modal has actually left UIManager's
+    -- window stack. User actions launched by the modal run after close, so they
+    -- still refresh immediately.
+    if self:_home_modal_surface_active() then
+        self:_home_defer_refresh_kind(kind)
+        self:_home_resume_visible_work_after_idle()
+        logger.info("[MiuRead][Home] refresh deferred behind modal",tostring(kind))
         return false
     end
     if HomeView.is_shown() then
-        local kind=refresh_kind or "content"
         UIManager:scheduleIn(.05,function()
             if not HomeView.is_shown() or self:_active_reader_ui() then return end
+            if self:_home_modal_surface_active() then
+                self:_home_defer_refresh_kind(kind)
+                self:_home_resume_visible_work_after_idle()
+                return
+            end
             if kind=="header" then
                 -- Header-only state changes must not reconstruct shelves or covers.
                 self:_home_refresh_header_now(false,false)
