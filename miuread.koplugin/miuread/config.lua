@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.8.0-beta.3",
+    VERSION = "5.6.0",
     SCHEMA = 126,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
@@ -8,11 +8,11 @@ local C = {
 
     -- 当前安装包自身仍有 stable/beta 身份；用户选择的 OTA 通道独立保存。
     -- beta.20 起所有实时更新清单都由统一仓库 miuread-koreader 提供。
-    UPDATE_CHANNEL = "beta",
-    UPDATE_CHANNEL_LABEL = "内测通道",
-    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+    UPDATE_CHANNEL = "stable",
+    UPDATE_CHANNEL_LABEL = "正式通道",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
     UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
     },
     UPDATE_CHANNELS = {
         stable = {
