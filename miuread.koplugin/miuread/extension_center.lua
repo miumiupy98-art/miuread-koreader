@@ -27,6 +27,7 @@ local PENDING_KEY="extension_center_pending_restart_v1"
 local MAX_RESULTS=24
 local SEARCH_TTL=30*60
 local META_TTL=30*60
+local UPDATE_VISIBLE_TTL=24*60*60
 local MAX_ARCHIVE_ENTRIES=6000
 local MAX_PLUGIN_FILES=5000
 local MAX_PLUGIN_BYTES=96*1024*1024
@@ -36,10 +37,10 @@ local SESSION_TOKEN=tostring(os.time()).."-"..tostring(math.random(100000,999999
 -- These entries are aliases/compatibility hints only. They are not a separate
 -- MiuRead plugin source and never replace the real GitHub repository identity.
 local KNOWN_REPOS={
-    {repo="hesan1232/fanqie.koplugin",name="番茄小说",aliases={"番茄","番茄小说","fanqie"},description="在 KOReader 中浏览、阅读和管理番茄小说。"},
-    {repo="ZlibraryKO/zlibrary.koplugin",name="Z-Library",aliases={"zlibrary","z-library","z lib"},description="在 KOReader 中搜索和下载 Z-Library 书籍。"},
-    {repo="doctorhetfield-cmd/simpleui.koplugin",name="SimpleUI",aliases={"simpleui","simple ui"},description="KOReader 界面扩展。",ui_conflict=true},
-    {repo="AnthonyGress/zen_ui.koplugin",name="Zen UI",aliases={"zen ui","zenui"},description="KOReader 极简界面扩展。",ui_conflict=true},
+    {repo="hesan1232/fanqie.koplugin",name="番茄小说",aliases={"番茄","番茄小说","fanqie"},description="在 KOReader 中浏览、阅读和管理番茄小说。",recommended=true,recommendation="适合中文网络小说阅读"},
+    {repo="ZlibraryKO/zlibrary.koplugin",name="Z-Library",aliases={"zlibrary","z-library","z lib"},description="在 KOReader 中搜索和下载 Z-Library 书籍。",recommended=true,recommendation="图书搜索与下载"},
+    {repo="doctorhetfield-cmd/simpleui.koplugin",name="SimpleUI",aliases={"simpleui","simple ui"},description="KOReader 界面扩展。",ui_conflict=true,recommended=true,recommendation="简化 KOReader 界面"},
+    {repo="AnthonyGress/zen_ui.koplugin",name="Zen UI",aliases={"zen ui","zenui"},description="KOReader 极简界面扩展。",ui_conflict=true,recommended=true,recommendation="极简 KOReader 界面"},
     {repo="omer-faruq/appstore.koplugin",name="App Store",aliases={"app store","appstore"},description="KOReader 社区插件市场。"},
 }
 
@@ -953,6 +954,10 @@ local function remote_marker(repo_info,release)
 end
 
 local function show_menu(plugin,title,items)
+    if plugin and type(plugin._push_miuread_menu)=="function" then
+        local pushed=plugin:_push_miuread_menu(title,items,{page_size=7})
+        if pushed then return pushed end
+    end
     if plugin and type(plugin._show_miuread_menu)=="function" then
         return plugin:_show_miuread_menu(title,items,{page_size=7})
     end
@@ -1213,9 +1218,65 @@ local function installed_count(plugin)
     return count
 end
 
+local function managed_repo_map(plugin)
+    local out={}
+    local list=managed_plugins(plugin)
+    for _,item in ipairs(list) do
+        if item.ghost~=true and valid_repo(item.repo) then out[item.repo]=item end
+    end
+    -- A manually installed known plugin may not have an extension-center source
+    -- record yet. For trusted aliases only, match its canonical install dirname
+    -- so recommendation/search/popular still report the same installed state.
+    for _,known in ipairs(KNOWN_REPOS) do
+        if not out[known.repo] then
+            local expected=tostring(known.repo):match("([^/]+)$")
+            local match,count=nil,0
+            for _,item in ipairs(list) do
+                if item.ghost~=true and tostring(item.dir or "")==expected then
+                    match=item; count=count+1
+                end
+            end
+            if count==1 then out[known.repo]=match end
+        end
+    end
+    return out
+end
+
+local function recent_update_state(states,item)
+    if type(states)~="table" or type(item)~="table" then return nil end
+    local state=states[update_key(item)]
+    if type(state)~="table" then return nil end
+    local checked_at=tonumber(state.checked_at) or 0
+    if checked_at<=0 or os.time()-checked_at>UPDATE_VISIBLE_TTL then return nil end
+    return state
+end
+
+local function installed_status_label(plugin,item,states)
+    if type(item)~="table" then return "" end
+    if item.pending then return pending_label(item.pending) end
+    if item.duplicate then return "重复安装" end
+    local state=recent_update_state(states,item)
+    if state and state.status=="update" then return "有更新" end
+    if item.enabled==false then
+        return (trim(item.version)~="" and (trim(item.version).." · ") or "").."未启用"
+    end
+    if trim(item.version)~="" then return trim(item.version) end
+    return "已安装"
+end
+
 local function find_managed_by_repo(plugin,repo)
-    for _,item in ipairs(managed_plugins(plugin)) do
+    local list=managed_plugins(plugin)
+    for _,item in ipairs(list) do
         if item.ghost~=true and tostring(item.repo or "")==tostring(repo or "") then return item end
+    end
+    local known=known_repo(repo)
+    if known then
+        local expected=tostring(repo or ""):match("([^/]+)$")
+        local match,count=nil,0
+        for _,item in ipairs(list) do
+            if item.ghost~=true and tostring(item.dir or "")==expected then match=item; count=count+1 end
+        end
+        if count==1 then return match end
     end
 end
 
@@ -1301,6 +1362,7 @@ local function install_repo(plugin,repo,repo_info,release)
         save_update_state(plugin,states)
         local action=result.updated and "更新完成" or "安装完成"
         local version=result.version~="" and ("\n版本："..result.version) or ""
+        if type(plugin._refresh_miuread_menu)=="function" then plugin:_refresh_miuread_menu() end
         plugin:info(action.."："..result.dir..version.."\n\n请完整重启 KOReader 后使用。")
     end
 
@@ -1389,6 +1451,7 @@ local function uninstall(plugin,item)
             if not removed then plugin:info("卸载失败：\n"..tostring(err or "无法删除插件目录")); return end
             forget_install(plugin,item)
             mark_pending(plugin,item,"removed")
+            if type(plugin._refresh_miuread_menu)=="function" then plugin:_refresh_miuread_menu() end
             plugin:info("已卸载 "..tostring(item.name or item.dir).."。\n\n请完整重启 KOReader 后完成卸载。")
         end,
     })
@@ -1426,9 +1489,15 @@ local function repo_detail_rows(plugin,repo,info,release,fallback,stale)
     local rows={
         {text=repo,enabled=false},
         {text=description,enabled=false},
-        {text="来源",post_text="GitHub · 第三方扩展",enabled=false},
-        {text="社区",post_text=tostring(info.stargazers_count or 0).." ★",enabled=false},
     }
+    if type(fallback)=="table" and trim(fallback.recommendation_reason)~="" then
+        rows[#rows+1]={text="觅阅推荐",post_text=trim(fallback.recommendation_reason),enabled=false}
+    end
+    local author=tostring(repo or ""):match("^([^/]+)/") or "未知"
+    rows[#rows+1]={text="作者",post_text=author,enabled=false}
+    rows[#rows+1]={text="来源",post_text="GitHub · 第三方扩展",enabled=false}
+    rows[#rows+1]={text="仓库",post_text=repo,enabled=false}
+    rows[#rows+1]={text="社区",post_text=tostring(info.stargazers_count or 0).." ★",enabled=false}
     if stale then rows[#rows+1]={text="网络状态",post_text="显示上次获取的信息",enabled=false} end
     local known=known_repo(repo)
     if known and known.ui_conflict then
@@ -1660,19 +1729,27 @@ end
 
 local function show_search_results(plugin,data,title,stale)
     local rows={}
+    local installed=managed_repo_map(plugin)
+    local states=update_state(plugin)
     for _,repo in ipairs(type(data.items)=="table" and data.items or {}) do
         local full=repo.full_name
         local known=known_repo(full)
         local name=(known and known.name) or repo.name or full
-        local post=(tonumber(repo.stargazers_count) or 0)>0 and (tostring(repo.stargazers_count).." ★") or full
+        local local_item=installed[full]
+        local post
+        if local_item then
+            post=installed_status_label(plugin,local_item,states)
+        else
+            post=(tonumber(repo.stargazers_count) or 0)>0 and (tostring(repo.stargazers_count).." ★") or full
+        end
         rows[#rows+1]={
-            text=name,post_text=post,
+            text=name,post_text=post,keep_menu_open=true,
             callback=function() repo_detail(plugin,full,{name=name,description=repo.description}) end,
         }
     end
     if stale then rows[#rows+1]={text="GitHub 暂时无法连接，以上为上次结果",enabled=false} end
     if data.has_more==true then
-        rows[#rows+1]={text="查看更多结果",callback=function()
+        rows[#rows+1]={text="查看更多结果",keep_menu_open=true,callback=function()
             local mode=tostring(data.mode or "search")
             local query=tostring(data.query or "")
             local page=(tonumber(data.page) or 1)+1
@@ -1759,10 +1836,44 @@ local function center_about(plugin)
     )
 end
 
+local function recommendation_menu(plugin)
+    local rows={
+        {text="第三方 GitHub 扩展 · 觅阅人工整理",enabled=false},
+    }
+    local installed=managed_repo_map(plugin)
+    local states=update_state(plugin)
+    local desktop=type(plugin._home_enabled)=="function" and plugin:_home_enabled()==true
+    for _,known in ipairs(KNOWN_REPOS) do
+        if known.recommended==true and not (desktop and known.ui_conflict==true) then
+            local item=installed[known.repo]
+            local status=item and installed_status_label(plugin,item,states) or ""
+            local reason=trim(known.recommendation)
+            local post=reason
+            if status~="" then post=post~="" and (post.." · "..status) or status end
+            local target=known
+            rows[#rows+1]={
+                text=tostring(target.name or target.repo),post_text=post,keep_menu_open=true,
+                callback=function()
+                    repo_detail(plugin,target.repo,{
+                        name=target.name,description=target.description,
+                        recommendation_reason=target.recommendation,
+                    })
+                end,
+            }
+        end
+    end
+    if desktop then
+        rows[#rows+1]={text="界面类扩展未作为桌面模式重点推荐",post_text="避免与觅阅桌面冲突",enabled=false}
+    end
+    if #rows==1 then rows[#rows+1]={text="暂无适合当前运行模式的推荐扩展",enabled=false} end
+    return rows
+end
+
 local function discovery_menu(plugin)
     return {
-        {text="搜索扩展",callback=function() show_search_dialog(plugin) end},
-        {text="社区热门",post_text="GitHub",callback=function() github_search(plugin,"topic:koreader-plugin","社区热门",1,"popular",false) end},
+        {text="觅阅推荐",post_text="第三方 GitHub 扩展",sub_item_table_func=function() return recommendation_menu(plugin) end},
+        {text="搜索扩展",keep_menu_open=true,callback=function() show_search_dialog(plugin) end},
+        {text="社区热门",post_text="GitHub",keep_menu_open=true,callback=function() github_search(plugin,"topic:koreader-plugin","社区热门",1,"popular",false) end},
         {text="关于扩展中心",callback=function() center_about(plugin) end},
     }
 end
@@ -1819,6 +1930,7 @@ local function check_updates(plugin)
             end
         end
         save_update_state(plugin,states)
+        if type(plugin._refresh_miuread_menu)=="function" then plugin:_refresh_miuread_menu() end
         local msg="检查完成："..tostring(checked).." 个可跟踪扩展"
         if updates>0 then msg=msg.."\n发现更新："..tostring(updates) end
         if unknown>0 then msg=msg.."\n无法自动判断："..tostring(unknown) end
@@ -1826,15 +1938,80 @@ local function check_updates(plugin)
     end,120)
 end
 
-local function installed_detail(plugin,item)
+local function fetch_repo_snapshot(plugin,repo,force,done)
+    if not valid_repo(repo) then
+        plugin:info("GitHub 仓库地址无效")
+        return
+    end
+    if force~=true then
+        local cached=meta_cache_get(plugin,repo,false)
+        if cached then
+            done(cached.repo_info,cached.release,cached.release_missing==true)
+            return
+        end
+    end
+    run_async_with_progress(plugin,"正在读取扩展信息……","extension_repo_snapshot",function()
+        local info,repo_error=github_repo(plugin,repo)
+        info=compact_repo_info(info)
+        if not info then return {info=nil,error=repo_error} end
+        local release,release_error=latest_release(plugin,repo)
+        release=compact_release(release)
+        return {info=info,release=release,release_missing=release_error=="no_release"}
+    end,function(value,worker_error)
+        local info=type(value)=="table" and value.info or nil
+        if not info then
+            local _,message=classify_github_error(worker_error or (type(value)=="table" and value.error or nil))
+            plugin:info(message.."。")
+            return
+        end
+        local release=type(value)=="table" and value.release or nil
+        local release_missing=type(value)=="table" and value.release_missing==true
+        meta_cache_put(plugin,repo,info,release,release_missing)
+        done(info,release,release_missing)
+    end,45)
+end
+
+local function check_single_update(plugin,item)
+    if not item or not valid_repo(item.repo) then return end
+    fetch_repo_snapshot(plugin,item.repo,true,function(info,release)
+        local status=update_status_for(plugin,item,info,release)
+        status.checked_at=os.time()
+        local states=update_state(plugin)
+        states[update_key(item)]=status
+        save_update_state(plugin,states)
+        if type(plugin._refresh_miuread_menu)=="function" then plugin:_refresh_miuread_menu() end
+        if status.status=="update" then
+            plugin:info("发现更新："..tostring(item.name or item.dir)
+                ..(trim(status.remote_version)~="" and ("\n最新版本："..trim(status.remote_version)) or ""))
+        elseif status.status=="same" then
+            plugin:info("当前已是最新："..tostring(item.name or item.dir))
+        else
+            plugin:info("无法可靠判断这个插件是否有更新。\n\n你仍可以选择重新安装当前 GitHub 版本。")
+        end
+    end)
+end
+
+local function install_managed_repo(plugin,item,mode)
+    if not item or not valid_repo(item.repo) or item.duplicate then return end
+    fetch_repo_snapshot(plugin,item.repo,false,function(info,release)
+        local is_update=mode=="update"
+        local verb=is_update and "更新" or "重新安装"
+        local note=is_update and "安装前会备份当前插件，写入失败会自动恢复。"
+            or "当前版本会先备份，安装失败会自动恢复。"
+        UIManager:show(ConfirmBox:new{
+            text=verb.."“"..tostring(item.name or item.dir).."”？\n\n"..note,
+            ok_text=verb,cancel_text="取消",
+            ok_callback=function() install_repo(plugin,item.repo,info,release) end,
+        })
+    end)
+end
+
+local function installed_detail_rows(plugin,item)
     if item.ghost then
-        return show_menu(plugin,"我的插件 · "..tostring(item.name or item.dir),{
+        return {
             {text=pending_label(item.pending),enabled=false},
             {text="完整重启 KOReader 后，这条状态会自动消失。",enabled=false},
-        })
-    end
-    if item.repo and valid_repo(item.repo) then
-        return repo_detail(plugin,item.repo,{name=item.name})
+        }
     end
     local rows={}
     local open_row=native_open_row(plugin,item)
@@ -1842,17 +2019,40 @@ local function installed_detail(plugin,item)
     local settings_row=item.native and NativePlugins.settings_entry(plugin,item.native) or nil
     if settings_row then rows[#rows+1]=settings_row end
     rows[#rows+1]={text="当前版本",post_text=item.version~="" and item.version or "未知",enabled=false}
-    rows[#rows+1]={text="来源",post_text="外部安装",enabled=false}
+    if valid_repo(item.repo) then
+        rows[#rows+1]={text="来源",post_text="GitHub · 第三方扩展",enabled=false}
+        rows[#rows+1]={text="仓库",post_text=item.repo,enabled=false}
+    else
+        rows[#rows+1]={text="来源",post_text="外部安装",enabled=false}
+    end
     if item.enabled==false then rows[#rows+1]={text="插件状态",post_text="未启用",enabled=false} end
-    if item.pending then rows[#rows+1]={text="当前更改",post_text=pending_label(item.pending),enabled=false} end
+    if item.pending then
+        rows[#rows+1]={text="当前更改",post_text=pending_label(item.pending),enabled=false}
+        if trim(item.runtime_version)~="" and trim(item.runtime_version)~=trim(item.version) then
+            rows[#rows+1]={text="当前运行版本",post_text=item.runtime_version,enabled=false}
+        end
+    end
     if item.duplicate then
         rows[#rows+1]={text="重复安装",post_text=tostring(#(item.duplicate_paths or {})).." 个位置",enabled=false}
         for _,path in ipairs(item.duplicate_paths or {}) do rows[#rows+1]={text=path,enabled=false} end
-        rows[#rows+1]={text="自动卸载已停用",enabled=false}
-    else
-        rows[#rows+1]={text="卸载插件",callback=function() uninstall(plugin,item) end}
+        rows[#rows+1]={text="自动更新与卸载已停用",enabled=false}
+        return rows
     end
-    show_menu(plugin,"我的插件 · "..tostring(item.name or item.dir),rows)
+    if valid_repo(item.repo) then
+        local state=recent_update_state(update_state(plugin),item)
+        if state and state.status=="update" then
+            rows[#rows+1]={text="更新扩展",post_text=trim(state.remote_version)~="" and trim(state.remote_version) or "有更新",keep_menu_open=true,
+                callback=function() install_managed_repo(plugin,item,"update") end}
+        end
+        rows[#rows+1]={text="检查更新",keep_menu_open=true,callback=function() check_single_update(plugin,item) end}
+        rows[#rows+1]={text="重新安装",keep_menu_open=true,callback=function() install_managed_repo(plugin,item,"reinstall") end}
+    end
+    rows[#rows+1]={text="卸载插件",keep_menu_open=true,callback=function() uninstall(plugin,item) end}
+    return rows
+end
+
+local function installed_detail(plugin,item)
+    return show_menu(plugin,"插件 · "..tostring(item.name or item.dir),installed_detail_rows(plugin,item))
 end
 
 local function installed_menu(plugin)
@@ -1867,7 +2067,7 @@ local function installed_menu(plugin)
     local list=managed_plugins(plugin)
     local trackable=0
     for _,item in ipairs(list) do if item.ghost~=true and valid_repo(item.repo) and not item.duplicate then trackable=trackable+1 end end
-    rows[#rows+1]={text="检查更新",post_text=trackable>0 and (tostring(trackable).." 个可跟踪") or "暂无可跟踪扩展",enabled=trackable>0,callback=trackable>0 and function() check_updates(plugin) end or nil}
+    rows[#rows+1]={text="检查更新",post_text=trackable>0 and (tostring(trackable).." 个可跟踪") or "暂无可跟踪扩展",enabled=trackable>0,keep_menu_open=true,callback=trackable>0 and function() check_updates(plugin) end or nil}
     local states=update_state(plugin)
     for _,item in ipairs(list) do
         local label=tostring(item.name or item.dir)
@@ -1875,20 +2075,21 @@ local function installed_menu(plugin)
         if item.pending then post=pending_label(item.pending)
         elseif item.duplicate then post="重复安装"
         else
-            local state=states[update_key(item)]
-            if type(state)=="table" and state.status=="update" then post="有更新"
-            elseif type(state)=="table" and state.status=="error" then post="检查失败"
-            elseif item.enabled==false then post=(item.version~="" and (item.version.." · ") or "").."未启用"
-            else post=item.version~="" and item.version or (item.repo and "GitHub" or "外部安装") end
+            post=installed_status_label(plugin,item,states)
         end
-        rows[#rows+1]={text=label,post_text=post,callback=function() installed_detail(plugin,item) end}
+        local target=item
+        rows[#rows+1]={text=label,post_text=post,sub_item_table_func=function() return installed_detail_rows(plugin,target) end}
     end
-    if #list==0 then rows[#rows+1]={text="暂无用户插件",post_text="可从“查找扩展”安装",enabled=false} end
+    if #list==0 then rows[#rows+1]={text="暂无用户插件",post_text="可从“觅阅推荐”或“搜索扩展”安装",enabled=false} end
     return rows
 end
 
 function M.discovery_menu(plugin)
     return discovery_menu(plugin)
+end
+
+function M.recommendation_menu(plugin)
+    return recommendation_menu(plugin)
 end
 
 function M.installed_menu(plugin)
@@ -1900,10 +2101,44 @@ function M.installed_count(plugin)
 end
 
 function M.menu(plugin)
-    return {
-        {text="查找扩展",sub_item_table_func=function() return discovery_menu(plugin) end},
-        {text="我的插件",post_text=tostring(installed_count(plugin)),sub_item_table_func=function() return installed_menu(plugin) end},
+    local rows={
+        {text="觅阅推荐",post_text="第三方 GitHub 扩展",sub_item_table_func=function() return recommendation_menu(plugin) end},
+        {text="搜索扩展",keep_menu_open=true,callback=function() show_search_dialog(plugin) end},
+        {text="社区热门",post_text="GitHub",keep_menu_open=true,callback=function() github_search(plugin,"topic:koreader-plugin","社区热门",1,"popular",false) end},
+        {text="已安装插件",separator=true,enabled=false},
     }
+    local pending=pending_state(plugin)
+    if next(pending)~=nil then
+        rows[#rows+1]={text="部分插件更改需要重启",post_text="重启 KOReader",callback=function()
+            if type(plugin._restart_koreader)=="function" then plugin:_restart_koreader("extension_center")
+            else plugin:info("请完整重启 KOReader 后继续使用。") end
+        end}
+    end
+    local list=managed_plugins(plugin)
+    local trackable=0
+    for _,item in ipairs(list) do
+        if item.ghost~=true and valid_repo(item.repo) and not item.duplicate then trackable=trackable+1 end
+    end
+    rows[#rows+1]={
+        text="检查全部更新",
+        post_text=trackable>0 and (tostring(trackable).." 个可跟踪") or "暂无可跟踪扩展",
+        enabled=trackable>0,
+        keep_menu_open=true,
+        callback=trackable>0 and function() check_updates(plugin) end or nil,
+    }
+    local states=update_state(plugin)
+    for _,item in ipairs(list) do
+        local target=item
+        rows[#rows+1]={
+            text=tostring(target.name or target.dir),
+            post_text=installed_status_label(plugin,target,states),
+            sub_item_table_func=function() return installed_detail_rows(plugin,target) end,
+        }
+    end
+    if #list==0 then
+        rows[#rows+1]={text="暂无用户插件",post_text="可从“觅阅推荐”或“搜索扩展”安装",enabled=false}
+    end
+    return rows
 end
 
 return M

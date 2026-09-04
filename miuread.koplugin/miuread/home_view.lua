@@ -1033,12 +1033,12 @@ function HomeWidget:_build_header(children, m)
     }},nil)
 
     -- The final cell owns the remainder and no trailing span is painted outside
-    -- the safe inset. This is what keeps “更多” away from the bezel.
+    -- the safe inset. This is what keeps “工具” away from the bezel.
     local menu_w=last_w
     header[#header+1]=tappable(menu_w,m.header_h,
         fixed_frame(menu_w,m.header_h,{bordersize=0,background=Blitbuffer.COLOR_WHITE},
-            Ui.text("更多",menu_w,m.header_h,face("smallinfofont",10.8,14.8),{bold=true})),function()
-        logger.info("[MiuRead][Home] more menu tapped")
+            Ui.text("工具",menu_w,m.header_h,face("smallinfofont",10.8,14.8),{bold=true})),function()
+        logger.info("[MiuRead][Home] tools menu tapped")
         if self.opts and self.opts.on_menu then self.opts.on_menu()
         elseif self.opts and self.opts.on_quick_panel then self.opts.on_quick_panel() end
     end)

@@ -273,7 +273,7 @@ function M.menu(owner)
         out[#out+1]=entry_for(owner,record)
     end
     if #out==0 then
-        out[1]={text="暂无用户插件",post_text="可从“查找扩展”安装",enabled=false}
+        out[1]={text="暂无用户插件",post_text="可从“觅阅推荐”或“搜索扩展”安装",enabled=false}
     end
     return out
 end

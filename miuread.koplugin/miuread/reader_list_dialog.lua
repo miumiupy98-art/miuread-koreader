@@ -599,6 +599,19 @@ function Dialog:onCloseWidget()
 end
 
 local M = {}
+function M.push(title, items, subtitle)
+    if live_dialog and not live_dialog.closed then
+        return live_dialog:_push(title, items, subtitle)
+    end
+    return false
+end
+function M.refresh()
+    if live_dialog and not live_dialog.closed then
+        live_dialog:_rebuild()
+        return true
+    end
+    return false
+end
 function M.close()
     if live_dialog and not live_dialog.closed then live_dialog:_close(nil, true) end
     live_dialog = nil

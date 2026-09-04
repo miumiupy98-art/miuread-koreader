@@ -16,6 +16,7 @@
 
 local BlitBuffer = require("ffi/blitbuffer")
 local ButtonTable = require("ui/widget/buttontable")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -25,8 +26,9 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local ImageWidget = require("ui/widget/imagewidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
-local RawQRMessage = require("ui/widget/qrmessage")
+local QRWidget = require("ui/widget/qrwidget")
 local TextWidget = require("ui/widget/textwidget")
+local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -54,10 +56,20 @@ local function gesture_aware_class(base, attrs)
     return class
 end
 
-local QRMessage = gesture_aware_class(RawQRMessage, {
+local QRDialog = gesture_aware_class(ButtonDialog, {
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
+    dismiss_callback = nil,
+    dismiss_reason = nil,
 })
+
+function QRDialog:onCloseWidget()
+    ButtonDialog.onCloseWidget(self)
+    local callback = self.dismiss_callback
+    self.dismiss_callback = nil
+    if callback then callback(self.dismiss_reason or "return") end
+end
 
 -- 可点占位容器：dimen 即命中区，[1] 为展示内容，回调由 onTapSelect 触发。
 local TapBox = InputContainer:extend{
@@ -764,19 +776,41 @@ local function reopen(host, context, selection, generation)
 end
 
 local function show_qr(url, host, context, selection, generation)
-    local size = math.floor(math.min(Device.screen:getWidth(), Device.screen:getHeight()) * .72)
     local dialog
-    dialog = QRMessage:new{
-        text = url,
-        width = size,
-        height = size,
-        scale_factor = .92,
-        dismiss_callback = function()
+    local function dismiss(reason)
+        if not dialog then return end
+        dialog.dismiss_reason = reason or "return"
+        UIManager:close(dialog)
+    end
+    dialog = QRDialog:new{
+        title = "手机扫码保存",
+        title_align = "center",
+        width_factor = .88,
+        buttons = {
+            {{text = "返回书本", callback = function() dismiss("return") end}},
+            {{text = "重新选择样式", callback = function() dismiss("reselect") end}},
+        },
+        dismiss_callback = function(reason)
             if qr_dialog == dialog then qr_dialog = nil end
             Transfer.stop("qr page closed")
-            if not closing then reopen(host, context, selection, generation) end
+            remove_preview()
+            if reason == "reselect" and not closing then
+                reopen(host, context, selection, generation)
+            end
         end,
     }
+
+    local available = math.max(160, tonumber(dialog:getAddedWidgetAvailableWidth()) or math.floor(Device.screen:getWidth() * .76))
+    local size = math.floor(math.min(Device.screen:getWidth(), Device.screen:getHeight(), available) * .68)
+    size = math.max(120, size)
+    local qr = QRWidget:new{text = url, width = size, height = size, scale_factor = .92}
+    dialog:addWidget(CenterContainer:new{dimen = Geom:new{w = available, h = size}, qr})
+    dialog:addWidget(TextBoxWidget:new{
+        text = "扫码无法打开时，请确认手机与阅读器连接同一 Wi-Fi",
+        width = available,
+        face = Font:getFace("smallinfofont"),
+        alignment = "center",
+    })
     qr_dialog = dialog
     UIManager:show(dialog)
 end
@@ -800,13 +834,13 @@ function M._show_qr_transfer(host, context, selection)
     }
     if not url then
         info(host, tostring(details or "无法开启手机扫码保存"))
+        remove_preview(path)
         reopen(host, context, selection, generation)
         return false
     end
-    -- Single-surface rule: the editor is already closed; QR is the only main
-    -- overlay. Dismissing it stops the temporary LAN server and restores editor.
+    -- The editor is already closed. Normal QR dismissal returns directly to the
+    -- reader; only the explicit “重新选择样式” action reopens the editor.
     show_qr(url, host, context, selection, generation)
-    toast(host, "手机与阅读器需连接同一局域网；扫码后可在手机保存原图", 4)
     return true
 end
 

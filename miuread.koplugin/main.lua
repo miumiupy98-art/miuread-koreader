@@ -139,9 +139,9 @@ local HOME_ACTION_LAYOUT_VERSION=3
 -- The pull-down row can use eight slots. Bluetooth is conditional on a
 -- working platform backend. Capability is probed once per KOReader session;
 -- opening the pull-down never performs a Bluetooth system query.
-local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false}
-local HOME_PANEL_LAYOUT_VERSION=3
+local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","return_koreader","restart","sleep"}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,return_koreader=true,restart=true,sleep=true}
+local HOME_PANEL_LAYOUT_VERSION=4
 -- ReaderUI and FileManager create separate plugin instances. Keep navigation
 -- state in _G so opening/closing a document does not lose its MiuRead origin.
 local HOME_SESSION=rawget(_G,"__MIUREAD_HOME_SESSION")
@@ -1818,9 +1818,13 @@ function Plugin:home_menu()
         {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
         {text=self:_sync_menu_text(),sub_item_table_func=function() return self:sync_menu() end},
         account,
-        {text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end},
-        {text="KOReader 菜单",callback=function() self:_show_native_koreader_menu() end},
     }
+    if not self:_home_enabled() then
+        trailing[#trailing+1]={text="插件与扩展",post_text="安装 更新与插件管理",sub_item_table_func=function() return PluginSettings.plugins_extensions(self) end}
+        trailing[#trailing+1]={text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(self) end}
+    end
+    trailing[#trailing+1]={text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end}
+    trailing[#trailing+1]={text="KOReader 菜单",callback=function() self:_show_native_koreader_menu() end}
     for _,row in ipairs(trailing) do out[#out+1]=row end
     local health=self:_auth_health()
     self:_recompute_auth_health(health)
@@ -5558,12 +5562,11 @@ end
 
 local HOME_ACTION_LABELS={
     refresh="刷新",search="搜索",downloads="下载",sync="同步",sleep="休眠",
-    miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
+    miuread_settings="设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
 }
 local HOME_PANEL_LABELS={
-    wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",screenshot="截图",koreader_settings="KOReader 设置",
-    return_koreader="返回 KOReader",quit="退出 KO",frontlight="前光",sync="同步",
-    miuread_settings="觅阅设置",downloads="下载",restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
+    wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",screenshot="截图",
+    return_koreader="返回 KOReader",restart="重启 KOReader",sleep="休眠",full_refresh="全屏刷新",
 }
 
 function Plugin:_home_toggle_group_item(group,key)
@@ -5579,7 +5582,7 @@ function Plugin:_home_toggle_group_item(group,key)
         if items[name]==true and (is_action or self:_home_panel_item_available(name)) then count=count+1 end
     end
     if not currently and count>=max_count then
-        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑工具栏最多显示八项"),2)
+        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑控制中心最多显示八项"),2)
         return false
     end
     items[key]=not currently
@@ -5711,13 +5714,13 @@ end
 function Plugin:home_customization_menu()
     return {
         {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
-        {text="下滑工具栏",post_text=tostring(self:_home_group_enabled_count("panel")).." / 8",sub_item_table_func=function() return self:home_panel_settings_menu() end},
-        {text="恢复全部推荐布局",post_text="主页 + 下滑工具栏",callback=function() self:_home_restore_all_quick_defaults() end},
+        {text="下滑控制中心",post_text=tostring(self:_home_group_enabled_count("panel")).." / 8",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="恢复全部推荐布局",post_text="主页 + 下滑控制中心",callback=function() self:_home_restore_all_quick_defaults() end},
     }
 end
 
 function Plugin:show_home_customization(anchor)
-    return self:_show_standalone_menu("主页自定义",self:home_customization_menu(),{anchor=anchor})
+    return self:_show_standalone_menu("快捷入口",self:home_customization_menu(),{anchor=anchor})
 end
 
 
@@ -6106,6 +6109,19 @@ end
 
 function Plugin:_miuread_menu_rows(items,options)
     return PluginMenuAdapter.rows(self,items,options)
+end
+
+function Plugin:_push_miuread_menu(title,items,options)
+    options=options or {}
+    items=type(items)=="table" and items or {}
+    if #items==0 then self:info("没有可用选项"); return false end
+    return ReaderListDialog.push(tostring(title or "觅阅"),function()
+        return self:_miuread_menu_rows(items,options)
+    end,tostring(options.subtitle or ""))
+end
+
+function Plugin:_refresh_miuread_menu()
+    return ReaderListDialog.refresh()
 end
 
 function Plugin:_show_miuread_menu(title,items,options)
@@ -9308,7 +9324,7 @@ function Plugin:_home_action_entries()
         sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
             self:_sync_home_pending(); self:_show_home_quick_notice(anchor,"正在同步","未完成内容已提交")
         end},
-        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",callback=function() self:_show_home_settings_center() end},
+        miuread_settings={icon="⚙",icon_key="settings",label="设置",callback=function() self:_show_home_settings_center() end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
         history={icon="◷",label="阅读历史",callback=function() self:show_home_reading_history() end},
         file_manager={icon="▤",label="文件管理",callback=function(anchor) self:_show_home_file_manager_popup(anchor) end},
@@ -11727,7 +11743,6 @@ function Plugin:show_home_quick_panel(more_expanded)
     elseif wifi_linked and wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
     elseif wifi_linked then wifi_detail="已连接"
     else wifi_detail="未连接" end
-    local download_detail=tostring(self._home_panel_download_detail or "")
     local sync_label=self:_home_sync_status_label()
     local bluetooth_state=self:_bluetooth_state(false)
     local definitions={
@@ -11749,14 +11764,7 @@ function Plugin:show_home_quick_panel(more_expanded)
             hold_callback=function() self:_show_orientation_panel() end
         },
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
-        koreader_settings={icon="⚙",icon_key="ko-reader",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
-        return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
-        quit={icon="⏻",icon_key="power",label="退出 KO",detail="",callback=function() self:_quit_koreader() end},
-        sync={icon="⇅",icon_key="sync",label="同步",detail=sync_label,callback=function() self:_sync_home_pending() end,hold_callback=function(anchor) self:_show_home_sync_popup(anchor) end},
-        miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_home_settings_center() end},
-        downloads={icon="⇩",icon_key="download",label="下载",detail=download_detail,
-            callback=function(anchor) self:_show_home_download_popup(anchor) end,
-            hold_callback=function() self:show_downloads() end},
+        return_koreader={icon="←",icon_key="return",label="返回 KOReader",detail="",callback=function() self:_home_close_to_native(true) end},
         restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader() end},
         full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
     }
@@ -11800,10 +11808,6 @@ function Plugin:show_home_quick_panel(more_expanded)
         status_text=status_text,
         buttons=buttons,
         frontlight=frontlight_control,
-        on_customize=function(anchor) self:show_home_customization(anchor) end,
-        on_tools=function(anchor)
-            self:_show_standalone_menu("系统与维护",self:maintenance_menu(),{anchor=anchor})
-        end,
     }
     self._home_quick_panel_opening=false
     local completed=monotonic_wall_time()
@@ -11982,9 +11986,27 @@ function Plugin:_quit_koreader(confirmed,anchor)
     return true
 end
 
+function Plugin:home_file_manager_menu()
+    return {
+        {text="本地书库",post_text="浏览设备中的本地书",callback=function() self:show_home_local_library() end},
+        {text="我的分类",post_text="KOReader Collections",callback=function() self:_home_open_koreader_collections() end},
+    }
+end
+
+function Plugin:tools_menu()
+    return {
+        {text="全部书籍",callback=function() self:show_home_all_books() end},
+        {text="阅读历史",callback=function() self:show_home_reading_history() end},
+        {text="文件管理",sub_item_table_func=function() return self:home_file_manager_menu() end},
+        {text="插件与扩展",post_text=tostring(require("miuread.extension_center").installed_count(self)).." 个已安装",sub_item_table_func=function() return PluginSettings.plugins_extensions(self) end},
+        {text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(self) end},
+        {text="KOReader",post_text="设置 文件管理与返回",sub_item_table_func=function() return PluginSettings.koreader_tools(self) end},
+    }
+end
+
 function Plugin:show_home_menu()
-    if not self:_home_enabled() then return self:_show_standalone_menu("插件设置",PluginSettings.menu(self)) end
-    return self:_show_standalone_menu("觅阅菜单",self:settings_menu())
+    if not self:_home_enabled() then return self:_show_standalone_menu("觅阅设置",self:settings_menu()) end
+    return self:_show_standalone_menu("工具",self:tools_menu(),{page_size=7})
 end
 
 function Plugin:_mark_reader_busy(seconds,share_report)
@@ -24001,6 +24023,17 @@ function Plugin:check_update(automatic)
     if not started then self:info("无法启动后台更新检查：\n"..tostring(start_err or "后台任务不可用")) end
     return started
 end
+function Plugin:show_third_party_notices()
+    local path=ROOT.."/THIRD_PARTY_NOTICES"
+    local raw=U.read_file(path,true)
+    if not raw or U.trim(tostring(raw))=="" then
+        self:info("当前安装包没有可显示的第三方声明。")
+        return false
+    end
+    self:info("第三方声明\n\n"..tostring(raw))
+    return true
+end
+
 function Plugin:show_about()
     local memory_note=""
     local memory_status=self.memory_mode:status()
