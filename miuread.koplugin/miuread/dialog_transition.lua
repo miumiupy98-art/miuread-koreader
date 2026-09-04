@@ -27,7 +27,7 @@ function M.after_close(region, action, label)
     local token = M.cancel_pending()
     local dirty = copied(region)
     UIManager:nextTick(function()
-        if dirty then UIManager:setDirty("all", "ui", dirty) end
+        if dirty then UIManager:setDirty("all", "full", dirty) end
         if type(action) ~= "function" then return end
         UIManager:scheduleIn(.05, function()
             if token ~= M.generation then return end
@@ -38,7 +38,7 @@ function M.after_close(region, action, label)
             end
             if dirty then
                 UIManager:nextTick(function()
-                    UIManager:setDirty("all", "ui", dirty)
+                    UIManager:setDirty("all", "full", dirty)
                 end)
             end
         end)

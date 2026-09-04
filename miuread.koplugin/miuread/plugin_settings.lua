@@ -1,4 +1,6 @@
 local ExtensionCenter=require("miuread.extension_center")
+local NativePlugins=require("miuread.native_plugins")
+local Device=require("device")
 local M={}
 
 local function append(rows,items)
@@ -7,43 +9,17 @@ local function append(rows,items)
 end
 
 function M.sync(plugin)
-    local rows={
-        {text="同步状态",post_text=plugin:_home_sync_status_label(),callback=function() plugin:show_sync_status(false) end},
-        {text="同步待处理内容",post_text="进度 划线 想法",callback=function() plugin:_sync_home_pending() end},
-    }
-    append(rows,plugin:sync_settings_menu())
-    if plugin:_current_book_record() then
-        rows[#rows+1]={text="重新读取当前书籍云端进度",callback=function() plugin:manual_sync() end}
-    end
-    return rows
-end
-
-function M.account_sync(plugin)
-    local rows={
-        {text="账号状态",post_text=plugin:_account_status_label(),callback=function() plugin:show_account_status() end},
-        {text=plugin:logged_in() and "重新扫码登录" or "扫码登录",callback=function() plugin.auth_flow:start() end},
-    }
-    if plugin:logged_in() then rows[#rows+1]={text="退出登录",callback=function() plugin:confirm_logout() end} end
-    append(rows,M.sync(plugin))
-    return rows
-end
-
-function M.annotation_sync(plugin)
     return {
-        {text="结束阅读时上传批注",post_text=plugin:_annotation_close_upload_enabled() and "已开启" or "已关闭",checked_func=function() return plugin:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() plugin:toggle_annotation_close_upload() end},
-        {text="立即同步本书批注",post_text="阅读页下滑工具栏 · 批注",enabled=false},
-        {text="坐标保护",post_text="raw XHTML · 双向校验 · 官方锚点",enabled=false},
-        {text="坐标诊断",post_text="打开书籍后在阅读页批注中导出",enabled=false},
-        {text="新想法可见范围",post_text=plugin:annotation_sync_visibility_label(),sub_item_table_func=function() return plugin:annotation_sync_visibility_menu() end},
+        {text="同步状态",post_text=plugin:_home_sync_status_label(),callback=function() plugin:show_sync_status(false) end},
+        {text="同步未完成内容",post_text="进度 划线 想法",callback=function() plugin:_sync_home_pending() end},
+        {text="同步设置",post_text="时间 进度 批注",sub_item_table_func=function() return plugin:sync_settings_menu() end},
     }
 end
 
 function M.comments(plugin)
-    local rows={}
-    rows[#rows+1]={text="我的评论收藏",post_text=tostring(plugin:_thought_favorite_count()).." 条",callback=function() plugin:show_thought_favorites() end}
-    append(rows,plugin:thought_font_settings_menu())
-    rows[#rows+1]={text="本地划线与想法",post_text="显示与本地数据",enabled=false}
-    return rows
+    -- Keep only behavior/display settings here. Favorites, history and record
+    -- lists are content pages and no longer live inside Settings.
+    return plugin:thought_font_settings_menu()
 end
 
 function M.notices(plugin)
@@ -73,29 +49,148 @@ function M.performance(plugin)
     return rows
 end
 
-function M.update_about(plugin)
+local function weread_settings(plugin)
+    return {
+        {text="账号",post_text=plugin:logged_in() and "已登录" or "未登录",sub_item_table_func=function() return plugin:account_menu() end},
+        {text="微信书架范围",post_text=plugin:_shelf_filter_label(),sub_item_table_func=function() return plugin:shelf_filter_settings_menu() end},
+    }
+end
+
+function M.reading_library(plugin)
+    return {
+        {text="微信读书",post_text=plugin:logged_in() and "已登录" or "未登录",sub_item_table_func=function() return weread_settings(plugin) end},
+        {text="本地书库",post_text=plugin:_local_library_root_label(),sub_item_table_func=function() return plugin:local_library_preferences_menu() end},
+        {text="公众号阅读",post_text="图片与缓存",sub_item_table_func=function() return plugin:mp_settings_menu() end},
+        {text="评论显示",post_text=plugin:_thought_display_label(),sub_item_table_func=function() return M.comments(plugin) end},
+    }
+end
+
+function M.sync_download(plugin)
+    return {
+        {text="同步",post_text="时间 进度 批注",sub_item_table_func=function() return plugin:sync_settings_menu() end},
+        {text="下载",post_text=plugin:_download_settings_summary(),sub_item_table_func=function() return plugin:download_settings_menu() end},
+        {text="存储",post_text="缓存与清理",sub_item_table_func=function() return plugin:storage_management_menu() end},
+    }
+end
+
+local function home_page_settings(plugin)
+    local home=plugin:_home_preferences()
+    return {
+        {text="页面布局",post_text=(home.layout_style=="compact" and "紧凑布局" or "标准布局"),sub_item_table_func=function() return plugin:home_layout_settings_menu() end},
+        {text="主页阅读统计",post_text=plugin:_home_stats_visibility_label(home),sub_item_table_func=function() return plugin:home_stats_settings_menu() end},
+        {text="统一书架",post_text="书架 · 本机 · 最近",sub_item_table_func=function() return {
+            {text="书架筛选",post_text="来源 类型 本机状态与排序",sub_item_table_func=function() return plugin:_home_library_filter_menu("shelf") end},
+            {text="本机筛选",post_text="来源 类型与排序",sub_item_table_func=function() return plugin:_home_library_filter_menu("device") end},
+            {text="本地书库",post_text=plugin:_local_library_root_label(),sub_item_table_func=function() return plugin:local_library_preferences_menu() end},
+        } end},
+        {text="显示书架封面",checked_func=function() return plugin.store:preferences().shelf_covers~=false end,keep_menu_open=true,callback=function() plugin:_toggle_preference("shelf_covers") end},
+        {text="网络补全图书信息",post_text="只补充缺失资料",checked_func=function() return plugin:_home_preferences().network_metadata~=false end,keep_menu_open=true,callback=function() plugin:_toggle_home_network_metadata() end},
+    }
+end
+
+
+local function display_typography_settings(plugin)
+    local home=plugin:_home_preferences()
+    local size_labels={compact="紧凑",standard="标准",large="大号"}
+    return {
+        {text="觅阅显示大小",post_text=size_labels[home.display_size] or "标准",sub_item_table_func=function() return plugin:home_display_size_menu() end},
+        {text="觅阅界面字体",post_text=plugin:_home_ui_font_label(home),sub_item_table_func=function() return plugin:home_ui_font_menu() end},
+        {text="时间与时区",post_text=plugin:_time_settings_label(),sub_item_table_func=function() return plugin:time_display_settings_menu() end},
+    }
+end
+
+local function lockscreen_settings(plugin)
+    local home=plugin:_home_preferences()
+    return {
+        {text="主页锁屏显示最近阅读封面",checked_func=function() return plugin:_home_preferences().lockscreen_recent~=false end,keep_menu_open=true,callback=function() plugin:_toggle_home_lockscreen() end},
+        {text="锁屏封面样式",post_text=plugin:_home_lockscreen_style_label(home),enabled_func=function() return plugin:_home_preferences().lockscreen_recent~=false end,sub_item_table_func=function() return plugin:home_lockscreen_style_menu() end},
+    }
+end
+
+function M.home_interface(plugin)
+    return {
+        {text="主页",post_text="布局与内容",sub_item_table_func=function() return home_page_settings(plugin) end},
+        {text="快捷工具",post_text="主页 + 下滑工具栏",sub_item_table_func=function() return plugin:home_customization_menu() end},
+        {text="阅读界面",post_text=plugin:_reader_toolbar_setting_summary(),sub_item_table_func=function() return plugin:reader_quick_panel_settings_menu() end},
+        {text="字体与显示",post_text="大小 字体与时间",sub_item_table_func=function() return display_typography_settings(plugin) end},
+        {text="锁屏与封面",post_text=plugin:_home_lockscreen_style_label(plugin:_home_preferences()),sub_item_table_func=function() return lockscreen_settings(plugin) end},
+    }
+end
+
+function M.plugins_extensions(plugin)
+    return {
+        {text="觅阅扩展中心",post_text="发现 安装 更新与卸载",sub_item_table_func=function() return ExtensionCenter.menu(plugin) end},
+        {text="已安装插件",post_text=tostring(NativePlugins.count()),sub_item_table_func=function() return NativePlugins.menu(plugin) end},
+    }
+end
+
+local function power_menu(plugin)
     local rows={}
-    append(rows,plugin:update_settings_menu())
-    rows[#rows+1]={text="关于觅阅",callback=plugin:safe("about",function() plugin:show_about() end)}
+    if Device:canSuspend() then rows[#rows+1]={text="休眠",callback=function() plugin:_home_sleep() end} end
+    rows[#rows+1]={text="重启 KOReader",callback=function() plugin:_restart_koreader("settings") end}
+    rows[#rows+1]={text="退出 KOReader",callback=function() plugin:_quit_koreader() end}
+    if type(Device.canReboot)=="function" and Device:canReboot() then rows[#rows+1]={text="重启设备",callback=function() plugin:_home_reboot_device() end} end
+    if type(Device.canPowerOff)=="function" and Device:canPowerOff() then rows[#rows+1]={text="关机",callback=function() plugin:_home_poweroff_device() end} end
     return rows
 end
 
-function M.extensions(plugin)
-    return ExtensionCenter.menu(plugin)
+local function koreader_menu(plugin)
+    local start=tostring(plugin:_home_root() or "")
+    return {
+        {text="KOReader 设置",callback=function() plugin:_show_native_koreader_menu() end},
+        {text="KOReader 文件管理",callback=function() plugin:_home_open_koreader_filemanager(start~="" and start or nil,true) end},
+        {text="返回 KOReader",callback=function() plugin:_home_close_to_native(true) end},
+    }
+end
+
+function M.device_koreader(plugin)
+    local rows={
+        {text="Wi-Fi",callback=function() plugin:_home_wifi_settings() end},
+    }
+    local bt=plugin:_bluetooth_state(false)
+    if bt.supported==true then
+        rows[#rows+1]={text="Bluetooth",post_text=bt.enabled==true and "已开启" or "已关闭",callback=function() plugin:_bluetooth_show_devices() end}
+    end
+    if Device:hasFrontlight() then
+        rows[#rows+1]={text="前光与色温",callback=function() plugin:_show_reader_frontlight_panel(function() plugin:_show_home_settings_center() end) end}
+    end
+    rows[#rows+1]={text="屏幕方向",post_text=plugin:_orientation_status_label(),callback=function() plugin:_show_orientation_panel() end}
+    rows[#rows+1]={text="休眠与电源",sub_item_table_func=function() return power_menu(plugin) end}
+    rows[#rows+1]={text="KOReader",sub_item_table_func=function() return koreader_menu(plugin) end}
+    return rows
+end
+
+function M.system_maintenance(plugin)
+    return {
+        {text="诊断",post_text="同步与时间",sub_item_table_func=function() return plugin:diagnostics_menu() end},
+        {text="数据修复",post_text="书库与书籍完整性",sub_item_table_func=function() return plugin:data_repair_menu() end},
+        {text="性能与兼容性",post_text=plugin:_performance_mode_label(),sub_item_table_func=function() return M.performance(plugin) end},
+        {text="运行模式",post_text=plugin:_home_mode_label(),sub_item_table_func=function() return plugin:home_mode_menu() end},
+        {text="更新",post_text=plugin:_update_channel_label(plugin:_update_channel()),sub_item_table_func=function() return plugin:update_settings_menu() end},
+    }
+end
+
+function M.about(plugin)
+    return {
+        {text="当前版本",post_text=tostring(plugin.version),enabled=false},
+        {text="许可证",post_text="AGPL-3.0-only",enabled=false},
+        {text="关于觅阅",callback=plugin:safe("about",function() plugin:show_about() end)},
+    }
 end
 
 function M.menu(plugin)
-    return {
-        {text="账号与同步",post_text=plugin:progress_sync_label(),sub_item_table_func=function() return M.account_sync(plugin) end},
-        {text="下载与存储",post_text=plugin:_download_settings_summary(),sub_item_table_func=function() return plugin:download_settings_menu() end},
-        {text="评论与批注",post_text=plugin:_thought_display_label(),sub_item_table_func=function() return M.comments(plugin) end},
-        {text="公众号阅读",sub_item_table_func=function() return plugin:mp_settings_menu() end},
-        {text="阅读界面",post_text=plugin:_reader_toolbar_setting_summary(),sub_item_table_func=function() return plugin:reader_quick_panel_settings_menu() end},
-        {text="性能与兼容性",post_text=plugin:_performance_mode_label(),sub_item_table_func=function() return M.performance(plugin) end},
-        {text="扩展",post_text="觅阅扩展中心",sub_item_table_func=function() return M.extensions(plugin) end},
-        {text="更新与关于",sub_item_table_func=function() return M.update_about(plugin) end},
-        {text="运行模式",post_text=plugin:_home_mode_label(),sub_item_table_func=function() return plugin:home_mode_menu() end},
+    local rows={
+        {text="阅读与书库",post_text="微信读书 本地书与评论",sub_item_table_func=function() return M.reading_library(plugin) end},
+        {text="同步与下载",post_text="同步 下载与存储",sub_item_table_func=function() return M.sync_download(plugin) end},
     }
+    if plugin:_home_enabled() then
+        rows[#rows+1]={text="首页与界面",post_text="主页 书架与快捷工具",sub_item_table_func=function() return M.home_interface(plugin) end}
+    end
+    rows[#rows+1]={text="插件与扩展",post_text="扩展中心与已安装插件",sub_item_table_func=function() return M.plugins_extensions(plugin) end}
+    rows[#rows+1]={text="设备与 KOReader",post_text="设备控制与原生入口",sub_item_table_func=function() return M.device_koreader(plugin) end}
+    rows[#rows+1]={text="系统与维护",post_text="诊断 修复 性能与更新",sub_item_table_func=function() return M.system_maintenance(plugin) end}
+    rows[#rows+1]={text="关于觅阅",post_text=tostring(plugin.version),sub_item_table_func=function() return M.about(plugin) end}
+    return rows
 end
 
 return M

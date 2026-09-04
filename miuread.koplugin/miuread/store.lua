@@ -25,7 +25,7 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={}},home_ui={enabled=false,layout_version=26,layout_style="desk",show_weread_stats=true,show_local_stats=true,stats_slot="weread_month",display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",page_by_section={},source_order={"account","generated","local","mp"},status_card_enabled=true,status_items={time=true,date=true,wifi=true,battery=true,sync=true,bluetooth=false,downloads=false},status_order={"time","date","wifi","battery","sync","bluetooth","downloads"},action_items={refresh=true,search=true,downloads=true,sleep=true,extensions=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,sync=false},action_order={"refresh","search","downloads","sleep","extensions","miuread_settings","sync","all_books","history","file_manager","screenshot"},action_layout_version=5,panel_items={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,sleep=true,koreader_settings=true,return_koreader=true,quit=false,restart=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","sleep","koreader_settings","return_koreader","quit","restart"},panel_layout_version=4,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={}},home_ui={enabled=false,layout_version=24,layout_style="desk",show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="all",kind="all",locality="all",sort="recent"},device={source="all",kind="all",locality="all",sort="recent"}},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"},panel_layout_version=3,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={books={},mp={},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},recent_reads={version=1,items={}},
  prefetch_cache={},
@@ -601,6 +601,105 @@ function Store:migrate()
             self:save_preferences(current)
             logger.info("[MiuRead][Migration] schema 123 -> 124 done",
                 "restored=",tostring(restored),"transient_cleared=",tostring(cleared))
+        end
+        if schema<125 then
+            -- 5.7.0-beta.7 rolls the experimental beta.5/beta.6 Home redesign
+            -- back to the established beta.4 layout. Keep the slimming and
+            -- synchronization fixes, but restore the original first header row,
+            -- dashboard proportions and six-item Home action bar.
+            local current=self:preferences()
+            current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
+            local home=current.home_ui
+            home.layout_version=24
+            if home.show_weread_stats==nil then home.show_weread_stats=true end
+            if home.show_local_stats==nil then home.show_local_stats=true end
+            home.stats_slot=nil
+            home.status_card_enabled=nil
+            home.status_items=nil
+            home.status_order=nil
+
+            home.action_items={
+                refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,
+                all_books=false,history=false,file_manager=false,screenshot=false,
+            }
+            home.action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"}
+            home.action_layout_version=3
+
+            home.panel_items={
+                wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,
+                koreader_settings=true,return_koreader=true,quit=true,sync=true,
+                miuread_settings=false,downloads=false,restart=false,sleep=false,
+            }
+            home.panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"}
+            home.panel_layout_version=3
+
+            -- Keep beta.6's ghost-sync protection while rolling back only UI.
+            -- Orphan/stale transient snapshots must not reappear as actionable
+            -- work after the Home layout rollback.
+            local sessions=self.db:readSetting("sessions",{}) or {}
+            local library=self.db:readSetting("library",{}) or {}
+            local cleared=0
+            for id,session in pairs(type(sessions)=="table" and sessions or {}) do
+                if type(session)=="table" then
+                    local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
+                    local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
+                    local verified_seq=tonumber(session.progress_verified_sequence or 0) or 0
+                    local has_book_record=type(library[tostring(id)])=="table"
+                    if pending and ((pending_seq>0 and verified_seq>=pending_seq) or not has_book_record) then
+                        session.pending_progress=false
+                        session.progress_worker_active=false
+                        session.progress_worker_updated_at=0
+                        session.progress_upload_pending_at=false
+                        session.progress_upload_error=false
+                        session.progress_resubmit_allowed=false
+                        session.progress_last_verify_reason=false
+                        session.progress_sync_state=verified_seq>0 and "local_uploaded" or ""
+                        session.progress_sync_message="已清理失效的历史同步状态"
+                        cleared=cleared+1
+                    end
+                    if not has_book_record then
+                        if tonumber(session.pending_report_seconds or 0)>0 then
+                            session.pending_report_seconds=0
+                            cleared=cleared+1
+                        end
+                        session.sync_repair_required=false
+                    end
+                end
+            end
+            self.db:saveSetting("sessions",sessions)
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 124 -> 125 done",
+                "home_layout=classic","ghost_sync_cleared=",tostring(cleared))
+        end
+        if schema<126 then
+            -- 5.7.0-beta.10 introduces a source-agnostic Home library index.
+            -- This migration only initializes view/filter state; existing
+            -- databases, downloaded files and local-library caches stay put.
+            local current=self:preferences()
+            current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
+            local home=current.home_ui
+            local map={account="shelf",generated="device",["local"]="device",mp="shelf"}
+            home.active_section=map[home.active_section] or home.active_section
+            if home.active_section~="shelf" and home.active_section~="device" and home.active_section~="recent" then
+                home.active_section="shelf"
+            end
+            home.library_layout_version=1
+            home.library_membership=type(home.library_membership)=="table" and home.library_membership or {}
+            home.library_filters=type(home.library_filters)=="table" and home.library_filters or {}
+            home.library_filters.shelf=type(home.library_filters.shelf)=="table" and home.library_filters.shelf
+                or {source="all",kind="all",locality="all",sort="recent"}
+            home.library_filters.device=type(home.library_filters.device)=="table" and home.library_filters.device
+                or {source="all",kind="all",locality="all",sort="recent"}
+            home.source_order={"shelf","device","recent"}
+            home.visible_sections=type(home.visible_sections)=="table" and home.visible_sections or {}
+            home.visible_sections.shelf=true; home.visible_sections.device=true; home.visible_sections.recent=true
+            home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
+            home.page_by_section.shelf=tonumber(home.page_by_section.shelf) or 1
+            home.page_by_section.device=tonumber(home.page_by_section.device) or 1
+            home.page_by_section.recent=tonumber(home.page_by_section.recent) or 1
+            self:save_preferences(current)
+            logger.info("[MiuRead][Migration] schema 125 -> 126 done",
+                "home_library=unified","files_moved=false","existing_data_preserved=true")
         end
         self.db:saveSetting("schema",Config.SCHEMA)
     end

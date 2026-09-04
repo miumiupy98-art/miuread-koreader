@@ -672,7 +672,12 @@ local function version_is_newer(remote,local_version)
     return ok and result==true
 end
 
-local function show_menu(title,items)
+local function show_menu(plugin,title,items)
+    -- Extension Center is MiuRead-owned UI. Reuse the same centered menu shell
+    -- as Home/settings rather than falling back to KOReader's page-like Menu.
+    if plugin and type(plugin._show_miuread_menu)=="function" then
+        return plugin:_show_miuread_menu(title,items,{page_size=7})
+    end
     UIManager:show(Menu:new{title=title,item_table=items,items_per_page=8})
 end
 
@@ -758,7 +763,7 @@ local function repo_detail(plugin,repo,fallback)
             })
         end}
     end
-    show_menu("觅阅扩展中心 · "..display_repo_name(info,fallback),rows)
+    show_menu(plugin,"觅阅扩展中心 · "..display_repo_name(info,fallback),rows)
 end
 
 local function repo_item(plugin,repo,fallback)
@@ -797,7 +802,7 @@ local function github_search(plugin,query,title)
     if #items==0 then plugin:info("没有找到相关 KOReader 扩展。") return end
     plugin.store:set_deferred(SEARCH_CACHE_KEY,{query=query,updated_at=os.time()})
     plugin.store:flush()
-    show_menu(title or "GitHub 社区",items)
+    show_menu(plugin,title or "GitHub 社区",items)
 end
 
 local function show_search_dialog(plugin)
@@ -854,7 +859,7 @@ local function installed_menu(plugin)
                 elseif repo and valid_repo(repo) then
                     repo_detail(plugin,repo,{name=row.name})
                 else
-                    show_menu("已安装 · "..row.name,{
+                    show_menu(plugin,"已安装 · "..row.name,{
                         {text=row.dir,post_text=row.version,enabled=false},
                         {text="来源",post_text="非扩展中心安装",enabled=false},
                         {text="卸载扩展",callback=function() uninstall(plugin,row) end},
@@ -888,11 +893,23 @@ end
 
 local function center_about(plugin)
     plugin:info(
-        "觅阅扩展中心 · 5.7.0-beta.6\n\n"
+        "觅阅扩展中心 · 5.7.0-beta.11\n\n"
         .."第一版直接使用 GitHub 的 KOReader 社区生态作为扩展来源，并提供中文精选入口。\n\n"
         .."安装包会先下载到临时目录，检查 ZIP 路径、插件结构和体积后才写入 plugins。更新现有插件时会先备份，写入失败自动恢复。\n\n"
         .."普通第三方插件仍由插件自己管理账号和设置。安装、更新或卸载后请完整重启 KOReader。"
     )
+end
+
+function M.installed_menu(plugin)
+    return installed_menu(plugin)
+end
+
+function M.installed_count()
+    return #scan_installed()
+end
+
+function M.update_menu(plugin)
+    return update_menu(plugin)
 end
 
 function M.menu(plugin)
@@ -901,7 +918,7 @@ function M.menu(plugin)
         {text="分类浏览",sub_item_table_func=function() return categories_menu(plugin) end},
         {text="GitHub 社区",post_text="热门",callback=function() github_search(plugin,"topic:koreader-plugin","GitHub 社区 · 热门") end},
         {text="搜索扩展",callback=function() show_search_dialog(plugin) end},
-        {text="已安装",post_text=tostring(#scan_installed()),sub_item_table_func=function() return installed_menu(plugin) end},
+        {text="管理已安装扩展",post_text=tostring(#scan_installed()),sub_item_table_func=function() return installed_menu(plugin) end},
         {text="扩展更新",sub_item_table_func=function() return update_menu(plugin) end},
         {text="关于扩展中心",callback=function() center_about(plugin) end},
     }

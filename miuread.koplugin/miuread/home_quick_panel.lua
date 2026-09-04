@@ -575,7 +575,7 @@ function QuickPanelWidget:_build()
         if has_tools then
             local tools = tappable(item_w, footer_h,
                 fixed_frame(item_w, footer_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
-                    Ui.text("工具与维护  ›", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
+                    Ui.text("系统与维护  ›", item_w, footer_h, face("cfont", 13.2, 18), {bold = true})),
                 function(anchor)
                     if not self:_controls_armed() then return true end
                     self:_close(function() self.opts.on_tools(anchor) end)

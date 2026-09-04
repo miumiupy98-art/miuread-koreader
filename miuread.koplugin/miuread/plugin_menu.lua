@@ -18,13 +18,12 @@ end
 function M.home(plugin)
     plugin:maybe_auto_check_update(false)
     return {
-        {text="我的书架",callback=plugin:safe("shelf",function() plugin:show_shelf(false,false,"account") end)},
+        {text="微信书架",callback=plugin:safe("shelf",function() plugin:show_shelf(false,false,"account") end)},
         {text="搜索书籍",callback=plugin:safe("search",function() plugin:search_dialog() end)},
         {text=plugin:_download_menu_text(),callback=plugin:safe("downloads",function() plugin:show_downloads() end)},
         {text=plugin:_sync_menu_text(),sub_item_table_func=function() return PluginSettings.sync(plugin) end},
         {text="公众号",callback=plugin:safe("mp-shelf",function() plugin:show_mp_shelf(false) end)},
-        {text="账号",sub_item_table_func=function() return plugin:account_menu() end},
-        {text="插件设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
+        {text="觅阅设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
     }
 end
 
@@ -39,7 +38,7 @@ function M.reader(plugin)
             {text="下一篇",callback=plugin:safe("mp-next",function() plugin:open_mp_neighbor(1) end)},
             {text="当前文章",sub_item_table_func=function() return plugin:current_mp_article_menu(mp_context) end},
             {text=plugin:_download_menu_text(),callback=function() plugin:show_downloads() end},
-            {text="插件设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
+            {text="觅阅设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
         }
     end
     return {
@@ -48,7 +47,7 @@ function M.reader(plugin)
         {text=plugin:_sync_menu_text(),sub_item_table_func=function() return PluginSettings.sync(plugin) end},
         {text=plugin:_download_menu_text(),callback=function() plugin:show_downloads() end},
         {text="评论与想法",sub_item_table_func=function() return comment_and_thought_menu(plugin) end},
-        {text="插件设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
+        {text="觅阅设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
     }
 end
 
