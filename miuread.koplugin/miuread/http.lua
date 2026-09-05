@@ -3,6 +3,7 @@ local socketutil = require("socketutil")
 local ok_http, http = pcall(require, "socket.http")
 local ok_https, https = pcall(require, "ssl.https")
 local ok_socket, socket = pcall(require, "socket")
+local ok_url, url_module = pcall(require, "socket.url")
 local ok_lfs, lfs = pcall(require, "lfs")
 local Json = require("miuread.json")
 local Config = require("miuread.config")
@@ -92,6 +93,188 @@ local function ipv4_tcp_factory()
     return conn
 end
 
+-- Connection reuse ----------------------------------------------------------
+-- socket.http and ssl.https open a fresh TCP+TLS connection for every request
+-- and close it again afterwards. One chapter needs four sequential requests to
+-- the same host, so on slow e-ink hardware the handshakes cost more than the
+-- transfers do. Both transports accept a `create` hook that supplies the
+-- connection object, which lets the socket from the previous request be handed
+-- back instead of a new one. This removes handshakes only: request pacing,
+-- ordering and the shared rate-limit budget are untouched.
+--
+-- Reuse is deliberately conservative. A socket returns to the pool only when
+-- the response carried a self-delimiting body, the peer did not ask for a
+-- close, and LuaSocket did not restart the exchange internally. Every other
+-- outcome closes the socket, which is exactly the previous behaviour.
+
+local KEEPALIVE_IDLE_SECONDS = 25
+local KEEPALIVE_MAX_REUSE = 64
+
+local function url_endpoint(url)
+    local scheme, authority = tostring(url or ""):match("^(https?)://([^/]+)")
+    if not scheme then return nil end
+    local host, port = authority:match("^(.-):(%d+)$")
+    host = host or authority
+    if host == "" then return nil end
+    return scheme, host:lower(), tonumber(port) or (scheme == "https" and 443 or 80)
+end
+
+-- ssl.https rewrites the request URL so the default port is explicit, which is
+-- what puts "host:443" in the Host header. Driving socket.http directly has to
+-- reproduce that, otherwise the request goes out subtly differently.
+local function explicit_port_url(url, port)
+    if not (ok_url and url_module and type(url_module.parse) == "function"
+        and type(url_module.build) == "function") then
+        return nil
+    end
+    local built, parsed = pcall(url_module.parse, url, {port = port})
+    if not built or type(parsed) ~= "table" then return nil end
+    local ok_build, value = pcall(url_module.build, parsed)
+    if not ok_build or type(value) ~= "string" or value == "" then return nil end
+    return value
+end
+
+local function apply_socket_timeouts(conn)
+    if not conn or type(conn.settimeout) ~= "function" then return end
+    pcall(conn.settimeout, conn, tonumber(socketutil.block_timeout) or 15, "b")
+    pcall(conn.settimeout, conn, tonumber(socketutil.total_timeout) or 35, "t")
+end
+
+-- A pooled socket the peer closed while it was idle becomes readable at once.
+-- Nothing is expected on an idle connection, so anything readable - a FIN or
+-- unread leftovers - means the socket cannot carry another request.
+local function connection_is_stale(conn)
+    if not conn then return true end
+    if not (ok_socket and socket and type(socket.select) == "function") then return false end
+    local called, readable = pcall(socket.select, {conn}, nil, 0)
+    if not called then return true end
+    return type(readable) == "table" and next(readable) ~= nil
+end
+
+local function open_connection(scheme, host, port, force_ipv4)
+    local previous_tcp
+    if force_ipv4 then
+        if not (ok_socket and socket and type(socket.tcp4) == "function") then
+            return nil, "IPv4 socket unavailable"
+        end
+        -- LuaSec builds its transport from socket.tcp, so the existing IPv4
+        -- override is the only way to reach the same family selection here.
+        previous_tcp = socket.tcp
+        socket.tcp = ipv4_tcp_factory
+    end
+
+    local conn, err
+    if scheme == "https" then
+        local factory_ok, factory = pcall(https.tcp, {})
+        if factory_ok and type(factory) == "function" then
+            local created, value = pcall(factory)
+            if created then conn = value else err = value end
+        else
+            err = factory_ok and "LuaSec create hook unavailable" or factory
+        end
+    elseif force_ipv4 then
+        conn, err = ipv4_tcp_factory()
+    else
+        local created, value = pcall(socket.tcp)
+        if created then conn = value else err = value end
+    end
+
+    if conn then
+        apply_socket_timeouts(conn)
+        local called, result, connect_error = pcall(conn.connect, conn, host, port)
+        if not called then
+            err = result
+        elseif result == nil then
+            err = connect_error or "connect failed"
+        end
+        if err then
+            pcall(conn.close, conn)
+            conn = nil
+        else
+            -- LuaSec swaps in the TLS socket during connect and only then
+            -- exposes its methods, so the timeouts have to be applied again.
+            apply_socket_timeouts(conn)
+        end
+    end
+
+    if previous_tcp then socket.tcp = previous_tcp end
+    if not conn then return nil, tostring(err or "connection failed") end
+    return conn
+end
+
+-- The object handed to socket.http through `create`. It looks like a socket to
+-- LuaSocket while keeping ownership of the underlying connection: close() only
+-- marks the exchange finished, and Http:_keepalive_finish decides afterwards
+-- whether the socket is clean enough to serve another request.
+local KeepaliveMethods = {}
+
+local Keepalive_mt = {
+    __index = function(session, key)
+        local method = KeepaliveMethods[key]
+        if method then return method end
+        local conn = rawget(session, "conn")
+        local target = conn and conn[key]
+        if type(target) ~= "function" then return nil end
+        return function(_, ...) return target(conn, ...) end
+    end,
+}
+
+function KeepaliveMethods:_drop()
+    local conn = rawget(self, "conn")
+    self.conn = nil
+    self.reused = false
+    if conn then pcall(conn.close, conn) end
+end
+
+function KeepaliveMethods:settimeout(...)
+    local conn = rawget(self, "conn")
+    if not conn or type(conn.settimeout) ~= "function" then return 1 end
+    return conn:settimeout(...)
+end
+
+function KeepaliveMethods:connect(host, port)
+    -- socket.http passes the port through from the parsed URL, where it is a
+    -- string. The pool compares it against a number, so normalise first.
+    port = tonumber(port) or port
+    self.hops = self.hops + 1
+    -- A second connect inside one request means LuaSocket restarted the
+    -- exchange for an internal redirect. It abandoned the previous response
+    -- without reading the body, so that socket can only be replaced.
+    if self.hops > 1 then self:_drop() end
+    if rawget(self, "conn") and not self.dirty and self.host == host and self.port == port then
+        apply_socket_timeouts(self.conn)
+        self.reused = true
+        return 1
+    end
+    self:_drop()
+    local conn, err = open_connection(self.scheme, host, port, self.force_ipv4)
+    if not conn then return nil, tostring(err) end
+    self.conn, self.host, self.port = conn, host, port
+    self.dirty, self.reused, self.uses = false, false, 0
+    return 1
+end
+
+function KeepaliveMethods:close()
+    self.dirty = true
+    return 1
+end
+
+function KeepaliveMethods:send(...)
+    local conn = rawget(self, "conn")
+    if not conn then return nil, "closed" end
+    local sent, err, last = conn:send(...)
+    if sent then self.sent_ok = true end
+    return sent, err, last
+end
+
+function KeepaliveMethods:receive(...)
+    local conn = rawget(self, "conn")
+    if not conn then return nil, "closed" end
+    local data, err, partial = conn:receive(...)
+    if data ~= nil or (partial ~= nil and #partial > 0) then self.received_any = true end
+    return data, err, partial
+end
+
 local function body_rate_limit(text)
     text = tostring(text or "")
     if text == "" or #text > 32768 or not text:match("^%s*[%[{]") then return nil end
@@ -130,12 +313,156 @@ function Http:new(store)
     }, self)
 end
 
+-- Instrumentation. The counters answer the only question an A/B download run
+-- needs: how much of the elapsed time was handshakes, transfers, or deliberate
+-- pacing, and how many connections the run actually had to open.
+function Http:_stats()
+    local stats = self.stats
+    if not stats then
+        stats = {
+            requests = 0, connections_opened = 0, connections_reused = 0,
+            network_seconds = 0, pacing_seconds = 0, rate_limit_seconds = 0,
+            bytes = 0,
+        }
+        self.stats = stats
+    end
+    return stats
+end
+
+function Http:stats_snapshot()
+    local copy = {}
+    for key, value in pairs(self:_stats()) do copy[key] = value end
+    return copy
+end
+
+function Http:_sleep_accounted(seconds, field)
+    seconds = tonumber(seconds) or 0
+    if seconds <= 0 then return end
+    local stats = self:_stats()
+    stats[field] = (stats[field] or 0) + seconds
+    pause(seconds)
+end
+
 function Http:set_download_network_policy(options)
     self.network_policy = NetworkPolicy:new(options or {})
     return self.network_policy
 end
 
-function Http:_transport_request(transport, request, force_ipv4)
+-- Hands out a reusable connection for `url`, taking the socket left over by
+-- the previous request to the same origin when one is still usable. Returns
+-- nil whenever reuse does not apply, which keeps the caller on the stock
+-- one-connection-per-request path.
+function Http:_keepalive_begin(url, opt, force_ipv4, sink_path)
+    if Config.HTTP_KEEPALIVE == false then return nil end
+    if opt and opt.keepalive == false then return nil end
+    -- Streaming downloads write straight into a file and are large enough that
+    -- the handshake is noise; leaving them out keeps the replay below simple.
+    if tostring(sink_path or "") ~= "" then return nil end
+    if not is_weread_url(url) then return nil end
+    local scheme, host, port = url_endpoint(url)
+    if not scheme then return nil end
+    -- ssl.https rejects a request table that already carries a create hook
+    -- ("create function not permitted"), so a reused TLS connection has to be
+    -- driven through socket.http directly. That is what ssl.https does
+    -- internally anyway: it only installs the TLS-aware create and forwards.
+    -- ssl.https.tcp builds exactly that connection, with LuaSec's own defaults,
+    -- so the TLS parameters stay identical to the non-pooled path.
+    local transport_url
+    if scheme == "https" then
+        local usable = ok_https and https and type(https.tcp) == "function"
+            and ok_http and http and type(http.request) == "function"
+        if usable then transport_url = explicit_port_url(url, port) end
+        if not transport_url then
+            if not self.keepalive_unavailable_logged then
+                self.keepalive_unavailable_logged = true
+                logger.warn("[MiuRead][HTTP] connection reuse unavailable for TLS",
+                    "luasec_tcp=", tostring(ok_https and https and type(https.tcp) == "function"),
+                    "socket_url=", tostring(ok_url and url_module ~= nil))
+            end
+            return nil
+        end
+    elseif not (ok_socket and socket and type(socket.tcp) == "function") then
+        return nil
+    end
+
+    force_ipv4 = force_ipv4 == true
+    local key = scheme .. "://" .. host .. (force_ipv4 and "#4" or "#a")
+    local pool = self.keepalive_pool
+    if not pool then pool = {}; self.keepalive_pool = pool end
+    local entry = pool[key]
+    pool[key] = nil
+    if entry and (clock_now() - (tonumber(entry.idle_since) or 0) > KEEPALIVE_IDLE_SECONDS
+        or connection_is_stale(entry.conn)) then
+        pcall(entry.conn.close, entry.conn)
+        entry = nil
+    end
+    return setmetatable({
+        scheme = scheme, force_ipv4 = force_ipv4, key = key,
+        conn = entry and entry.conn or nil,
+        host = entry and entry.host or nil,
+        port = entry and entry.port or port,
+        uses = entry and tonumber(entry.uses) or 0,
+        pooled = entry ~= nil,
+        transport_url = transport_url,
+        dirty = false, hops = 0, reused = false,
+        sent_ok = false, received_any = false,
+    }, Keepalive_mt)
+end
+
+-- Decides after the exchange whether the socket may serve another request. The
+-- response must have been complete and self-delimiting, otherwise the next
+-- request would start reading in the middle of this one.
+function Http:_keepalive_finish(session, called, code, headers, status, stream_error)
+    if not session then return end
+    local conn = rawget(session, "conn")
+    if not conn then return end
+
+    local reusable = called == true and tonumber(code) ~= nil
+        and session.hops == 1 and not stream_error
+    if reusable then
+        local numeric = tonumber(code)
+        local version = tostring(status or ""):match("^HTTP/(%d+%.%d+)") or "1.1"
+        local connection = tostring(hget(headers, "connection") or ""):lower()
+        local encoding = tostring(hget(headers, "transfer-encoding") or ""):lower()
+        local delimited = hget(headers, "content-length") ~= nil
+            or encoding:find("chunked", 1, true) ~= nil
+            or numeric == 204 or numeric == 304
+        if connection:find("close", 1, true) then
+            reusable = false
+        elseif version == "1.0" and not connection:find("keep-alive", 1, true) then
+            reusable = false
+        elseif not delimited then
+            reusable = false
+        elseif session.uses + 1 >= KEEPALIVE_MAX_REUSE then
+            reusable = false
+        end
+    end
+    if not reusable then return session:_drop() end
+
+    session.uses = session.uses + 1
+    local pool = self.keepalive_pool
+    if not pool then pool = {}; self.keepalive_pool = pool end
+    -- Every download stage is serial, so one idle socket per origin is enough.
+    local previous = pool[session.key]
+    if previous and previous.conn ~= conn then pcall(previous.conn.close, previous.conn) end
+    pool[session.key] = {
+        conn = conn, host = session.host, port = session.port,
+        uses = session.uses, idle_since = clock_now(),
+    }
+    session.conn = nil
+end
+
+function Http:close_idle_connections()
+    local pool = self.keepalive_pool
+    if not pool then return end
+    self.keepalive_pool = {}
+    for _, entry in pairs(pool) do
+        if entry and entry.conn then pcall(entry.conn.close, entry.conn) end
+    end
+end
+
+function Http:_transport_request(transport, request, force_ipv4, keepalive)
+    if keepalive then request.create = function() return keepalive end end
     if force_ipv4~=true then return pcall(transport.request, request) end
     if not (ok_socket and socket and type(socket.tcp4)=="function") then
         logger.warn("[MiuRead][NetworkPolicy] IPv4-only socket unavailable; keeping automatic networking")
@@ -216,6 +543,9 @@ function Http:_observe_download_network(url, delay, code)
 end
 
 function Http:probe_download_recovery()
+    -- This runs only after the route was lost, so nothing in the pool can have
+    -- survived. Drop the sockets before probing rather than reusing a dead one.
+    self:close_idle_connections()
     local policy=self.network_policy
     local base=probe_origin(self.last_request_url) or "https://weread.qq.com/"
     local mode=policy and policy:current_mode() or "auto"
@@ -379,6 +709,9 @@ function Http:_report_rate_limit(remaining, attempt, maximum, code)
 end
 
 function Http:_wait_rate_limit(seconds, attempt, maximum, code)
+    -- A cooldown outlasts any server-side keep-alive window, so the pooled
+    -- sockets are certain to be dead by the time the wait ends.
+    self:close_idle_connections()
     seconds = math.max(1, math.floor(tonumber(seconds) or 1))
     local deadline = clock_now() + seconds
     self.rate_limit_until = math.max(tonumber(self.rate_limit_until) or 0, deadline)
@@ -391,7 +724,7 @@ function Http:_wait_rate_limit(seconds, attempt, maximum, code)
             self:_report_rate_limit(remaining, attempt, maximum, code)
             last_report = remaining
         end
-        pause(math.min(1, remaining))
+        self:_sleep_accounted(math.min(1, remaining), "rate_limit_seconds")
     end
 end
 
@@ -404,13 +737,13 @@ function Http:_pace(url, opt)
     local wait = math.max(0, (tonumber(self.rate_limit_until) or 0) - now)
     local interval = tonumber(opt.min_interval) or tonumber(self.min_weread_interval) or 0
     wait = math.max(wait, interval - (now - scoped_last))
-    if wait > 0 then pause(wait) end
+    if wait > 0 then self:_sleep_accounted(wait, "pacing_seconds") end
     if self:_cancelled() then error("download cancelled") end
     if opt.shared_pacing==true then
         local shared_wait=self:_reserve_shared_pacing(scope,interval,opt.pacing_jitter)
-        if shared_wait>0 then pause(shared_wait) end
+        if shared_wait>0 then self:_sleep_accounted(shared_wait, "pacing_seconds") end
     elseif tonumber(opt.pacing_jitter or 0)>0 then
-        pause(math.random()*tonumber(opt.pacing_jitter))
+        self:_sleep_accounted(math.random()*tonumber(opt.pacing_jitter), "pacing_seconds")
     end
     if self:_cancelled() then error("download cancelled") end
     local requested_at=clock_now()
@@ -589,14 +922,51 @@ function Http:_request_once(opt)
             return 1
         end
         local force_ipv4=self.network_policy and self.network_policy:should_force_ipv4() or false
-        local called, ok, code, resp_headers, status = self:_transport_request(transport, {
-            url = current,
-            method = method,
-            headers = headers,
-            source = body and ltn12.source.string(body) or nil,
-            sink = sink,
-        }, force_ipv4)
+        local keepalive=self:_keepalive_begin(current,opt,force_ipv4,sink_path)
+        local request_url,request_port=current,nil
+        if keepalive and keepalive.scheme=="https" then
+            -- ssl.https would refuse the create hook, so drive socket.http with
+            -- the URL and port ssl.https would have produced for it.
+            transport=http
+            request_url=keepalive.transport_url
+            request_port=keepalive.port
+        end
+        headers["Connection"]=keepalive and "keep-alive" or nil
+        local called, ok, code, resp_headers, status
+        local transport_started=clock_now()
+        for attempt = 1, 2 do
+            called, ok, code, resp_headers, status = self:_transport_request(transport, {
+                url = request_url,
+                port = request_port,
+                method = method,
+                headers = headers,
+                source = body and ltn12.source.string(body) or nil,
+                sink = sink,
+            }, force_ipv4, keepalive)
+            if attempt > 1 or (called and tonumber(code)) then break end
+            -- A pooled socket the peer closed between requests fails before the
+            -- response starts. Nothing was delivered, so replaying it once is
+            -- safe; for a write only while the request itself never got out.
+            local replayable = keepalive ~= nil and keepalive.reused == true
+                and keepalive.received_any ~= true and total_bytes == 0
+                and (method == "GET" or method == "HEAD" or keepalive.sent_ok ~= true)
+            if not replayable then break end
+            logger.info("[MiuRead][HTTP] reused connection closed by peer; retrying on a new socket",
+                "url=", Util.redact_url(current))
+            keepalive:_drop()
+            keepalive.hops, keepalive.pooled, keepalive.sent_ok = 0, false, false
+            chunks, first_data_at = {}, nil
+        end
         local request_finished=clock_now()
+        local stats=self:_stats()
+        stats.requests=stats.requests+1
+        stats.network_seconds=stats.network_seconds+math.max(0,request_finished-transport_started)
+        stats.bytes=stats.bytes+total_bytes
+        if keepalive and keepalive.reused==true then
+            stats.connections_reused=stats.connections_reused+1
+        else
+            stats.connections_opened=stats.connections_opened+1
+        end
         if stream_file then
             local flushed,flush_error=stream_file:flush()
             stream_file:close()
@@ -607,6 +977,7 @@ function Http:_request_once(opt)
             pcall(opt.on_chunk,total_bytes,current)
         end
         socketutil:reset_timeout()
+        self:_keepalive_finish(keepalive,called,code,resp_headers,status,stream_error)
         local text = sink_path~="" and table.concat(preview) or table.concat(chunks)
         if stream_error then return text,nil,resp_headers,current,tostring(stream_error) end
         if not called then return text, nil, resp_headers, current, tostring(ok) end
