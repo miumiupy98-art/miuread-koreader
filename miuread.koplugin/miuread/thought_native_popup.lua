@@ -1064,7 +1064,7 @@ function NativePopup:_apply_like_result(comment_index, result)
             h = math.max(1, bottom - top),
         }
     end
-    UIManager:setDirty(self, function() return "partial", dirty end)
+    UIManager:setDirty(self, function() return "ui", dirty end)
     return true
 end
 
@@ -1614,7 +1614,7 @@ function NativePopup:init()
 end
 
 function NativePopup:onShow()
-    UIManager:setDirty(self, function() return "partial", self.popup_dimen end)
+    UIManager:setDirty(self, function() return "ui", self.popup_dimen end)
 end
 
 function NativePopup:onTapPage(_, ges)
@@ -1679,7 +1679,7 @@ function NativePopup:onCloseWidget()
         self.on_close_callback = nil
         pcall(callback)
     end
-    if region then UIManager:setDirty("all", function() return "partial", region end) end
+    if region then UIManager:setDirty(nil, function() return "ui", region end) end
 end
 
 function NativePopup:_reopen(opts)
