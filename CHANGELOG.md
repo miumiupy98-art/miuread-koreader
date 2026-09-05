@@ -1,3 +1,10 @@
+## 5.8.0-beta.8
+
+- 修复 Beta Release 被插件目录内开发文档阻断的问题：`PERFORMANCE_IMPLEMENTATION.md` 移至仓库根目录，不再进入 `miuread.koplugin` 发布包；发布校验同时会直接打印具体违规文件名，便于后续定位。
+- “觅阅推荐”新增「墨痕壁纸」（miumiupy98-art/inkstain.koplugin），同时进入“精选推荐”和“阅读增强”分类；支持按 KOReader 阅读统计或觅阅书架数据生成墨痕账单风格休眠壁纸。
+- 墨痕按标准扩展安装流程处理，不新增专属安装器；推荐卡片补充“阅读统计与休眠壁纸”说明，并保留当前仅 KPW4 完成真机测试的设备提示。
+- 修正 beta.6 / beta.7 在 CHANGELOG 中误用一级标题的问题，确保 Release beta workflow 能正确识别版本段落。
+
 ## 5.8.0-beta.7
 
 - 累积 beta.6 的主页/调度器优化，并完成 #87/#90 Reader 生命周期与功耗收口。

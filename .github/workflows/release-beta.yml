@@ -213,15 +213,19 @@ jobs:
           Path("update-summary.txt").write_text(summary + "\n", encoding="utf-8")
           PY
 
-          if find miuread.koplugin -type f \( \
-              -iname '*.md' -o \
-              -iname '*.epub' -o \
-              -iname '*.log' -o \
-              -name '.DS_Store' -o \
-              -name 'miuread.lua' -o \
-              -name 'settings.reader.lua' \
-          \) | grep -q .; then
-            echo "::error::插件目录包含不应发布的文件。"
+          BAD_FILES="$(
+            find miuread.koplugin -type f \( \
+                -iname '*.md' -o \
+                -iname '*.epub' -o \
+                -iname '*.log' -o \
+                -name '.DS_Store' -o \
+                -name 'miuread.lua' -o \
+                -name 'settings.reader.lua' \
+            \) -print
+          )"
+          if [ -n "$BAD_FILES" ]; then
+            echo "::error::插件目录包含不应发布的文件："
+            printf '%s\n' "$BAD_FILES"
             exit 1
           fi
 
