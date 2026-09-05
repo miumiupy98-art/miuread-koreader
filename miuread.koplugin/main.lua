@@ -12820,6 +12820,17 @@ function Plugin:_thoughts_enabled()
     return (self.store:preferences().thoughts or {}).enabled~=false
 end
 
+function Plugin:_online_comment_likes_enabled()
+    return (self.store:preferences().thoughts or {}).online_likes==true
+end
+
+function Plugin:_toggle_online_comment_likes()
+    local p=self.store:preferences(); p.thoughts=p.thoughts or {}
+    p.thoughts.online_likes=p.thoughts.online_likes~=true
+    self:_save_ui_preferences(p,"online_comment_likes")
+    return true
+end
+
 function Plugin:_set_thoughts_enabled(enabled)
     enabled=enabled~=false
     local p=self.store:preferences(); p.thoughts=p.thoughts or {}
@@ -25031,6 +25042,188 @@ function Plugin:_close_active_thought_popup(reason)
     end
 end
 
+-- Likes are the only web annotation feature without a Skill Gateway fallback, so
+-- a timed-out session shows up as a heart that silently does nothing while the
+-- bookshelf and comments still work. Say why. The notice is throttled, always
+-- optional and fully contained: it can never turn into a second failure path for
+-- the like itself, and it uses the plugin's own transient toast, which the reader
+-- return watcher ignores and which never closes the thought popup.
+function Plugin:_notify_online_like_auth_expired()
+    local now=monotonic_wall_time()
+    local last=tonumber(self._online_like_auth_notice_at)
+    if last and now-last<6 then return end
+    self._online_like_auth_notice_at=now
+    pcall(function() self:toast("微信读书登录已失效，请重新扫码登录后再点赞",3) end)
+end
+
+function Plugin:_online_like_account_key()
+    local auth=self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    local cookies=type(auth.cookies)=="table" and auth.cookies or {}
+    local account_id=U.trim(tostring(account.vid or ""))
+    if account_id=="" then account_id=U.trim(tostring(cookies.wr_vid or "")) end
+    return account_id.."|"..U.trim(tostring(auth.login_session_id or ""))
+end
+
+function Plugin:_online_like_state_cache()
+    local account_key=self:_online_like_account_key()
+    if self._online_like_state_account_key~=account_key then
+        self._online_like_state_account_key=account_key
+        self._online_like_states={}
+    end
+    self._online_like_states=self._online_like_states or {}
+    return self._online_like_states
+end
+
+function Plugin:_remember_online_like_state(account_key,review_id,is_liked)
+    if account_key~=self:_online_like_account_key() then return end
+    review_id=U.trim(tostring(review_id or ""))
+    if review_id=="" then return end
+    self:_online_like_state_cache()[review_id]=is_liked==true
+end
+
+function Plugin:_toggle_online_review_like(request,callback)
+    request=type(request)=="table" and request or {}
+    local review_id=U.trim(tostring(request.review_id or ""))
+    local function finish(value,err)
+        if callback then pcall(callback,value,err) end
+    end
+    if not self:_online_comment_likes_enabled() or review_id=="" then
+        finish(nil,"disabled")
+        return false
+    end
+    if self.interactive_network_async and self.interactive_network_async:busy() then
+        pcall(function() self:toast("其他网络操作正在进行，请稍后再点赞",2) end)
+        finish(nil,"busy")
+        return false
+    end
+
+    -- Every like runs in a fresh child process, so the Api-level annotation
+    -- circuit cannot survive between taps. Remember a confirmed session timeout
+    -- against the credential revision that produced it; otherwise each tap
+    -- spends a full request timeout plus a login renewal already known to fail,
+    -- and the heart looks unresponsive for tens of seconds. Any real credential
+    -- change bumps the revision, so a fresh login clears this on its own.
+    local revision=self.store:auth_revision()
+    if self._online_like_auth_dead==revision then
+        self:_notify_online_like_auth_expired()
+        finish(nil,"auth_expired")
+        return false
+    end
+
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local known_is_liked=request.is_liked
+    if type(known_is_liked)~="boolean" then known_is_liked=nil end
+    local cached_likes=math.max(0,math.floor(tonumber(request.likes) or 0))
+    local like_account_key=self:_online_like_account_key()
+    local wire_context={bookId=request.book_id,chapterUid=request.chapter_uid}
+    local started,err=self:_run_interactive_network("review-like","review-like",function()
+        local HttpChild=require("miuread.http")
+        local ApiChild=require("miuread.api")
+        local ReaderChild=require("miuread.reader")
+        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_http=HttpChild:new(child_store)
+        local child_reader=ReaderChild:new(child_http,child_store)
+        local child_api=ApiChild:new(child_http,child_store,child_reader)
+        local is_liked=known_is_liked
+        local likes=cached_likes
+        if is_liked==nil then
+            local state_ok,state=pcall(child_api.review_single,child_api,review_id,wire_context)
+            if not state_ok or type(state)~="table" then
+                local child_auth,auth_changed=child_store:snapshot()
+                return {request_ok=false,error=state_ok and "review state missing" or tostring(state),
+                    auth=child_auth,auth_changed=auth_changed}
+            end
+            local nested=type(state.review)=="table" and state.review or {}
+            local flag=rawget(nested,"isLike")
+            if flag==nil then flag=rawget(state,"isLike") end
+            if flag==nil then
+                local child_auth,auth_changed=child_store:snapshot()
+                return {request_ok=false,error="review like state missing",
+                    auth=child_auth,auth_changed=auth_changed}
+            end
+            is_liked=flag==true or tonumber(flag)==1 or tostring(flag):lower()=="true"
+            likes=math.max(0,math.floor(tonumber(rawget(state,"likesCount")
+                or rawget(nested,"likesCount") or likes) or 0))
+            -- The popup has no stored like state, so a reopened comment always
+            -- draws the empty heart and the first tap can only mean "like". When
+            -- the review turns out to be liked already, just report the official
+            -- state: dropping a like the reader gave earlier is far worse than
+            -- doing nothing, and the heart still ends up filled either way.
+            if is_liked==true then
+                local child_auth,auth_changed=child_store:snapshot()
+                return {request_ok=true,is_liked=true,likes=likes,synced_only=true,
+                    auth=child_auth,auth_changed=auth_changed}
+            end
+        end
+        local write_ok,write_result=pcall(
+            child_api.like_review,child_api,review_id,is_liked,wire_context
+        )
+        local child_auth,auth_changed=child_store:snapshot()
+        if not write_ok then
+            return {request_ok=false,error=tostring(write_result),auth=child_auth,auth_changed=auth_changed}
+        end
+        -- The Web reader only flips its own state once the response reports succ,
+        -- and it prefers the likesCount the response carries over a local guess.
+        -- A zero errCode alone does not mean the like was accepted, so a rejected
+        -- write must not be reported as a successful one. Both fields are treated
+        -- as optional: when the endpoint omits them the previous behaviour stands.
+        local response=type(write_result)=="table" and write_result or nil
+        local succ=response and rawget(response,"succ")
+        if succ~=nil and not (succ==true or tonumber(succ)==1 or tostring(succ):lower()=="true") then
+            return {request_ok=false,error="微信读书未接受本次点赞",
+                auth=child_auth,auth_changed=auth_changed}
+        end
+        local server_likes=response and tonumber(rawget(response,"likesCount")) or nil
+        if server_likes and server_likes<0 then server_likes=nil end
+        return {request_ok=true,is_liked=not is_liked,
+            likes=server_likes and math.max(0,math.floor(server_likes))
+                or math.max(0,likes+(is_liked and -1 or 1)),
+            server_count=server_likes~=nil,
+            auth=child_auth,auth_changed=auth_changed}
+    end,function(result)
+        local payload=result and result.ok==true and type(result.value)=="table" and result.value or nil
+        if payload and payload.auth_changed==true then
+            self:_apply_interactive_auth{auth=payload.auth,changed=true}
+        end
+        if not payload or payload.request_ok~=true then
+            local reason=tostring(payload and payload.error
+                or (result and result.error) or "network task failed")
+            -- Only the confirmed web-session timeout opens the circuit. Other
+            -- failures may be transient and must stay retryable.
+            local auth_code=tonumber(Http.auth_error_code(reason))
+            if auth_code==-2011 or auth_code==-2012 then
+                local dead_revision=self.store:auth_revision()
+                if self._online_like_auth_dead~=dead_revision then
+                    logger.warn("[MiuRead][ThoughtLike] likes paused; login session timed out",
+                        "code=",tostring(auth_code),"revision=",tostring(dead_revision))
+                end
+                self._online_like_auth_dead=dead_revision
+                self:_notify_online_like_auth_expired()
+            end
+            logger.warn("[MiuRead][ThoughtLike] request failed","review=",review_id,
+                "error=",reason)
+            finish(nil,payload and payload.error or "request failed")
+            return
+        end
+        self._online_like_auth_dead=nil
+        self:_remember_online_like_state(like_account_key,review_id,payload.is_liked)
+        logger.info("[MiuRead][ThoughtLike] updated","review=",review_id,
+            "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes),
+            "synced_only=",tostring(payload.synced_only==true),
+            "server_count=",tostring(payload.server_count==true))
+        finish({is_liked=payload.is_liked==true,likes=tonumber(payload.likes) or cached_likes})
+    end,{silent=true,timeout=35})
+    if not started then
+        local message=err=="offline" and "当前网络不可用，无法在线点赞"
+            or "暂时无法启动点赞请求，请稍后再试"
+        pcall(function() self:toast(message,2) end)
+        finish(nil,err)
+    end
+    return started
+end
+
 function Plugin:_open_thought_info(info,generation)
     if generation~=self._thought_popup_generation or not (self.ui and self.ui.document) then
         self:_finish_thought_popup(generation)
@@ -25052,6 +25245,21 @@ function Plugin:_open_thought_info(info,generation)
         local source,comments,count,native_cache_hit,native_signature=Thoughts.native_parts_cached(
             self.store,info.book_id,info.chapter_uid,info.range,group,token
         )
+        local like_state_signature={}
+        if prefs.online_likes==true then
+            local states=self:_online_like_state_cache()
+            local shared_comments=comments
+            local detached=false
+            for index,item in ipairs(comments or {}) do
+                local review_id=U.trim(tostring(item.review_id or ""))
+                local state=states[review_id]
+                if type(state)=="boolean" then
+                    if not detached then comments=U.copy(shared_comments); detached=true end
+                    comments[index].is_liked=state
+                    like_state_signature[#like_state_signature+1]=review_id..":"..(state and "1" or "0")
+                end
+            end
+        end
         local parts_ms=math.floor((monotonic_wall_time()-parts_started)*1000+.5)
         if tostring(source or "")=="" and #(comments or {})==0 then notice="没有想法内容"; return end
         local show_started=monotonic_wall_time()
@@ -25063,6 +25271,7 @@ function Plugin:_open_thought_info(info,generation)
             cache_key=table.concat({
                 tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
                 tostring(info.range or ""), tostring(native_signature or ""),
+                table.concat(like_state_signature,","),
             }, "|"),
             font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
             font_name=self:_thought_font_name(prefs),
@@ -25071,8 +25280,16 @@ function Plugin:_open_thought_info(info,generation)
             is_favorite_callback=favorite_callbacks.is_favorite,
             toggle_favorite_callback=favorite_callbacks.toggle_favorite,
             copy_callback=favorite_callbacks.copy,
+            online_likes_enabled=prefs.online_likes==true,
             on_close=on_close,
             on_interact=function() self:_mark_reader_busy(30) end,
+            on_like=function(request,done)
+                request=type(request)=="table" and request or {}
+                request.book_id=info.book_id
+                request.chapter_uid=info.chapter_uid
+                self:_mark_reader_busy(30)
+                return self:_toggle_online_review_like(request,done)
+            end,
             on_error=function()
                 self:info("评论显示失败，窗口已安全关闭。当前阅读位置不会丢失。")
             end,

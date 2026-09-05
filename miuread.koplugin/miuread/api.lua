@@ -559,6 +559,45 @@ function Api:add_review(payload)
         payload.bookId or payload.bookid, payload.chapterUid or payload.chapteruid)
 end
 
+function Api:review_single(review_id, context)
+    local id = tostring(review_id or "")
+    if id == "" then error("reviewId missing") end
+    context = type(context) == "table" and context or {}
+    local url = "https://weread.qq.com/web/review/single?reviewId=" .. Protocol.escape(id)
+    local function request_once()
+        return self.http:get_json(url, {
+            headers=annotation_write_headers(
+                context.bookId or context.bookid, context.chapterUid or context.chapteruid
+            ),
+            retries=0,
+            rate_limit_retries=0,
+            timeout={10,18},
+            pacing_scope="annotation-read",
+            shared_pacing=true,
+            min_interval=0.35,
+        })
+    end
+    local ok, data = pcall(request_once)
+    local auth_code = not ok and tonumber(Http.auth_error_code(data)) or nil
+    if not ok and (auth_code == -2011 or auth_code == -2012) and self.reader
+        and type(self.reader._recover_login_session) == "function" then
+        local recovered = self.reader:_recover_login_session()
+        if recovered then ok, data = pcall(request_once) end
+    end
+    if not ok then error("/web/review/single: " .. tostring(data)) end
+    return unwrap(data)
+end
+
+function Api:like_review(review_id, is_unlike, context)
+    local id = tostring(review_id or "")
+    if id == "" then error("reviewId missing") end
+    context = type(context) == "table" and context or {}
+    return self:_web_annotation_write("/web/review/like", {
+        reviewId=id,
+        isUnlike=is_unlike == true,
+    }, context.bookId or context.bookid, context.chapterUid or context.chapteruid)
+end
+
 function Api:remove_review(payload)
     payload = type(payload) == "table" and payload or {}
     local review_id = tostring(payload.reviewId or payload.review_id or "")
