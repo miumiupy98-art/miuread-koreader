@@ -257,6 +257,9 @@ function Store:migrate()
         self.db:saveSetting("schema",schema)
     end
     if schema<Config.SCHEMA then
+        -- beta.6: migrate entirely in memory and let Store:new() perform the
+        -- single validated atomic flush. This removes one fsync per schema step.
+        self._migration_batch=true
         local previous=self.db:readSetting("preferences",{}) or {}
         if schema<114 then
             logger.info("[MiuRead][Migration] schema 113 -> 114 begin","from=",tostring(schema))
@@ -752,12 +755,36 @@ function Store:migrate()
             logger.info("[MiuRead][Migration] schema 126 -> 127 done",
                 "weread_scope=preserved","hidden_filters=cleared","panel_max=12","stream_navigation=false")
         end
+        if schema<128 then
+            -- 5.8.0-beta.5 introduces the generic extension installer v2 and
+            -- makes persisted download state fail-open for user cleanup. Only
+            -- obviously incomplete active records are normalized here; a valid
+            -- child-process descriptor is still recovered by Plugin:init().
+            local state=DownloadDatabase.get_download_state(self)
+            if type(state)=="table" and (state.status=="active" or state.status=="prefetch")
+                and type(state.task)~="table" then
+                if state.status=="prefetch" or (type(state.options)=="table" and state.options.prefetch==true) then
+                    DownloadDatabase.clear_download_state(self)
+                else
+                    state.status="interrupted"
+                    state.error_kind="interrupted"
+                    state.error="上次下载状态不完整，已恢复为可继续状态；下载断点仍保留。"
+                    state.task=nil
+                    state.updated_at=os.time()
+                    DownloadDatabase.set_download_state(self,state)
+                end
+            end
+            logger.info("[MiuRead][Migration] schema 127 -> 128 done",
+                "extension_installer=v2","download_state=repairable")
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
+        self._migration_batch=false
     end
 end
 function Store:get(k,d) local v=self.db:readSetting(k,nil); return v==nil and U.copy(d) or v end
 function Store:set(k,v)
     self.db:saveSetting(k,v)
+    if self._migration_batch==true then return true end
     return self:flush()
 end
 function Store:set_deferred(k,v) self.db:saveSetting(k,v) end

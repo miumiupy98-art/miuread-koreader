@@ -30,7 +30,13 @@ function Async:_schedule()
     if self.poll then return end; local task; task=function() if self.poll~=task then return end; self.poll=nil; self:_check() end; self.poll=task; UIManager:scheduleIn(self.poll_interval,task)
 end
 function Async:_check()
-    local j=self.job; if not j then return end; if os.time()-j.started>j.timeout then pcall(FFIUtil.terminateSubProcess,j.pid); j.timedout=true end
+    local j=self.job; if not j then return end
+    -- timeout <= 0 means the caller intentionally has no absolute wall-clock
+    -- deadline. Long extension downloads still have transport-level connect and
+    -- stall detection, so a large but healthy package is not killed mid-transfer.
+    if tonumber(j.timeout) and tonumber(j.timeout)>0 and os.time()-j.started>tonumber(j.timeout) then
+        pcall(FFIUtil.terminateSubProcess,j.pid); j.timedout=true
+    end
     local ok,done=pcall(FFIUtil.isSubProcessDone,j.pid,false); if ok and not done and not j.timedout then self:_schedule(); return end
     local raw=U.read_file(j.path,true); os.remove(j.path); os.remove(j.path..".tmp"); self.job=nil
     local result; if j.timedout then result={ok=false,error="worker timeout"} elseif not raw then result={ok=false,error="worker returned no result"} else local good,x=pcall(Json.decode,raw); result=good and x or {ok=false,error="worker result decode failed"} end
@@ -83,7 +89,9 @@ function Async:run(label,fn,callback,timeout)
         RuntimePressure.note_worker_failure(label,failure)
         return false,failure
     end
-    self.job={pid=pid,path=path,label=label,callback=callback,started=os.time(),timeout=timeout or 45}
+    local resolved_timeout = timeout
+    if resolved_timeout == nil then resolved_timeout = 45 end
+    self.job={pid=pid,path=path,label=label,callback=callback,started=os.time(),timeout=resolved_timeout}
     self:_schedule()
     return true
 end

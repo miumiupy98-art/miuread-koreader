@@ -42,12 +42,20 @@ local function command_exists(name)
     return output ~= nil and output:match("%S") ~= nil
 end
 
-local TIMEOUT_RUNNER = command_exists("timeout") and "timeout"
-    or (command_exists("busybox") and "busybox timeout" or nil)
+local TIMEOUT_RUNNER = false -- false=unresolved, nil=unavailable, string=runner
 local timeout_warning_logged = false
 
+local function timeout_runner()
+    if TIMEOUT_RUNNER~=false then return TIMEOUT_RUNNER end
+    if command_exists("timeout") then TIMEOUT_RUNNER="timeout"
+    elseif command_exists("busybox") then TIMEOUT_RUNNER="busybox timeout"
+    else TIMEOUT_RUNNER=nil end
+    return TIMEOUT_RUNNER
+end
+
 local function timeout_command(command, seconds)
-    if not TIMEOUT_RUNNER then
+    local runner=timeout_runner()
+    if not runner then
         if not timeout_warning_logged then
             timeout_warning_logged = true
             logger.warn("[MiuRead][Bluetooth] bounded shell runner unavailable; external Bluetooth commands disabled")
@@ -55,7 +63,7 @@ local function timeout_command(command, seconds)
         return nil
     end
     seconds = math.max(1, math.floor(tonumber(seconds) or 3))
-    return TIMEOUT_RUNNER .. " " .. tostring(seconds) .. " sh -c " .. shell_quote(command)
+    return runner .. " " .. tostring(seconds) .. " sh -c " .. shell_quote(command)
 end
 
 local function command_output(command, seconds)

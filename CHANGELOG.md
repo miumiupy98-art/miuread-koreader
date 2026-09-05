@@ -1,3 +1,41 @@
+# 5.8.0-beta.7
+
+- 累积 beta.6 的主页/调度器优化，并完成 #87/#90 Reader 生命周期与功耗收口。
+- Reader rebuild 增加 Resume grace，短暂 `document=nil` 不会过早被判定为真实关闭。
+- ReadReport 对登录 session/revision/vid 不一致增加 identity fuse；连续 stale 后停止 10 秒轮询，下一当前会话显式启动时重新绑定。
+- Reader finalizer 硬期限由 20 秒收紧到 12 秒；精确本地 pending 仍保留，云端失败延后重试。用户 Wake 取消旧 finalizer 的 beta.5 行为保持。
+- Reader 入场时 Home 只保留轻量壳并记录释放前后内存；评论内存缓存减半，跨章节/休眠主动释放。
+- Bluetooth shell runner 改为懒检测，插件启动和 QuickPanel memory-only 路径不再因 `command -v` 调用 `io.popen`。
+- 增加 `InputLifecycle` generation 日志和 Reader 文件 size/mtime 指纹；用于定位 Broken pipe 第一现场与 CRE stylesheet cache 失效。
+- BackgroundScheduler 活跃 worker 不再每 500ms 自轮询；release 事件负责唤醒下一任务。
+
+# 5.8.0-beta.6
+
+- 修复 5.6 统一主页回归：`shelf/recent` 终于进入可复用页面缓存，栏目切换不再每次重新 hydrate 当前 8 本书。
+- Home section 改为 UI 首帧 + 静止后一次 full 清理刷新，保留最终墨水屏质量；渲染层缓存收敛到 3 个并按逻辑视图淘汰旧 revision。
+- Reader 进入时把 Home 收缩为轻量返回壳，释放非活动 section/封面层。
+- 后台调度增加真正 PARK/WAKE；前台忙、内存压力和 annotation 竞争不再靠 4–8 秒轮询。
+- QuickPanel 不再同步扫描持久化 session；先用缓存显示，随后低优先级刷新。Wi-Fi 分离开关/连接/联网状态。
+- Schema 保持 128；旧 schema 连续迁移在内存中完成，最终只做一次已验证的原子写入。
+- 增加 HomeSwitchPerf/HomeShell/PARK 日志，便于 #86 真机 A/B。
+
+## 5.8.0-beta.5
+
+- 重构第三方扩展通用安装器 v2：安装、更新、重新安装统一走同一条流程，不再按 Pinyin IME、FilebrowserPlus 等插件名称编写专属安装路径；目录中的架构、二进制位置和 Release 文件名仅作为可选提示。
+- 扩展安装会先判断仓库源码是否本身包含可安装的 `main.lua` + `_meta.lua`。已确认源码不可直接安装的仓库只使用有效 Release 包，Release 下载失败时不再错误回退到不可安装源码，因此不会再把网络失败误报成“缺少 main.lua / _meta.lua”。
+- Release ZIP 改为通用候选排序：自动排除 checksum/debug/source 等明显非安装包，按仓库名、`.koplugin`、插件关键词和当前 CPU 架构选择候选；已有插件更新保持原来的 Release / branch 渠道，不会静默切到开发分支或另一发布渠道。
+- ZIP 插件识别改为安全递归发现：解压后寻找任意层级中同时包含 `main.lua` 与 `_meta.lua` 的目录；单候选自动安装，多候选能明确匹配仓库时自动选择，仍有歧义时由用户选择。
+- 架构检查通用化：Release 文件名可识别 armv7/armhf、arm64/aarch64、x86/x86_64、mips 等通用标记；解压后扫描 ELF 程序并与当前设备 CPU 再次核对。已知插件的 `binary_relpath` 只作为更强验证提示，不再决定专属安装流程。
+- 扩展文件下载与 GitHub API 分离：扩展下载源新增“自动 / GitHub 直连 / 多个镜像 / 自定义镜像”；自动模式记录最近成功与失败线路并动态排序，GitHub API 仍直接访问，不把账号请求交给第三方镜像。
+- 扩展下载取消固定总时长强杀：curl 使用连接超时 + 低速停滞检测，支持 `.part` 断点续传；无 curl 时可使用 `wget -c`，最后才回退 KOReader 自身下载。大体积插件只要持续有数据就不会因为原 150/180/240 秒上限被中止。
+- 每条下载线路分别记录结果；全部失败时展示 GitHub/各镜像的实际失败原因，不再只显示最后一个 `ghproxy.net curl failed`。下载完成先验证 ZIP 文件头和完整目录，代理返回 HTML、403/502 页面或截断 ZIP 会直接切换下一线路，不再进入错误的插件结构判断。
+- GitHub 仓库、Release 与搜索信息继续使用短时缓存，并允许网络失败时回退到上一次成功快照并明确标记“显示上次获取的信息”；Release-only 插件无法取得发布信息时明确报告元数据问题。
+- 扩展安装继续保留目录穿越、符号链接、文件数量、解压体积、剩余空间、重复插件、同名目录冲突检查；更新前备份旧插件，复制或安装后完整性验证失败时自动恢复旧版。扩展中心启动后会清理过期 ZIP/JSON/stage 残留，但保留近期 `.part` 供断点续传。
+- 修复书籍下载停止后长期停留“正在恢复”、无法进入删除的问题：持久化 active/prefetch 状态会与真实子进程重新校准；真实 worker 已消失时自动转为“下载已中断”，已完成内容和断点均保留，不再形成幽灵下载锁。
+- 下载状态新增明确的暂停/继续/停止/停止并删除断点入口；“正在恢复”只有短暂确认窗口，用户可以取消恢复并继续清理。删除书籍、本机文件和下载断点前都会先校准真实任务，真正仍在运行时可先停止再执行原删除确认。
+- 未完成下载断点与已经生成的 EPUB 分开处理：“删除下载断点”只清理未完成缓存，不会误删完整本机书；中断任务可继续下载或单独删除断点。Schema 升至 128，升级时会把缺少真实任务信息的旧 active 状态修正为可继续/可删除的中断状态。
+- 保留 5.8.0-beta.4 的微信分组、主页结构、控制中心与 Wi-Fi 改动；本版不重写章节获取/EPUB 生成、同步协议、阅读进度、批注同步、Kindle/Kobo 休眠唤醒和 OTA 主流程。
+
 ## 5.8.0-beta.4
 
 - 修复 5.7/5.8 统一书架重构后微信分组范围可能失效的问题：微信服务器完整书架改为原始快照，用户允许进入觅阅的微信书架改为独立有效范围；统一书架只接收当前有效范围，旧的 `in_account_shelf` 标记不再能把已移出分组的本机微信书重新带回“书架”。

@@ -3327,11 +3327,25 @@ function Sync:_import_daemon_status(force)
         if status_session~=current_session then reasons[#reasons+1]="session" end
         if status_revision~=current_revision then reasons[#reasons+1]="revision" end
         if status_vid~=current_vid then reasons[#reasons+1]="vid" end
-        logger.info("[MiuRead][ReadReport] stale login status ignored",
-            "reason=",table.concat(reasons,","),
-            "status_session=",status_session,"current_session=",current_session,
-            "status_revision=",tostring(status_revision),"current_revision=",tostring(current_revision),
-            "status_vid=",status_vid,"current_vid=",current_vid)
+        local fingerprint=table.concat({table.concat(reasons,","),status_session,current_session,tostring(status_revision),tostring(current_revision),status_vid,current_vid},"|")
+        if tostring(daemon.stale_identity_fingerprint or "")==fingerprint then
+            daemon.stale_identity_count=(tonumber(daemon.stale_identity_count) or 0)+1
+        else
+            daemon.stale_identity_fingerprint=fingerprint
+            daemon.stale_identity_count=1
+        end
+        if daemon.stale_identity_count==1 then
+            logger.warn("[MiuRead][ReadReport] stale login identity detected",
+                "reason=",table.concat(reasons,","),"status_revision=",tostring(status_revision),
+                "current_revision=",tostring(current_revision))
+        end
+        if daemon.stale_identity_count>=2 then
+            daemon.identity_stale=true
+            daemon.active=false
+            self:_write_daemon_control(false,true,{identity_stale=true,_time_only=true})
+            logger.warn("[MiuRead][ReadReport] stale daemon polling fused",
+                "count=",tostring(daemon.stale_identity_count),"reason=",table.concat(reasons,","))
+        end
         return
     end
 
@@ -3607,6 +3621,12 @@ function Sync:_schedule_daemon_poll(delay)
         local daemon = self.daemon
         if not daemon then return end
         self:_import_daemon_status(false)
+        if daemon.identity_stale==true then
+            self.state="stopped"
+            self.last_stage="旧阅读时间服务身份已失效，等待当前会话重新启动"
+            logger.info("[MiuRead][ReadReport] daemon poll stopped","reason=identity_stale")
+            return
+        end
         self:_maybe_refresh_precise_position()
         if not process_alive(daemon.pid) then
             local was_active = daemon.active
@@ -3760,6 +3780,9 @@ function Sync:_start_daemon(reason)
         tonumber(existing_status.generation or 0) or 0
     ) + 1
     daemon.generation = self.daemon_generation
+    daemon.identity_stale=false
+    daemon.stale_identity_count=0
+    daemon.stale_identity_fingerprint=nil
     daemon.active = true
     self.precise_due_refreshed = 0
     daemon.book_id = book_id

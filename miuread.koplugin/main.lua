@@ -1034,6 +1034,16 @@ function Plugin:init()
         local recovered=self:_recover_download_state()
         if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
     end
+    -- Extension install staging is independent from book-download checkpoints.
+    -- Clean only stale extension-center artifacts after startup is responsive;
+    -- recent .part files remain available for Range resume.
+    UIManager:scheduleIn(2.0,function()
+        local ok,center=pcall(require,"miuread.extension_center")
+        if ok and center and type(center.cleanup_stale)=="function" then
+            local cleaned_ok,cleaned=pcall(center.cleanup_stale,self,false)
+            if not cleaned_ok then logger.warn("[MiuRead][Extensions] startup temp cleanup failed",tostring(cleaned)) end
+        end
+    end)
     Actions.register()
     if self:_home_enabled() then install_home_screensaver_patch() end
     if self:_home_enabled() and not DIRECT_MENU_INSERTED then
@@ -2251,14 +2261,15 @@ function Plugin:_prepare_shelf_rows(rows)
 end
 
 function Plugin:_home_clear_cloud_page_cache(section)
-    self._home_cloud_page_cache=type(self._home_cloud_page_cache)=="table" and self._home_cloud_page_cache or {account={},mp={}}
-    self._home_cloud_page_cache_order=type(self._home_cloud_page_cache_order)=="table" and self._home_cloud_page_cache_order or {account={},mp={}}
-    if section=="account" or section=="mp" then
+    self._home_cloud_page_cache=type(self._home_cloud_page_cache)=="table" and self._home_cloud_page_cache or {}
+    self._home_cloud_page_cache_order=type(self._home_cloud_page_cache_order)=="table" and self._home_cloud_page_cache_order or {}
+    if section and tostring(section)~="" then
+        section=tostring(section)
         self._home_cloud_page_cache[section]={}
         self._home_cloud_page_cache_order[section]={}
     else
-        self._home_cloud_page_cache={account={},mp={}}
-        self._home_cloud_page_cache_order={account={},mp={}}
+        self._home_cloud_page_cache={}
+        self._home_cloud_page_cache_order={}
     end
 end
 
@@ -2304,7 +2315,8 @@ function Plugin:_home_cloud_page_signature(rows)
 end
 
 function Plugin:_home_cached_cloud_page(section,page,rows)
-    if section~="account" and section~="mp" then return nil end
+    section=tostring(section or "")
+    if section=="" then return nil end
     page=math.max(1,tonumber(page) or 1)
     local cache=self._home_cloud_page_cache and self._home_cloud_page_cache[section]
     local entry=type(cache)=="table" and cache[page] or nil
@@ -2318,10 +2330,11 @@ function Plugin:_home_cached_cloud_page(section,page,rows)
 end
 
 function Plugin:_home_store_cloud_page(section,page,rows,raw_rows)
-    if section~="account" and section~="mp" then return end
+    section=tostring(section or "")
+    if section=="" then return end
     page=math.max(1,tonumber(page) or 1)
-    self._home_cloud_page_cache=type(self._home_cloud_page_cache)=="table" and self._home_cloud_page_cache or {account={},mp={}}
-    self._home_cloud_page_cache_order=type(self._home_cloud_page_cache_order)=="table" and self._home_cloud_page_cache_order or {account={},mp={}}
+    self._home_cloud_page_cache=type(self._home_cloud_page_cache)=="table" and self._home_cloud_page_cache or {}
+    self._home_cloud_page_cache_order=type(self._home_cloud_page_cache_order)=="table" and self._home_cloud_page_cache_order or {}
     local cache=self._home_cloud_page_cache[section] or {}; self._home_cloud_page_cache[section]=cache
     local order=self._home_cloud_page_cache_order[section] or {}; self._home_cloud_page_cache_order[section]=order
     cache[page]={
@@ -3417,6 +3430,14 @@ function Plugin:_home_enabled()
     return tostring(self._runtime_mode or rawget(_G,RUNTIME_MODE_KEY) or "plugin")=="desktop"
 end
 
+function Plugin:_input_lifecycle(hook,action,reason)
+    logger.info("[MiuRead][InputLifecycle]",
+        "hook=",tostring(hook or "unknown"),"action=",tostring(action or "state"),
+        "reader_generation=",tostring(tonumber(HOME_SESSION.reader_session_generation) or 0),
+        "transition_generation=",tostring(tonumber(HOME_SESSION.page_transition_generation) or 0),
+        "reason=",tostring(reason or ""))
+end
+
 function Plugin:_configured_home_enabled()
     local home=self:_home_preferences()
     return home.enabled~=false
@@ -3774,22 +3795,24 @@ function Plugin:_background_claim(key,options,retry)
     end
     local token,reason=self.background_scheduler:claim(key,options)
     if token then return token,nil,false end
-    local retryable=reason~="suspended" and reason~="exiting" and reason~="reader_active" and reason~="reader_transition"
-        and reason~="desktop_frozen" and reason~="lockscreen_visual"
-        and not tostring(reason or ""):find("^power_")
-    if retryable and type(retry)=="function" then
+    local hard_block=reason=="suspended" or reason=="exiting" or reason=="reader_active" or reason=="reader_transition"
+        or reason=="desktop_frozen" or reason=="lockscreen_visual" or tostring(reason or ""):find("^power_")~=nil
+    local parkable=options.user_requested~=true and (reason=="memory_critical" or reason=="memory_low"
+        or reason=="runtime_pressure" or reason=="foreground_priority" or reason=="annotation_sync")
+    if parkable and type(retry)=="function" then
+        self.background_scheduler:park(key,retry,{
+            priority=options.priority or 20,reason=reason,
+        })
+        return nil,reason,true
+    end
+    if not hard_block and type(retry)=="function" then
         local retry_delay=options.retry_delay or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9
-        if reason=="memory_critical" or reason=="memory_low" or reason=="runtime_pressure" then
-            retry_delay=math.max(4.0,tonumber(retry_delay) or .9)
-        end
         if reason=="download_yielding" or reason=="download_hibernating" or reason=="download_heavy"
             or reason=="download_memory_pressure" then
-            retry_delay=math.max(.4,math.min(1.5,tonumber(retry_delay) or .9))
+            retry_delay=math.max(.7,math.min(1.8,tonumber(retry_delay) or .9))
         end
         self.background_scheduler:defer(key,retry,{
-            delay=retry_delay,
-            priority=options.priority or (options.user_requested==true and 80 or 20),
-            reason=reason,
+            delay=retry_delay,priority=options.priority or (options.user_requested==true and 80 or 20),reason=reason,
         })
         return nil,reason,true
     end
@@ -3919,7 +3942,7 @@ function Plugin:_home_refresh_header_now(force_device,force_sync)
         wifi_text=self:_home_wifi_text(),
         bluetooth_visible=self:_bluetooth_supported(),
         bluetooth_text=self:_home_bluetooth_text(),
-        sync_text=self:_home_sync_status_label(force_sync==true),
+        sync_text=force_sync==true and self:_home_sync_status_label(true) or self:_home_sync_status_label_cached(),
         battery_text=self:_home_battery_text(),
     }
 end
@@ -4072,6 +4095,9 @@ function Plugin:_home_resume_visible_work_after_idle()
             return
         end
         self._home_ui_resume_task=nil
+        if self.background_scheduler and type(self.background_scheduler.wake_parked)=="function" then
+            self.background_scheduler:wake_parked("home_idle")
+        end
         -- Recent-reading changes are applied only after the post-reader/user
         -- interaction barrier releases. This keeps Reader->Home fast and uses
         -- a static hero-layer update instead of rebuilding the shelf.
@@ -6584,18 +6610,25 @@ function Plugin:_home_wifi_text()
     local state=HomeData.cached_device_state() or {}
     local health=require("miuread.network_health").snapshot()
     local phase=tostring(state.network_phase or "")
+    local ssid=U.trim(tostring(state.wifi_name or ""))
+    local ssid_text=ssid~="" and U.utf8_truncate(ssid,13,"…") or nil
     if state.wifi_on==false or phase=="off" then return "已关闭" end
-    if phase=="unavailable" or (health.state=="down" and health.age<=20) then return "网络不可用" end
-    if phase=="recovering" or (health.state=="recovering" and health.age<=50) then return "正在确认网络" end
-    if phase=="connecting" or state.connected==false then return "正在连接" end
-    if state.connected==true then
-        if state.online==false then return "已连接 · 无网络" end
-        if state.online==nil then return "正在确认网络" end
-        local ssid=U.trim(tostring(state.wifi_name or ""))
-        if ssid~="" then return U.utf8_truncate(ssid,13,"…") end
-        return "已连接"
+    if phase=="unavailable" or (health.state=="down" and health.age<=20) then
+        if state.connected==true then return (ssid_text or "已连接").." · 无网络" end
+        return state.wifi_on==true and "Wi-Fi 已开启 · 网络不可用" or "网络不可用"
     end
-    return state.wifi_on==true and "正在确认网络" or "Wi-Fi"
+    if phase=="connecting" or state.connected==false then return "Wi-Fi 已开启 · 正在连接" end
+    if state.connected==true then
+        if state.online==false then return (ssid_text or "已连接").." · 无网络" end
+        if state.online==nil or phase=="recovering" or (health.state=="recovering" and health.age<=50) then
+            return (ssid_text or "已连接").." · 确认网络"
+        end
+        return ssid_text or "已连接"
+    end
+    if phase=="recovering" or (health.state=="recovering" and health.age<=50) then
+        return "Wi-Fi 已开启 · 确认中"
+    end
+    return state.wifi_on==true and "Wi-Fi 已开启" or "Wi-Fi"
 end
 
 
@@ -11772,14 +11805,14 @@ function Plugin:show_home_quick_panel(more_expanded)
     local wifi_detail
     if wifi_on==false or wifi_phase=="off" then wifi_detail="已关闭"
     elseif wifi_phase=="unavailable" then wifi_detail="网络不可用"
-    elseif wifi_phase=="recovering" then wifi_detail="正在确认网络"
-    elseif wifi_phase=="connecting" or state.connected==false then wifi_detail="正在连接"
-    elseif wifi_linked and state.online==false then wifi_detail="已连接 · 无网络"
-    elseif wifi_linked and state.online==nil then wifi_detail="正在确认网络"
+    elseif wifi_phase=="recovering" then wifi_detail="Wi-Fi 已开启 · 确认中"
+    elseif wifi_phase=="connecting" or state.connected==false then wifi_detail="Wi-Fi 已开启 · 正在连接"
+    elseif wifi_linked and wifi_name~="" and state.online==false then wifi_detail=U.utf8_truncate(wifi_name,9,"…").." · 无网络"
     elseif wifi_linked and wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
-    elseif wifi_linked then wifi_detail="已连接"
-    else wifi_detail="正在确认网络" end
-    local sync_label=self:_home_sync_status_label()
+    elseif wifi_linked and state.online==false then wifi_detail="已连接 · 无网络"
+    elseif wifi_linked then wifi_detail="已连接 · 确认网络"
+    else wifi_detail="Wi-Fi 已开启" end
+    local sync_label=self:_home_sync_status_label_cached()
     local bluetooth_state=self:_bluetooth_state(false)
     local definitions={
         wifi={
@@ -11867,6 +11900,11 @@ function Plugin:show_home_quick_panel(more_expanded)
         return false
     end
     self:_record_performance("home_panel",total_ms)
+    UIManager:scheduleIn(.15,function()
+        if HomeView.is_shown() and not self:_active_reader_ui() then
+            self:_schedule_home_annotation_summary_refresh(false)
+        end
+    end)
     return true
 end
 
@@ -15675,6 +15713,7 @@ end
 
 function Plugin:_uninstall_reader_toolbar_hooks(readerui,reason)
     readerui=readerui or self.ui
+    self:_input_lifecycle("reader_toolbar","remove",reason)
     -- Invalidate first so any callback already queued for this ReaderUI becomes
     -- harmless before we touch the registered zones or menu methods.
     self:_invalidate_reader_toolbar_hook_token(readerui)
@@ -15697,6 +15736,7 @@ function Plugin:_sync_reader_toolbar_hooks(reason)
     self:_reader_toolbar_hook_token(readerui)
     self:_install_reader_menu_bridge()
     self:_install_reader_quick_panel_zone()
+    self:_input_lifecycle("reader_toolbar","install",reason or "reader active")
     logger.info("[MiuRead][ReaderToolbar] hooks synchronized",
         "mode=",self:_reader_toolbar_mode(),"reason=",tostring(reason or "reader active"))
     return true
@@ -16114,9 +16154,14 @@ function Plugin:_close_home_for_reader(reason)
         self:_home_stop_background(reason or "reader active",{defer_home_preferences=true})
         self:_close_miuread_transients()
         if HomeView.is_shown() then
+            local before=RuntimePressure.memory_snapshot(true)
             HomeView.park()
             self._home_view=HomeView.current()
-            logger.info("[MiuRead][Home] parked below reader",tostring(reason or "reader active"))
+            collectgarbage("step",96)
+            local after=RuntimePressure.memory_snapshot(true)
+            logger.info("[MiuRead][Home] parked light below reader",tostring(reason or "reader active"),
+                "memory_before_kb=",tostring(before and before.available_kb or "unknown"),
+                "memory_after_kb=",tostring(after and after.available_kb or "unknown"))
         end
     else
         logger.dbg("[MiuRead][DesktopPerf] duplicate reader freeze skipped",
@@ -16475,7 +16520,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         wifi_text=self:_home_wifi_text(),
         bluetooth_visible=self:_bluetooth_supported(),
         bluetooth_text=self:_home_bluetooth_text(),
-        sync_text=self:_home_sync_status_label(),
+        sync_text=self:_home_sync_status_label_cached(),
         battery_text=self:_home_battery_text(),
         account_name=self:_home_account_name(),
         clock_text=self:_display_time("%H:%M"),
@@ -18147,12 +18192,15 @@ function Plugin:_has_download_status()
     end
     local state=self.store:download_state()
     if state.status=="completed" then self.store:clear_download_state(); return false end
-    return state.status=="failed" or state.status=="interrupted" or state.status=="pending_install"
+    return state.status=="active" or state.status=="failed" or state.status=="interrupted" or state.status=="pending_install"
         or state.status=="annotation_pending"
 end
 function Plugin:_download_status_label()
     local state=self:_download_state()
     if state.status=="active" then
+        if state.paused==true or (self.download_task and self.download_task:is_paused()) then
+            return "后台下载 · 已暂停，可继续"
+        end
         if state.stage=="rate_limit" then
             local wait=tonumber(state.wait_seconds) or 0
             return wait>0 and ("后台下载 · 请求受限，"..tostring(wait).."秒后继续") or "后台下载 · 请求受限，等待恢复"
@@ -18205,6 +18253,7 @@ function Plugin:_active_download_payload(runtime,state)
         percent=state and state.percent or 0,
         chapter=state and state.chapter or "",
         message=state and state.message or "",
+        paused=state and state.paused==true or nil,
         waiting_network=state and (state.waiting_network==true or state.stage=="waiting_network") or nil,
         network_wait_started_at=state and state.network_wait_started_at or nil,
         network_wait_seconds=state and state.network_wait_seconds or nil,
@@ -18270,6 +18319,16 @@ function Plugin:_show_active_download_dialog()
     dialog=DownloadProgress:new{
         title="正在下载《"..tostring(runtime.book.title or "未命名").."》",
         on_cancel=function() if self.download_task then self.download_task:cancel() end end,
+        on_pause=function()
+            if not self.download_task then return end
+            self.download_task:pause("manual")
+            runtime.background=true
+            runtime.last_state=U.copy(runtime.last_state or {})
+            runtime.last_state.paused=true
+            runtime.last_state.message="下载已暂停，可稍后继续"
+            self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
+            self:status_toast("下载已暂停","断点已保留",3)
+        end,
         on_background=function() self:_send_download_to_background() end,
         on_close=function(widget,reason)
             if self._download_runtime~=runtime then return end
@@ -18398,12 +18457,92 @@ function Plugin:_show_download_complete(rec,opt,book)
     UIManager:show(dialog)
 end
 function Plugin:show_download_status()
+    local reconciled,running,run_mode=self:_reconcile_download_state("show_status")
     if self:_passive_prefetch_active() then
         self:info("下一章正在后台准备。\n\n它属于隐藏预读取缓存，不会提前加入本地书架；读到本章末尾时会直接接管当前任务。")
         return
     end
-    if self.download_task and self.download_task:busy() then self:_show_active_download_dialog(); return end
-    local state=self.store:download_state()
+    if self.download_task and self.download_task:busy() and not self.download_task:is_paused() then self:_show_active_download_dialog(); return end
+    local state=type(reconciled)=="table" and reconciled or self.store:download_state()
+    if running and (not self.download_task or not self.download_task:busy()) then
+        local title=tostring(state.title or "未命名")
+        local dialog
+        local paused=state.paused==true or (self.download_task and self.download_task:is_paused()==true)
+        local label=paused and "后台下载已暂停"
+            or (run_mode=="recovering" and "后台下载正在恢复" or "后台下载仍在运行")
+        local first_action
+        if paused then
+            first_action={text="继续下载",callback=function()
+                if self.download_task then self.download_task:resume("manual") end
+                UIManager:close(dialog)
+                state.paused=nil; state.message="正在继续下载"; state.updated_at=os.time()
+                self.store:save_download_state(state)
+                self:toast("正在继续下载")
+            end}
+        else
+            first_action={text="暂停下载",callback=function()
+                if self.download_task then self.download_task:pause("manual") end
+                UIManager:close(dialog)
+                state.paused=true; state.message="下载已暂停，可稍后继续"; state.updated_at=os.time()
+                self.store:save_download_state(state)
+                self:toast("下载已暂停")
+            end}
+        end
+        dialog=ButtonDialog:new{
+            title=label.."\n《"..title.."》\n\n进度 "..tostring(self:_download_percent(state)).."%",
+            title_align="center",
+            buttons={
+                {first_action},
+                {{text="停止下载",callback=function()
+                    UIManager:close(dialog)
+                    self:_force_stop_download_for_cleanup("user_stop_download",function() self:show_download_status() end)
+                end}},
+                {{text="停止并删除断点",callback=function()
+                    UIManager:close(dialog)
+                    self:_force_stop_download_for_cleanup("user_delete_partial",function()
+                        local book_id=tostring(state.book_id or (state.book and state.book.bookId) or "")
+                        if book_id~="" then self:_confirm_clear_partial_cache(book_id,state.title)
+                        else self.store:clear_download_state() end
+                    end)
+                end}},
+                {{text="关闭",callback=function() UIManager:close(dialog) end}},
+            },
+        }
+        UIManager:show(dialog)
+        return
+    end
+    if self.download_task and self.download_task:busy() and self.download_task:is_paused() then
+        local runtime=self._download_runtime
+        local book=(runtime and runtime.book) or state.book
+        local options=(runtime and runtime.options) or state.options or {}
+        local dialog
+        dialog=ButtonDialog:new{title="下载已暂停\n《"..tostring((runtime and runtime.book and runtime.book.title) or state.title or "未命名").."》\n\n断点已保留。",title_align="center",buttons={
+            {{text="继续下载",callback=function()
+                UIManager:close(dialog)
+                self.download_task:resume("manual")
+                if runtime then
+                    runtime.last_state=U.copy(runtime.last_state or {})
+                    runtime.last_state.paused=nil
+                    runtime.last_state.message="正在继续下载"
+                    self:_write_download_state("active",self:_active_download_payload(runtime,runtime.last_state),true)
+                    UIManager:scheduleIn(.08,function() self:_show_active_download_dialog() end)
+                elseif type(book)=="table" then
+                    self:download(book,options,false)
+                end
+            end}},
+            {{text="停止并删除断点",callback=function()
+                UIManager:close(dialog)
+                self:_force_stop_download_for_cleanup("user_delete_partial",function()
+                    local book_id=tostring(state.book_id or (book and book.bookId) or "")
+                    if book_id~="" then self:_confirm_clear_partial_cache(book_id,state.title)
+                    else self.store:clear_download_state() end
+                end)
+            end}},
+            {{text="关闭",callback=function() UIManager:close(dialog) end}},
+        }}
+        UIManager:show(dialog)
+        return
+    end
     if not state.status or state.status=="" then self:info("当前没有后台下载记录。") return end
     if state.status=="completed" then
         self.store:clear_download_state()
@@ -18451,6 +18590,12 @@ function Plugin:show_download_status()
         end}}
     elseif (state.status=="failed" or state.status=="interrupted") and type(state.book)=="table" then
         buttons[#buttons+1]={{text="继续下载",callback=function() UIManager:close(dialog); self:download(state.book,state.options or {},false) end}}
+        if #self.store:partial_cache_paths(state.book_id or (state.book and state.book.bookId))>0 then
+            buttons[#buttons+1]={{text="删除下载断点",callback=function()
+                UIManager:close(dialog)
+                self:_confirm_clear_partial_cache(state.book_id or state.book.bookId,state.title)
+            end}}
+        end
     end
     if (state.status=="failed" or state.status=="interrupted") and #self.store:download_queue()>0 then
         buttons[#buttons+1]={{text="跳过并开始等待书籍",callback=function()
@@ -18460,7 +18605,7 @@ function Plugin:show_download_status()
             UIManager:close(dialog); self.store:clear_download_state(); self.store:save_download_queue({}); self:toast("下载任务已全部停止")
         end}}
     end
-    buttons[#buttons+1]={{text="清除记录",callback=function() UIManager:close(dialog); self.store:clear_download_state() end}}
+    buttons[#buttons+1]={{text="删除任务记录",callback=function() UIManager:close(dialog); self.store:clear_download_state() end}}
     buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
     dialog=ButtonDialog:new{title=table.concat(lines,"\n"),title_align="center",buttons=buttons}
     UIManager:show(dialog)
@@ -19649,9 +19794,11 @@ function Plugin:_open_file_direct(path,session_kind,book_id)
         return self:_recover_failed_reader_open(path,opening_generation,err)
     end
 
+    local file_attr=lfs.attributes(path) or {}
     logger.info("[MiuRead][ReaderOpenPerf] handoff",
         "pre_handoff_ms=",tostring(math.floor((monotonic_wall_time()-open_request_clock)*1000+.5)),
-        "kind=",tostring(session_kind or ""),"file=",tostring(path))
+        "kind=",tostring(session_kind or ""),"file=",tostring(path),
+        "size=",tostring(file_attr.size or "unknown"),"mtime=",tostring(file_attr.modification or "unknown"))
 
     if self.ui and self.ui.document and type(self.ui.switchDocument)=="function" then
         local ok,result=xpcall(function() return self.ui:switchDocument(path) end,debug.traceback)
@@ -19698,11 +19845,101 @@ function Plugin:_close_download_menus()
     if detail then pcall(function() UIManager:close(detail) end) end
     if root and root~=detail then pcall(function() UIManager:close(root) end) end
 end
-function Plugin:_cache_action_blocked()
-    if self.download_task and self.download_task:busy() then self:info("下载任务进行中，暂时不能修改下载文件。") return true end
+function Plugin:_reconcile_download_state(reason)
     local state=self.store:download_state()
-    if state.status=="active" or state.status=="prefetch" then self:info("后台任务状态正在恢复，暂时不能清理文件。") return true end
+    if state.status~="active" and state.status~="prefetch" then return state,false,"idle" end
+    if self.download_task and self.download_task:busy() then return state,true,"attached" end
+
+    local alive,mode=false,"no_task"
+    if self.download_task and type(self.download_task.descriptor_alive)=="function" then
+        alive,mode=self.download_task:descriptor_alive(state.task)
+    end
+    if alive==true then return state,true,"shared" end
+
+    -- A process state that cannot be inspected gets one short recovery window.
+    -- After that it is treated as interrupted, never as an indefinite lock on
+    -- the user's files.
+    local age=os.time()-(tonumber(state.updated_at) or tonumber(state.started_at) or 0)
+    if alive==nil and age<15 then return state,true,"recovering" end
+
+    if state.status=="prefetch" or (type(state.options)=="table" and state.options.prefetch==true) then
+        self.store:clear_download_state()
+        logger.warn("[MiuRead][DownloadState] stale prefetch cleared","reason=",tostring(reason or "reconcile"),"mode=",tostring(mode))
+        return self.store:download_state(),false,"prefetch_cleared"
+    end
+    state.status="interrupted"
+    state.error_kind="interrupted"
+    state.error="下载进程已经停止；已完成内容和断点仍保留，可继续下载或删除。"
+    state.message="下载已中断"
+    state.task=nil
+    state.updated_at=os.time()
+    self.store:save_download_state(state)
+    logger.warn("[MiuRead][DownloadState] stale active state repaired","reason=",tostring(reason or "reconcile"),"mode=",tostring(mode))
+    return state,false,"interrupted"
+end
+
+function Plugin:_force_stop_download_for_cleanup(reason,on_done)
+    on_done=type(on_done)=="function" and on_done or function() end
+    local state=self.store:download_state()
+    self:_close_download_dialog("cancelled")
+    local ok,mode=true,"idle"
+    if self.download_task and type(self.download_task.force_cancel)=="function" then
+        ok,mode=self.download_task:force_cancel(reason or "user_cleanup",3)
+    elseif self.download_task and self.download_task:busy() then
+        self.download_task:cancel()
+        ok=false; mode="cancel_requested"
+    end
+    self._download_runtime=nil
+    if ok~=true then
+        self:info("下载任务暂时无法安全停止，请稍后再试。\n\n状态："..tostring(mode or "unknown"))
+        return false
+    end
+    if state.status=="active" or state.status=="prefetch" then
+        if state.status=="prefetch" or (type(state.options)=="table" and state.options.prefetch==true) then
+            self.store:clear_download_state()
+        else
+            state.status="interrupted"
+            state.error_kind="interrupted"
+            state.error="下载已由用户停止；断点仍保留。"
+            state.message="下载已停止"
+            state.task=nil
+            state.updated_at=os.time()
+            self.store:save_download_state(state)
+        end
+    end
+    UIManager:scheduleIn(.08,on_done)
+    return true
+end
+
+function Plugin:_guard_cache_action(operation,retry)
+    if self.cache_cleanup_task and self.cache_cleanup_task:busy() then
+        self:info("缓存任务正在运行，请勿重复操作。")
+        return true
+    end
+    local state,running,mode=self:_reconcile_download_state("cache_action")
+    if not running then return false end
+    local title=tostring(state and state.title or "当前书籍")
+    local text=(mode=="recovering")
+        and ("后台任务正在恢复。要取消恢复并"..tostring(operation or "继续清理").."吗？")
+        or ("《"..title.."》仍有下载任务正在运行。要停止下载并"..tostring(operation or "继续清理").."吗？")
+    UIManager:show(ConfirmBox:new{
+        text=text.."\n\n已完成的内容不会因为停止任务而自动删除；具体删除范围仍以接下来的确认窗口为准。",
+        ok_text=mode=="recovering" and "取消恢复并继续" or "停止下载并继续",
+        cancel_text="取消",
+        ok_callback=function()
+            self:_force_stop_download_for_cleanup("user_cache_action",retry)
+        end,
+    })
+    return true
+end
+
+function Plugin:_cache_action_blocked()
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then self:info("缓存任务正在运行，请勿重复操作。") return true end
+    local _,running,mode=self:_reconcile_download_state("cache_action_blocked")
+    if running then
+        self:info(mode=="recovering" and "后台下载正在恢复，请稍候；也可以从下载状态中取消恢复。" or "下载任务进行中，请先暂停或停止下载。")
+        return true
+    end
     return false
 end
 local function human_size(bytes)
@@ -20078,6 +20315,11 @@ function Plugin:_execute_book_delete_plan(plan,done_text)
     local function finish_final(check,second_result)
         self:_emit_book_local_content_changed(plan.book_id,plan.local_path)
         if check and check.ok==true then
+            local current_state=self.store:download_state()
+            if tostring(current_state.book_id or "")~="" and tostring(current_state.book_id or "")==tostring(plan.book_id or "")
+                and current_state.status~="active" and current_state.status~="prefetch" then
+                self.store:clear_download_state()
+            end
             local message=tostring(done_text or "本机内容已删除")
             if total_freed>0 then message=message.."\n释放空间："..human_size(total_freed) end
             self:toast(message,4)
@@ -20128,7 +20370,7 @@ function Plugin:_execute_book_delete_plan(plan,done_text)
 end
 
 function Plugin:_confirm_delete_variant(book_id,kind,title)
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("删除这个本机版本",function() self:_confirm_delete_variant(book_id,kind,title) end) then return end
     local plan=self.book_delete_service:plan_variant(book_id,kind)
     local record=self.store:variant(book_id,kind)
     if not (record and record.file and U.file_exists(record.file)) then
@@ -20150,7 +20392,7 @@ function Plugin:_confirm_delete_variant(book_id,kind,title)
 end
 
 function Plugin:_confirm_delete_chapter_cache(book_id,uid,title)
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("删除本章文件",function() self:_confirm_delete_chapter_cache(book_id,uid,title) end) then return end
     local plan=self.book_delete_service:plan_chapter(book_id,uid)
     if #plan.documents==0 then
         self.book_delete_service:commit(plan)
@@ -20170,7 +20412,7 @@ function Plugin:_confirm_delete_chapter_cache(book_id,uid,title)
 end
 
 function Plugin:_confirm_clear_partial_cache(book_id,title)
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("清理下载断点",function() self:_confirm_clear_partial_cache(book_id,title) end) then return end
     local paths=self.store:partial_cache_paths(book_id)
     if #paths==0 then self:toast("没有未完成下载缓存"); return end
     UIManager:show(ConfirmBox:new{
@@ -20179,14 +20421,21 @@ function Plugin:_confirm_clear_partial_cache(book_id,title)
             self:_run_cache_cleanup(self.store:partial_cache_paths(book_id),{
                 progress_text="正在清理未完成下载缓存……",
                 done_text="下载断点已清理",
-                commit=function() self.store:prune_missing_files() end,
+                commit=function()
+                    self.store:prune_missing_files()
+                    local current_state=self.store:download_state()
+                    if tostring(current_state.book_id or "")==tostring(book_id or "")
+                        and current_state.status~="active" and current_state.status~="prefetch" then
+                        self.store:clear_download_state()
+                    end
+                end,
                 policy={mode="download_residue"},operation="清理单本下载断点",
             })
         end,
     })
 end
 function Plugin:_confirm_delete_book_downloads(book_id,title)
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("删除本机内容",function() self:_confirm_delete_book_downloads(book_id,title) end) then return end
     book_id=tostring(book_id or "")
     local service=self.book_delete_service
     local summary=service:summary(book_id)
@@ -20299,7 +20548,7 @@ function Plugin:show_storage_usage()
     if not started then pcall(function() UIManager:close(dialog) end); self:info("无法开始统计：\n"..tostring(err)) end
 end
 function Plugin:_clear_download_residue()
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("清理临时文件",function() self:_clear_download_residue() end) then return end
     local paths=self:_download_residue_paths()
     UIManager:show(ConfirmBox:new{text="清理下载断点、失败任务和扩展安装留下的临时文件？\n\n不会删除已完成书籍、已安装插件、想法、章节数据或封面。",ok_callback=function()
         self:_run_cache_cleanup(paths,{progress_text="正在清理临时文件……",done_text="临时文件已清理",operation="清理临时文件",policy={mode="download_residue"},commit=function()
@@ -20333,7 +20582,7 @@ function Plugin:_prefetch_cleanup_candidates(book_id)
 end
 
 function Plugin:_clear_prefetched_chapters(book_id,title)
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("清理预读取缓存",function() self:_clear_prefetched_chapters(book_id,title) end) then return end
     self.store:reload(); self.store:prune_missing_files()
     local entries,paths,kept=self:_prefetch_cleanup_candidates(book_id)
     if #entries==0 then
@@ -20365,7 +20614,7 @@ function Plugin:_clear_prefetched_chapters(book_id,title)
 end
 
 function Plugin:show_download_cleanup_dialog()
-    if self:_cache_action_blocked() then return end
+    if self:_guard_cache_action("打开存储清理",function() self:show_download_cleanup_dialog() end) then return end
     if HomeView.is_shown() and not self:_active_reader_ui() then
         return ActionSheet.show{
             title="存储清理",
@@ -20389,6 +20638,7 @@ function Plugin:show_download_cleanup_dialog()
 end
 
 function Plugin:show_downloads(back_callback)
+    self:_reconcile_download_state("open_downloads")
     if type(back_callback)=="function" then
         self._downloads_return_callback=back_callback
     elseif self.ui and self.ui.document and type(self._downloads_return_callback)=="function" then
@@ -21146,33 +21396,33 @@ function Plugin:_home_sync_summary(force)
     return summary
 end
 
-function Plugin:_home_sync_status_label(force)
-    local summary=self:_home_sync_summary(force)
+function Plugin:_home_sync_status_label_from_summary(summary)
+    summary=type(summary)=="table" and summary or {}
     if (tonumber(summary.auth_required or 0) or 0)>0 then return "登录待验证" end
     if (tonumber(summary.repair_required or 0) or 0)>0 then return "需要处理 "..tostring(summary.repair_required) end
-    if summary.annotation_upgrade_recheck>0 then
-        return "待重新检查 "..tostring(summary.annotation_upgrade_recheck)
-    end
-    if summary.annotation_action_required>0 then
-        return "批注待确认 "..tostring(summary.annotation_action_required)
-    end
-    if summary.failed>0 then return "需要处理 "..tostring(summary.failed) end
-    if (tonumber(summary.progress_active or 0) or 0)>0 then
-        return "进度同步中 "..tostring(summary.progress_active)
-    end
-    if (tonumber(summary.progress_unconfirmed or 0) or 0)>0 then
-        return "进度待确认 "..tostring(summary.progress_unconfirmed)
-    end
-    if (tonumber(summary.progress_waiting_network or 0) or 0)>0 then
-        return "等待网络 "..tostring(summary.progress_waiting_network)
-    end
-    if (tonumber(summary.progress_waiting or 0) or 0)>0 then
-        return "进度待同步 "..tostring(summary.progress_waiting)
-    end
-    if summary.total>0 then return "待同步 "..tostring(summary.total) end
+    if (tonumber(summary.annotation_upgrade_recheck or 0) or 0)>0 then return "待重新检查 "..tostring(summary.annotation_upgrade_recheck) end
+    if (tonumber(summary.annotation_action_required or 0) or 0)>0 then return "批注待确认 "..tostring(summary.annotation_action_required) end
+    if (tonumber(summary.failed or 0) or 0)>0 then return "需要处理 "..tostring(summary.failed) end
+    if (tonumber(summary.progress_active or 0) or 0)>0 then return "进度同步中 "..tostring(summary.progress_active) end
+    if (tonumber(summary.progress_unconfirmed or 0) or 0)>0 then return "进度待确认 "..tostring(summary.progress_unconfirmed) end
+    if (tonumber(summary.progress_waiting_network or 0) or 0)>0 then return "等待网络 "..tostring(summary.progress_waiting_network) end
+    if (tonumber(summary.progress_waiting or 0) or 0)>0 then return "进度待同步 "..tostring(summary.progress_waiting) end
+    if (tonumber(summary.total or 0) or 0)>0 then return "待同步 "..tostring(summary.total) end
     if self.annotation_async and self.annotation_async:busy() then return "同步中" end
     if summary.checking==true then return "同步检查中" end
     return "已同步"
+end
+
+function Plugin:_home_sync_status_label(force)
+    return self:_home_sync_status_label_from_summary(self:_home_sync_summary(force))
+end
+
+function Plugin:_home_sync_status_label_cached()
+    local summary=type(self._home_sync_summary_cache)=="table" and self._home_sync_summary_cache or nil
+    if not summary then
+        return self:logged_in() and "同步状态待更新" or "登录待验证"
+    end
+    return self:_home_sync_status_label_from_summary(summary)
 end
 
 function Plugin:_home_open_sync_status()
@@ -24374,6 +24624,7 @@ function Plugin:_teardown_thought_tap()
         link_mod._miuread_original_onGotoLink=nil
         link_mod._miuread_wrapper_onGotoLink=nil
         self._thought_link_guard=nil
+        self:_input_lifecycle("thought_link_guard","remove","thought teardown")
         logger.info("[MiuRead][ThoughtPopup] link guard removed",
             "owned=",tostring(wrapper~=nil and link_mod.onGotoLink==original))
     end
@@ -24546,6 +24797,11 @@ function Plugin:_schedule_thought_prewarm()
         if chapter_uid=="" then return end
         local key=book_id.."|"..chapter_uid
         if self._thought_prewarm_key==key then return end
+        if self._thought_prewarm_key and self._thought_prewarm_key~=key then
+            Thoughts.clear_memory_cache()
+            collectgarbage("step",64)
+            logger.info("[MiuRead][ThoughtPrewarm] previous chapter cache released")
+        end
         local limit=math.max(1,math.min(12,tonumber(Config.THOUGHT_PREWARM_GROUPS) or 6))
         local store=self.store
         local started,err=self.thought_async:run("thought-prewarm",function()
@@ -25243,6 +25499,7 @@ function Plugin:_install_thought_link_guard()
     link_mod._miuread_wrapper_onGotoLink=wrapper
     link_mod.onGotoLink=wrapper
     self._thought_link_guard=true
+    self:_input_lifecycle("thought_link_guard","install","reader active")
     logger.info("[MiuRead][ThoughtPopup] link guard installed (keyboard/non-touch path)")
     return true
 end
@@ -25641,6 +25898,21 @@ function Plugin:_finish_reader_rebuild_candidate(generation,reason)
         return false
     end
 
+    local resume_age=monotonic_wall_time()-(tonumber(HOME_SESSION.last_resume_clock) or 0)
+    if (PowerState.state()=="RESUMING" or (resume_age>=0 and resume_age<=10)) and elapsed<10 then
+        local task
+        task=function()
+            if self._reader_rebuild_task~=task then return end
+            self._reader_rebuild_task=nil
+            self:_finish_reader_rebuild_candidate(generation,reason)
+        end
+        self._reader_rebuild_task=task
+        UIManager:scheduleIn(.35,task)
+        logger.info("[MiuRead][Lifecycle] rebuild candidate held for resume grace",
+            "elapsed_ms=",tostring(math.floor(elapsed*1000+.5)),"power=",tostring(PowerState.state()))
+        return false
+    end
+
     local old_path=READER_REBUILD.reader_file
     local old_session=READER_REBUILD.session_generation
     self:_reader_rebuild_cancel("candidate confirmed closed",true)
@@ -25684,7 +25956,7 @@ function Plugin:_start_reader_rebuild_candidate(closing_path,session_generation,
     -- take several seconds, so give that explicit signal a longer bounded
     -- window without delaying ordinary unrequested closes.
     READER_REBUILD.max_wait=READER_REBUILD.internal_hint and 18.0
-        or (fuse and 5.5 or ((recent_dimension or recent_resume) and 4.2 or 2.4))
+        or (fuse and 8.5 or (recent_resume and 8.0 or (recent_dimension and 5.5 or 2.4)))
     self:_set_foreground("reader")
     logger.info("[MiuRead][Lifecycle] rebuild candidate",
         "book=",tostring(path or ""),"session=",tostring(READER_REBUILD.session_generation),
@@ -27181,7 +27453,7 @@ function Plugin:onSuspend()
     local finalizer_generation,finalizer_deadline=nil,nil
     if sync_candidate and guarded_finalizer then
         finalizer_generation,finalizer_deadline=self:_reader_finalizer_begin(
-            tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 20)
+            tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 12)
     end
     local pseudo_active=false
     if power_platform=="kindle" then
@@ -27273,7 +27545,7 @@ function Plugin:onSuspend()
                 end
                 logger.warn("[MiuRead][ReadingEnd] reader finalizer hard deadline",
                     "generation=",tostring(finalizer_generation),
-                    "seconds=",tostring(tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 20))
+                    "seconds=",tostring(tonumber(Config.READER_FINALIZER_DEADLINE_SECONDS) or 12))
                 self:_finish_suspend_reader_finalizer(false,finalizer_generation,"hard_deadline")
             end)
         end
@@ -27321,6 +27593,9 @@ function Plugin:onSuspend()
     StatusToast.set_blocked(true)
     StatusToast.close()
     self:_cancel_thought_prewarm("suspend")
+    Thoughts.clear_memory_cache()
+    collectgarbage("step",96)
+    logger.info("[MiuRead][RuntimePressure] reader transient caches released","reason=suspend")
     self:_cancel_interactive_network("suspend")
     if self._local_annotation_snapshot_task then
         UIManager:unschedule(self._local_annotation_snapshot_task)

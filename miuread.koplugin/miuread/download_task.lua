@@ -1004,6 +1004,94 @@ function DownloadTask:busy()
     return self.job ~= nil or self.hibernated ~= nil
 end
 
+function DownloadTask:descriptor_alive(descriptor)
+    descriptor=type(descriptor)=="table" and descriptor or self:_control_descriptor()
+    if type(descriptor)~="table" then return false,"no_task" end
+    if descriptor.hibernated==true then return false,"hibernated" end
+    local pid=tonumber(descriptor.pid)
+    if not pid or pid<=1 then return false,"no_process" end
+    local alive=process_exists(pid)
+    if alive==true then return true,"running" end
+    if alive==false then return false,"stopped" end
+    return nil,"unknown"
+end
+
+function DownloadTask:force_cancel(reason,timeout)
+    reason=tostring(reason or "user_cleanup")
+    timeout=math.max(.25,tonumber(timeout) or 3)
+    if self.hibernated then
+        self.hibernated=nil
+        os.remove(self.heavy_watch_path)
+        PseudoLockscreen.set_download_active(false)
+        self:_clear_lockscreen_network("force_cancel_hibernated")
+        self:_release_awake()
+        pcall(PseudoLockscreen.background_task_done,"download_force_cancel")
+        return true,"hibernated_cancelled"
+    end
+
+    local job=self.job
+    local descriptor=job or self:_control_descriptor()
+    if type(descriptor)~="table" then return true,"idle" end
+    local pid=tonumber(descriptor.pid)
+    if job then job.on_done=nil end
+    local cancel_path=tostring(descriptor.cancel_path or "")
+    if cancel_path~="" then pcall(U.atomic_write,cancel_path,"1",true) end
+    if job then
+        job.cancel_requested_at=os.time()
+        self.pause_reasons={}
+        if job.pause_path then os.remove(job.pause_path) end
+    end
+
+    local function stopped()
+        if not pid or pid<=1 then return true end
+        local alive=process_exists(pid)
+        if alive==false then return true end
+        local done_ok,done=pcall(FFIUtil.isSubProcessDone,pid,false)
+        if done_ok and done==true then return true end
+        return false,alive
+    end
+
+    local deadline=wall_now()+timeout
+    local is_stopped,alive=stopped()
+    while not is_stopped and wall_now()<deadline do
+        short_sleep(.05)
+        is_stopped,alive=stopped()
+    end
+    if not is_stopped and pid and pid>1 then
+        pcall(FFIUtil.terminateSubProcess,pid)
+        short_sleep(.12)
+        is_stopped,alive=stopped()
+        if not is_stopped then
+            pcall(signal_worker,pid,9)
+            short_sleep(.08)
+            is_stopped,alive=stopped()
+        end
+    end
+    if not is_stopped then
+        logger.warn("[MiuRead][DownloadTask] force cancel could not confirm stop",
+            "reason=",reason,"pid=",tostring(pid or ""),"alive=",tostring(alive))
+        return false,"worker_still_alive"
+    end
+
+    if job and self.job==job then
+        self:_finish(job,"下载已取消")
+    else
+        for _,path in ipairs({descriptor.progress_path,descriptor.result_path,descriptor.recovery_path,
+            descriptor.cancel_path,descriptor.pause_path,descriptor.pause_ack_path,descriptor.hibernate_path,
+            descriptor.network_path,descriptor.worker_settings_path}) do
+            if tostring(path or "")~="" then os.remove(path) end
+        end
+        os.remove(self.owner_path)
+        PseudoLockscreen.set_download_active(false)
+        self:_clear_lockscreen_network("force_cancel_shared")
+        self:_release_awake()
+        pcall(PseudoLockscreen.background_task_done,"download_force_cancel_shared")
+    end
+    logger.warn("[MiuRead][DownloadTask] force cancelled",
+        "reason=",reason,"pid=",tostring(pid or ""),"alive=false")
+    return true,"cancelled"
+end
+
 function DownloadTask:is_hibernated()
     return self.hibernated ~= nil
 end

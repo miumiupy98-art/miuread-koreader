@@ -5,9 +5,9 @@ local lfs = require("libs/libkoreader-lfs")
 
 local Thoughts = {}
 
-local POPUP_CACHE_LIMIT = 16
+local POPUP_CACHE_LIMIT = 8
 local POPUP_CACHE_VERSION = "4"
-local GROUP_CACHE_LIMIT = 24
+local GROUP_CACHE_LIMIT = 12
 local popup_cache = {}
 local popup_cache_order = {}
 local group_cache = {}

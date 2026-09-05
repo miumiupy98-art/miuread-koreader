@@ -17,6 +17,7 @@ function Scheduler:new()
         active=nil,
         token=0,
         pending={},
+        parked={},
         pump_task=nil,
         last_defer_log={},
         foreground_barrier_until=0,
@@ -29,12 +30,15 @@ function Scheduler:snapshot()
     local active=self.active
     local pending=0
     for _ in pairs(self.pending or {}) do pending=pending+1 end
+    local parked=0
+    for _ in pairs(self.parked or {}) do parked=parked+1 end
     local barrier_ms=math.max(0,math.floor(((tonumber(self.foreground_barrier_until) or 0)-monotonic())*1000+.5))
     return {
         active=active and active.key or nil,
         active_user=active and active.user_requested==true or false,
         active_ms=active and math.floor((monotonic()-(active.started or monotonic()))*1000+.5) or 0,
         pending=pending,
+        parked=parked,
         foreground_barrier_ms=barrier_ms,
         foreground_barrier_reason=barrier_ms>0 and self.foreground_barrier_reason or nil,
     }
@@ -113,6 +117,7 @@ function Scheduler:claim(key,options)
     if self.active then
         return nil,"busy:"..tostring(self.active.key)
     end
+    if self.parked then self.parked[key]=nil end
     self.token=(tonumber(self.token) or 0)+1
     local token=self.token
     self.active={
@@ -151,13 +156,49 @@ function Scheduler:force_release(reason)
     return true
 end
 
+function Scheduler:park(key,callback,options)
+    if type(callback)~="function" then return false end
+    options=options or {}
+    key=tostring(key or "background")
+    self.parked=type(self.parked)=="table" and self.parked or {}
+    local current=self.parked[key]
+    local priority=tonumber(options.priority) or 10
+    self.parked[key]={key=key,callback=callback,priority=priority,reason=tostring(options.reason or "blocked"),parked_at=monotonic()}
+    -- A parked task deliberately owns no timer. Log only on state/reason change.
+    if not current or tostring(current.reason or "")~=tostring(options.reason or "") then
+        logger.info("[MiuRead][Background] parked","key=",key,"reason=",tostring(options.reason or "blocked"))
+    end
+    return true
+end
+
+function Scheduler:wake_parked(reason,key)
+    self.parked=type(self.parked)=="table" and self.parked or {}
+    local moved=0
+    for id,item in pairs(self.parked) do
+        if key==nil or tostring(key)==tostring(id) then
+            self.parked[id]=nil
+            self.pending[id]={key=id,callback=item.callback,priority=tonumber(item.priority) or 10,due=monotonic()}
+            moved=moved+1
+        end
+    end
+    if moved>0 then
+        logger.info("[MiuRead][Background] parked tasks woken","count=",tostring(moved),"reason=",tostring(reason or "event"))
+        self:_schedule_pump(.05)
+    end
+    return moved
+end
+
 function Scheduler:defer(key,callback,options)
     if type(callback)~="function" then return false end
     options=options or {}
     key=tostring(key or "background")
+    if self.parked then self.parked[key]=nil end
     local due=monotonic()+math.max(.15,tonumber(options.delay) or tonumber(Config.BACKGROUND_RETRY_SECONDS) or .9)
     local current=self.pending[key]
     local priority=tonumber(options.priority) or 10
+    if options.force_timer~=true and priority<80 and RuntimePressure.active() then
+        return self:park(key,callback,{priority=priority,reason="runtime_pressure:"..tostring(options.reason or "deferred")})
+    end
     if not current or priority>=tonumber(current.priority or 0) then
         self.pending[key]={key=key,callback=callback,priority=priority,due=due}
     elseif due<(tonumber(current.due) or due) then
@@ -197,7 +238,8 @@ function Scheduler:_schedule_pump(delay)
         self.pump_task=nil
         self:_clear_stale_active()
         if self.active then
-            self:_schedule_pump(.5)
+            -- release()/force_release() owns the next wake. Polling every 500ms
+            -- while a worker is alive only burns wakeups and never changes state.
             return
         end
         if self:foreground_barrier_active() then
@@ -232,6 +274,7 @@ function Scheduler:cancel_key(key,reason,include_active)
     if key=="" then return false end
     local changed=false
     if self.pending and self.pending[key] then self.pending[key]=nil; changed=true end
+    if self.parked and self.parked[key] then self.parked[key]=nil; changed=true end
     if include_active==true and self.active and tostring(self.active.key)==key then
         self:force_release(reason or (key.." cancelled"))
         changed=true
@@ -246,6 +289,7 @@ end
 
 function Scheduler:cancel_pending(reason)
     self.pending={}
+    self.parked={}
     if self.pump_task then UIManager:unschedule(self.pump_task); self.pump_task=nil end
     if reason then logger.info("[MiuRead][Background] pending cleared",tostring(reason)) end
     return true

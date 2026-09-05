@@ -27,6 +27,7 @@ local DownloadProgress = InputContainer:extend{
     covers_fullscreen = true,
     stop_events_propagation = true,
     on_cancel = nil,
+    on_pause = nil,
     on_background = nil,
     on_close = nil,
 }
@@ -121,6 +122,14 @@ function DownloadProgress:init()
                     self.status_widget:setText("正在取消……")
                     self:_redraw()
                     if self.on_cancel then self.on_cancel() end
+                end,
+            },
+            {
+                text = "暂停下载",
+                callback = function()
+                    if self.cancelled then return end
+                    if self.on_pause then self.on_pause() end
+                    self:close("paused")
                 end,
             },
             {

@@ -1,7 +1,7 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "5.8.0-beta.4",
-    SCHEMA = 127,
+    VERSION = "5.8.0-beta.7",
+    SCHEMA = 128,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
     DATA_DIR = "miuread",
@@ -65,6 +65,16 @@ local C = {
     -- A manual refresh bypasses the runtime backoff once.
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
 
+    -- beta.6: keep only the three primary Home views resident. Section switches
+    -- paint immediately with the normal UI waveform, then one coalesced full
+    -- cleanup refresh restores e-ink quality after interaction settles.
+    HOME_SECTION_CACHE_LAYERS = 3,
+    HOME_SECTION_CLEAN_REFRESH_DELAY = 2.8,
+
+    -- Automatic maintenance blocked by memory/foreground pressure is parked
+    -- without a polling timer and is woken by the next Home-idle event.
+    BACKGROUND_PARK_LOG_INTERVAL = 20,
+
     READ_INTERVAL = 60,
     -- First confirmed reading-time report is intentionally earlier than the
     -- steady 60 s cadence so the user can verify sync without waiting a minute.
@@ -100,7 +110,7 @@ local C = {
     -- A screen-off reader finalizer is a short best-effort task, never a
     -- second long-lived power state. When this deadline expires the local
     -- checkpoint remains authoritative and Kindle may return to native sleep.
-    READER_FINALIZER_DEADLINE_SECONDS = 20,
+    READER_FINALIZER_DEADLINE_SECONDS = 12,
 
     -- 5.4.5-beta.1 resolves downloaded-book positions from persisted source
     -- caches before any chapter network fetch. Local mapping gets a short

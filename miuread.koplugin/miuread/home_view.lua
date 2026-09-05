@@ -23,6 +23,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local U = require("miuread.util")
+local Config = require("miuread.config")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
 
@@ -1522,16 +1523,24 @@ end
 function HomeWidget:_remember_section_layer(cache_id,layer,region,slots)
     if not cache_id or not layer then return end
     self._section_layer_cache=type(self._section_layer_cache)=="table" and self._section_layer_cache or {}
+    -- One logical view keeps only its newest revision. Cover/progress/header
+    -- mutations must not accumulate whole rendered Home layers.
+    local logical=tostring(cache_id):match("^(.*)|[^|]+$") or tostring(cache_id)
+    for id,entry in pairs(self._section_layer_cache) do
+        local other=tostring(id):match("^(.*)|[^|]+$") or tostring(id)
+        if id~=cache_id and other==logical then
+            self._section_layer_cache[id]=nil
+            if entry.layer and entry.layer~=self._section_layer and entry.layer.free then pcall(entry.layer.free,entry.layer) end
+        end
+    end
     self._section_cache_clock=(tonumber(self._section_cache_clock) or 0)+1
     self._section_layer_cache[cache_id]={
-        layer=layer,
-        region=region and region:copy() or nil,
-        slots=slots,
-        used=self._section_cache_clock,
+        layer=layer,region=region and region:copy() or nil,slots=slots,used=self._section_cache_clock,
     }
     local count=0
     for _ in pairs(self._section_layer_cache) do count=count+1 end
-    while count>8 do
+    local max_layers=math.max(1,tonumber(Config.HOME_SECTION_CACHE_LAYERS) or 3)
+    while count>max_layers do
         local oldest_id,oldest_entry
         for id,entry in pairs(self._section_layer_cache) do
             if entry.layer~=self._section_layer
@@ -1601,7 +1610,26 @@ function HomeWidget:_mark_dirty(kind, previous_region)
         local right=math.min(Screen:getWidth(),(region.x or 0)+(region.w or 1)+safety)
         local bottom=math.min(Screen:getHeight(),(region.y or 0)+(region.h or 1)+safety)
         region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
-        UIManager:setDirty(self, function() return kind == "section" and "full" or "ui", region end)
+        if kind=="section" then
+            -- First surface uses the normal UI waveform so tab/source/page
+            -- switching is responsive. A coalesced full cleanup runs only after
+            -- the user stops switching, preserving final e-ink quality.
+            UIManager:setDirty(self,function() return "ui",region end)
+            if self._section_clean_refresh_task then UIManager:unschedule(self._section_clean_refresh_task) end
+            local clean_region=region:copy()
+            local task
+            task=function()
+                if self._miu_closed or self._section_clean_refresh_task~=task then return end
+                self._section_clean_refresh_task=nil
+                if self._miu_input_suspended==true or self._miu_device_suspended==true then return end
+                UIManager:setDirty(self,function() return "full",clean_region end)
+                logger.info("[MiuRead][HomeSwitchPerf] quality cleanup","delay_ms=",tostring(math.floor((tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8)*1000+.5)))
+            end
+            self._section_clean_refresh_task=task
+            UIManager:scheduleIn(math.max(.8,tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8),task)
+        else
+            UIManager:setDirty(self,function() return "ui",region end)
+        end
     else
         UIManager:setDirty(self, "full")
     end
@@ -1801,6 +1829,9 @@ function HomeWidget:updateSection(opts)
     logger.info("[MiuRead][HomeSwitch] layer",
         "key=",tostring(cache_id or "none"),"cache_hit=",tostring(cache_hit),
         "ms=",tostring(math.floor((os.clock()-started)*1000+.5)))
+    logger.info("[MiuRead][HomeSwitchPerf] section patched",
+        "cache_hit=",tostring(cache_hit),"cards=",tostring(#(self.opts.shelf_books or {})),
+        "cpu_ms=",tostring(math.floor((os.clock()-started)*1000+.5)),"refresh=ui_then_full")
     return self
 end
 
@@ -2009,6 +2040,7 @@ function HomeWidget:onCloseWidget()
     self._miu_closed = true
     self._dimension_refresh_generation=(tonumber(self._dimension_refresh_generation) or 0)+1
     if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task); self._dimension_refresh_task=nil end
+    if self._section_clean_refresh_task then UIManager:unschedule(self._section_clean_refresh_task); self._section_clean_refresh_task=nil end
     self:_clear_inactive_section_cache()
     if live_widget == self then live_widget = nil end
     if self.opts and self.opts.on_close then pcall(self.opts.on_close, self) end
@@ -2060,6 +2092,14 @@ function HomeView.park()
     live_widget._miu_input_suspended=true
     live_widget._miu_resume_interaction_callback=nil
     live_widget._miu_resume_waiting_interaction=false
+    if live_widget._section_clean_refresh_task then
+        UIManager:unschedule(live_widget._section_clean_refresh_task)
+        live_widget._section_clean_refresh_task=nil
+    end
+    -- Reader keeps only the currently visible lightweight shell. Inactive
+    -- rendered section layers (and their cover surfaces) are released here.
+    if type(live_widget._clear_inactive_section_cache)=="function" then live_widget:_clear_inactive_section_cache() end
+    logger.info("[MiuRead][HomeShell] parked light","active_section=",tostring(live_widget.opts and live_widget.opts.section_cache_key or ""))
     return true
 end
 function HomeView.suspend()

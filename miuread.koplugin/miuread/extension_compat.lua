@@ -246,20 +246,69 @@ function M.binary_arch(path)
     return ELF_MACHINE[machine] or ("elf_machine_" .. tostring(machine))
 end
 
+local function binary_matches(expected, actual)
+    if expected == "armv7" or expected == "arm_legacy" then return actual == "arm" end
+    return expected == actual
+end
+
+local function scan_elf_arches(root)
+    local arches, seen, scanned = {}, {}, 0
+    local function walk(path)
+        local ok, iter, state = pcall(lfs.dir, path)
+        if not ok or type(iter) ~= "function" then return end
+        for entry in iter, state do
+            if entry ~= "." and entry ~= ".." then
+                local child = path .. "/" .. entry
+                local mode = lfs.attributes(child, "mode")
+                if mode == "directory" then
+                    walk(child)
+                elseif mode == "file" and scanned < 400 then
+                    scanned = scanned + 1
+                    local actual = M.binary_arch(child)
+                    if actual and not seen[actual] then
+                        seen[actual] = true
+                        arches[#arches + 1] = actual
+                    end
+                end
+            end
+        end
+    end
+    walk(tostring(root or ""))
+    return arches
+end
+
 function M.validate_candidate(entry, candidate_root, compatibility)
     entry = type(entry) == "table" and entry or {}
-    if not entry.binary_relpath then return true end
-    local path = tostring(candidate_root or "") .. "/" .. tostring(entry.binary_relpath)
-    if lfs.attributes(path, "mode") ~= "file" then
-        return nil, "插件包缺少架构相关二进制：" .. tostring(entry.binary_relpath)
-    end
-    local actual, err = M.binary_arch(path)
-    if not actual then return nil, "无法验证插件二进制架构（" .. tostring(err) .. "）" end
     local expected = compatibility and compatibility.arch or "unknown"
-    local matches = (expected == "armv7" or expected == "arm_legacy") and actual == "arm"
-        or expected == actual
-    if not matches then
-        return nil, "插件二进制架构与当前设备不匹配（包=" .. tostring(actual) .. "，设备=" .. tostring(expected) .. "）"
+
+    -- A catalogue may name the primary binary as a hint. This is still data,
+    -- not a plugin-specific install path, and gives the strongest verification.
+    if entry.binary_relpath then
+        local path = tostring(candidate_root or "") .. "/" .. tostring(entry.binary_relpath)
+        if lfs.attributes(path, "mode") ~= "file" then
+            return nil, "插件包缺少架构相关二进制：" .. tostring(entry.binary_relpath)
+        end
+        local actual, err = M.binary_arch(path)
+        if not actual then return nil, "无法验证插件二进制架构（" .. tostring(err) .. "）" end
+        if not binary_matches(expected, actual) then
+            return nil, "插件二进制架构与当前设备不匹配（包=" .. tostring(actual) .. "，设备=" .. tostring(expected) .. "）"
+        end
+        return true
+    end
+
+    -- Generic fallback: every candidate is inspected for ELF programs. This
+    -- discovers architecture sensitivity from the package itself, so unknown
+    -- third-party repositories do not need a catalogue-specific rule.
+    local arches = scan_elf_arches(candidate_root)
+    if #arches > 0 then
+        if expected == "unknown" then
+            return nil, "插件包包含本机程序，但当前设备 CPU 架构无法可靠识别，已停止自动安装"
+        end
+        for _, actual in ipairs(arches) do
+            if binary_matches(expected, actual) then return true end
+        end
+        return nil, "插件包中的程序架构与当前设备不匹配（包=" .. table.concat(arches, "/")
+            .. "，设备=" .. tostring(expected) .. "）"
     end
     return true
 end
