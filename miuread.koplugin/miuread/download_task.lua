@@ -98,6 +98,7 @@ function DownloadTask:new(store)
         hibernated = nil,
         poll_task = nil,
         standby_held = false,
+        last_device_timeout_reset_at = 0,
         keep_awake_enabled = true,
         backgrounded = false,
         pause_reasons = {},
@@ -140,11 +141,7 @@ end
 function DownloadTask:set_backgrounded(value)
     self.backgrounded = value == true
     if self.hibernated then self.hibernated.backgrounded=self.backgrounded end
-    -- beta.9 never keeps the normal Home surface awake just because a download
-    -- exists. The lock is acquired only after the physical Suspend lifecycle
-    -- has entered DOWNLOAD_LOCKED; this lets Home auto-sleep normally and then
-    -- continue the same worker behind the lock screen.
-    if background_lock_mode(self.power_mode) and not self:is_paused() then
+    if self.job and not self:is_paused() then
         self:_hold_awake()
     else
         self:_release_awake()
@@ -827,15 +824,30 @@ end
 
 function DownloadTask:_lockscreen_keepalive_allowed()
     return self.keep_awake_enabled == true
-        and background_lock_mode(self.power_mode)
+        and self.job ~= nil
+        and not self:is_paused()
 end
 
 function DownloadTask:_reset_device_timeout()
     if not self:_lockscreen_keepalive_allowed() then return false end
     if device_is("Kindle") then
-        -- Kindle workers do not touch T1 or powerd. A true result only
-        -- means the screen-saver hold session is still owned by the controller.
-        return PseudoLockscreen.active() == true
+        if PseudoLockscreen.active() == true then return true end
+        local now=os.time()
+        -- Kindle's own implementation warns that this should be requested no
+        -- more often than every five minutes. Four minutes leaves margin before
+        -- the normal inactivity timeout without hammering powerd.
+        if now-tonumber(self.last_device_timeout_reset_at or 0)<240 then
+            return true
+        end
+        local powerd = Device and Device.powerd
+        if not powerd or type(powerd.resetT1Timeout) ~= "function" then return false end
+        local ok, err = pcall(powerd.resetT1Timeout, powerd)
+        if ok then
+            self.last_device_timeout_reset_at=now
+        else
+            logger.warn("[MiuRead][DownloadTask] device timeout reset failed", tostring(err))
+        end
+        return ok
     end
     local powerd = Device and Device.powerd
     if powerd and type(powerd.resetT1Timeout) == "function" then
@@ -870,22 +882,18 @@ function DownloadTask:_hold_awake()
         self:_release_awake()
         return false
     end
-    if device_is("Kindle") and PseudoLockscreen.active()~=true then
-        self:_release_awake()
-        return false
-    end
     if PseudoLockscreen.active()==true then
-        local stale=self.standby_held or SuspendWorkLease.has("download")
+        local stale=self.standby_held == true
         self.standby_held=false
-        SuspendWorkLease.release("download")
+        if stale then SuspendWorkLease.release_download() end
         local alive=self:_reset_device_timeout()
         if stale then
             logger.info("[MiuRead][DownloadTask] worker power claim released; controller owns background")
         end
         return alive==true or (not device_is("Kindle") and SuspendWorkLease.has("pseudo_lockscreen"))
     end
-    if self.standby_held and SuspendWorkLease.has("download") then return true end
-    local ok = SuspendWorkLease.acquire("download")
+    if self.standby_held then return true end
+    local ok = SuspendWorkLease.acquire_download()
     if ok then
         self.standby_held = true
         local reset = self:_reset_device_timeout()
@@ -898,9 +906,9 @@ function DownloadTask:_hold_awake()
 end
 
 function DownloadTask:_release_awake()
-    local held = self.standby_held or SuspendWorkLease.has("download")
+    local held = self.standby_held == true
     self.standby_held = false
-    SuspendWorkLease.release("download")
+    if held then SuspendWorkLease.release_download() end
     if held then logger.info("[MiuRead][DownloadTask] standby lease released") end
 end
 
