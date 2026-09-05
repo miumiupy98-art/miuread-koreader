@@ -131,6 +131,19 @@ function CloseButton:onTapClose()
     return true
 end
 
+local LikeButton = WidgetContainer:extend{dimen = nil, callback = nil}
+function LikeButton:getSize()
+    return self.dimen or Geom:new{w = 1, h = 1}
+end
+function LikeButton:paintTo(bb, x, y)
+    self.dimen.x, self.dimen.y = x, y
+    if self[1] then self[1]:paintTo(bb, x, y) end
+end
+function LikeButton:trigger()
+    if self.callback then return self.callback() end
+    return true
+end
+
 local function clamp(value, minimum, maximum)
     value = tonumber(value) or minimum
     if value < minimum then return minimum end
@@ -270,8 +283,10 @@ local NativePopup = InputContainer:extend{
     font_name = nil,
     width_ratio = 0.92,
     height_ratio = 0.55,
+    online_likes_enabled = false,
     on_close_callback = nil,
     on_interact_callback = nil,
+    on_like_callback = nil,
     on_error_callback = nil,
     closing = false,
     page_index = 1,
@@ -282,6 +297,8 @@ local NativePopup = InputContainer:extend{
     page_indicator_dimen = nil,
     content_refresh_dimen = nil,
     page_refresh_count = 0,
+    like_buttons = nil,
+    _like_inflight = nil,
     _measurement_cache = nil,
 }
 
@@ -369,6 +386,7 @@ function NativePopup:_layout_cache_key(width, maximum_height, metrics)
         tostring(metrics.body_size),
         tostring(metrics.meta_size),
         tostring(metrics.source_size),
+        self.online_likes_enabled == true and "likes-on" or "likes-off",
         clean(self.font_name),
         ThoughtFaceFactory:signature(),
     }, "|")
@@ -379,6 +397,7 @@ function NativePopup:_measure_piece(piece, width, metrics)
     local key = table.concat({
         clean(piece.author),
         tostring(tonumber(piece.likes or 0) or 0),
+        self.online_likes_enabled == true and tostring(piece.review_id or "") or "",
         piece.continuation and "1" or "0",
         clean_body(piece.content),
         tostring(width),
@@ -456,19 +475,11 @@ local function needs_comment_separator(previous_piece, current_piece)
     return not current_piece.continuation
 end
 
-function NativePopup:_piece_widget(piece, width, metrics)
+function NativePopup:_piece_widget(piece, width, metrics, interactive)
     local group = VerticalGroup:new{align = "left"}
     local author = ThoughtFaceFactory:displayText(clean(piece.author))
     if author == "" then author = "微信读书用户" end
     local likes = tonumber(piece.likes or 0) or 0
-    local meta
-    if piece.continuation then
-        meta = author .. " · 续"
-    elseif likes > 0 then
-        meta = author .. " · 赞 " .. tostring(likes)
-    else
-        meta = author
-    end
     local content = ThoughtFaceFactory:displayText(clean_body(piece.content))
     if content == "" then content = " " end
 
@@ -476,10 +487,61 @@ function NativePopup:_piece_widget(piece, width, metrics)
     -- A forced height clipped or completely hid author names on later pages on
     -- some Kindle font metrics. Keep the row muted so the comment body remains
     -- the primary reading focus.
-    group[#group + 1] = self:_text_box(meta, metrics.meta_face, width, {
-        line_height = 0.10,
-        fgcolor = MUTED_TEXT_COLOR,
-    })
+    local can_like = self.online_likes_enabled == true and not piece.continuation
+        and clean(piece.review_id) ~= ""
+    if can_like then
+        local suffix_text = " · 赞" .. (likes > 0 and (" " .. tostring(likes)) or "")
+        local suffix = TextWidget:new{
+            text = suffix_text,
+            face = metrics.meta_face,
+            fgcolor = MUTED_TEXT_COLOR,
+        }
+        local suffix_size = suffix:getSize()
+        local heart_w = math.max(26, math.floor(metrics.meta_size * 1.55 + .5))
+        local heart_h = math.max(suffix_size.h, math.floor(metrics.meta_size * 1.35 + .5))
+        local author_w = math.max(1, width - suffix_size.w - heart_w)
+        local author_widget = self:_text_box(author, metrics.meta_face, author_w, {
+            line_height = 0.10,
+            fgcolor = MUTED_TEXT_COLOR,
+        })
+        local heart = LikeButton:new{
+            dimen = Geom:new{w = heart_w, h = heart_h},
+            comment_index = tonumber(piece.comment_index),
+            row_height = math.max(author_widget:getSize().h, suffix_size.h, heart_h),
+            suffix_width = suffix_size.w,
+            callback = function() return self:_request_like(piece) end,
+        }
+        heart[1] = CenterContainer:new{
+            dimen = Geom:new{w = heart_w, h = heart_h},
+            TextWidget:new{
+                text = piece.is_liked == true and "♥" or "♡",
+                face = metrics.meta_face,
+                fgcolor = MUTED_TEXT_COLOR,
+            },
+        }
+        if interactive then
+            self.like_buttons = self.like_buttons or {}
+            self.like_buttons[#self.like_buttons + 1] = heart
+        end
+        group[#group + 1] = HorizontalGroup:new{
+            author_widget,
+            suffix,
+            heart,
+        }
+    else
+        local meta
+        if piece.continuation then
+            meta = author .. " · 续"
+        elseif likes > 0 then
+            meta = author .. " · 赞 " .. tostring(likes)
+        else
+            meta = author
+        end
+        group[#group + 1] = self:_text_box(meta, metrics.meta_face, width, {
+            line_height = 0.10,
+            fgcolor = MUTED_TEXT_COLOR,
+        })
+    end
     group[#group + 1] = VerticalSpan:new{height = metrics.meta_body_gap}
     group[#group + 1] = self:_text_box(content, metrics.body_face, width, {
         line_height = metrics.body_line_height,
@@ -497,6 +559,8 @@ function NativePopup:_fit_prefix(item, content, maximum_height, width, metrics, 
         local measured = self:_measure_piece({
             author = item.author,
             likes = item.likes,
+            review_id = item.review_id,
+            is_liked = item.is_liked,
             content = prefix,
             continuation = continuation,
             comment_index = item.comment_index,
@@ -513,6 +577,8 @@ function NativePopup:_fit_prefix(item, content, maximum_height, width, metrics, 
         local measured = self:_measure_piece({
             author = item.author,
             likes = item.likes,
+            review_id = item.review_id,
+            is_liked = item.is_liked,
             content = U.utf8_sub(content, 1, 1),
             continuation = continuation,
             comment_index = item.comment_index,
@@ -563,6 +629,8 @@ function NativePopup:_paginate_next_page(width, maximum_height, metrics)
             local item = {
                 author = clean(raw.author),
                 likes = tonumber(raw.likes or 0) or 0,
+                review_id = tostring(raw.review_id or ""),
+                is_liked = type(raw.is_liked) == "boolean" and raw.is_liked or nil,
                 content = clean_body(raw.content),
                 comment_index = index,
             }
@@ -585,6 +653,8 @@ function NativePopup:_paginate_next_page(width, maximum_height, metrics)
                 local probe_piece = {
                     author = item.author,
                     likes = item.likes,
+                    review_id = item.review_id,
+                    is_liked = item.is_liked,
                     content = remaining_content,
                     continuation = state.continuation == true,
                     comment_index = item.comment_index,
@@ -606,6 +676,8 @@ function NativePopup:_paginate_next_page(width, maximum_height, metrics)
                         add({
                             author = item.author,
                             likes = item.likes,
+                            review_id = item.review_id,
+                            is_liked = item.is_liked,
                             content = prefix,
                             continuation = state.continuation == true,
                             comment_index = item.comment_index,
@@ -626,6 +698,8 @@ function NativePopup:_paginate_next_page(width, maximum_height, metrics)
                         add({
                             author = item.author,
                             likes = item.likes,
+                            review_id = item.review_id,
+                            is_liked = item.is_liked,
                             content = forced_prefix,
                             continuation = state.continuation == true,
                             comment_index = item.comment_index,
@@ -723,6 +797,8 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
         local item = {
             author = clean(raw.author),
             likes = tonumber(raw.likes or 0) or 0,
+            review_id = tostring(raw.review_id or ""),
+            is_liked = type(raw.is_liked) == "boolean" and raw.is_liked or nil,
             content = clean_body(raw.content),
             comment_index = comment_index,
         }
@@ -734,6 +810,8 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
                 local probe_piece = {
                     author = item.author,
                     likes = item.likes,
+                    review_id = item.review_id,
+                    is_liked = item.is_liked,
                     content = remaining_content,
                     continuation = continuation,
                     comment_index = item.comment_index,
@@ -760,6 +838,8 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
                         add({
                             author = item.author,
                             likes = item.likes,
+                            review_id = item.review_id,
+                            is_liked = item.is_liked,
                             content = prefix,
                             continuation = continuation,
                             comment_index = item.comment_index,
@@ -778,6 +858,8 @@ function NativePopup:_paginate_comments(width, maximum_height, metrics)
                         add({
                             author = item.author,
                             likes = item.likes,
+                            review_id = item.review_id,
+                            is_liked = item.is_liked,
                             content = forced_prefix,
                             continuation = continuation,
                             comment_index = item.comment_index,
@@ -860,6 +942,7 @@ function NativePopup:_build_comment_page(width, metrics, target_height)
     local group = VerticalGroup:new{align = "left"}
     local hit_targets = {}
     local cursor_y = 0
+    self.like_buttons = {}
     if #page == 0 then
         local empty_h = math.max(metrics.body_size * 2, Screen:scaleBySize(38))
         local top_gap = math.max(6, Screen:scaleBySize(5))
@@ -878,7 +961,7 @@ function NativePopup:_build_comment_page(width, metrics, target_height)
                 group[#group + 1] = self:_separator_widget(width, metrics, true, false)
                 cursor_y = cursor_y + metrics.comment_separator_height
             end
-            local widget, piece_h = self:_piece_widget(piece, width, metrics)
+            local widget, piece_h = self:_piece_widget(piece, width, metrics, true)
             piece_h = math.max(1, tonumber(piece_h) or widget:getSize().h)
             group[#group + 1] = widget
             local comment_index = tonumber(piece.comment_index)
@@ -904,6 +987,96 @@ function NativePopup:_build_comment_page(width, metrics, target_height)
         final_h = target_height
     end
     return group, math.max(1, final_h), natural_h
+end
+
+function NativePopup:_apply_like_result(comment_index, result)
+    if self.closing or type(result) ~= "table" then return false end
+    comment_index = tonumber(comment_index)
+    local item = comment_index and self.comments and self.comments[comment_index] or nil
+    if type(item) ~= "table" then return false end
+    local previous_button
+    for _, button in ipairs(self.like_buttons or {}) do
+        if tonumber(button.comment_index) == comment_index then
+            previous_button = button
+            break
+        end
+    end
+    local previous_button_dimen = previous_button and previous_button.dimen
+        and previous_button.dimen:copy() or nil
+    local previous_row_height = previous_button and tonumber(previous_button.row_height) or nil
+    local previous_suffix_width = previous_button and tonumber(previous_button.suffix_width) or nil
+    local likes = math.max(0, math.floor(tonumber(result.likes) or tonumber(item.likes) or 0))
+    local is_liked = result.is_liked == true
+    item.likes, item.is_liked = likes, is_liked
+    for _, page in ipairs(self.pages or {}) do
+        for _, piece in ipairs(page or {}) do
+            if tonumber(piece.comment_index) == comment_index then
+                piece.likes, piece.is_liked = likes, is_liked
+            end
+        end
+    end
+    local pending = self._pagination_state and self._pagination_state.item or nil
+    if pending and tonumber(pending.comment_index) == comment_index then
+        pending.likes, pending.is_liked = likes, is_liked
+    end
+
+    -- A result may arrive after the reader has turned to another popup page.
+    -- Keep its runtime state current, but do not repaint an unrelated page.
+    if not previous_button_dimen then return true end
+
+    local previous, current = self:_replace_comment_page()
+    local current_button
+    for _, button in ipairs(self.like_buttons or {}) do
+        if tonumber(button.comment_index) == comment_index then
+            current_button = button
+            break
+        end
+    end
+    local current_row_height = current_button and tonumber(current_button.row_height) or nil
+    local current_suffix_width = current_button and tonumber(current_button.suffix_width) or nil
+    local dirty = self.comments_dimen or current or previous
+    if self.comments_dimen and previous_row_height and current_row_height
+        and previous_row_height == current_row_height
+        and previous_suffix_width and current_suffix_width then
+        local padding = math.max(1, Screen:scaleBySize(1))
+        local left = math.max(self.comments_dimen.x,
+            previous_button_dimen.x - math.max(previous_suffix_width, current_suffix_width) - padding)
+        local top = math.max(self.comments_dimen.y, previous_button_dimen.y - padding)
+        local right = math.min(self.comments_dimen.x + self.comments_dimen.w,
+            previous_button_dimen.x + previous_button_dimen.w + padding)
+        local bottom = math.min(self.comments_dimen.y + self.comments_dimen.h,
+            previous_button_dimen.y + previous_row_height + padding)
+        dirty = Geom:new{
+            x = left,
+            y = top,
+            w = math.max(1, right - left),
+            h = math.max(1, bottom - top),
+        }
+    end
+    UIManager:setDirty(self, function() return "partial", dirty end)
+    return true
+end
+
+function NativePopup:_request_like(piece)
+    if self.closing or self.online_likes_enabled ~= true or not self.on_like_callback then return true end
+    local comment_index = tonumber(piece and piece.comment_index)
+    local item = comment_index and self.comments and self.comments[comment_index] or nil
+    local review_id = clean((item and item.review_id) or (piece and piece.review_id))
+    if not comment_index or type(item) ~= "table" or review_id == "" then return true end
+    self._like_inflight = self._like_inflight or {}
+    if self._like_inflight[comment_index] then return true end
+    self._like_inflight[comment_index] = true
+    local function done(result)
+        if self._like_inflight then self._like_inflight[comment_index] = nil end
+        if type(result) == "table" then self:_apply_like_result(comment_index, result) end
+    end
+    local ok, accepted = pcall(self.on_like_callback, {
+        review_id = review_id,
+        likes = tonumber(item.likes) or 0,
+        is_liked = type(item.is_liked) == "boolean" and item.is_liked or nil,
+    }, done)
+    if not ok or accepted == false then self._like_inflight[comment_index] = nil end
+    return true
 end
 
 function NativePopup:_page_indicator_text()
@@ -1433,6 +1606,12 @@ function NativePopup:onTapPage(_, ges)
     if not pos then return false end
     if self.close_dimen and not pos:notIntersectWith(self.close_dimen) then return self:_close() end
     if pos:notIntersectWith(self.popup_dimen) then return self:_close() end
+    for _, button in ipairs(self.like_buttons or {}) do
+        local dimen = button and button.dimen
+        if dimen and tonumber(dimen.x) and tonumber(dimen.y) and not pos:notIntersectWith(dimen) then
+            return button:trigger()
+        end
+    end
     if pos.x < self.popup_dimen.x + math.floor(self.popup_dimen.w / 2) then
         return self:_change_page(-1)
     end
@@ -1497,8 +1676,10 @@ function NativePopup:_reopen(opts)
     self.font_name = opts.font_name
     self.width_ratio = opts.width_ratio
     self.height_ratio = opts.height_ratio
+    self.online_likes_enabled = opts.online_likes_enabled == true
     self.on_close_callback = opts.on_close
     self.on_interact_callback = opts.on_interact
+    self.on_like_callback = opts.on_like
     self.on_error_callback = opts.on_error
     self.is_favorite_callback = opts.is_favorite_callback
     self.toggle_favorite_callback = opts.toggle_favorite_callback
@@ -1513,6 +1694,8 @@ function NativePopup:_reopen(opts)
     self._pagination_layout = nil
     self._pagination_complete = nil
     self.page_refresh_count = 0
+    self.like_buttons = nil
+    self._like_inflight = nil
     self._measurement_cache = nil
     self:init()
 end
@@ -1533,8 +1716,10 @@ function M.show(opts)
             font_name = opts.font_name,
             width_ratio = opts.width_ratio,
             height_ratio = opts.height_ratio,
+            online_likes_enabled = opts.online_likes_enabled == true,
             on_close_callback = opts.on_close,
             on_interact_callback = opts.on_interact,
+            on_like_callback = opts.on_like,
             on_error_callback = opts.on_error,
             is_favorite_callback = opts.is_favorite_callback,
             toggle_favorite_callback = opts.toggle_favorite_callback,
@@ -1575,6 +1760,7 @@ function M.cleanup()
     if popup then
         popup.on_close_callback = nil
         popup.on_interact_callback = nil
+        popup.on_like_callback = nil
         popup.on_error_callback = nil
         if popup[1] and type(popup[1].free) == "function" then
             pcall(popup[1].free, popup[1])
@@ -1583,6 +1769,8 @@ function M.cleanup()
         popup.pages = nil
         popup.page_heights = nil
         popup.comments = nil
+        popup.like_buttons = nil
+        popup._like_inflight = nil
         popup.source_text = nil
     end
     collectgarbage("step", 48)
