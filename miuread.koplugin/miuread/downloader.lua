@@ -17,8 +17,26 @@ local U = require("miuread.util")
 local logger = require("logger")
 local ok_socket, socket = pcall(require, "socket")
 
+-- Time spent deliberately yielding to the UI or waiting out a stall. Counted
+-- separately from network time so an A/B download run can tell throttling
+-- apart from transfer cost.
+local throttle_seconds = 0
+
 local function pause(seconds)
+    throttle_seconds = throttle_seconds + math.max(0, tonumber(seconds) or 0)
     if ok_socket and socket and type(socket.sleep) == "function" then socket.sleep(seconds) end
+end
+
+local function now()
+    if ok_socket and socket and type(socket.gettime) == "function" then return socket.gettime() end
+    return os.time()
+end
+
+local function human_bytes(value)
+    value = tonumber(value) or 0
+    if value >= 1048576 then return string.format("%.1fMB", value / 1048576) end
+    if value >= 1024 then return string.format("%.0fkB", value / 1024) end
+    return tostring(math.floor(value)) .. "B"
 end
 
 local Downloader = {}
@@ -706,12 +724,13 @@ local function txt_catalog_title(title, chapter_idx)
 end
 
 function Downloader:catalog(id, request_options)
+    request_options = type(request_options) == "table" and request_options or {}
     local catalog = self.reader:catalog(id, request_options)
     local source = catalog.updated or catalog.chapterInfos or catalog.chapters or {}
     -- chapterInfos does not reliably expose the book format. Use the reader
     -- page context when available; on failure keep the source titles unchanged.
     local book_format
-    local ok_state, state = pcall(self.reader.state, self.reader, id)
+    local ok_state, state = pcall(self.reader.state, self.reader, id, request_options.keepalive)
     if ok_state and type(state) == "table" and type(state.book) == "table" then
         book_format = tostring(state.book.format or ""):lower()
     else
@@ -1180,9 +1199,14 @@ local function append_entry(chapters, assets, css_list, css_seen, entry, body_so
     chapters[#chapters + 1] = chapter
 end
 
-function Downloader:book(input, opt, progress)
+function Downloader:_book_once(input, opt, progress)
     opt = opt or {}
     progress = progress or function() end
+    local run_started = now()
+    local throttle_at_start = throttle_seconds
+    local http_at_start = type(self.http) == "table" and self.http.stats_snapshot
+        and self.http:stats_snapshot() or nil
+    local chapters_fetched, chapters_from_checkpoint = 0, 0
     local function respect_reader_priority(stage)
         local pause_logged=false
         local function worker_paused()
@@ -1315,7 +1339,8 @@ function Downloader:book(input, opt, progress)
         local max_poll=math.max(poll,tonumber(Config.DOWNLOAD_NETWORK_RECOVERY_MAX_POLL_SECONDS) or 15)
         while true do
             if opt.cancelled and opt.cancelled() then error("download cancelled") end
-            local ok,catalog,all=pcall(self.catalog,self,book.bookId,{on_retry=catalog_retry_notice})
+            local ok,catalog,all=pcall(self.catalog,self,book.bookId,
+                {on_retry=catalog_retry_notice,keepalive=true})
             if ok then
                 if catalog_wait_started then
                     progress("resume",0,1,book.title,{message="网络已恢复，正在继续读取目录"})
@@ -1820,6 +1845,7 @@ function Downloader:book(input, opt, progress)
                 if valid then
                     failure_map[uid] = nil
                     restricted_map[uid] = nil
+                    chapters_from_checkpoint = chapters_from_checkpoint + 1
                     return true
                 end
                 cached_style="完成章节结构无效："..tostring(validation_error)
@@ -1841,6 +1867,7 @@ function Downloader:book(input, opt, progress)
         end
 
         if not body then
+            chapters_fetched = chapters_fetched + 1
             progress("content", index, expected, chapter.title)
             local last_activity_at,last_activity_bytes=0,0
             local function chapter_activity(kind,detail)
@@ -1859,6 +1886,9 @@ function Downloader:book(input, opt, progress)
                 self.reader.chapter, self.reader, book, chapter, format, {
                     images=opt.images,
                     activity=chapter_activity,
+                    -- Chapter content is the only place where reuse is enabled:
+                    -- five sequential requests to the same origin per chapter.
+                    keepalive=true,
                     yield=function(stage) respect_reader_priority(stage or "images") end,
                 })
             if not ok then
@@ -2271,7 +2301,61 @@ function Downloader:book(input, opt, progress)
     else
         U.remove_tree(cache.root)
     end
+    self:_log_run_summary(book, {
+        started = run_started,
+        throttle = throttle_seconds - throttle_at_start,
+        http_before = http_at_start,
+        chapters = #chapters,
+        fetched = chapters_fetched,
+        from_checkpoint = chapters_from_checkpoint,
+    })
     return record
+end
+
+-- Connection reuse is scoped to a single download run. However the run ends --
+-- finished, cancelled, or aborted by an error -- the pooled sockets are closed
+-- here, so none of them survives into a screen-off, a network change or the
+-- next task.
+function Downloader:book(input, opt, progress)
+    local ok, result = pcall(self._book_once, self, input, opt, progress)
+    if type(self.http) == "table" and type(self.http.close_idle_connections) == "function" then
+        pcall(self.http.close_idle_connections, self.http)
+    end
+    if not ok then error(result, 0) end
+    return result
+end
+
+-- One greppable line per completed download. `fetched` versus `checkpoint`
+-- matters when comparing two runs: a repeat download of the same book reuses
+-- its chapter checkpoints unless the partial directory was removed first, and
+-- a run with fetched=0 measured nothing.
+function Downloader:_log_run_summary(book, run)
+    local elapsed = math.max(0, now() - (tonumber(run.started) or 0))
+    local after = type(self.http) == "table" and self.http.stats_snapshot
+        and self.http:stats_snapshot() or nil
+    local before = run.http_before or {}
+    local function delta(field)
+        if not after then return 0 end
+        return (tonumber(after[field]) or 0) - (tonumber(before[field]) or 0)
+    end
+    local opened, reused = delta("connections_opened"), delta("connections_reused")
+    local requests = delta("requests")
+    logger.info("[MiuRead][Download] run summary",
+        "book=", tostring(book and book.bookId or ""),
+        "title=", tostring(book and book.title or ""),
+        "keepalive=", tostring(Config.HTTP_KEEPALIVE ~= false),
+        "chapters=", tostring(run.chapters or 0),
+        "fetched=", tostring(run.fetched or 0),
+        "checkpoint=", tostring(run.from_checkpoint or 0),
+        string.format("elapsed=%.1fs", elapsed),
+        string.format("network=%.1fs", delta("network_seconds")),
+        string.format("pacing=%.1fs", delta("pacing_seconds")),
+        string.format("ratelimit=%.1fs", delta("rate_limit_seconds")),
+        string.format("throttle=%.1fs", tonumber(run.throttle) or 0),
+        "requests=", tostring(requests),
+        "connections=", tostring(opened),
+        "reused=", tostring(reused),
+        "bytes=", human_bytes(delta("bytes")))
 end
 
 Downloader._prepare_chapter_body = prepare_chapter_body

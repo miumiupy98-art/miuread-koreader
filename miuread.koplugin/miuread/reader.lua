@@ -874,9 +874,10 @@ function Reader:check_login_session()
     return result
 end
 
-local function load_reader_context(self,book_id,chapter_uid,require_psvts)
+local function load_reader_context(self,book_id,chapter_uid,require_psvts,keepalive)
     local url=Protocol.is_mp(book_id) and Protocol.mp_reader_url(book_id) or Protocol.reader_url(book_id,chapter_uid)
-    local html,_,final_url=self.http:download(url,{headers={Accept="text/html,application/xhtml+xml"},retries=2})
+    local html,_,final_url=self.http:download(url,{headers={Accept="text/html,application/xhtml+xml"},retries=2,
+        keepalive=keepalive==true})
     local page_error=login_page_error(html,final_url)
     if page_error then error(page_error) end
     local context=regex_context(html)
@@ -906,8 +907,10 @@ local function load_reader_context(self,book_id,chapter_uid,require_psvts)
     return context
 end
 
-function Reader:state(book_id,chapter_uid)
-    return load_reader_context(self,book_id,chapter_uid,true)
+-- `keepalive` is set only by the download task, which issues this request and
+-- the four chapter shards back to back against the same origin.
+function Reader:state(book_id,chapter_uid,keepalive)
+    return load_reader_context(self,book_id,chapter_uid,true,keepalive)
 end
 
 function Reader:catalog(book_id, request_options)
@@ -920,6 +923,7 @@ function Reader:catalog(book_id, request_options)
         local http_options={
             headers={Origin=BASE, Referer=Protocol.reader_url(book_id)},
             retries=1, timeout={10,22},
+            keepalive=request_options.keepalive==true,
         }
         if type(request_options.on_retry)=="function" then http_options.on_retry=request_options.on_retry end
         local data = self.http:post_json(BASE .. "/web/book/chapterInfos", {bookIds={tostring(book_id)}},http_options)
@@ -951,11 +955,12 @@ function Reader:catalog(book_id, request_options)
     error(result)
 end
 
-function Reader:shard(path, book_id, chapter_uid, psvts, style)
+function Reader:shard(path, book_id, chapter_uid, psvts, style, keepalive)
     local body = Protocol.content_fields(book_id, chapter_uid, psvts, style)
     local raw, code = self.http:request{
         url=BASE .. path, method="POST", body=Json.encode(body), retries=3,
         headers={Origin=BASE, Referer=Protocol.reader_url(book_id, chapter_uid), ["Content-Type"]="application/json;charset=UTF-8"},
+        keepalive=keepalive==true,
     }
     if code < 200 or code >= 300 then error(path .. " failed: HTTP " .. tostring(code)) end
     local auth_error = raw_service_auth_error(raw)
@@ -968,9 +973,9 @@ function Reader:_txt_once(book, chapter, opt, state)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
-    state = state or self:state(id, uid)
-    local a = self:shard("/web/book/chapter/t_0", id, uid, state.psvts, false)
-    local ok_b, b = pcall(self.shard, self, "/web/book/chapter/t_1", id, uid, state.psvts, false)
+    state = state or self:state(id, uid, opt.keepalive)
+    local a = self:shard("/web/book/chapter/t_0", id, uid, state.psvts, false, opt.keepalive)
+    local ok_b, b = pcall(self.shard, self, "/web/book/chapter/t_1", id, uid, state.psvts, false, opt.keepalive)
     if not ok_b then b = "" end
     local xhtml = Codec.text_xhtml(Codec.decode_parts({a, b}))
     if not has_readable_content(xhtml, false) then error("decoded TXT chapter is empty") end
@@ -986,14 +991,14 @@ function Reader:_epub_once(book, chapter, opt, state)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
-    state = state or self:state(id, uid)
+    state = state or self:state(id, uid, opt.keepalive)
 
-    local a = self:shard("/web/book/chapter/e_0", id, uid, state.psvts, false)
+    local a = self:shard("/web/book/chapter/e_0", id, uid, state.psvts, false, opt.keepalive)
     if a:match("^%s*{") and a:find('"bookId"', 1, true) then
         return self:_txt_once(book, chapter, opt, state)
     end
-    local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false)
-    local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false)
+    local b = self:shard("/web/book/chapter/e_1", id, uid, state.psvts, false, opt.keepalive)
+    local c = self:shard("/web/book/chapter/e_3", id, uid, state.psvts, false, opt.keepalive)
     local xhtml = Codec.decode_parts({a, b, c})
     -- Keep the exact decrypted XHTML before image localization, body extraction
     -- or any MiuRead rewrite. This is the missing reference required to compare
@@ -1004,7 +1009,7 @@ function Reader:_epub_once(book, chapter, opt, state)
     state.coord_html = AnnotationCoord.fromDownloadedXhtml(xhtml)
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
-    local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true)
+    local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true, opt.keepalive)
     if ok_style and not style_raw:match("^%s*{") then
         local ok, value = pcall(Codec.decode_parts, {style_raw})
         if ok and value ~= "" then css = value end
@@ -1116,7 +1121,7 @@ function Reader:_chapter_once(book, chapter, format, opt)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
-    local state = self:state(id, uid)
+    local state = self:state(id, uid, opt.keepalive)
 
     if format == "txt" then
         local ok, a, b, c, d = pcall(self._txt_once, self, book, chapter, opt, state)

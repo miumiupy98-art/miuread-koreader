@@ -177,6 +177,15 @@ local C = {
     LIGHTWEIGHT_DERIVATIVE_GAP = 1.1,
 
     AUTH_NOTICE_FAILURE_THRESHOLD = 2,
+
+    -- Reuse the TCP+TLS connection between consecutive requests to the same
+    -- WeRead origin. Enabled per request and only inside a download run: one
+    -- chapter needs five sequential requests, so dropping the handshakes is the
+    -- largest saving available without touching request pacing. Login, shelf,
+    -- progress, read-time and annotation requests never reuse a connection.
+    -- Set to false to put downloads back on one connection per request.
+    HTTP_KEEPALIVE = true,
+
     DOWNLOAD_AUTO_RESTARTS = 2,
     DOWNLOAD_DIAGNOSTIC_KEEP = 3,
 
