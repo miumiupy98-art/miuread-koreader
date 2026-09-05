@@ -137,12 +137,14 @@ local HOME_SECTION_ORDER={"shelf","device","recent"}
 local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"}
 local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false}
 local HOME_ACTION_LAYOUT_VERSION=4
--- The pull-down control center exposes the full legacy/advanced candidate
--- pool again. Unsupported hardware entries disappear dynamically. Up to 12
--- selected actions are rendered as a 6 x 2 grid.
+-- Keep the full pull-down control-center candidate pool, but render at most
+-- eight supported/selected controls in one compact row. The display limit is
+-- intentionally separate from the candidate-pool size so new controls do not
+-- force another layout rewrite.
 local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"}
 local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=false,rotate=true,screenshot=true,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false}
-local HOME_PANEL_LAYOUT_VERSION=5
+local HOME_PANEL_LAYOUT_VERSION=6
+local HOME_PANEL_MAX_VISIBLE=8
 -- ReaderUI and FileManager create separate plugin instances. Keep navigation
 -- state in _G so opening/closing a document does not lose its MiuRead origin.
 local HOME_SESSION=rawget(_G,"__MIUREAD_HOME_SESSION")
@@ -1835,7 +1837,7 @@ function Plugin:home_menu()
     }
     if not self:_home_enabled() then
         trailing[#trailing+1]={text="插件与扩展",post_text="安装 更新与插件管理",sub_item_table_func=function() return PluginSettings.plugins_extensions(self) end}
-        trailing[#trailing+1]={text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(self) end}
+        trailing[#trailing+1]={text="系统维护",post_text="诊断 修复与清理",sub_item_table_func=function() return PluginSettings.system_maintenance(self) end}
     end
     trailing[#trailing+1]={text="觅阅设置",sub_item_table_func=function() return self:settings_menu() end}
     trailing[#trailing+1]={text="KOReader 菜单",callback=function() self:_show_native_koreader_menu() end}
@@ -3240,18 +3242,16 @@ function Plugin:_home_preferences()
     normalize_quick_group("action_items","action_order","action_layout_version",HOME_ACTION_LAYOUT_VERSION,HOME_ACTION_ITEM_ORDER,HOME_ACTION_ITEM_DEFAULT)
     if home.action_items.frontlight~=nil then home.action_items.frontlight=nil; changed=true end
     normalize_quick_group("panel_items","panel_order","panel_layout_version",HOME_PANEL_LAYOUT_VERSION,HOME_PANEL_ITEM_ORDER,HOME_PANEL_ITEM_DEFAULT)
-    -- Unsupported hardware controls disappear instead of leaving dead slots.
-    if not Device:canSuspend() then
-        if home.panel_items.sleep==true then home.panel_items.sleep=false; changed=true end
-        if home.action_items.sleep==true then home.action_items.sleep=false; changed=true end
+    -- Unsupported control-center items are filtered at render/settings time,
+    -- not destructively cleared here. This preserves a user's selection when
+    -- the same settings file moves between devices with different hardware.
+    -- The homepage action row keeps its existing device-specific sleep rule.
+    if not Device:canSuspend() and home.action_items.sleep==true then
+        home.action_items.sleep=false; changed=true
     end
-    local panel_enabled=0
-    for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
-        if home.panel_items[key]==true and self:_home_panel_item_available(key) then
-            panel_enabled=panel_enabled+1
-            if panel_enabled>12 then home.panel_items[key]=false; changed=true end
-        end
-    end
+    -- Do not trim legacy control-center selections here. beta.9 renders only
+    -- the first HOME_PANEL_MAX_VISIBLE supported items and asks the user to
+    -- reduce an old >8 selection when they next open customization.
     if type(home.hidden_local_files)~="table" then home.hidden_local_files={}; changed=true end
     if home.more_expanded==nil then home.more_expanded=false; changed=true end
     if home.network_metadata==nil then home.network_metadata=true; changed=true end
@@ -5591,7 +5591,7 @@ function Plugin:_home_toggle_group_item(group,key)
     local is_action=group=="action"
     local items_key=is_action and "action_items" or "panel_items"
     local order=is_action and HOME_ACTION_ITEM_ORDER or HOME_PANEL_ITEM_ORDER
-    local max_count=is_action and 6 or 12
+    local max_count=is_action and 6 or HOME_PANEL_MAX_VISIBLE
     local items=home[items_key] or {}
     local currently=items[key]==true
     local count=0
@@ -5599,13 +5599,20 @@ function Plugin:_home_toggle_group_item(group,key)
         if items[name]==true and (is_action or self:_home_panel_item_available(name)) then count=count+1 end
     end
     if not currently and count>=max_count then
-        self:toast((is_action and "主页快捷栏最多显示六项" or "下滑控制中心最多显示十二项"),2)
+        self:toast((is_action and "主页快捷栏最多显示六项" or "控制中心最多显示 8 项"),2)
         return false
     end
     items[key]=not currently
     home[items_key]=items
     self:_save_home_preferences(home,preferences)
     if HomeView.is_shown() then self:_refresh_home_view(nil,"content") end
+    if not is_action then
+        local selected=0
+        for _,name in ipairs(order) do
+            if items[name]==true and self:_home_panel_item_available(name) then selected=selected+1 end
+        end
+        self:toast("控制中心快捷项 "..tostring(selected).." / "..tostring(HOME_PANEL_MAX_VISIBLE),1)
+    end
     return true
 end
 
@@ -5672,6 +5679,16 @@ function Plugin:_home_group_settings_menu(group)
     local order_key=is_action and "action_order" or "panel_order"
     local version_key=is_action and "action_layout_version" or "panel_layout_version"
     local rows={}
+    if not is_action then
+        local selected=self:_home_group_enabled_count("panel")
+        local overflow=math.max(0,selected-HOME_PANEL_MAX_VISIBLE)
+        rows[#rows+1]={
+            text=overflow>0 and ("已选择 "..tostring(selected).." 项 · 请取消 "..tostring(overflow).." 项")
+                or ("已选择 "..tostring(selected).." / "..tostring(HOME_PANEL_MAX_VISIBLE)),
+            post_text=overflow>0 and ("最多 "..tostring(HOME_PANEL_MAX_VISIBLE).." 项") or "单行显示",
+            enabled=false,
+        }
+    end
     for _,key in ipairs(order) do
         local item_key=key
         if is_action or self:_home_panel_item_available(item_key) then
@@ -5709,7 +5726,7 @@ function Plugin:_home_group_enabled_count(group)
     for _,key in ipairs(order) do
         if items[key]==true and (is_action or self:_home_panel_item_available(key)) then count=count+1 end
     end
-    return math.min(count,is_action and 6 or 12)
+    return is_action and math.min(count,6) or count
 end
 
 function Plugin:_home_restore_all_quick_defaults()
@@ -5729,9 +5746,13 @@ function Plugin:_home_restore_all_quick_defaults()
 end
 
 function Plugin:home_customization_menu()
+    local panel_count=self:_home_group_enabled_count("panel")
+    local panel_post=panel_count>HOME_PANEL_MAX_VISIBLE
+        and (tostring(panel_count).." 已选 · 最多 "..tostring(HOME_PANEL_MAX_VISIBLE))
+        or (tostring(panel_count).." / "..tostring(HOME_PANEL_MAX_VISIBLE))
     return {
         {text="主页快捷栏",post_text=tostring(self:_home_group_enabled_count("action")).." / 6",sub_item_table_func=function() return self:home_action_settings_menu() end},
-        {text="下滑控制中心",post_text=tostring(self:_home_group_enabled_count("panel")).." / 12",sub_item_table_func=function() return self:home_panel_settings_menu() end},
+        {text="下滑控制中心",post_text=panel_post,sub_item_table_func=function() return self:home_panel_settings_menu() end},
         {text="恢复全部推荐布局",post_text="主页 + 下滑控制中心",callback=function() self:_home_restore_all_quick_defaults() end},
     }
 end
@@ -11804,15 +11825,27 @@ function Plugin:show_home_quick_panel(more_expanded)
     local wifi_phase=tostring(state.network_phase or "")
     local wifi_detail
     if wifi_on==false or wifi_phase=="off" then wifi_detail="已关闭"
-    elseif wifi_phase=="unavailable" then wifi_detail="网络不可用"
-    elseif wifi_phase=="recovering" then wifi_detail="Wi-Fi 已开启 · 确认中"
-    elseif wifi_phase=="connecting" or state.connected==false then wifi_detail="Wi-Fi 已开启 · 正在连接"
-    elseif wifi_linked and wifi_name~="" and state.online==false then wifi_detail=U.utf8_truncate(wifi_name,9,"…").." · 无网络"
-    elseif wifi_linked and wifi_name~="" then wifi_detail=U.utf8_truncate(wifi_name,11,"…")
-    elseif wifi_linked and state.online==false then wifi_detail="已连接 · 无网络"
-    elseif wifi_linked then wifi_detail="已连接 · 确认网络"
-    else wifi_detail="Wi-Fi 已开启" end
+    elseif wifi_phase=="unavailable" then wifi_detail="不可用"
+    elseif wifi_phase=="recovering" then wifi_detail="确认中"
+    elseif wifi_phase=="connecting" or state.connected==false then wifi_detail="连接中"
+    elseif wifi_linked and state.online==false then wifi_detail="无网络"
+    elseif wifi_linked then wifi_detail="已连接"
+    else wifi_detail="已开启" end
     local sync_label=self:_home_sync_status_label_cached()
+    local sync_detail
+    if sync_label:match("^失败") then sync_detail="失败"
+    elseif sync_label:match("^待同步%s+%d+") then sync_detail=sync_label
+    elseif sync_label:find("同步中",1,true) or sync_label:find("同步检查",1,true) then sync_detail="同步中"
+    elseif sync_label:find("待更新",1,true) then sync_detail="待更新"
+    elseif sync_label:find("登录",1,true) then sync_detail="待登录"
+    elseif sync_label:find("已同步",1,true) then sync_detail="已同步"
+    else sync_detail=U.utf8_truncate(sync_label,6,"…") end
+    local orientation_status=self:_orientation_status_label()
+    local orientation_detail
+    if orientation_status:find("已锁定",1,true) then orientation_detail="已锁定"
+    elseif orientation_status:find("限制",1,true) then orientation_detail="已限制"
+    elseif orientation_status:find("自动旋转",1,true) then orientation_detail="自动"
+    else orientation_detail=U.utf8_truncate(orientation_status,6,"…") end
     local bluetooth_state=self:_bluetooth_state(false)
     local definitions={
         wifi={
@@ -11828,20 +11861,20 @@ function Plugin:show_home_quick_panel(more_expanded)
             hold_callback=function() self:_bluetooth_show_devices() end
         } or nil,
         rotate={
-            icon="方向",icon_key=self:_orientation_icon_key(),label="方向锁定",detail=self:_orientation_status_label(),
+            icon="方向",icon_key=self:_orientation_icon_key(),label="方向锁定",detail=orientation_detail,
             callback=function() self:_orientation_toggle_lock() end,
             hold_callback=function() self:_show_orientation_panel() end
         },
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
         full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
-        downloads={icon="⇩",icon_key="download",label="下载",detail=self:_download_menu_text(),callback=function() self:show_downloads() end},
-        sync={icon="⇅",icon_key="sync",label="同步",detail=sync_label,callback=function() self:_sync_home_pending() end},
+        downloads={icon="⇩",icon_key="download",label="下载",detail="",callback=function() self:show_downloads() end},
+        sync={icon="⇅",icon_key="sync",label="同步",detail=sync_detail,callback=function() self:_sync_home_pending() end},
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_home_settings_center() end},
-        koreader_settings={icon="⚙",icon_key="koreader-settings",label="KOReader 设置",detail="",callback=function() self:_show_native_koreader_menu() end},
-        koreader_file_manager={icon="▤",icon_key="file-manager",label="KOReader 文件管理",detail="",callback=function() self:_home_open_koreader_filemanager(self:_home_root(),true) end},
-        return_koreader={icon="←",icon_key="return",label="返回 KOReader",detail="",callback=function() self:_home_close_to_native(true) end},
-        quit={icon="⏻",icon_key="quit",label="退出 KOReader",detail="",callback=function(anchor) self:_quit_koreader(false,anchor) end},
-        restart={icon="↺",icon_key="restart",label="重启 KOReader",detail="",callback=function() self:_restart_koreader("home quick panel") end},
+        koreader_settings={icon="⚙",icon_key="settings",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
+        koreader_file_manager={icon="▤",icon_key="file-manager",label="文件",detail="",callback=function() self:_home_open_koreader_filemanager(self:_home_root(),true) end},
+        return_koreader={icon="←",icon_key="return",label="返回",detail="",callback=function() self:_home_close_to_native(true) end},
+        quit={icon="⏻",icon_key="quit",label="退出",detail="",callback=function(anchor) self:_quit_koreader(false,anchor) end},
+        restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader("home quick panel") end},
     }
     if Device:canSuspend() then definitions.sleep={icon="◐",icon_key="sleep",label="休眠",detail="",callback=function() self:_home_sleep() end} end
     if type(Device.canReboot)=="function" and Device:canReboot() then definitions.reboot={icon="↻",icon_key="reboot",label="重启设备",detail="",callback=function(anchor) self:_home_reboot_device(anchor) end} end
@@ -11849,9 +11882,11 @@ function Plugin:show_home_quick_panel(more_expanded)
 
     local home,preferences=self:_home_preferences()
     local buttons={}
+    -- Filter unsupported controls first, preserve the user's order, then apply
+    -- the visual capacity. Unsupported items therefore never consume a slot.
     for _,key in ipairs(home.panel_order or HOME_PANEL_ITEM_ORDER) do
         if home.panel_items[key]==true and definitions[key] then buttons[#buttons+1]=definitions[key] end
-        if #buttons>=12 then break end
+        if #buttons>=HOME_PANEL_MAX_VISIBLE then break end
     end
 
     local battery=tonumber(state.battery) and (tostring(math.floor(state.battery+.5)).."%") or "未知"
@@ -12082,7 +12117,7 @@ function Plugin:tools_menu()
         {text="阅读历史",callback=function() self:show_home_reading_history() end},
         {text="文件管理",sub_item_table_func=function() return self:home_file_manager_menu() end},
         {text="插件与扩展",post_text=tostring(require("miuread.extension_center").installed_count(self)).." 个已安装",sub_item_table_func=function() return PluginSettings.plugins_extensions(self) end},
-        {text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(self) end},
+        {text="系统维护",post_text="诊断 修复与清理",sub_item_table_func=function() return PluginSettings.system_maintenance(self) end},
         {text="KOReader",post_text="设置 文件管理与返回",sub_item_table_func=function() return PluginSettings.koreader_tools(self) end},
     }
 end

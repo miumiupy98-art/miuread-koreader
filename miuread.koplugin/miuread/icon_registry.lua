@@ -2,6 +2,7 @@ local Blitbuffer = require("ffi/blitbuffer")
 local ImageWidget = require("ui/widget/imagewidget")
 local TextWidget = require("ui/widget/textwidget")
 local lfs = require("libs/libkoreader-lfs")
+local logger = require("logger")
 
 local Registry = {}
 
@@ -29,7 +30,7 @@ local MAP = {
     ["⌕"] = "search", search = "search",
     ["⇩"] = "download", download = "download",
     ["⇧"] = "upload", upload = "upload",
-    ["⚙"] = "settings", settings = "settings",
+    ["⚙"] = "settings", settings = "settings", ["koreader-settings"] = "settings",
     ["◷"] = "history", history = "history",
     ["▤"] = "file-manager", ["file-manager"] = "file-manager", file = "file-manager",
     ["▣"] = "screenshot", screenshot = "screenshot",
@@ -49,7 +50,7 @@ local MAP = {
     ["!"] = "warning", warning = "warning",
     ["▶"] = "play", play = "play",
     ["⏻"] = "power", power = "power", quit = "power",
-    ["↺"] = "restart", restart = "restart",
+    ["↺"] = "restart", restart = "restart", reboot = "restart",
     rotate = "rotate", ["旋转"] = "rotate",
     ["orientation-lock"] = "orientation-lock", ["orientation-auto"] = "orientation-auto", ["方向"] = "orientation-auto",
     night = "night", warmth = "warmth", battery = "battery",
@@ -65,7 +66,7 @@ local MAP = {
     ["↔"] = "swap", swap = "swap",
     ["☁"] = "cloud", cloud = "cloud",
     ["◎"] = "newspaper", newspaper = "newspaper", mp = "newspaper",
-    ["■"] = "power-off", ["power-off"] = "power-off",
+    ["■"] = "power-off", ["power-off"] = "power-off", poweroff = "power-off",
     ["⇥"] = "cache", cache = "cache",
     ["✓"] = "check", check = "check",
     ["•"] = "dot", dot = "dot",
@@ -83,31 +84,46 @@ function Registry.path(value)
     return icon_root .. key .. ".svg"
 end
 
+local missing_once = {}
+
+local function image_widget(path, size)
+    if not (path and path ~= "" and lfs.attributes(path, "mode") == "file") then return nil end
+    local image
+    local ok = pcall(function()
+        image = ImageWidget:new{
+            file = path,
+            width = size,
+            height = size,
+            file_do_cache = true,
+            is_icon = true,
+        }
+        image:getSize()
+    end)
+    if ok and image then return image end
+    if image and type(image.free) == "function" then pcall(image.free, image) end
+    return nil
+end
+
 function Registry.widget(value, size, opts)
     opts = opts or {}
     size = math.max(1, math.floor(tonumber(size) or 20))
-    local path = opts.path or Registry.path(value)
-    if path and path ~= "" and lfs.attributes(path, "mode") == "file" then
-        local image
-        -- Do not pass scale_factor=0: that keeps the SVG's aspect ratio and
-        -- letterboxes optically-small glyphs. Nil stretches to the square slot,
-        -- matching KOReader IconWidget. Stroke/fill live on each shape so
-        -- NanoSVG does not depend on parent inheritance.
-        local ok = pcall(function()
-            image = ImageWidget:new{
-                file = path,
-                width = size,
-                height = size,
-                file_do_cache = true,
-                is_icon = true,
-            }
-            image:getSize()
-        end)
-        if ok and image then return image end
-        if image and type(image.free) == "function" then pcall(image.free, image) end
+    local key = Registry.key(opts.icon_key or value)
+    local path = opts.path or Registry.path(key)
+    local image = image_widget(path, size)
+    if image then return image end
+
+    -- A missing official icon must never degrade to an unexplained bullet in
+    -- the user interface. Log once, then use the bundled neutral more.svg.
+    local miss=tostring(key or value or "")
+    if not missing_once[miss] then
+        missing_once[miss]=true
+        logger.warn("[MiuRead][IconRegistry] missing icon","key=",miss,"path=",tostring(path or ""),"fallback=more")
     end
+    image=image_widget(icon_root .. "more.svg", size)
+    if image then return image end
+
     return TextWidget:new{
-        text = tostring(opts.fallback_text or value or "•"),
+        text = tostring(opts.fallback_text or "⋯"),
         face = opts.face,
         bold = opts.bold ~= false,
         fgcolor = opts.fgcolor or Blitbuffer.COLOR_BLACK,

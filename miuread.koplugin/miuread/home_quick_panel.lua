@@ -198,51 +198,53 @@ function ControlSlider:onPanSlide(_,ges)
     return self:_set_from_position(ges,false)
 end
 
-local function panel_button(entry, width, height, close_callback, compact, owner, index)
+local function panel_button(entry, width, height, close_callback, compact, owner, index, show_detail)
     local label = tostring(entry.label or entry.text or "")
     local detail = tostring(entry.detail or "")
     local icon = tostring(entry.icon_key or entry.icon or "")
     local enabled = entry.enabled ~= false
     local has_detail = detail ~= ""
-    local dense = compact and width < UiScale.dp(104, 90, 136)
+    local dense = compact and width < UiScale.dp(100, 86, 130)
     local pad = UiScale.dp(dense and 2 or (compact and 3 or 4), 2, dense and 4 or 6)
     local inner_w = math.max(1, width - pad * 2)
-    local gap_h = UiScale.dp(dense and 2 or 3, 2, dense and 4 or 5)
-    local icon_slot_h = UiScale.dp(dense and 31 or (compact and 34 or 38), dense and 28 or (compact and 30 or 34), dense and 40 or (compact and 44 or 50))
-    local label_slot_h = UiScale.dp(dense and 30 or (compact and 31 or 34), dense and 27 or (compact and 27 or 30), dense and 38 or (compact and 40 or 44))
-    -- Reserve the same third line in every cell. Without this, Wi-Fi (which
-    -- has an SSID detail) becomes taller and its icon is vertically shifted.
-    local detail_slot_h = UiScale.dp(dense and 19 or (compact and 20 or 22), dense and 17 or (compact and 18 or 20), dense and 24 or (compact and 26 or 29))
-    local icon_size = UiScale.dp(dense and 24 or (compact and 27 or 30), dense and 22 or (compact and 24 or 27), dense and 31 or (compact and 35 or 39))
+    local gap_h = UiScale.dp(dense and 1.5 or 2.5, 1, dense and 3 or 4)
+    local icon_slot_h = UiScale.dp(dense and 34 or (compact and 37 or 40), dense and 30 or (compact and 33 or 36), dense and 43 or (compact and 47 or 52))
+    local label_slot_h = UiScale.dp(dense and 26 or (compact and 28 or 32), dense and 23 or (compact and 25 or 28), dense and 34 or (compact and 36 or 42))
+    local detail_slot_h = UiScale.dp(dense and 17 or (compact and 18 or 20), dense and 15 or (compact and 16 or 18), dense and 22 or (compact and 24 or 27))
+    local icon_size = UiScale.dp(dense and 28 or (compact and 31 or 34), dense and 25 or (compact and 28 or 31), dense and 36 or (compact and 40 or 44))
 
     local label_box=Ui.textbox(label, inner_w, label_slot_h,
-        face("smallinfofont", dense and 10.5 or (compact and 11.6 or 12.3), dense and 13.6 or (compact and 14.8 or 16.0), dense and 9.2 or (compact and 10.1 or 10.7)), {
+        face("smallinfofont", dense and 9.8 or (compact and 10.8 or 11.8), dense and 12.8 or (compact and 14.2 or 15.4), dense and 8.8 or (compact and 9.6 or 10.2)), {
             bold = true, alignment = "center", halign = "center",
             height_overflow_show_ellipsis = true,
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
         })
-    local detail_box=Ui.textbox(has_detail and detail or " ", inner_w, detail_slot_h,
-        face("smallinfofont", dense and 8.5 or (compact and 9.2 or 9.8), dense and 11.1 or (compact and 12.0 or 12.8), dense and 7.4 or (compact and 8.0 or 8.5)), {
-            alignment = "center", halign = "center",
-            height_overflow_show_ellipsis = true,
-            fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
-        })
+    local detail_box=nil
+    if show_detail then
+        detail_box=Ui.textbox(has_detail and detail or " ", inner_w, detail_slot_h,
+            face("smallinfofont", dense and 8.0 or (compact and 8.8 or 9.4), dense and 10.5 or (compact and 11.5 or 12.3), dense and 7.0 or (compact and 7.6 or 8.0)), {
+                alignment = "center", halign = "center",
+                height_overflow_show_ellipsis = true,
+                fgcolor = enabled and Blitbuffer.COLOR_DARK_GRAY or Blitbuffer.COLOR_GRAY,
+            })
+    end
     if owner and index then
         owner._button_refs[index]={label=label_box and label_box[1],detail=detail_box and detail_box[1]}
     end
-    local content = VerticalGroup:new{
+    local content_items={
         align = "center",
         Ui.icon(icon, inner_w, icon_slot_h, icon_size, {
             icon_key = icon,
             icon_path = entry.icon_path,
-            face = UiScale.iconFace("cfont", dense and 19.5 or (compact and 22 or 25), dense and 26 or (compact and 29 or 33), dense and 16.5 or (compact and 18 or 20)),
+            face = UiScale.iconFace("cfont", dense and 21.5 or (compact and 23.5 or 26), dense and 28 or (compact and 31 or 34), dense and 18.5 or (compact and 20 or 22)),
             fgcolor = enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
-            fallback_text = "•",
+            fallback_text = "⋯",
         }),
         VerticalSpan:new{height = gap_h},
         label_box,
-        detail_box,
     }
+    if detail_box then content_items[#content_items+1]=detail_box end
+    local content = VerticalGroup:new(content_items)
 
     local surface = fixed_frame(width, height, {
         bordersize = 0,
@@ -260,9 +262,7 @@ local function panel_button(entry, width, height, close_callback, compact, owner
             end)
             return
         end
-        if close_callback then
-            close_callback(function() return action(anchor) end)
-        end
+        if close_callback then close_callback(function() return action(anchor) end) end
     end
 
     return tappable(width, height, surface,
@@ -372,11 +372,16 @@ function QuickPanelWidget:_build()
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- Up to twelve controls are displayed as at most six columns by two rows.
-    -- Hidden/unsupported controls never consume a slot.
-    local visible_button_count = math.min(12, #buttons)
-    local columns = math.max(1, math.min(6, visible_button_count))
-    local rows = visible_button_count > 0 and math.ceil(visible_button_count / 6) or 0
+    -- beta.9 restores the compact single-row control strip. The candidate
+    -- pool may be larger, but this view renders at most eight entries.
+    local visible_button_count = math.min(8, #buttons)
+    local columns = math.max(1, visible_button_count)
+    local rows = visible_button_count > 0 and 1 or 0
+    local has_button_detail=false
+    for index,entry in ipairs(buttons) do
+        if index>visible_button_count then break end
+        if tostring(entry.detail or "")~="" then has_button_detail=true; break end
+    end
     local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
     local warmth=frontlight and type(frontlight.warmth)=="table" and frontlight.warmth or nil
     if frontlight then
@@ -390,7 +395,9 @@ function QuickPanelWidget:_build()
     local frontlight_h=frontlight and UiScale.dp(warmth and 142 or 94,warmth and 126 or 84,warmth and 182 or 122) or 0
 
     local title_h = UiScale.dp(52, 47, 70)
-    local button_h = UiScale.dp(98, 90, 128)
+    -- No permanently-reserved third line: the whole row only grows when at
+    -- least one visible control has a short runtime status.
+    local button_h = has_button_detail and UiScale.dp(88, 82, 112) or UiScale.dp(70, 66, 90)
     local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(34, 30, 46) or 0
 
     self.panel_h = margin * 2 + title_h + line + gap * 2
@@ -463,15 +470,20 @@ function QuickPanelWidget:_build()
     y = y + line + gap
 
     if rows > 0 then
-        local button_w = math.floor((sw - margin * 2 - button_gap * (columns - 1)) / columns)
+        local available_w=math.max(columns,sw-margin*2-button_gap*(columns-1))
+        local base_w=math.floor(available_w/columns)
+        local remainder=available_w-base_w*columns
+        local x=margin
         for index, entry in ipairs(buttons) do
-            if index > 12 then break end
-            local row = math.floor((index - 1) / columns)
-            local col = (index - 1) % columns
-            self:_add(children, margin + col * (button_w + button_gap), y + row * (button_h + gap),
-                panel_button(entry, button_w, button_h, function(action) self:_close(action) end, true, self, index))
+            if index > visible_button_count then break end
+            -- Distribute remainder pixels across the leading cells so the row
+            -- reaches both margins exactly for 3/5/7/8-column layouts.
+            local button_w=base_w+(index<=remainder and 1 or 0)
+            self:_add(children,x,y,
+                panel_button(entry,button_w,button_h,function(action) self:_close(action) end,true,self,index,has_button_detail))
+            x=x+button_w+button_gap
         end
-        y = y + rows * button_h + math.max(0, rows - 1) * gap + gap
+        y = y + button_h + gap
     end
 
     if frontlight_h > 0 and y + line + gap + frontlight_h <= self.panel_h then
@@ -573,9 +585,13 @@ local function panel_signature(opts)
         tostring(type(opts.frontlight)=="table"),
         tostring(type(opts.frontlight)=="table" and type(opts.frontlight.warmth)=="table"),
         tostring(type(opts.customize_callback)=="function")}
-    for _,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
+    local any_detail=false
+    for index,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
+        if index>8 then break end
+        if tostring(entry.detail or "")~="" then any_detail=true end
         parts[#parts+1]=tostring(entry.icon_key or entry.icon or "")..":"..tostring(entry.label or "")
     end
+    parts[#parts+1]="detail:"..tostring(any_detail)
     return table.concat(parts,"|")
 end
 
@@ -595,6 +611,7 @@ function QuickPanelWidget:updateFromOptions(opts)
     update_text(self._text_refs.battery,opts.battery_text or "未知")
     update_text(self._text_refs.status,opts.status_text or "")
     for index,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
+        if index>8 then break end
         local refs=self._button_refs[index] or {}
         update_text(refs.label,entry.label or entry.text or "")
         update_text(refs.detail,(entry.detail and entry.detail~="") and entry.detail or " ")

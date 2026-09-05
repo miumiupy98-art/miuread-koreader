@@ -24,7 +24,7 @@ function M.home(plugin)
         {text=plugin:_sync_menu_text(),sub_item_table_func=function() return PluginSettings.sync(plugin) end},
         {text="公众号",callback=plugin:safe("mp-shelf",function() plugin:show_mp_shelf(false) end)},
         {text="插件与扩展",post_text="安装 更新与插件管理",sub_item_table_func=function() return PluginSettings.plugins_extensions(plugin) end},
-        {text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(plugin) end},
+        {text="系统维护",post_text="诊断 修复与清理",sub_item_table_func=function() return PluginSettings.system_maintenance(plugin) end},
         {text="觅阅设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
     }
 end
@@ -41,7 +41,7 @@ function M.reader(plugin)
             {text="当前文章",sub_item_table_func=function() return plugin:current_mp_article_menu(mp_context) end},
             {text=plugin:_download_menu_text(),callback=function() plugin:show_downloads() end},
             {text="插件与扩展",post_text="安装 更新与插件管理",sub_item_table_func=function() return PluginSettings.plugins_extensions(plugin) end},
-            {text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(plugin) end},
+            {text="系统维护",post_text="诊断 修复与清理",sub_item_table_func=function() return PluginSettings.system_maintenance(plugin) end},
             {text="觅阅设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
         }
     end
@@ -52,7 +52,7 @@ function M.reader(plugin)
         {text=plugin:_download_menu_text(),callback=function() plugin:show_downloads() end},
         {text="评论与想法",sub_item_table_func=function() return comment_and_thought_menu(plugin) end},
         {text="插件与扩展",post_text="安装 更新与插件管理",sub_item_table_func=function() return PluginSettings.plugins_extensions(plugin) end},
-        {text="系统维护",post_text="诊断 修复 清理与更新",sub_item_table_func=function() return PluginSettings.system_maintenance(plugin) end},
+        {text="系统维护",post_text="诊断 修复与清理",sub_item_table_func=function() return PluginSettings.system_maintenance(plugin) end},
         {text="觅阅设置",sub_item_table_func=function() return PluginSettings.menu(plugin) end},
     }
 end

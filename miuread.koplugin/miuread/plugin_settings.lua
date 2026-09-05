@@ -141,6 +141,7 @@ function M.update_about(plugin)
         {text="检查频率",post_text=plugin:_update_interval_label(update.interval),sub_item_table_func=function() return plugin:update_frequency_menu() end},
         {text="更新完成后",post_text=restart_label,sub_item_table_func=function() return plugin:update_restart_menu() end},
         {text="更新通道",post_text=channel_label,sub_item_table_func=function() return plugin:update_channel_menu() end},
+        {text="检查"..channel_label.."更新",post_text="当前："..channel_label,callback=plugin:safe("update",function() plugin:check_update(false) end)},
         {text="当前版本",post_text=tostring(plugin.version),enabled=false},
         {text="关于觅阅",callback=plugin:safe("about",function() plugin:show_about() end)},
         {text="许可证",post_text="AGPL-3.0-only",enabled=false},
@@ -175,7 +176,6 @@ function M.system_maintenance(plugin)
         {text="重建书架索引",callback=function() plugin.store:reload(); plugin.store:prune_missing_files(); plugin:_show_miuread_home_now(false,true,true,"full") end},
         {text="检查下载完整性",callback=function() plugin:scan_downloaded_books_for_integrity_repair() end},
         {text="存储清理",post_text="临时文件、预下载与失效封面",callback=function() plugin:show_download_cleanup_dialog() end},
-        {text="检查觅阅更新",post_text=plugin:_update_channel_label(plugin:_update_channel()),callback=plugin:safe("update",function() plugin:check_update(false) end)},
     }
 end
 
