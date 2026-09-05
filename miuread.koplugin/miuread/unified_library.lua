@@ -163,6 +163,7 @@ local function merge_prefer(existing, incoming)
         "title","author","cover","cover_path","description","intro","summary","format",
         "bookId","book_id","unified_source_id","progress","last_opened","added_at",
         "source_state","external_payload","external_source",
+        "archiveName","archiveNames","archiveNamesList","archiveKeys","inArchive",
     }
     for _, key in ipairs(fields) do
         if (out[key] == nil or out[key] == "" or out[key] == 0) and other[key] ~= nil and other[key] ~= "" then out[key] = other[key] end
@@ -418,7 +419,7 @@ function M.build(opts)
 
     for _, row in ipairs(type(opts.generated) == "table" and opts.generated or {}) do
         local id = trim(row.bookId or row.book_id)
-        local in_remote_shelf=weread_state~="logged_out" and (account_ids[id] == true or row.in_account_shelf == true)
+        local in_remote_shelf=weread_state~="logged_out" and account_ids[id] == true
         local item = decorate(row, {source="weread", in_shelf=in_remote_shelf, local_available=true, source_state=weread_state})
         put(map, order, item)
     end

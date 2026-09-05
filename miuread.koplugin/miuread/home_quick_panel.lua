@@ -372,11 +372,11 @@ function QuickPanelWidget:_build()
     local buttons = type(self.opts.buttons) == "table" and self.opts.buttons or {}
     local line = UiScale.line("thin")
 
-    -- The pull-down shortcut strip uses the actual visible count (up to eight).
-    -- Hidden/unsupported controls therefore never leave dead space on the right.
-    local visible_button_count = math.min(8, #buttons)
-    local columns = math.max(1, visible_button_count)
-    local rows = visible_button_count > 0 and 1 or 0
+    -- Up to twelve controls are displayed as at most six columns by two rows.
+    -- Hidden/unsupported controls never consume a slot.
+    local visible_button_count = math.min(12, #buttons)
+    local columns = math.max(1, math.min(6, visible_button_count))
+    local rows = visible_button_count > 0 and math.ceil(visible_button_count / 6) or 0
     local frontlight=type(self.opts.frontlight)=="table" and self.opts.frontlight or nil
     local warmth=frontlight and type(frontlight.warmth)=="table" and frontlight.warmth or nil
     if frontlight then
@@ -411,9 +411,11 @@ function QuickPanelWidget:_build()
     local children = OverlapGroup:new{dimen = self.dimen:copy(), allow_mirroring = false}
     self:_add(children, 0, 0, fixed_frame(sw, self.panel_h, {background = Blitbuffer.COLOR_WHITE}))
 
-    local close_w = UiScale.dp(92, 80, 120)
-    local battery_w = UiScale.dp(98, 84, 126)
-    local time_w = math.max(1, sw - margin * 2 - close_w - battery_w - gap * 2)
+    local close_w = UiScale.dp(82, 72, 108)
+    local custom_w = type(self.opts.customize_callback)=="function" and UiScale.dp(86, 74, 112) or 0
+    local battery_w = UiScale.dp(92, 80, 120)
+    local header_gaps=custom_w>0 and 3 or 2
+    local time_w = math.max(1, sw - margin * 2 - close_w - custom_w - battery_w - gap * header_gaps)
 
     local time_box=Ui.text(tostring(self.opts.time_text or os.date("%H:%M")), time_w, title_h,
         face("cfont", 20.5, 28.5), {bold = true, halign = "left"})
@@ -436,11 +438,21 @@ function QuickPanelWidget:_build()
             },
         },
         HorizontalSpan:new{width = gap},
-        tappable(close_w, title_h,
-            fixed_frame(close_w, title_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
-                Ui.text("收起 ↑", close_w, title_h, face("smallinfofont", 11.8, 16), {bold = true})),
-            self:_guarded(function() self:_close() end)),
     }
+    if custom_w>0 then
+        title_row[#title_row+1]=tappable(custom_w,title_h,
+            fixed_frame(custom_w,title_h,{bordersize=0,background=Blitbuffer.COLOR_WHITE},
+                Ui.text("自定义",custom_w,title_h,face("smallinfofont",11.2,15.2),{bold=true})),
+            self:_guarded(function(anchor)
+                local callback=self.opts.customize_callback
+                self:_close(function() if callback then callback(anchor) end end)
+            end))
+        title_row[#title_row+1]=HorizontalSpan:new{width=gap}
+    end
+    title_row[#title_row+1]=tappable(close_w, title_h,
+        fixed_frame(close_w, title_h, {bordersize = 0, background = Blitbuffer.COLOR_WHITE},
+            Ui.text("收起 ↑", close_w, title_h, face("smallinfofont", 11.8, 16), {bold = true})),
+        self:_guarded(function() self:_close() end))
     self:_add(children, margin, margin, title_row)
 
     local y = margin + title_h + gap
@@ -453,7 +465,7 @@ function QuickPanelWidget:_build()
     if rows > 0 then
         local button_w = math.floor((sw - margin * 2 - button_gap * (columns - 1)) / columns)
         for index, entry in ipairs(buttons) do
-            if index > 8 then break end
+            if index > 12 then break end
             local row = math.floor((index - 1) / columns)
             local col = (index - 1) % columns
             self:_add(children, margin + col * (button_w + button_gap), y + row * (button_h + gap),
@@ -559,7 +571,8 @@ local function panel_signature(opts)
         tostring(UiScale.getFontName and UiScale.getFontName() or ""),
         tostring((opts.status_text and opts.status_text~="") and 1 or 0),
         tostring(type(opts.frontlight)=="table"),
-        tostring(type(opts.frontlight)=="table" and type(opts.frontlight.warmth)=="table")}
+        tostring(type(opts.frontlight)=="table" and type(opts.frontlight.warmth)=="table"),
+        tostring(type(opts.customize_callback)=="function")}
     for _,entry in ipairs(type(opts.buttons)=="table" and opts.buttons or {}) do
         parts[#parts+1]=tostring(entry.icon_key or entry.icon or "")..":"..tostring(entry.label or "")
     end

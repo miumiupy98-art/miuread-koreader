@@ -38,6 +38,11 @@ local function first_number(...)
     return nil
 end
 
+local function archive_source_present(data)
+    data=type(data)=="table" and data or {}
+    return data.archive~=nil or data.archives~=nil or data.bookArchives~=nil or data.archiveList~=nil
+end
+
 local function archive_entries(data)
     local source=data.archive or data.archives or data.bookArchives or data.archiveList or {}
     if type(source)~="table" then return {} end
@@ -56,43 +61,61 @@ local function archive_entries(data)
     return out
 end
 
-local function build_archive_map(data)
+local function archive_stable_id(archive)
+    archive=type(archive)=="table" and archive or {}
+    for _,field in ipairs({"archiveId","archive_id","groupId","group_id","id"}) do
+        local value=archive[field]
+        if value~=nil and tostring(value)~="" then return tostring(value) end
+    end
+    return nil
+end
+
+local function archive_identity(archive,index)
+    local name=U.trim(tostring(archive.name or archive.title or archive.archiveName or "分组"))
+    if name=="" then name="分组 "..tostring(index or "") end
+    local stable_id=archive_stable_id(archive)
+    return stable_id and ("id:"..stable_id) or ("name:"..name),name,stable_id~=nil
+end
+
+local function archive_ids(archive)
+    local ids=archive.bookIds or archive.bookIdList or archive.books or archive.items or {}
+    if type(ids)=="string" then
+        local parsed={}
+        for id in ids:gmatch("[^,%s]+") do parsed[#parsed+1]=id end
+        ids=parsed
+    end
+    return type(ids)=="table" and ids or {}
+end
+
+local function build_archive_snapshot(data)
     local map={}
+    local groups={updated_at=os.time(),authoritative=archive_source_present(data),list={},book_groups={}}
     for archive_index,archive in ipairs(archive_entries(data or {})) do
-        local ids=archive.bookIds or archive.bookIdList or archive.books or archive.items or {}
-        if type(ids)=="string" then
-            local parsed={}
-            for id in ids:gmatch("[^,%s]+") do parsed[#parsed+1]=id end
-            ids=parsed
-        end
-        if type(ids)=="table" then
-            local archive_name=tostring(archive.name or archive.title or archive.archiveName or "分组")
-            for item_index,item in ipairs(ids) do
-                local id
-                if type(item)=="table" then
-                    id=item.bookId or item.book_id or item.id
-                else
-                    id=item
+        local group_key,archive_name,stable=archive_identity(archive,archive_index)
+        local member_count=0
+        for item_index,item in ipairs(archive_ids(archive)) do
+            local id=type(item)=="table" and (item.bookId or item.book_id or item.id) or item
+            id=tostring(id or "")
+            if id~="" then
+                member_count=member_count+1
+                local current=map[id]
+                if not current then
+                    current={archiveIndex=archive_index,archiveItemOrder=item_index,archiveName=archive_name,
+                        archiveNames={},archiveKeys={}}
+                    map[id]=current
                 end
-                id=tostring(id or "")
-                if id~="" then
-                    local current=map[id]
-                    if not current then
-                        current={
-                            archiveIndex=archive_index,
-                            archiveItemOrder=item_index,
-                            archiveName=archive_name,
-                            archiveNames={},
-                        }
-                        map[id]=current
-                    end
-                    current.archiveNames[#current.archiveNames+1]=archive_name
-                end
+                current.archiveNames[#current.archiveNames+1]=archive_name
+                current.archiveKeys[#current.archiveKeys+1]=group_key
+                local relation=groups.book_groups[id]
+                if not relation then relation={names={},keys={}}; groups.book_groups[id]=relation end
+                relation.names[#relation.names+1]=archive_name
+                relation.keys[#relation.keys+1]=group_key
             end
         end
+        groups.list[#groups.list+1]={key=group_key,name=archive_name,stable=stable,member_count=member_count}
     end
     for _,row in pairs(map) do row.archiveNamesText=table.concat(row.archiveNames,"、") end
-    return map
+    return map,groups
 end
 
 local function book(row,raw_index,archive_map)
@@ -123,15 +146,14 @@ local function book(row,raw_index,archive_map)
         rawIndex=tonumber(raw_index) or 0,
         explicitOrder=explicit_order,
         cloudOrder=tonumber(row.cloudOrder or row.cloud_order),
-        -- Keep the cloud reading timestamp independent from the book-content
-        -- update timestamp. The old, proven shelf order uses readUpdateTime;
-        -- updateTime must never be used as its fallback.
         readUpdateTime=tonumber(row.readUpdateTime or b.readUpdateTime or 0) or 0,
         cloudUpdatedAt=tonumber(row.readUpdateTime or b.readUpdateTime or 0) or 0,
         archiveIndex=archive and archive.archiveIndex or nil,
         archiveItemOrder=archive and archive.archiveItemOrder or nil,
         archiveName=archive and archive.archiveName or nil,
         archiveNames=archive and archive.archiveNamesText or nil,
+        archiveNamesList=archive and U.copy(archive.archiveNames) or {},
+        archiveKeys=archive and U.copy(archive.archiveKeys) or {},
         inArchive=archive~=nil,
     }
 end
@@ -194,46 +216,197 @@ local function order_cloud_rows(rows)
     return rows
 end
 
-local function archive_allowed(selected,entry)
-    if not entry then return false end
-    for _,name in ipairs(entry.archiveNames or {}) do
-        if selected[name] then return true end
+local function table_keys_sorted(t)
+    local out={}
+    for key,value in pairs(type(t)=="table" and t or {}) do
+        if value==true then out[#out+1]=tostring(key) end
     end
+    table.sort(out)
+    return out
+end
+
+local function current_filter(store)
+    local prefs=store and store.preferences and store:preferences() or {}
+    local filter=type(prefs.shelf_filter)=="table" and prefs.shelf_filter or {}
+    return {
+        enabled=filter.enabled==true,
+        archives=type(filter.archives)=="table" and filter.archives or {},
+        archive_keys=type(filter.archive_keys)=="table" and filter.archive_keys or {},
+    },prefs
+end
+
+local function filter_fingerprint(filter)
+    if filter.enabled~=true then return "all" end
+    return "selected|"..table.concat(table_keys_sorted(filter.archive_keys),",").."|"..table.concat(table_keys_sorted(filter.archives),",")
+end
+
+local function row_group_names(row)
+    local out={}
+    if type(row.archiveNamesList)=="table" then
+        for _,name in ipairs(row.archiveNamesList) do if tostring(name or "")~="" then out[#out+1]=tostring(name) end end
+    elseif tostring(row.archiveNames or "")~="" then
+        for name in tostring(row.archiveNames):gmatch("[^、]+") do if name~="" then out[#out+1]=name end end
+    elseif tostring(row.archiveName or "")~="" then out[#out+1]=tostring(row.archiveName) end
+    return out
+end
+
+local function row_group_keys(row)
+    local out={}
+    if type(row.archiveKeys)=="table" then for _,key in ipairs(row.archiveKeys) do if tostring(key or "")~="" then out[#out+1]=tostring(key) end end end
+    return out
+end
+
+local function row_allowed(filter,row)
+    if filter.enabled~=true then return true end
+    for _,key in ipairs(row_group_keys(row)) do if filter.archive_keys[key]==true then return true end end
+    for _,name in ipairs(row_group_names(row)) do if filter.archives[name]==true then return true end end
     return false
 end
 
-function Library:_shelf_filter_selection(data)
-    local names={}
-    for _,archive in ipairs(archive_entries(data or {})) do
-        local name=tostring(archive.name or archive.title or archive.archiveName or "分组")
-        if name~="" then names[#names+1]=name end
+local function apply_filter(filter,rows)
+    if filter.enabled~=true then return U.copy(rows or {}),0 end
+    local out,filtered={},0
+    for _,row in ipairs(type(rows)=="table" and rows or {}) do
+        if row_allowed(filter,row) then out[#out+1]=U.copy(row) else filtered=filtered+1 end
     end
-    if self.store and self.store.set_deferred and #names>0 then
-        pcall(self.store.set_deferred,self.store,"shelf_archive_names",names)
-    end
-    if self.load_all_once then
-        self.load_all_once=nil
-        return nil
-    end
-    if not (self.store and self.store.preferences) then return nil end
-    local ok,prefs=pcall(self.store.preferences,self.store)
-    if not ok or type(prefs)~="table" then return nil end
-    local filter=type(prefs.shelf_filter)=="table" and prefs.shelf_filter or {}
-    local selected=type(filter.archives)=="table" and filter.archives or {}
-    if filter.enabled~=true or next(selected)==nil then return nil end
-    return selected
+    return out,filtered
 end
 
-function Library:normalize(data)
+local function group_member_sets(groups)
+    groups=type(groups)=="table" and groups or {}
+    local by_key={}
+    for _,group in ipairs(type(groups.list)=="table" and groups.list or {}) do
+        by_key[tostring(group.key or "")]={}
+    end
+    for book_id,relation in pairs(type(groups.book_groups)=="table" and groups.book_groups or {}) do
+        relation=type(relation)=="table" and relation or {}
+        for _,key in ipairs(type(relation.keys)=="table" and relation.keys or {}) do
+            key=tostring(key or "")
+            if key~="" then
+                by_key[key]=by_key[key] or {}
+                by_key[key][tostring(book_id)]=true
+            end
+        end
+        -- Legacy/name-only snapshots may not carry keys. Reconstruct them
+        -- conservatively from the display name.
+        for _,name in ipairs(type(relation.names)=="table" and relation.names or {}) do
+            name=tostring(name or "")
+            local key="name:"..name
+            if name~="" and by_key[key]~=nil then by_key[key][tostring(book_id)]=true end
+        end
+    end
+    return by_key
+end
+
+local function set_similarity(a,b)
+    a=type(a)=="table" and a or {}; b=type(b)=="table" and b or {}
+    local intersection,union=0,0
+    local seen={}
+    for id in pairs(a) do
+        seen[id]=true; union=union+1
+        if b[id] then intersection=intersection+1 end
+    end
+    for id in pairs(b) do if not seen[id] then union=union+1 end end
+    if union==0 then return 0,intersection,union end
+    return intersection/union,intersection,union
+end
+
+function Library:_reconcile_group_preferences(groups)
+    groups=type(groups)=="table" and groups or {}
+    if groups.authoritative~=true or not self.store then return false end
+    local filter,prefs=current_filter(self.store)
+    prefs.shelf_filter=type(prefs.shelf_filter)=="table" and prefs.shelf_filter or {}
+    prefs.shelf_filter.archives=type(prefs.shelf_filter.archives)=="table" and prefs.shelf_filter.archives or {}
+    prefs.shelf_filter.archive_keys=type(prefs.shelf_filter.archive_keys)=="table" and prefs.shelf_filter.archive_keys or {}
+    local by_name,by_key={},{}
+    for _,group in ipairs(groups.list or {}) do
+        by_name[tostring(group.name or "")]=group
+        by_key[tostring(group.key or "")]=group
+    end
+    local new_names,new_keys={},{}
+    if filter.enabled==true then
+        -- Stable keys survive a rename directly. Name-only groups are migrated
+        -- only when one disappeared selected group has exactly one highly
+        -- overlapping new candidate; ambiguous cases remain fail-closed.
+        for key,value in pairs(filter.archive_keys) do
+            if value==true and by_key[tostring(key)] then
+                local group=by_key[tostring(key)]
+                new_keys[tostring(group.key)]=true
+                new_names[tostring(group.name)]=true
+            end
+        end
+        local unresolved={}
+        for name,value in pairs(filter.archives) do
+            if value==true and by_name[tostring(name)] then
+                local group=by_name[tostring(name)]
+                new_names[tostring(group.name)]=true
+                new_keys[tostring(group.key)]=true
+            elseif value==true then
+                unresolved[#unresolved+1]=tostring(name)
+            end
+        end
+
+        if #unresolved>0 then
+            local previous_cache=self.store:shelf_cache()
+            local previous=type(previous_cache.groups)=="table" and previous_cache.groups or {}
+            local old_by_name={}
+            for _,group in ipairs(type(previous.list)=="table" and previous.list or {}) do
+                old_by_name[tostring(group.name or "")]=group
+            end
+            local old_members,new_members=group_member_sets(previous),group_member_sets(groups)
+            local claimed={}
+            for _,old_name in ipairs(unresolved) do
+                local old_group=old_by_name[old_name]
+                -- Stable IDs that disappeared are deletions, not rename guesses.
+                if old_group and old_group.stable~=true then
+                    local old_key=tostring(old_group.key or ("name:"..old_name))
+                    local candidates={}
+                    for _,candidate in ipairs(groups.list or {}) do
+                        local candidate_key=tostring(candidate.key or "")
+                        local candidate_name=tostring(candidate.name or "")
+                        if candidate.stable~=true and not claimed[candidate_key]
+                            and not old_by_name[candidate_name] then
+                            local score,common=set_similarity(old_members[old_key],new_members[candidate_key])
+                            if common>=2 and score>=0.80 then
+                                candidates[#candidates+1]={group=candidate,score=score}
+                            end
+                        end
+                    end
+                    table.sort(candidates,function(a,b) return a.score>b.score end)
+                    if #candidates==1 or (#candidates>1 and candidates[1].score>candidates[2].score+0.10) then
+                        local chosen=candidates[1] and candidates[1].group or nil
+                        if chosen then
+                            local chosen_key,chosen_name=tostring(chosen.key or ""),tostring(chosen.name or "")
+                            claimed[chosen_key]=true
+                            new_keys[chosen_key]=true
+                            new_names[chosen_name]=true
+                            logger.info("[MiuRead][ShelfGroups] conservative rename inferred",
+                                "from=",old_name,"to=",chosen_name,"score=",string.format("%.2f",candidates[1].score))
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local changed=filter_fingerprint(filter)~=filter_fingerprint{enabled=filter.enabled,archives=new_names,archive_keys=new_keys}
+    if changed then
+        prefs.shelf_filter.archives=new_names
+        prefs.shelf_filter.archive_keys=new_keys
+        self.store:save_preferences(prefs)
+        logger.info("[MiuRead][ShelfGroups] selection reconciled",
+            "enabled=",tostring(filter.enabled==true),"groups=",tostring(#table_keys_sorted(new_names)))
+    end
+    return changed
+end
+
+function Library:_normalize_full(data)
     data=type(data)=="table" and data or {}
     local books,mp={},{}
     local seen_books,seen_mp={},{}
-    local archive_map=build_archive_map(data)
-    local selected_archives=self:_shelf_filter_selection(data)
+    local archive_map,groups=build_archive_snapshot(data)
     local src=data.books or data.bookList or data.updated or {}
     if type(src)~="table" then src={} end
     local raw_index=0
-    local filtered_out=0
     for _,r in ipairs(src) do
         raw_index=raw_index+1
         local b=book(r,raw_index,archive_map)
@@ -241,218 +414,176 @@ function Library:normalize(data)
             if Protocol.is_mp_account(b.bookId) then
                 if not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
             elseif not Protocol.is_mp(b.bookId) and not seen_books[b.bookId] then
-                if selected_archives==nil or archive_allowed(selected_archives,archive_map[b.bookId]) then
-                    books[#books+1]=b
-                    seen_books[b.bookId]=true
-                else
-                    filtered_out=filtered_out+1
-                end
+                books[#books+1]=b; seen_books[b.bookId]=true
             end
         end
     end
-    if selected_archives~=nil then
-        self.last_shelf_filter={kept=#books,filtered=filtered_out}
-        logger.info("[MiuRead][ShelfFilter] applied","kept=",tostring(#books),"filtered=",tostring(filtered_out))
-    else
-        self.last_shelf_filter=nil
-    end
-    local extras={data.mp,data.mpBook,data.officialAccounts}
-    for _,x in ipairs(extras) do
+    for _,x in ipairs({data.mp,data.mpBook,data.officialAccounts}) do
         if type(x)=="table" then
-            if x[1] then
-                for _,r in ipairs(x) do
-                    raw_index=raw_index+1
-                    local b=book(r,raw_index,archive_map)
-                    if Protocol.is_mp_account(b.bookId) and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
-                end
-            else
+            local rows=x[1] and x or {x}
+            for _,r in ipairs(rows) do
                 raw_index=raw_index+1
-                local b=book(x,raw_index,archive_map)
+                local b=book(r,raw_index,archive_map)
                 if Protocol.is_mp_account(b.bookId) and not seen_mp[b.bookId] then mp[#mp+1]=b; seen_mp[b.bookId]=true end
             end
         end
     end
-    order_cloud_rows(books)
-    order_cloud_rows(mp)
+    order_cloud_rows(books); order_cloud_rows(mp)
+    return books,mp,groups
+end
+
+function Library:normalize(data)
+    local raw_books,mp,groups=self:_normalize_full(data)
+    self:_reconcile_group_preferences(groups)
+    local filter=current_filter(self.store)
+    local books,filtered=apply_filter(filter,raw_books)
+    if filter.enabled==true then
+        self.last_shelf_filter={kept=#books,filtered=filtered}
+        logger.info("[MiuRead][ShelfFilter] applied","kept=",tostring(#books),"filtered=",tostring(filtered))
+    else self.last_shelf_filter=nil end
     return books,mp
 end
 
-local function shelf_rows_by_id(cache)
-    local out={}
-    cache=type(cache)=="table" and cache or {}
-    for _,group in ipairs({cache.books or {},cache.mp or {}}) do
-        for _,row in ipairs(group) do
-            local id=tostring(type(row)=="table" and (row.bookId or row.book_id) or "")
-            if id~="" then out[id]=row end
-        end
+local function fallback_groups(cache,store)
+    local list,seen,book_groups={}, {}, {}
+    local function add_group(name,key)
+        name=U.trim(tostring(name or "")); if name=="" then return end
+        key=tostring(key or ("name:"..name))
+        if not seen[key] then seen[key]=true; list[#list+1]={key=key,name=name,stable=key:sub(1,3)=="id:",member_count=0} end
     end
-    return out
+    for _,name in ipairs(store and store.get and store:get("shelf_archive_names",{}) or {}) do add_group(name) end
+    for _,row in ipairs(type(cache.raw_books)=="table" and cache.raw_books or (cache.books or {})) do
+        local id=tostring(row.bookId or row.book_id or "")
+        local names,keys=row_group_names(row),row_group_keys(row)
+        if id~="" and (#names>0 or #keys>0) then book_groups[id]={names=U.copy(names),keys=U.copy(keys)} end
+        for i,name in ipairs(names) do add_group(name,keys[i]) end
+    end
+    table.sort(list,function(a,b) return tostring(a.name)<tostring(b.name) end)
+    return {updated_at=tonumber(cache.updated_at) or 0,authoritative=false,list=list,book_groups=book_groups}
 end
 
-local function id_set(values)
-    local out={}
-    for _,value in ipairs(type(values)=="table" and values or {}) do
-        local id=tostring(value or "")
-        if id~="" then out[id]=true end
+function Library:group_snapshot()
+    local cache=self.store:shelf_cache()
+    local groups=type(cache.groups)=="table" and cache.groups or nil
+    if groups and type(groups.list)=="table" and (#groups.list>0 or groups.authoritative==true) then return U.copy(groups) end
+    return fallback_groups(cache,self.store)
+end
+
+local function attach_group_snapshot(rows,groups)
+    groups=type(groups)=="table" and groups or {}
+    local relations=type(groups.book_groups)=="table" and groups.book_groups or {}
+    for _,row in ipairs(type(rows)=="table" and rows or {}) do
+        local id=tostring(row.bookId or row.book_id or "")
+        local relation=type(relations[id])=="table" and relations[id] or nil
+        if relation then
+            row.archiveNamesList=U.copy(type(relation.names)=="table" and relation.names or {})
+            row.archiveKeys=U.copy(type(relation.keys)=="table" and relation.keys or {})
+            row.archiveName=row.archiveNamesList[1]
+            row.archiveNames=#row.archiveNamesList>0 and table.concat(row.archiveNamesList,"、") or nil
+            row.inArchive=#row.archiveNamesList>0 or #row.archiveKeys>0
+        end
     end
-    return out
+    return rows
 end
 
 function Library:_apply_stream_response(data)
     data=type(data)=="table" and data or {}
     local stream=type(data._miuread_stream)=="table" and data._miuread_stream or nil
-    if stream and stream.keep_cache==true then
-        local previous=self.store:shelf_cache() or {}
-        local books=type(previous.books)=="table" and previous.books or {}
-        local mp=type(previous.mp)=="table" and previous.mp or {}
-        logger.info("[MiuRead][ShelfStream] cached shelf retained",
-            "reason=",tostring(stream.reason or "stream_unavailable"),
+    -- beta.4 makes Home navigation fully local. A streamed/partial response can
+    -- no longer replace the authoritative shelf snapshot; retain the last valid
+    -- cache and wait for the next full refresh instead.
+    if stream and (stream.keep_cache==true or stream.enabled==true) then
+        local books,mp=self:cached()
+        logger.info("[MiuRead][ShelfStream] partial response ignored",
+            "reason=",tostring(stream.reason or "local_navigation_policy"),
             "books=",tostring(#books),"mp=",tostring(#mp))
         return books,mp,false,true
     end
-    if not (stream and stream.enabled==true and type(stream.ids)=="table" and #stream.ids>0) then
-        local books,mp=self:normalize(data)
-        self.store:save_shelf_cache({
-            books=books,mp=mp,updated_at=os.time(),
-            stream={enabled=false,ids={},hydrated_ids={},total=#books+#mp,source=stream and stream.source or "full"},
-        })
-        return books,mp,false
-    end
-
-    local hydrated_books,hydrated_mp=self:normalize(data)
-    local hydrated={}
-    for _,row in ipairs(hydrated_books) do hydrated[tostring(row.bookId or "")]=row end
-    for _,row in ipairs(hydrated_mp) do hydrated[tostring(row.bookId or "")]=row end
-
-    local previous=self.store:shelf_cache()
-    local cached=shelf_rows_by_id(previous)
-    local loaded=id_set(stream.hydrated_ids)
-    local books,mp={},{}
-    for index,value in ipairs(stream.ids) do
-        local id=tostring(value or "")
-        if id~="" then
-            local row=hydrated[id] and U.copy(hydrated[id]) or (cached[id] and U.copy(cached[id]) or nil)
-            if not row then
-                row={
-                    bookId=id,title="正在加载…",author="",cover=nil,progress=0,
-                    _stream_placeholder=true,
-                }
-            else
-                row._stream_placeholder=nil
-            end
-            row.bookId=id
-            row.rawIndex=index
-            row.cloudOrder=index
-            if loaded[id] then row._stream_placeholder=nil end
-            if Protocol.is_mp_account(id) then mp[#mp+1]=row else books[#books+1]=row end
+    local raw_books,mp,groups=self:_normalize_full(data)
+    local filter=current_filter(self.store)
+    if groups.authoritative~=true then
+        local previous_cache=self.store:shelf_cache()
+        local previous_groups=type(previous_cache.groups)=="table" and previous_cache.groups or nil
+        if filter.enabled==true then
+            -- A successful book response without archive metadata is not a
+            -- successful group refresh. Keep the last valid scoped snapshot.
+            local books,cached_mp=self:cached()
+            logger.warn("[MiuRead][ShelfGroups] incomplete group response retained cache",
+                "books=",tostring(#books),"mp=",tostring(#cached_mp))
+            return books,cached_mp,false,true
+        end
+        -- Full-account mode may accept fresh book metadata while keeping the
+        -- last known group relations for future local selected-group switches.
+        if previous_groups and type(previous_groups.list)=="table"
+            and (#previous_groups.list>0 or previous_groups.authoritative==true) then
+            groups=U.copy(previous_groups)
+            attach_group_snapshot(raw_books,groups)
         end
     end
-    -- onlyBookid responses are optimized for books and may omit the separate
-    -- public-account directory. Preserve an existing MP cache unless the index
-    -- explicitly supplied MP information; this avoids making the MP tab vanish
-    -- during an otherwise successful streamed book refresh.
-    local stream_has_mp=false
-    for _,id in ipairs(stream.ids or {}) do
-        if Protocol.is_mp_account(tostring(id or "")) then stream_has_mp=true; break end
-    end
-    if not stream_has_mp and data.mp==nil then
-        local existing={}
-        for _,row in ipairs(mp) do existing[tostring(row.bookId or "")]=true end
-        for _,row in ipairs(previous.mp or {}) do
-            local id=tostring(row.bookId or row.book_id or "")
-            if id~="" and not existing[id] then mp[#mp+1]=U.copy(row); existing[id]=true end
-        end
-    end
-    local stream_state={
-        enabled=true,
-        ids=U.copy(stream.ids),
-        hydrated_ids=U.copy(stream.hydrated_ids or {}),
-        total=tonumber(stream.total) or #stream.ids,
-        has_more=stream.has_more==true,
-        source=tostring(stream.source or "web_stream"),
-        updated_at=tonumber(stream.updated_at) or os.time(),
-    }
-    self.store:save_shelf_cache({books=books,mp=mp,updated_at=os.time(),stream=stream_state})
-    logger.info("[MiuRead][ShelfStream] index applied",
-        "total=",tostring(#stream.ids),"hydrated=",tostring(#(stream.hydrated_ids or {})),
-        "cached_reused=",tostring(#stream.ids-#(stream.hydrated_ids or {})))
-    return books,mp,true
+    self:_reconcile_group_preferences(groups)
+    filter=current_filter(self.store)
+    local books,filtered=apply_filter(filter,raw_books)
+    self.last_shelf_filter=filter.enabled==true and {kept=#books,filtered=filtered} or nil
+    self.store:save_shelf_cache({
+        raw_books=raw_books,raw_mp=U.copy(mp),books=books,mp=mp,groups=groups,updated_at=os.time(),
+        effective_scope={mode=filter.enabled and "selected" or "all",fingerprint=filter_fingerprint(filter),updated_at=os.time()},
+        stream={enabled=false,ids={},hydrated_ids={},total=#raw_books+#mp,source="full",updated_at=os.time()},
+    })
+    logger.info("[MiuRead][ShelfGroups] full snapshot saved",
+        "raw=",tostring(#raw_books),"effective=",tostring(#books),"groups=",tostring(#(groups.list or {})),
+        "authoritative=",tostring(groups.authoritative==true))
+    return books,mp,false,false
 end
 
 function Library:merge_stream_batch(data,requested_ids)
-    local cache=self.store:shelf_cache()
-    local stream=type(cache.stream)=="table" and cache.stream or {}
-    if stream.enabled~=true then return false end
-    local books,mp=self:normalize(type(data)=="table" and data or {})
-    local fresh={}
-    for _,row in ipairs(books) do fresh[tostring(row.bookId or "")]=row end
-    for _,row in ipairs(mp) do fresh[tostring(row.bookId or "")]=row end
-    local groups={cache.books or {},cache.mp or {}}
-    local changed=0
-    for _,group in ipairs(groups) do
-        for index,row in ipairs(group) do
-            local id=tostring(row.bookId or row.book_id or "")
-            if fresh[id] then
-                local replacement=U.copy(fresh[id])
-                replacement.rawIndex=row.rawIndex
-                replacement.cloudOrder=row.cloudOrder
-                replacement._stream_placeholder=nil
-                group[index]=replacement
-                changed=changed+1
-            end
-        end
-    end
-    local loaded=id_set(stream.hydrated_ids)
-    for _,id in ipairs(type(requested_ids)=="table" and requested_ids or {}) do
-        id=tostring(id or "")
-        if id~="" and fresh[id] then loaded[id]=true end
-    end
-    local ordered={}
-    for _,id in ipairs(stream.ids or {}) do
-        id=tostring(id or "")
-        if loaded[id] then ordered[#ordered+1]=id end
-    end
-    stream.hydrated_ids=ordered
-    stream.updated_at=os.time()
-    cache.books,cache.mp=groups[1],groups[2]
-    cache.stream=stream
-    cache.updated_at=os.time()
-    self.store:save_shelf_cache(cache)
-    logger.info("[MiuRead][ShelfStream] batch merged",
-        "requested=",tostring(#(requested_ids or {})),"changed=",tostring(changed),
-        "hydrated=",tostring(#ordered),"total=",tostring(#(stream.ids or {})))
-    return changed>0
+    logger.info("[MiuRead][ShelfStream] page hydration disabled","requested=",tostring(#(requested_ids or {})))
+    return false
 end
 
-function Library:stream_missing(first,last)
-    local cache=self.store:shelf_cache()
-    local stream=type(cache.stream)=="table" and cache.stream or {}
-    if stream.enabled~=true then return {} end
-    local by_id=shelf_rows_by_id(cache)
-    first=math.max(1,tonumber(first) or 1)
-    last=math.min(#(stream.ids or {}),tonumber(last) or first)
-    local out={}
-    for index=first,last do
-        local id=tostring(stream.ids[index] or "")
-        local row=by_id[id]
-        if id~="" and (not row or row._stream_placeholder==true) then out[#out+1]=id end
-    end
-    return out
-end
+function Library:stream_missing(first,last) return {} end
 
 function Library:refresh(options)
     options=options or {}
-    local data
-    if options.stream==true and type(self.api.shelf_stream)=="function" then
-        data=self.api:shelf_stream(options)
-    else
-        data=self.api:shelf(options)
-    end
+    local data=self.api:shelf(options)
     local books,mp=self:_apply_stream_response(data)
     return books,mp
 end
-function Library:cached() local c=self.store:shelf_cache(); return c.books or {},c.mp or {},c.updated_at end
-function Library:cached_stream() local c=self.store:shelf_cache(); return type(c.stream)=="table" and c.stream or {} end
+
+function Library:cached()
+    local c=self.store:shelf_cache()
+    local filter=current_filter(self.store)
+    if filter.enabled~=true then
+        local rows=type(c.raw_books)=="table" and #c.raw_books>0 and c.raw_books or (c.books or {})
+        local clean={}
+        for _,row in ipairs(rows) do if type(row)=="table" and row._stream_placeholder~=true then clean[#clean+1]=row end end
+        return clean,c.mp or c.raw_mp or {},c.updated_at
+    end
+    local raw=type(c.raw_books)=="table" and #c.raw_books>0 and c.raw_books or nil
+    if raw then
+        local rows=apply_filter(filter,raw)
+        return rows,c.mp or c.raw_mp or {},c.updated_at
+    end
+    local scope=type(c.effective_scope)=="table" and c.effective_scope or {}
+    if tostring(scope.fingerprint or "")==filter_fingerprint(filter) then return c.books or {},c.mp or {},c.updated_at end
+    -- Legacy cache with unknown scope: only rows whose group membership can be
+    -- proven are allowed through. Failing closed prevents an upgrade/offline
+    -- path from expanding a selected shelf to the entire account.
+    local rows=apply_filter(filter,c.books or {})
+    return rows,c.mp or {},c.updated_at
+end
+function Library:rebuild_effective_cache()
+    local cache=self.store:shelf_cache()
+    local filter=current_filter(self.store)
+    local source=(type(cache.raw_books)=="table" and #cache.raw_books>0) and cache.raw_books or (cache.books or {})
+    local books=apply_filter(filter,source)
+    cache.books=books
+    cache.effective_scope={mode=filter.enabled and "selected" or "all",fingerprint=filter_fingerprint(filter),updated_at=os.time()}
+    self.store:save_shelf_cache(cache)
+    logger.info("[MiuRead][ShelfFilter] effective cache rebuilt","books=",tostring(#books),"mode=",filter.enabled and "selected" or "all")
+    return books
+end
+
+function Library:cached_stream() return {enabled=false,ids={},hydrated_ids={},total=0,source="disabled_beta4"} end
 
 local function record_state(row)
     local downloaded=false

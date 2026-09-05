@@ -513,6 +513,15 @@ function HomeData.cached_device_state()
     return device_cache and device_cache.value or nil
 end
 
+function HomeData.set_cached_device_state(value)
+    if type(value)~="table" then return false end
+    local now=os.time()
+    local state={}
+    for key,item in pairs(value) do state[key]=item end
+    device_cache={at=now,power_at=now,value=state}
+    return true
+end
+
 local function read_power_state()
     local result={battery=nil,charging=false}
     local ok_power,power=pcall(Device.getPowerDevice,Device)

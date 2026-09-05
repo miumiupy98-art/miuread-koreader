@@ -25,8 +25,8 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={}},home_ui={enabled=false,layout_version=24,layout_style="desk",show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="all",kind="all",locality="all",sort="recent"},device={source="all",kind="all",locality="all",sort="recent"}},action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot"},action_layout_version=3,panel_items={wifi=true,bluetooth=true,rotate=true,screenshot=true,full_refresh=true,koreader_settings=true,return_koreader=true,quit=true,sync=true,miuread_settings=false,downloads=false,restart=false,sleep=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","koreader_settings","return_koreader","quit","sync","miuread_settings","downloads","restart","sleep"},panel_layout_version=3,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
- library={},sessions={},shelf_cache={books={},mp={},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={},archive_keys={}},home_ui={enabled=false,layout_version=24,layout_style="desk",show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="all",kind="all",locality="all",sort="recent"},device={source="all",kind="all",locality="all",sort="recent"}},weread_group="all",action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"},action_layout_version=4,panel_items={wifi=true,bluetooth=false,rotate=true,screenshot=true,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false},panel_order={"wifi","bluetooth","rotate","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"},panel_layout_version=5,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ library={},sessions={},shelf_cache={raw_books={},raw_mp={},books={},mp={},groups={updated_at=0,authoritative=false,list={},book_groups={}},effective_scope={mode="all",fingerprint="all",updated_at=0},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},recent_reads={version=1,items={}},
  prefetch_cache={},
 }
@@ -701,6 +701,57 @@ function Store:migrate()
             logger.info("[MiuRead][Migration] schema 125 -> 126 done",
                 "home_library=unified","files_moved=false","existing_data_preserved=true")
         end
+        if schema<127 then
+            -- 5.8.0-beta.4 separates the complete WeRead snapshot from the
+            -- user-authorized shelf, removes hidden type/locality filters and
+            -- restores the complete quick-control candidate pools.
+            local current=self:preferences()
+            current.shelf_filter=type(current.shelf_filter)=="table" and current.shelf_filter or {enabled=false,archives={}}
+            current.shelf_filter.archives=type(current.shelf_filter.archives)=="table" and current.shelf_filter.archives or {}
+            current.shelf_filter.archive_keys=type(current.shelf_filter.archive_keys)=="table" and current.shelf_filter.archive_keys or {}
+            current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
+            local home=current.home_ui
+            home.library_filters=type(home.library_filters)=="table" and home.library_filters or {}
+            for _,section in ipairs({"shelf","device"}) do
+                home.library_filters[section]=type(home.library_filters[section])=="table" and home.library_filters[section] or {}
+                local state=home.library_filters[section]
+                state.source=tostring(state.source or "all")
+                state.sort=tostring(state.sort or "recent")
+                state.kind="all"
+                state.locality="all"
+            end
+            home.weread_group="all"
+            home.action_items=type(home.action_items)=="table" and home.action_items or {}
+            if home.action_items.extensions==nil then home.action_items.extensions=false end
+            home.action_order=type(home.action_order)=="table" and home.action_order or {}
+            local action_seen=false
+            for _,key in ipairs(home.action_order) do if key=="extensions" then action_seen=true; break end end
+            if not action_seen then home.action_order[#home.action_order+1]="extensions" end
+            home.action_layout_version=4
+            home.panel_items=type(home.panel_items)=="table" and home.panel_items or {}
+            local panel_defaults={bluetooth=false,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,
+                koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false}
+            for key,value in pairs(panel_defaults) do if home.panel_items[key]==nil then home.panel_items[key]=value end end
+            local desired={"wifi","bluetooth","rotate","screenshot","full_refresh","downloads","sync","miuread_settings",
+                "koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"}
+            local seen,order={},{}
+            for _,key in ipairs(type(home.panel_order)=="table" and home.panel_order or {}) do
+                if not seen[key] then seen[key]=true; order[#order+1]=key end
+            end
+            for _,key in ipairs(desired) do if not seen[key] then seen[key]=true; order[#order+1]=key end end
+            home.panel_order=order
+            home.panel_layout_version=5
+            self:save_preferences(current)
+            local cache=self.db:readSetting("shelf_cache",{}) or {}
+            cache.stream={enabled=false,ids={},hydrated_ids={},total=0,source="disabled_beta4",updated_at=0}
+            -- A beta.3 streamed cache may contain placeholder rows. Mark it
+            -- stale so Home schedules a complete snapshot refresh, while the
+            -- defensive cache reader keeps selected-group users fail-closed.
+            cache.updated_at=0
+            self.db:saveSetting("shelf_cache",cache)
+            logger.info("[MiuRead][Migration] schema 126 -> 127 done",
+                "weread_scope=preserved","hidden_filters=cleared","panel_max=12","stream_navigation=false")
+        end
         self.db:saveSetting("schema",Config.SCHEMA)
     end
 end
@@ -799,7 +850,9 @@ end
 function Store:clear_auth() return self:set("auth",U.copy(defaults.auth)) end
 function Store:clear_account_shelf_cache()
     local cache=self:shelf_cache()
-    cache.books={}; cache.mp={}; cache.updated_at=0
+    cache.raw_books={}; cache.raw_mp={}; cache.books={}; cache.mp={}; cache.updated_at=0
+    cache.groups={updated_at=0,authoritative=false,list={},book_groups={}}
+    cache.effective_scope={mode="all",fingerprint="all",updated_at=0}
     cache.stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}
     self:save_shelf_cache(cache)
 end
@@ -951,7 +1004,7 @@ function Store:forget_book_local_state(id)
 
     local shelf=self:shelf_cache()
     local shelf_changed=false
-    for _,group in ipairs({shelf.books or {},shelf.mp or {}}) do
+    for _,group in ipairs({shelf.raw_books or {},shelf.raw_mp or {},shelf.books or {},shelf.mp or {}}) do
         for _,row in ipairs(group) do
             if tostring(row.bookId or row.book_id or "")==key and row.cover_path~=nil then
                 row.cover_path=nil; shelf_changed=true
@@ -1571,7 +1624,7 @@ function Store:update_cached_progress(id,percent)
     if id=="" or percent==nil then return false end
     local cache=self:shelf_cache()
     local changed=false
-    for _,group in ipairs({cache.books or {},cache.mp or {}}) do
+    for _,group in ipairs({cache.raw_books or {},cache.raw_mp or {},cache.books or {},cache.mp or {}}) do
         for _,row in ipairs(group) do
             if tostring(row.bookId or row.book_id or "")==id then
                 row.progress=U.clamp(percent,0,100)
