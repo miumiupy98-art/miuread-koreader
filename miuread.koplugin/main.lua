@@ -24890,13 +24890,17 @@ function Plugin:_notify_online_like_auth_expired()
     pcall(function() self:toast("微信读书登录已失效，请重新扫码登录后再点赞",3) end)
 end
 
-function Plugin:_online_like_state_cache()
+function Plugin:_online_like_account_key()
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local cookies=type(auth.cookies)=="table" and auth.cookies or {}
-    local account_key=U.trim(tostring(account.vid or ""))
-    if account_key=="" then account_key=U.trim(tostring(cookies.wr_vid or "")) end
-    if account_key=="" then account_key=U.trim(tostring(auth.login_session_id or "")) end
+    local account_id=U.trim(tostring(account.vid or ""))
+    if account_id=="" then account_id=U.trim(tostring(cookies.wr_vid or "")) end
+    return account_id.."|"..U.trim(tostring(auth.login_session_id or ""))
+end
+
+function Plugin:_online_like_state_cache()
+    local account_key=self:_online_like_account_key()
     if self._online_like_state_account_key~=account_key then
         self._online_like_state_account_key=account_key
         self._online_like_states={}
@@ -24905,13 +24909,11 @@ function Plugin:_online_like_state_cache()
     return self._online_like_states
 end
 
-function Plugin:_remember_online_like_state(review_id,is_liked,likes)
+function Plugin:_remember_online_like_state(account_key,review_id,is_liked)
+    if account_key~=self:_online_like_account_key() then return end
     review_id=U.trim(tostring(review_id or ""))
     if review_id=="" then return end
-    self:_online_like_state_cache()[review_id]={
-        is_liked=is_liked==true,
-        likes=math.max(0,math.floor(tonumber(likes) or 0)),
-    }
+    self:_online_like_state_cache()[review_id]=is_liked==true
 end
 
 function Plugin:_toggle_online_review_like(request,callback)
@@ -24948,6 +24950,7 @@ function Plugin:_toggle_online_review_like(request,callback)
     local known_is_liked=request.is_liked
     if type(known_is_liked)~="boolean" then known_is_liked=nil end
     local cached_likes=math.max(0,math.floor(tonumber(request.likes) or 0))
+    local like_account_key=self:_online_like_account_key()
     local wire_context={bookId=request.book_id,chapterUid=request.chapter_uid}
     local started,err=self:_run_interactive_network("review-like","review-like",function()
         local HttpChild=require("miuread.http")
@@ -25039,7 +25042,7 @@ function Plugin:_toggle_online_review_like(request,callback)
             return
         end
         self._online_like_auth_dead=nil
-        self:_remember_online_like_state(review_id,payload.is_liked,payload.likes)
+        self:_remember_online_like_state(like_account_key,review_id,payload.is_liked)
         logger.info("[MiuRead][ThoughtLike] updated","review=",review_id,
             "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes),
             "synced_only=",tostring(payload.synced_only==true),
@@ -25076,16 +25079,18 @@ function Plugin:_open_thought_info(info,generation)
         local source,comments,count,native_cache_hit,native_signature=Thoughts.native_parts_cached(
             self.store,info.book_id,info.chapter_uid,info.range,group,token
         )
+        local like_state_signature={}
         if prefs.online_likes==true then
             local states=self:_online_like_state_cache()
             local shared_comments=comments
             local detached=false
             for index,item in ipairs(comments or {}) do
-                local state=states[U.trim(tostring(item.review_id or ""))]
-                if state then
+                local review_id=U.trim(tostring(item.review_id or ""))
+                local state=states[review_id]
+                if type(state)=="boolean" then
                     if not detached then comments=U.copy(shared_comments); detached=true end
-                    comments[index].is_liked=state.is_liked==true
-                    comments[index].likes=tonumber(state.likes) or tonumber(comments[index].likes) or 0
+                    comments[index].is_liked=state
+                    like_state_signature[#like_state_signature+1]=review_id..":"..(state and "1" or "0")
                 end
             end
         end
@@ -25100,6 +25105,7 @@ function Plugin:_open_thought_info(info,generation)
             cache_key=table.concat({
                 tostring(info.book_id or ""), tostring(info.chapter_uid or ""),
                 tostring(info.range or ""), tostring(native_signature or ""),
+                table.concat(like_state_signature,","),
             }, "|"),
             font_size=self:_thought_font_size(self:_thought_font_size_value(prefs)),
             font_name=self:_thought_font_name(prefs),
