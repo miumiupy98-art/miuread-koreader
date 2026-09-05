@@ -300,6 +300,7 @@ local NativePopup = InputContainer:extend{
     like_buttons = nil,
     _like_inflight = nil,
     _like_session = 0,
+    _like_state_detached = false,
     _measurement_cache = nil,
 }
 
@@ -993,6 +994,15 @@ end
 function NativePopup:_apply_like_result(comment_index, result)
     if self.closing or type(result) ~= "table" then return false end
     comment_index = tonumber(comment_index)
+    -- Thoughts and layout caches intentionally return shared tables. Detach only
+    -- when a successful request is about to mutate runtime like state, so an
+    -- account-specific heart/count can never leak back into either cache.
+    if self._like_state_detached ~= true then
+        self.comments = U.copy(self.comments or {})
+        self.pages = U.copy(self.pages or {})
+        if self._pagination_state then self._pagination_state = U.copy(self._pagination_state) end
+        self._like_state_detached = true
+    end
     local item = comment_index and self.comments and self.comments[comment_index] or nil
     if type(item) ~= "table" then return false end
     local previous_button
@@ -1702,6 +1712,7 @@ function NativePopup:_reopen(opts)
     self.page_refresh_count = 0
     self.like_buttons = nil
     self._like_inflight = nil
+    self._like_state_detached = false
     self._like_session = (tonumber(self._like_session) or 0) + 1
     self._measurement_cache = nil
     self:init()
@@ -1778,6 +1789,7 @@ function M.cleanup()
         popup.comments = nil
         popup.like_buttons = nil
         popup._like_inflight = nil
+        popup._like_state_detached = nil
         popup.source_text = nil
     end
     collectgarbage("step", 48)

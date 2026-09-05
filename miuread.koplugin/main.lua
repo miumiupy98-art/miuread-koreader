@@ -25067,6 +25067,7 @@ function Plugin:_toggle_online_review_like(request,callback)
         return false
     end
     if self.interactive_network_async and self.interactive_network_async:busy() then
+        pcall(function() self:toast("其他网络操作正在进行，请稍后再点赞",2) end)
         finish(nil,"busy")
         return false
     end
@@ -25164,11 +25165,12 @@ function Plugin:_toggle_online_review_like(request,callback)
                 or (result and result.error) or "network task failed")
             -- Only the confirmed web-session timeout opens the circuit. Other
             -- failures may be transient and must stay retryable.
-            if tonumber(Http.auth_error_code(reason))==-2012 then
+            local auth_code=tonumber(Http.auth_error_code(reason))
+            if auth_code==-2011 or auth_code==-2012 then
                 local dead_revision=self.store:auth_revision()
                 if self._online_like_auth_dead~=dead_revision then
                     logger.warn("[MiuRead][ThoughtLike] likes paused; login session timed out",
-                        "revision=",tostring(dead_revision))
+                        "code=",tostring(auth_code),"revision=",tostring(dead_revision))
                 end
                 self._online_like_auth_dead=dead_revision
                 self:_notify_online_like_auth_expired()
@@ -25185,7 +25187,12 @@ function Plugin:_toggle_online_review_like(request,callback)
             "server_count=",tostring(payload.server_count==true))
         finish({is_liked=payload.is_liked==true,likes=tonumber(payload.likes) or cached_likes})
     end,{silent=true,timeout=35})
-    if not started then finish(nil,err) end
+    if not started then
+        local message=err=="offline" and "当前网络不可用，无法在线点赞"
+            or "暂时无法启动点赞请求，请稍后再试"
+        pcall(function() self:toast(message,2) end)
+        finish(nil,err)
+    end
     return started
 end
 
