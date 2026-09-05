@@ -60,6 +60,32 @@ local function copy_reasons(value)
     return out
 end
 
+function M.acquire_download()
+    if not is_kindle() then return M.acquire("download") end
+    local value = shared()
+    value.download_count = math.max(0, tonumber(value.download_count) or 0)
+    value.download_count = value.download_count + 1
+    logger.info("[MiuRead][SuspendLease] Kindle download wake acquired",
+        "count=", tostring(value.download_count))
+    return true, M.snapshot()
+end
+
+function M.release_download()
+    if not is_kindle() then return M.release("download") end
+    local value = shared()
+    value.download_count = math.max(0, tonumber(value.download_count) or 0)
+    if value.download_count == 0 then return true, M.snapshot() end
+    value.download_count = value.download_count - 1
+    logger.info("[MiuRead][SuspendLease] Kindle download wake released",
+        "count=", tostring(value.download_count))
+    return true, M.snapshot()
+end
+
+function M.download_active()
+    if not is_kindle() then return M.has("download") end
+    return math.max(0, tonumber(shared().download_count) or 0) > 0
+end
+
 function M.acquire(reason)
     reason = tostring(reason or "background")
     local value = shared()
@@ -140,6 +166,7 @@ function M.clear(reason)
     local value = shared()
     local count = reason_count(value)
     value.reasons = {}
+    value.download_count = 0
     value.generation = value.generation + 1
     value.changed_at = os.time()
     if value.held then
