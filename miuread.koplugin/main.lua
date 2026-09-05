@@ -25056,6 +25056,30 @@ function Plugin:_notify_online_like_auth_expired()
     pcall(function() self:toast("微信读书登录已失效，请重新扫码登录后再点赞",3) end)
 end
 
+function Plugin:_online_like_state_cache()
+    local auth=self.store:auth()
+    local account=type(auth.account)=="table" and auth.account or {}
+    local cookies=type(auth.cookies)=="table" and auth.cookies or {}
+    local account_key=U.trim(tostring(account.vid or ""))
+    if account_key=="" then account_key=U.trim(tostring(cookies.wr_vid or "")) end
+    if account_key=="" then account_key=U.trim(tostring(auth.login_session_id or "")) end
+    if self._online_like_state_account_key~=account_key then
+        self._online_like_state_account_key=account_key
+        self._online_like_states={}
+    end
+    self._online_like_states=self._online_like_states or {}
+    return self._online_like_states
+end
+
+function Plugin:_remember_online_like_state(review_id,is_liked,likes)
+    review_id=U.trim(tostring(review_id or ""))
+    if review_id=="" then return end
+    self:_online_like_state_cache()[review_id]={
+        is_liked=is_liked==true,
+        likes=math.max(0,math.floor(tonumber(likes) or 0)),
+    }
+end
+
 function Plugin:_toggle_online_review_like(request,callback)
     request=type(request)=="table" and request or {}
     local review_id=U.trim(tostring(request.review_id or ""))
@@ -25181,6 +25205,7 @@ function Plugin:_toggle_online_review_like(request,callback)
             return
         end
         self._online_like_auth_dead=nil
+        self:_remember_online_like_state(review_id,payload.is_liked,payload.likes)
         logger.info("[MiuRead][ThoughtLike] updated","review=",review_id,
             "liked=",tostring(payload.is_liked==true),"likes=",tostring(payload.likes),
             "synced_only=",tostring(payload.synced_only==true),
@@ -25217,6 +25242,19 @@ function Plugin:_open_thought_info(info,generation)
         local source,comments,count,native_cache_hit,native_signature=Thoughts.native_parts_cached(
             self.store,info.book_id,info.chapter_uid,info.range,group,token
         )
+        if prefs.online_likes==true then
+            local states=self:_online_like_state_cache()
+            local shared_comments=comments
+            local detached=false
+            for index,item in ipairs(comments or {}) do
+                local state=states[U.trim(tostring(item.review_id or ""))]
+                if state then
+                    if not detached then comments=U.copy(shared_comments); detached=true end
+                    comments[index].is_liked=state.is_liked==true
+                    comments[index].likes=tonumber(state.likes) or tonumber(comments[index].likes) or 0
+                end
+            end
+        end
         local parts_ms=math.floor((monotonic_wall_time()-parts_started)*1000+.5)
         if tostring(source or "")=="" and #(comments or {})==0 then notice="没有想法内容"; return end
         local show_started=monotonic_wall_time()
