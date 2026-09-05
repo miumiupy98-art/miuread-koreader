@@ -1,4 +1,4 @@
-# 5.8.0-beta.7
+## 5.8.0-beta.7
 
 - 累积 beta.6 的主页/调度器优化，并完成 #87/#90 Reader 生命周期与功耗收口。
 - Reader rebuild 增加 Resume grace，短暂 `document=nil` 不会过早被判定为真实关闭。
@@ -9,7 +9,7 @@
 - 增加 `InputLifecycle` generation 日志和 Reader 文件 size/mtime 指纹；用于定位 Broken pipe 第一现场与 CRE stylesheet cache 失效。
 - BackgroundScheduler 活跃 worker 不再每 500ms 自轮询；release 事件负责唤醒下一任务。
 
-# 5.8.0-beta.6
+## 5.8.0-beta.6
 
 - 修复 5.6 统一主页回归：`shelf/recent` 终于进入可复用页面缓存，栏目切换不再每次重新 hydrate 当前 8 本书。
 - Home section 改为 UI 首帧 + 静止后一次 full 清理刷新，保留最终墨水屏质量；渲染层缓存收敛到 3 个并按逻辑视图淘汰旧 revision。
