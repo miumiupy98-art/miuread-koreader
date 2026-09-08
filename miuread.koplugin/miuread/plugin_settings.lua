@@ -16,7 +16,12 @@ end
 
 function M.comments(plugin)
     -- 收藏、历史和记录列表属于内容页，不放进“设置”。
-    return plugin:thought_font_settings_menu()
+    local rows={
+        {text="在线评论点赞",post_text=plugin:_online_comment_likes_enabled() and "已开启" or "已关闭",
+            checked_func=function() return plugin:_online_comment_likes_enabled() end,keep_menu_open=true,
+            callback=function() plugin:_toggle_online_comment_likes() end},
+    }
+    return append(rows,plugin:thought_font_settings_menu())
 end
 
 function M.notices(plugin)
