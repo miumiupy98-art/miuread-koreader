@@ -130,10 +130,7 @@ local function network_connected()
         if ok then connected=value==true end
     end
     if connected==false then return false end
-    if type(NetworkMgr.isOnline)=="function" then
-        local ok,value=pcall(NetworkMgr.isOnline,NetworkMgr)
-        if ok then return connected~=false and value==true end
-    end
+    -- This gate runs on UI timers; the worker checks Internet reachability.
     if connected~=nil then return connected==true end
     if type(NetworkMgr.isWifiOn)=="function" then
         local ok,value=pcall(NetworkMgr.isWifiOn,NetworkMgr)

@@ -561,7 +561,7 @@ function HomeData.quick_power_state(force)
     return power
 end
 
-function HomeData.quick_device_state(force)
+function HomeData.quick_device_state(force, probe_online)
     local now = os.time()
     if not force and device_cache and now - device_cache.at < 60 then
         return device_cache.value
@@ -583,7 +583,7 @@ function HomeData.quick_device_state(force)
             local ok, value = pcall(network.isConnected, network)
             if ok then state.connected = value == true end
         end
-        if state.connected ~= false and type(network.isOnline) == "function" then
+        if probe_online and state.connected ~= false and type(network.isOnline) == "function" then
             local ok, online = pcall(network.isOnline, network)
             if ok then state.online = online == true end
         elseif state.connected == false then
@@ -598,7 +598,17 @@ function HomeData.quick_device_state(force)
         end
     end
 
+    if probe_online and state.online == true then
+        NetworkHealth.note_success("network-manager")
+    end
     local health = NetworkHealth.snapshot()
+    if not probe_online and state.connected ~= false then
+        if health.state == "ok" and health.age <= 60 and health.reason ~= "network-manager-associated" then
+            state.online = true
+        elseif health.state == "down" and health.age <= 20 then
+            state.online = false
+        end
+    end
     if state.wifi_on == false then
         state.network_phase = "off"
     else
@@ -614,7 +624,6 @@ function HomeData.quick_device_state(force)
             -- state. Do not leave Home stuck on “恢复中” after Reader/network
             -- manager already sees the active network. Internet reachability is
             -- still represented separately by state.online.
-            NetworkHealth.note_success("network-manager-associated")
             state.network_phase = "connected"
         elseif health.state == "recovering" and health.age <= 50 then
             state.network_phase = "recovering"

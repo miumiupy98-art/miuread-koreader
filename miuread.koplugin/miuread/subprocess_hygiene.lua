@@ -1,5 +1,15 @@
 local M = {}
 
+function M.reset_resolver()
+    local ok, ffi = pcall(require, "ffi")
+    if not ok or not ffi then return false end
+    -- glibc retains resolver sockets/configuration across fork and suspend.
+    -- Other platforms may not export this symbol; leave their resolver alone.
+    pcall(ffi.cdef, "int __res_init(void);")
+    local called, result = pcall(function() return ffi.C.__res_init() end)
+    return called and result == 0
+end
+
 local function inherited_fd_target(ffi, fd)
     local path = "/proc/self/fd/" .. tostring(fd)
     local buffer = ffi.new("char[?]", 512)
@@ -12,6 +22,9 @@ local function inherited_fd_target(ffi, fd)
 end
 
 function M.close_inherited_sockets()
+    -- Release libc-owned sockets before the generic descriptor sweep, so its
+    -- next lookup cannot reuse a descriptor that now belongs to another file.
+    M.reset_resolver()
     local ok_ffi, ffi = pcall(require, "ffi")
     if not ok_ffi or not ffi then return false, "ffi_unavailable", 0 end
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")

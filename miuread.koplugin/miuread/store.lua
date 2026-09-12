@@ -262,12 +262,48 @@ local function invalidate_upload_health_table(auth)
     end
     return auth
 end
+-- Ordinary settings use the same literals as dump(), without indentation.
+-- Unusual values/keys or cycles retain the existing serializer fallback.
+local function compact_settings(data)
+    local out,active={},{}
+    local function append(value)
+        local kind=type(value)
+        if kind=="table" then
+            if active[value] then return false end
+            active[value]=true
+            out[#out+1]="{"
+            for key,item in pairs(value) do
+                local key_type=type(key)
+                if key_type~="string" and key_type~="number" and key_type~="boolean" then return false end
+                out[#out+1]="["
+                if not append(key) then return false end
+                out[#out+1]="]="
+                if not append(item) then return false end
+                out[#out+1]=","
+            end
+            out[#out+1]="}"
+            active[value]=nil
+        elseif kind=="string" then
+            out[#out+1]=string.format("%q",value)
+        elseif kind=="number" or kind=="boolean" or kind=="nil" then
+            out[#out+1]=tostring(value)
+        else
+            return false
+        end
+        return true
+    end
+    if not append(data) then return nil end
+    return table.concat(out)
+end
+
 local function settings_payload(data,path)
     -- Match KOReader LuaSettings:flush(): settings files are executable Lua
     -- chunks that must return the serialized table. dump() itself only emits
     -- the table expression, so writing it directly would create an invalid
     -- settings file beginning with "{".
-    return "-- "..tostring(path or "").."\nreturn "..dump(data,nil,true).."\n"
+    -- Key ordering has no persistence semantics, but sorting large catalogs on
+    -- every progress update blocks the foreground reader/Home event loop.
+    return "-- "..tostring(path or "").."\nreturn "..(compact_settings(data) or dump(data)).."\n"
 end
 
 local function settings_payload_valid(payload)
@@ -1307,7 +1343,10 @@ function Store:clear_account_shelf_cache()
 end
 function Store:preferences() return U.merge(defaults.preferences,self:get("preferences",{})) end
 function Store:save_preferences(v) return self:set("preferences",U.merge(defaults.preferences,v or {})) end
-function Store:save_preferences_deferred(v) self:set_deferred("preferences",U.merge(defaults.preferences,v or {})) end
+function Store:save_preferences_deferred(v,preserve_home_navigation)
+    self:set_deferred("preferences",U.merge(defaults.preferences,v or {}))
+    if preserve_home_navigation==true then self._pending_home_navigation=true end
+end
 function Store:books_root() local p=self:preferences().download_dir; if p=="" then p=self.default_books_dir end; U.mkdir(p); return p end
 function Store:epub_root() return self:books_root() end
 function Store:prefetch_book_path(id) return self.prefetch_dir.."/"..U.id_name(id) end
@@ -2267,11 +2306,47 @@ local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
     return memory_sessions
 end
 
+local function pending_home_navigation(store)
+    local prefs=store.db.data.preferences
+    local home=type(prefs)=="table" and prefs.home_ui
+    if not store._pending_home_navigation or type(home)~="table" then return nil end
+    return {active_section=home.active_section,page_by_section=U.copy(home.page_by_section)}
+end
+
+local function restore_home_navigation(store,navigation)
+    if not navigation then return end
+    local prefs=store.db.data.preferences
+    if type(prefs)~="table" then prefs={}; store.db.data.preferences=prefs end
+    if type(prefs.home_ui)~="table" then prefs.home_ui={} end
+    prefs.home_ui.active_section=navigation.active_section
+    prefs.home_ui.page_by_section=navigation.page_by_section
+end
+
+local function settings_equal(a,b,seen)
+    if a==b then return true end
+    -- dump() persists numbers through tostring(), whose precision can be lower
+    -- than an in-memory reading ratio. Compare the representation we can save.
+    if type(a)=="number" and type(b)=="number" then return tostring(a)==tostring(b) end
+    if type(a)~="table" or type(b)~="table" then return false end
+    seen=seen or {}
+    if seen[a]==b then return true end
+    seen[a]=b
+    for key,value in pairs(a) do
+        if not settings_equal(value,b[key],seen) then return false end
+    end
+    for key in pairs(b) do
+        if a[key]==nil then return false end
+    end
+    return true
+end
+
 function Store:flush(reason)
     local flush_started=store_perf_clock()
     reason=tostring(reason or "direct")
+    local navigation=pending_home_navigation(self)
+    local disk_data
     if not self.isolated then
-        local disk_data=settings_file_data(self.settings_path)
+        disk_data=settings_file_data(self.settings_path)
         if type(disk_data)=="table" then
             self.db.data.sessions=merge_newer_progress_sessions(self.db.data.sessions,disk_data.sessions)
         end
@@ -2289,10 +2364,17 @@ function Store:flush(reason)
                 "fields_removed=",tostring(removed))
         end
     end
+    -- Compare with the freshly read file, not a cached dirty flag: callers may
+    -- mutate nested settings and detached workers may advance progress on disk.
+    if disk_data and settings_equal(self.db.data,disk_data) then
+        self._pending_home_navigation=nil
+        logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
+            "elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)))
+        return true
+    end
     local previous_path=self.settings_path..".previous"
     if not self.isolated then
-        local valid=settings_file_valid(self.settings_path)
-        if valid then U.copy_file(self.settings_path,previous_path) end
+        if disk_data then U.copy_file(self.settings_path,previous_path) end
     end
 
     -- Serialize exactly like KOReader LuaSettings:flush(): dump() emits only a
@@ -2320,6 +2402,7 @@ function Store:flush(reason)
         if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
         local disk_ok=settings_file_valid(self.settings_path)
         if disk_ok then self.db=LuaSettings:open(self.settings_path) end
+        restore_home_navigation(self,navigation)
         logger.warn("[MiuRead][StorePerf] full settings flush failed",
             "reason=",reason,"elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)),
             "error=",tostring(err or "unknown"))
@@ -2332,6 +2415,7 @@ function Store:flush(reason)
         if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
         local disk_ok=settings_file_valid(self.settings_path)
         if disk_ok then self.db=LuaSettings:open(self.settings_path) end
+        restore_home_navigation(self,navigation)
         logger.warn("[MiuRead][StorePerf] full settings flush failed",
             "reason=",reason,"elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)),
             "error=",tostring(validation_reason or "validation_failed"))
@@ -2344,6 +2428,7 @@ function Store:flush(reason)
         end
         os.remove(previous_path)
     end
+    self._pending_home_navigation=nil
     logger.info("[MiuRead][StorePerf] full settings flush",
         "reason=",reason,
         "elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)),
@@ -2351,8 +2436,12 @@ function Store:flush(reason)
     return true
 end
 function Store:reload()
+    local navigation=pending_home_navigation(self)
     if not self.isolated then restore_settings_file(self.settings_path,self.settings_backup_path) end
     self.db = LuaSettings:open(self.settings_path)
+    -- Reload fresh worker results without discarding deferred tab/page choices.
+    -- Only navigation is overlaid; all other settings and library data reload.
+    restore_home_navigation(self,navigation)
     if not self.isolated then
         local valid=settings_file_valid(self.settings_path)
         if valid then U.copy_file(self.settings_path,self.settings_backup_path) end

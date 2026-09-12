@@ -1224,7 +1224,19 @@ function Plugin:_shelf_covers_enabled(prefs)
     return enabled
 end
 function Plugin:safe(label,fn) return function(...) local a={...}; local ok,e=xpcall(function() return fn(unpack_args(a)) end,debug.traceback); if not ok then logger.err("[MiuRead]",label,e); self:info(_("Operation failed")..":\n"..U.first_line(e)) end end end
-function Plugin:is_online() local ok,N=pcall(require,"ui/network/manager"); if not ok or not N or not N.isOnline then return true end; local g,v=pcall(N.isOnline,N); return not g or v==true end
+function Plugin:is_online()
+    local ok, network = pcall(require, "ui/network/manager")
+    if not ok or not network then return true end
+    -- UI preflight checks only the local link. isOnline performs synchronous
+    -- DNS; actual reachability is checked by the request's async worker.
+    for _, name in ipairs({"isWifiOn", "isConnected"}) do
+        if type(network[name]) == "function" then
+            local called, value = pcall(network[name], network)
+            if called and value == false then return false end
+        end
+    end
+    return true
+end
 -- Fast local hint for lifecycle paths. Never call NetworkManager:isOnline() from
 -- ReaderReady/close/Suspend: on some Kindle network states that synchronous
 -- probe can stall the UI thread for many seconds. false means the Wi-Fi radio
@@ -3413,10 +3425,12 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
     preferences=preferences or self.store:preferences()
     preferences.home_ui=home
     if self.store.save_preferences_deferred then
-        self.store:save_preferences_deferred(preferences)
+        self.store:save_preferences_deferred(preferences,delay==false)
     else
         return self:_save_home_preferences(home,preferences)
     end
+    self._home_state_save_on_exit=delay==false
+        and (self._home_state_save_pending~=true or self._home_state_save_on_exit==true)
     self._home_state_save_pending=true
     self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
     local generation=self._home_state_save_generation
@@ -3424,6 +3438,9 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
         UIManager:unschedule(self._home_state_save_task)
         self._home_state_save_task=nil
     end
+    -- Tab/page navigation stays in memory until an existing lifecycle flush.
+    -- A full settings write here blocks the next tap for seconds on Kindle.
+    if self._home_state_save_on_exit then return end
     local task
     task=function()
         if generation~=self._home_state_save_generation or not self._home_state_save_pending then
@@ -3431,8 +3448,7 @@ function Plugin:_save_home_preferences_deferred(home,preferences,delay)
             return
         end
         self._home_state_save_task=nil
-        self._home_state_save_pending=false
-        local saved,err=self.store:flush()
+        local saved,err=self:_flush_home_preferences()
         if saved==true then
             logger.info("[MiuRead][HomeState] preferences saved after idle")
         else
@@ -3456,6 +3472,7 @@ function Plugin:_pause_home_preferences_flush(reason)
 end
 
 function Plugin:_resume_home_preferences_flush(delay)
+    if self._home_state_save_on_exit then return false end
     if not self._home_state_save_pending or self._home_state_save_task then return false end
     self._home_state_save_generation=(tonumber(self._home_state_save_generation) or 0)+1
     local generation=self._home_state_save_generation
@@ -3470,8 +3487,7 @@ function Plugin:_resume_home_preferences_flush(delay)
             return
         end
         self._home_state_save_task=nil
-        self._home_state_save_pending=false
-        local saved,err=self.store:flush()
+        local saved,err=self:_flush_home_preferences()
         if saved==true then
             logger.info("[MiuRead][HomeState] deferred preferences saved after home idle")
         else
@@ -3490,13 +3506,18 @@ function Plugin:_flush_home_preferences()
         UIManager:unschedule(self._home_state_save_task)
         self._home_state_save_task=nil
     end
-    self._home_state_save_pending=false
+    local preferences=self.store:preferences()
     local saved,err=self.store:flush()
     if saved~=true then
+        -- Store may reload the last good disk snapshot on failure. Keep the
+        -- pending preferences in memory so the next save can retry them.
+        self.store:save_preferences_deferred(preferences)
         logger.warn("[MiuRead][HomeState] preferences save failed before leaving home",U.first_line(err or "unknown",160))
         return false,err
     end
-    logger.info("[MiuRead][HomeState] preferences saved before leaving home")
+    self._home_state_save_pending=false
+    self._home_state_save_on_exit=false
+    logger.info("[MiuRead][HomeState] preferences saved")
     return true
 end
 
@@ -4058,7 +4079,7 @@ function Plugin:_home_schedule_device_state_probe(delay)
         end
         local started=monotonic_wall_time()
         local ok,err=self.device_state_async:run("home-device-state",function()
-            return require("miuread.home_data").quick_device_state(true)
+            return require("miuread.home_data").quick_device_state(true, true)
         end,function(result)
             if generation~=self._home_device_probe_generation then return end
             local elapsed=math.floor((monotonic_wall_time()-started)*1000+.5)
@@ -4765,6 +4786,7 @@ function Plugin:_home_manual_refresh()
         return true
     end
     if active=="device" then
+        if self._home_state_save_pending and not self:_flush_home_preferences() then return false end
         self.store:reload(); self.store:prune_missing_files()
         local root=LocalLibrary.normalize(self:_home_root())
         if root=="" then
@@ -4802,6 +4824,7 @@ function Plugin:_home_refresh_whole_page()
 end
 
 function Plugin:_home_complete_refresh(confirmed)
+    if self._home_state_save_pending and not self:_flush_home_preferences() then return false end
     UnifiedLibrary.invalidate_external_cache()
     self:_home_reset_local_metadata()
     self.store:reload()
@@ -4936,7 +4959,7 @@ function Plugin:_home_change_page(delta)
     self._home_page_changed_at=Time.now()
     self:_home_cancel_visible_page_work("home page changed")
     self:_home_bump_interaction_generation()
-    self:_save_home_preferences_deferred(home,preferences)
+    self:_save_home_preferences_deferred(home,preferences,false)
     local applied=self:_home_apply_section(section)
     logger.info("[MiuRead][HomePageSwitch]","section=",tostring(section),"from=",tostring(current),"to=",tostring(target),"network=false")
     return applied
@@ -4957,7 +4980,7 @@ function Plugin:_home_apply_section(section)
         local current,preferences=self:_home_preferences()
         current.page_by_section=type(current.page_by_section)=="table" and current.page_by_section or {}
         current.page_by_section[section]=page
-        self:_save_home_preferences_deferred(current,preferences)
+        self:_save_home_preferences_deferred(current,preferences,false)
     end
     -- Keep the "visible work" target in sync with the page that is actually
     -- on screen. beta.23 could continue preparing covers from the previous page
@@ -5006,6 +5029,7 @@ function Plugin:_home_apply_section(section)
 end
 
 function Plugin:_set_home_section(section)
+    local started=monotonic_wall_time()
     local allowed={}
     for _,key in ipairs(self._home_visible_keys or HOME_SECTION_ORDER) do allowed[key]=true end
     section=allowed[section] and section or (self._home_visible_keys and self._home_visible_keys[1]) or "shelf"
@@ -5015,9 +5039,10 @@ function Plugin:_set_home_section(section)
     self._home_page_changed_at=Time.now()
     self:_home_cancel_visible_page_work("home section changed")
     self:_home_bump_interaction_generation()
-    self:_save_home_preferences_deferred(home,preferences)
+    self:_save_home_preferences_deferred(home,preferences,false)
     if self:_home_apply_section(section) then
-        logger.info("[MiuRead][HomeSectionSwitch]","to=",tostring(section),"network=false")
+        logger.info("[MiuRead][HomeSectionSwitch]","to=",tostring(section),"network=false",
+            "elapsed_ms=",tostring(math.floor((monotonic_wall_time()-started)*1000+.5)))
     else
         self:_refresh_home_view(nil,"section")
     end
@@ -11918,15 +11943,17 @@ function Plugin:_home_full_refresh(confirmed)
         UIManager:show(dialog)
         return true
     end
-    local listener=self:_koreader_device_listener()
+    -- Home callbacks may still belong to the closed Reader plugin. Its device
+    -- listener updates ReaderFooter before repainting, which needs a document.
+    local reader=self:_active_reader_ui()
+    local listener=reader and reader.document and reader.devicelistener
     if listener and type(listener.onFullRefresh)=="function" then
         local ok,err=pcall(listener.onFullRefresh,listener)
         if ok then return true end
         logger.warn("[MiuRead][Refresh] native full refresh failed",tostring(err))
     end
-    -- Compatibility fallback for KOReader builds where the active UI listener
-    -- is temporarily unavailable during a desktop transition.
-    UIManager:broadcastEvent(Event:new("FullRefresh"))
+    -- This is the native full-refresh operation without the Reader-only footer.
+    UIManager:setDirty(nil,"full")
     return true
 end
 
@@ -17525,6 +17552,11 @@ function Plugin:_request_reader_close(generation,source)
     if local_session then
         logger.info("[MiuRead][ReaderClose] local close command returned",
             "generation=",tostring(generation))
+    end
+    -- onClose has returned after saving/releasing the document. Restore the
+    -- parked Home before due background callbacks can block its next UI tick.
+    if self:_reader_lifecycle_state()=="closed" and HomeView.is_shown() then
+        return self:_finish_reader_return(generation,"reader close completed")
     end
     self:_schedule_reader_return_finish(generation,.10,"close requested")
     return true
@@ -25812,7 +25844,13 @@ function Plugin:_thought_favorite_context(info)
     local book_id=tostring(info.book_id or "")
     local chapter_uid=tostring(info.chapter_uid or "")
     local book=self.store and self.store:book(book_id) or nil
-    local current=self:_current_book_record()
+    -- Opening comments only needs metadata from the active document, not a
+    -- settings reload and backup. A document change still takes the full path.
+    local current=self:_reader_session_is_weread() and self.sync and self.sync.current or nil
+    if not current or type(current.path)~="string" or current.path==""
+        or current.path~=self.sync:_document_path() then
+        current=self:_current_book_record()
+    end
     if current and current.book and tostring(current.book.book_id or current.book.bookId or "")==book_id then
         book=current.book
     end
@@ -28905,6 +28943,7 @@ function Plugin:onSuspend()
     -- visible widget is preserved; normal Home downloads do not own a standby
     -- lease until this Suspend lifecycle has already committed.
     if HomeView.is_shown() and not self:_active_reader_ui() then
+        if self._home_state_save_on_exit then self:_flush_home_preferences() end
         self:_home_freeze_for_suspend()
     end
     if self._download_resume_task then
@@ -28983,6 +29022,7 @@ function Plugin:onResume()
             "time=ignored","progress=ignored","annotations=ignored")
         return
     end
+    require("miuread.subprocess_hygiene").reset_resolver()
     -- Kindle ScreenSaver Hold gets the strict wake boundary introduced in
     -- beta.10. Kobo keeps its already-validated legacy lifecycle unchanged.
     if PseudoLockscreen.device_platform()=="kindle" then
