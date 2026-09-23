@@ -489,19 +489,21 @@ function LocalMetadata.merge(book, metadata)
             changed = true
         end
     end
-    -- Never overwrite a non-empty title/author already held by the account
-    -- shelf (WeRead API). Desktop Home used to replace them with OPF-extracted
-    -- text and showed garbled titles for some books.
-    local function fill_identity(key, value)
+    -- Account shelf titles (WeRead API) already match library.lua's
+    -- `remote.title or local` policy and must not be replaced by OPF text.
+    -- Local-only books still let OPF correct a filename-derived title.
+    local function set_identity(key, value)
         if value == nil or value == "" then return end
-        local current = book[key]
-        if current == nil or current == "" then
+        if book.in_account_shelf == true and book[key] ~= nil and book[key] ~= "" then
+            return
+        end
+        if book[key] ~= value then
             book[key] = value
             changed = true
         end
     end
-    fill_identity("title", metadata.title)
-    fill_identity("author", metadata.author)
+    set_identity("title", metadata.title)
+    set_identity("author", metadata.author)
     set("series", metadata.series)
     set("language", metadata.language)
     set("description", metadata.description)

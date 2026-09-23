@@ -83,22 +83,27 @@ assert(xml_value(opf,{'title'})=='特殊书名','dc:title hex')
 local opf2='<dc:title><![CDATA[人生&lt;哲学&gt;]]></dc:title>'
 assert(xml_value(opf2,{'title'})=='人生<哲学>','dc:title cdata+named')
 
--- identity merge: never overwrite non-empty title/author
-local function fill_identity(book, key, value)
+-- identity merge: keep account-shelf titles; still allow OPF to fix local books
+local function set_identity(book, key, value)
     if value == nil or value == "" then return false end
-    local current = book[key]
-    if current == nil or current == "" then
+    if book.in_account_shelf == true and book[key] ~= nil and book[key] ~= "" then
+        return false
+    end
+    if book[key] ~= value then
         book[key] = value
         return true
     end
     return false
 end
-local book={title='微信读书正确标题',author='原作者'}
-assert(fill_identity(book,'title','乱码标题')==false,'keep existing title')
-assert(book.title=='微信读书正确标题','title unchanged')
-assert(fill_identity(book,'author','OPF作者')==false,'keep existing author')
-local empty = {}
-assert(fill_identity(empty,'title','从OPF补全')==true,'fill empty title')
+local account_book={title='微信读书正确标题',author='原作者',in_account_shelf=true}
+assert(set_identity(account_book,'title','乱码标题')==false,'keep account title')
+assert(account_book.title=='微信读书正确标题','account title unchanged')
+assert(set_identity(account_book,'author','OPF作者')==false,'keep account author')
+local local_book={title='filename-derived',local_only=true}
+assert(set_identity(local_book,'title','从OPF补全')==true,'local title corrected')
+assert(local_book.title=='从OPF补全','local title updated')
+local empty={}
+assert(set_identity(empty,'title','从OPF补全')==true,'fill empty title')
 assert(empty.title=='从OPF补全','title filled')
 
 print('title garble metadata: PASS')
