@@ -3,7 +3,7 @@ local logger = require("logger")
 local U = require("miuread.util")
 
 local LocalMetadata = {}
-local METADATA_EXTRACTOR_VERSION = 4
+local METADATA_EXTRACTOR_VERSION = 5
 
 local function trim(value)
     return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -38,6 +38,51 @@ local function normalize_progress(value)
     return value
 end
 
+local function codepoint_to_utf8(code)
+    code = tonumber(code)
+    if not code or code < 0 or code > 0x10FFFF then return "" end
+    if code < 0x80 then
+        return string.char(code)
+    elseif code < 0x800 then
+        return string.char(0xC0 + math.floor(code / 0x40), 0x80 + code % 0x40)
+    elseif code < 0x10000 then
+        return string.char(
+            0xE0 + math.floor(code / 0x1000),
+            0x80 + math.floor(code / 0x40) % 0x40,
+            0x80 + code % 0x40)
+    end
+    return string.char(
+        0xF0 + math.floor(code / 0x40000),
+        0x80 + math.floor(code / 0x1000) % 0x40,
+        0x80 + math.floor(code / 0x40) % 0x40,
+        0x80 + code % 0x40)
+end
+
+-- KOReader's util.htmlEntitiesToUtf8 only runs when htmlToPlainTextIfHtml
+-- decides the string is HTML. A dc:title made of bare &#xHHH; references is
+-- not HTML, so those entities used to leak through as visible "乱码" (#107).
+local function decode_numeric_entities(value)
+    value = tostring(value or "")
+    value = value:gsub("&#(%d+);", function(dec)
+        return codepoint_to_utf8(tonumber(dec))
+    end)
+    value = value:gsub("&#[xX](%x+);", function(hex)
+        return codepoint_to_utf8(tonumber(hex, 16))
+    end)
+    return value
+end
+
+-- Title/author/publisher are already plain XML text after entity decode.
+-- Never run htmlToPlainTextIfHtml on them: it strips "<...>" and can eat
+-- legitimate title characters like "人生<哲学>".
+local function xml_text(value)
+    value = trim(value)
+    if value == "" then return nil end
+    value = tostring(value):gsub("%s+", " ")
+    return trim(value) ~= "" and trim(value) or nil
+end
+
+-- description/summary may contain HTML fragments; keep the old cleaner.
 local function plain_text(value)
     value = trim(value)
     if value == "" then return nil end
@@ -66,8 +111,15 @@ local function shell_read(command, limit)
     return data
 end
 
-local function xml_unescape(value)
+local function strip_cdata(value)
     value = tostring(value or "")
+    value = value:gsub("^%s*<!%[CDATA%[", ""):gsub("%]%]>%s*$", "")
+    return value
+end
+
+local function xml_unescape(value)
+    value = strip_cdata(value)
+    value = decode_numeric_entities(value)
     return value:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"')
         :gsub("&apos;", "'"):gsub("&amp;", "&")
 end
@@ -89,12 +141,12 @@ local function read_epub_package(filepath, out)
     local opf_path = container:match('full%-path=["\']([^"\']+)["\']') or "OEBPS/package.opf"
     local opf = shell_read("unzip -p " .. quoted .. " " .. U.shell_quote(opf_path) .. " 2>/dev/null")
     if not opf or opf == "" then return false end
-    local title = plain_text(xml_value(opf, {"title"}))
-    local author = authors_text(plain_text(xml_value(opf, {"creator", "author"})))
+    local title = xml_text(xml_value(opf, {"title"}))
+    local author = authors_text(xml_text(xml_value(opf, {"creator", "author"})))
     local description = plain_text(xml_value(opf, {"description", "summary"}))
-    local subject = plain_text(xml_value(opf, {"subject"}))
-    local publisher = plain_text(xml_value(opf, {"publisher"}))
-    local language = plain_text(xml_value(opf, {"language"}))
+    local subject = xml_text(xml_value(opf, {"subject"}))
+    local publisher = xml_text(xml_value(opf, {"publisher"}))
+    local language = xml_text(xml_value(opf, {"language"}))
     local isbn = find_isbn(xml_value(opf, {"identifier", "isbn"}))
     if not isbn then
         for value in opf:gmatch("<[%w_%-:]*identifier[^>]*>(.-)</[%w_%-:]*identifier>") do
@@ -433,8 +485,19 @@ function LocalMetadata.merge(book, metadata)
             changed = true
         end
     end
-    set("title", metadata.title)
-    set("author", metadata.author)
+    -- Identity fields: never overwrite a non-empty title/author already held
+    -- by the account shelf (WeRead API). Desktop Home used to replace them with
+    -- OPF-extracted text and showed garbled titles for some books (#107).
+    local function fill_identity(key, value)
+        if value == nil or value == "" then return end
+        local current = book[key]
+        if current == nil or current == "" then
+            book[key] = value
+            changed = true
+        end
+    end
+    fill_identity("title", metadata.title)
+    fill_identity("author", metadata.author)
     set("series", metadata.series)
     set("language", metadata.language)
     set("description", metadata.description)
