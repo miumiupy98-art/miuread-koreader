@@ -34,8 +34,10 @@ local function read(path)
     local data=f:read('*a'); f:close(); return data
 end
 local fail_write=false
+local write_count=0
 local function write(path,data)
     if fail_write then return false,'simulated write failure' end
+    write_count=write_count+1
     local f=assert(io.open(path,'wb')); f:write(data); f:close(); return true
 end
 local function attributes(path,what)
@@ -122,6 +124,46 @@ local function run()
     assert(home:preferences().home_ui.local_entry_root=='/mnt/us/Other',
         'reload left another plugin instance on stale settings')
 
+    -- Navigation can remain pending while downloads/MP callbacks reload disk.
+    prefs=home:preferences()
+    prefs.home_ui.active_section='recent'
+    prefs.home_ui.page_by_section={recent=3}
+    home:save_preferences_deferred(prefs,true)
+    local downloaded=loadfile(path)()
+    downloaded.library['external-download']={title='New download'}
+    downloaded.preferences.home_ui.display_size='large'
+    assert(write(path,'return '..dump(downloaded)))
+    local reload_writes=write_count
+    reader:reload()
+    assert(write_count==reload_writes+1,'reload added a foreground settings save')
+    assert(home:preferences().home_ui.active_section=='recent',
+        'background reload discarded pending navigation')
+    assert(home:preferences().home_ui.page_by_section.recent==3)
+    assert(home:preferences().home_ui.display_size=='large','navigation hid a disk preference update')
+    assert(home:book('external-download').title=='New download','navigation hid a download result')
+    assert(home:flush())
+    downloaded=loadfile(path)()
+    assert(downloaded.preferences.home_ui.active_section=='recent')
+    downloaded.preferences.home_ui.active_section='device'
+    assert(write(path,'return '..dump(downloaded)))
+    home:reload()
+    assert(home:preferences().home_ui.active_section=='device','saved navigation remained pinned')
+    prefs=home:preferences(); prefs.home_ui.active_section='recent'
+    home:save_preferences_deferred(prefs,true)
+    fail_write=true
+    assert(home:flush()==false)
+    fail_write=false
+    assert(home:preferences().home_ui.active_section=='recent','failed save discarded navigation')
+    home:reload()
+    assert(home:preferences().home_ui.active_section=='recent','failed navigation could not survive reload')
+    assert(home:flush())
+    home:save_preferences_deferred(home:preferences(),true)
+    assert(home:flush()) -- unchanged flush must also release the pending overlay
+    downloaded=loadfile(path)(); downloaded.preferences.home_ui.active_section='shelf'
+    assert(write(path,'return '..dump(downloaded)))
+    home:reload()
+    assert(home:preferences().home_ui.active_section=='shelf','unchanged save retained stale navigation')
+
     -- A newer verified progress state written to disk must beat an older live
     -- pending snapshot when Home later flushes an unrelated preference.
     reader:set_deferred('sessions',{['book-progress']={
@@ -146,6 +188,59 @@ local function run()
         'Home preference flush lost the verified progress terminal state')
     assert(progress_saved.pending_progress==false,
         'Home preference flush resurrected an already verified pending upload')
+
+    -- Exact-byte validation must see a same-sized external update even when
+    -- filesystem timestamps have not changed (the fixture always reports 1).
+    local external_bytes=read(path)
+    local advanced=external_bytes:gsub('(progress_verified_sequence"%]=)7','%18')
+        :gsub('(progress_latest_sequence"%]=)7','%18')
+    assert(#advanced==#external_bytes and advanced~=external_bytes)
+    assert(write(path,advanced))
+    assert(home:read_persisted('sessions')['book-progress'].progress_verified_sequence==8,
+        'persisted read hid a same-sized external progress update')
+    assert(home:flush())
+    assert(loadfile(path)().sessions['book-progress'].progress_verified_sequence==8)
+    local readback=home:read_persisted('sessions')
+    readback['book-progress'].progress_verified_sequence=99
+    assert(home:read_persisted('sessions')['book-progress'].progress_verified_sequence==8,
+        'returned persisted values mutated the validated snapshot')
+
+    local before_writes=write_count
+    assert(home:flush('duplicate_close'))
+    assert(write_count==before_writes,'unchanged close rewrote settings/backups')
+    home.db.data.return_fraction=1/3
+    assert(home:flush())
+    before_writes=write_count
+    assert(home:flush('same_fraction'))
+    assert(write_count==before_writes,'serialized progress fraction caused another full save')
+    home.db.data.return_fraction=nil
+    assert(home:flush())
+    -- Nested in-place changes and deletions must still be durable immediately.
+    home.db.data.return_test={nested={value='new',remove=true},flag=false}
+    assert(home:flush())
+    assert(loadfile(path)().return_test.nested.value=='new')
+    home.db.data.return_test.nested.remove=nil
+    home.db.data.return_test.nested.value='changed'
+    assert(home:flush())
+    local changed=loadfile(path)().return_test
+    assert(changed.nested.remove==nil and changed.nested.value=='changed' and changed.flag==false)
+    home.db.data.return_test=nil
+    assert(home:flush())
+    assert(loadfile(path)().return_test==nil,'deleted table remained on disk')
+    local native_write=require('miuread.util').atomic_write
+    require('miuread.util').atomic_write=function(target,payload,...)
+        if target==path then payload=payload:gsub('readback_probe"%]=1','readback_probe"%]=2') end
+        return native_write(target,payload,...)
+    end
+    home.db.data.readback_probe=1
+    assert(home:flush()==false,'valid Lua with altered written bytes was accepted')
+    require('miuread.util').atomic_write=native_write
+    home.db.data.readback_probe=1
+    assert(home:flush(),'save could not recover after altered readback')
+    assert(loadfile(path)().readback_probe==1)
+    assert(write(path,'invalid settings chunk'))
+    assert(home:flush(),'invalid disk must be repaired, not treated as unchanged')
+    assert(loadfile(path)().preferences.home_ui.local_entry_root=='/mnt/us/Other')
 
     local isolated_options={settings_path=path,data_dir=options.data_dir,isolated=true}
     local isolated=Store:new(isolated_options)

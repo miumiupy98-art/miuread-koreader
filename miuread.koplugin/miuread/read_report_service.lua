@@ -2,6 +2,7 @@ local Json = require("miuread.json")
 local U = require("miuread.util")
 local Adapter = require("miuread.legacy_adapter_worker")
 local Config = require("miuread.config")
+local SubprocessHygiene = require("miuread.subprocess_hygiene")
 
 local Service = {}
 
@@ -343,6 +344,7 @@ function Service.run(job)
             out.writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
             local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
+            if kind == "transport" then SubprocessHygiene.reset_resolver() end
             if result.accepted then
                 consecutive_failures = 0
                 consecutive_unconfirmed = 0
@@ -409,6 +411,7 @@ function Service.run(job)
         consecutive_failures = consecutive_failures + 1
         consecutive_unconfirmed = 0
         local kind=classify_error(nil,result)
+        if kind == "transport" then SubprocessHygiene.reset_resolver() end
         blocked = kind == "authentication"
         local delay = retry_delay(kind, consecutive_failures, interval)
         local due = final_flush and 0 or (completed_at + delay)
@@ -523,6 +526,7 @@ function Service.run(job)
                         -- counted or replayed.
                         next_due = now + first_delay
                         last_report_at = now
+                        SubprocessHygiene.reset_resolver()
                     end
                     write_context()
                     write_service_status({
@@ -580,6 +584,7 @@ function Service.run(job)
                     local now = os.time()
                     last_report_at = now
                     next_due = now + first_delay
+                    SubprocessHygiene.reset_resolver()
                 end
             end
 
