@@ -30,6 +30,13 @@ local function normalize_ratio(value)
     return value
 end
 
+-- context.progress / remote_progress are WeRead 0-100 percents.
+local function percent_to_ratio(value)
+    value = tonumber(value)
+    if not value then return nil end
+    return math.max(0, math.min(1, value / 100))
+end
+
 local function position(context, ratio)
     local chapters = type(context.chapters) == "table" and context.chapters or {}
     ratio = normalize_ratio(ratio)
@@ -60,7 +67,7 @@ local function position(context, ratio)
         end
         if context.remote_progress_loaded == true then
             return {
-                progress = math.floor(normalize_ratio(context.remote_progress or context.progress) * 100 + 0.5),
+                progress = math.floor((percent_to_ratio(context.remote_progress or context.progress) or 0) * 100 + 0.5),
                 chapter_uid = context.remote_chapter_uid or context.chapter_uid or 0,
                 chapter_index = tonumber(context.remote_chapter_idx or context.chapter_idx) or 0,
                 offset = tonumber(context.remote_chapter_offset or context.chapter_offset) or 0,

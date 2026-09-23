@@ -75,6 +75,17 @@ local function normalize_progress_ratio(value)
     return value
 end
 
+-- book.progress / remote_progress are WeRead 0-100 percents. Exactly 1 is 1%,
+-- not "finished"; normalize_progress_ratio(1) would return 1.0 and mark the
+-- cloud book as 100% read.
+local function percent_to_ratio(value)
+    value = tonumber(value)
+    if not value then
+        return nil
+    end
+    return math.max(0, math.min(1, value / 100))
+end
+
 local function native_progress_percent(value)
     local ratio = normalize_progress_ratio(value) or 0
     -- The Web Reader uses parseInt(100 * ratio), i.e. floor for the valid
@@ -233,7 +244,7 @@ local function select_context_chapter(book)
 
     -- Ratio fallback uses only chapters with trustworthy positive length. It
     -- must never choose a zero-length structural/random chapter just to report.
-    local ratio = normalize_progress_ratio(book.progress) or 0
+    local ratio = percent_to_ratio(book.progress) or 0
     local total = 0
     for _, chapter in ipairs(chapters) do total = total + trusted_words(book, chapter) end
     if total > 0 then
@@ -382,8 +393,9 @@ end
 
 local function estimate_position(book, progress_ratio)
     local chapters = type(book.chapters) == "table" and book.chapters or {}
+    -- progress_ratio is a 0-1 ratio; book.progress is a 0-100 percent.
     local ratio = normalize_progress_ratio(progress_ratio)
-        or normalize_progress_ratio(book.progress)
+        or percent_to_ratio(book.progress)
         or 0
 
     local native, native_error = native_local_position(book, ratio)
@@ -401,7 +413,7 @@ local function estimate_position(book, progress_ratio)
                 chapter_uid = book.remote_chapter_uid or book.chapter_uid or 0,
                 chapter_idx = tonumber(book.remote_chapter_idx or book.chapter_idx) or 0,
                 chapter_offset = tonumber(book.remote_chapter_offset or book.chapter_offset) or 0,
-                progress = native_progress_percent(book.remote_progress or book.progress),
+                progress = math.floor((percent_to_ratio(book.remote_progress or book.progress) or 0) * 100),
                 source = "remote_fallback",
             }
         end
