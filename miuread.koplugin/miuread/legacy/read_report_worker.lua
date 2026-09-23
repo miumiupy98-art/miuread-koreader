@@ -75,9 +75,9 @@ local function normalize_progress_ratio(value)
     return value
 end
 
--- `book.progress` / `remote_progress` are WeRead 0-100 percents. Exactly 1
--- means 1%, not "finished" — normalize_progress_ratio(1) would return 1.0
--- and mark the cloud book as 100% read (issue #115).
+-- book.progress / remote_progress are WeRead 0-100 percents. Exactly 1 is 1%,
+-- not "finished"; normalize_progress_ratio(1) would return 1.0 and mark the
+-- cloud book as 100% read.
 local function percent_to_ratio(value)
     value = tonumber(value)
     if not value then
@@ -87,13 +87,7 @@ local function percent_to_ratio(value)
 end
 
 local function native_progress_percent(value)
-    -- Accept either a 0-1 ratio or a 0-100 percent.
-    local ratio
-    if value ~= nil and tonumber(value) and tonumber(value) > 1 then
-        ratio = percent_to_ratio(value)
-    else
-        ratio = normalize_progress_ratio(value) or 0
-    end
+    local ratio = normalize_progress_ratio(value) or 0
     -- The Web Reader uses parseInt(100 * ratio), i.e. floor for the valid
     -- non-negative range. Sending a rounded percentage can disagree with co by
     -- one whole percentage point on long books.
@@ -419,7 +413,7 @@ local function estimate_position(book, progress_ratio)
                 chapter_uid = book.remote_chapter_uid or book.chapter_uid or 0,
                 chapter_idx = tonumber(book.remote_chapter_idx or book.chapter_idx) or 0,
                 chapter_offset = tonumber(book.remote_chapter_offset or book.chapter_offset) or 0,
-                progress = math.floor(percent_to_ratio(book.remote_progress or book.progress) * 100),
+                progress = math.floor((percent_to_ratio(book.remote_progress or book.progress) or 0) * 100),
                 source = "remote_fallback",
             }
         end

@@ -477,10 +477,10 @@ function Sync:_read_report_allowed(record)
     return row.read_report_enabled~=false
 end
 
--- Issue #115: a freshly opened / just-downloaded full book can briefly expose
--- doc_height=1, page_count=1 or percent_finished=1 before CRE finishes layout.
--- Treating that sample as a real 100% and then uploading it marks the WeRead
--- cloud book as finished. Prefer "no ratio yet" over a false "already done".
+-- A freshly opened / just-downloaded full book can briefly expose doc_height=1,
+-- page_count=1 or percent_finished=1 before CRE finishes layout. Treating that
+-- sample as a real 100% and uploading it marks the WeRead cloud book finished.
+-- Prefer "no ratio yet" over a false "already done".
 local MIN_TRUSTED_DOC_HEIGHT = 32
 
 local function layout_ratio_ready(height, page_total)
@@ -552,7 +552,7 @@ function Sync:local_ratio()
     if value then
         local ratio = value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1)
         -- A "finished" sample while doc_height is still a layout placeholder
-        -- is not trustworthy — even if page_count already looks multi-page.
+        -- is not trustworthy, even if page_count already looks multi-page.
         if ratio >= 1 and (not height or height < MIN_TRUSTED_DOC_HEIGHT) then
             self.last_local_ratio_source = "footer_finished_untrusted"
             return nil

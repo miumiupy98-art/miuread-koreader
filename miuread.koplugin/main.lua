@@ -25873,10 +25873,10 @@ function Plugin:_copy_thought_comment(comment,source_text,include_source)
         self:toast("当前设备不支持系统剪贴板",2.5)
         return false
     end
-    -- KOReader's Input.setClipboardText(text) is a plain function, not a method.
-    -- Passing Device.input as the first argument stores the Input table itself,
-    -- so later paste/show yields "table: 0x..." (see issue #111).
-    local ok,err=pcall(Device.input.setClipboardText, tostring(text or ""))
+    -- setClipboardText(text) is a plain function, not a method. Passing
+    -- Device.input as the first argument stores the Input table itself and
+    -- later paste shows "table: 0x...".
+    local ok,err=pcall(Device.input.setClipboardText,text)
     if not ok then
         logger.warn("[MiuRead][ThoughtFavorite] clipboard failed",tostring(err))
         self:toast("复制失败",2)

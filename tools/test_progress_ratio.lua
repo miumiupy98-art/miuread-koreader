@@ -14,30 +14,25 @@ local function percent_to_ratio(value)
 end
 
 local function native_progress_percent(value)
-    local ratio
-    if value ~= nil and tonumber(value) and tonumber(value) > 1 then
-        ratio = percent_to_ratio(value)
-    else
-        ratio = normalize_progress_ratio(value) or 0
-    end
+    local ratio = normalize_progress_ratio(value) or 0
     return math.floor(math.max(0, math.min(1, ratio)) * 100)
 end
 
 -- 1% stored as WeRead percent must stay 1%, not become 100%.
-assert(percent_to_ratio(1) == 0.01, "1 percent must be 1%")
-assert(percent_to_ratio(100) == 1, "100 percent must be 100%")
-assert(percent_to_ratio(50) == 0.5, "50 percent must be 50%")
-assert(percent_to_ratio(0) == 0, "0 percent must be 0%")
+assert(percent_to_ratio(1)==0.01,'1 percent must be 1%')
+assert(percent_to_ratio(100)==1,'100 percent must be 100%')
+assert(percent_to_ratio(50)==0.5,'50 percent must be 50%')
+assert(percent_to_ratio(0)==0,'0 percent must be 0%')
 
 -- Ratio inputs remain valid (job.progress_ratio / report_ratio_from_position).
-assert(normalize_progress_ratio(0.01) == 0.01, "ratio 0.01 must stay 1%")
-assert(normalize_progress_ratio(1) == 1, "ratio 1 must stay 100%")
-assert(normalize_progress_ratio(50) == 0.5, "percent-like 50 becomes 50%")
+assert(normalize_progress_ratio(0.01)==0.01,'ratio 0.01 must stay 1%')
+assert(normalize_progress_ratio(1)==1,'ratio 1 must stay 100%')
+assert(normalize_progress_ratio(50)==0.5,'percent-like 50 becomes 50%')
 
-assert(native_progress_percent(0.01) == 1, "ratio 0.01 floors to 1%")
-assert(native_progress_percent(1) == 100, "ratio 1 floors to 100%")
-assert(native_progress_percent(50) == 50, "percent 50 floors to 50%")
-assert(native_progress_percent(1.5) == 1, "percent 1.5 floors to 1%")
+assert(native_progress_percent(0.01)==1,'ratio 0.01 floors to 1%')
+assert(native_progress_percent(1)==100,'ratio 1 floors to 100%')
+assert(native_progress_percent(50)==50,'percent 50 floors to 50%')
+assert(native_progress_percent(1.5)==1,'percent 1.5 floors to 1%')
 
 -- layout gate: one-page / tiny doc_height must not look finished
 local MIN_TRUSTED_DOC_HEIGHT = 32
@@ -48,9 +43,9 @@ local function layout_ratio_ready(height, page_total)
     if page_total and page_total > 1 then return true end
     return false
 end
-assert(layout_ratio_ready(1, 1) == false, "unready layout must be rejected")
-assert(layout_ratio_ready(1, nil) == false, "tiny height without pages must be rejected")
-assert(layout_ratio_ready(32, 1) == true, "trusted height is enough")
-assert(layout_ratio_ready(1, 2) == true, "multi-page is enough")
+assert(layout_ratio_ready(1,1)==false,'unready layout must be rejected')
+assert(layout_ratio_ready(1,nil)==false,'tiny height without pages must be rejected')
+assert(layout_ratio_ready(32,1)==true,'trusted height is enough')
+assert(layout_ratio_ready(1,2)==true,'multi-page is enough')
 
-print("progress ratio / layout gate: PASS")
+print('progress ratio / layout gate: PASS')
