@@ -477,28 +477,6 @@ function Sync:_read_report_allowed(record)
     return row.read_report_enabled~=false
 end
 
--- A freshly opened / just-downloaded full book can briefly expose doc_height=1,
--- page_count=1 or percent_finished=1 before CRE finishes layout. Treating that
--- sample as a real 100% and uploading it marks the WeRead cloud book finished.
--- Prefer "no ratio yet" over a false "already done".
-local MIN_TRUSTED_DOC_HEIGHT = 32
-
-local function layout_ratio_ready(height, page_total)
-    height = tonumber(height)
-    page_total = tonumber(page_total)
-    if height and height >= MIN_TRUSTED_DOC_HEIGHT then return true end
-    if page_total and page_total > 1 then return true end
-    return false
-end
-
-local function trusted_page_ratio(page, total)
-    page = tonumber(page)
-    total = tonumber(total)
-    if not page or not total or total <= 0 then return nil end
-    if total <= 1 then return nil end
-    return U.clamp(page / total, 0, 1)
-end
-
 function Sync:local_ratio()
     local ui = self.host.ui
     if not ui or not ui.document then return nil end
@@ -511,17 +489,7 @@ function Sync:local_ratio()
     -- with book length. CRE exposes a continuous position for the same XPointer
     -- we already use for precise source anchoring, so keep that precision here.
     local height = document.info and tonumber(document.info.doc_height) or nil
-    local page_total
-    if document.getPageCount then
-        local ok_count, count = pcall(document.getPageCount, document)
-        page_total = ok_count and tonumber(count) or nil
-    end
-    if not layout_ratio_ready(height, page_total) then
-        self.last_local_ratio_source = "layout_not_ready"
-        return nil
-    end
-    if ui.rolling and height and height >= MIN_TRUSTED_DOC_HEIGHT
-        and type(document.getPosFromXPointer) == "function" then
+    if ui.rolling and height and height > 0 and type(document.getPosFromXPointer) == "function" then
         local xp = ui.rolling.xpointer
         if (xp == nil or tostring(xp) == "") and type(document.getXPointer) == "function" then
             local ok_xp, current_xp = pcall(document.getXPointer, document)
@@ -539,7 +507,7 @@ function Sync:local_ratio()
 
     -- current_pos is also continuous and cheaper than page/page-count. Keep it
     -- as the second choice when an XPointer position cannot be resolved.
-    if ui.rolling and height and height >= MIN_TRUSTED_DOC_HEIGHT then
+    if ui.rolling and height and height > 0 then
         local pos = tonumber(ui.rolling.current_pos)
         if pos then
             self.last_local_ratio_source = "rolling_doc_pos"
@@ -550,25 +518,15 @@ function Sync:local_ratio()
     local footer = ui.view and ui.view.footer
     local value = footer and tonumber(footer.percent_finished)
     if value then
-        local ratio = value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1)
-        -- A "finished" sample while doc_height is still a layout placeholder
-        -- is not trustworthy, even if page_count already looks multi-page.
-        if ratio >= 1 and (not height or height < MIN_TRUSTED_DOC_HEIGHT) then
-            self.last_local_ratio_source = "footer_finished_untrusted"
-            return nil
-        end
         self.last_local_ratio_source = "footer_page_ratio"
-        return ratio
+        return value > 1 and U.clamp(value / 100, 0, 1) or U.clamp(value, 0, 1)
     end
     if document.getCurrentPage and document.getPageCount then
         local a, page = pcall(document.getCurrentPage, document)
         local b, total = pcall(document.getPageCount, document)
-        if a and b then
-            local ratio = trusted_page_ratio(page, total)
-            if ratio then
-                self.last_local_ratio_source = "document_page_ratio"
-                return ratio
-            end
+        if a and b and tonumber(total) and tonumber(total) > 0 then
+            self.last_local_ratio_source = "document_page_ratio"
+            return U.clamp(tonumber(page) / tonumber(total), 0, 1)
         end
     end
 end
