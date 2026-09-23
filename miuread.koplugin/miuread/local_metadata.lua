@@ -41,6 +41,10 @@ end
 local function codepoint_to_utf8(code)
     code = tonumber(code)
     if not code or code < 0 or code > 0x10FFFF then return "" end
+    local ok, util = pcall(require, "util")
+    if ok and util and type(util.unicodeCodepointToUtf8) == "function" then
+        return util.unicodeCodepointToUtf8(code) or ""
+    end
     if code < 0x80 then
         return string.char(code)
     elseif code < 0x800 then
@@ -58,9 +62,9 @@ local function codepoint_to_utf8(code)
         0x80 + code % 0x40)
 end
 
--- KOReader's util.htmlEntitiesToUtf8 only runs when htmlToPlainTextIfHtml
--- decides the string is HTML. A dc:title made of bare &#xHHH; references is
--- not HTML, so those entities used to leak through as visible "乱码" (#107).
+-- util.htmlEntitiesToUtf8 only runs when htmlToPlainTextIfHtml treats the
+-- string as HTML. A dc:title of bare &#xHHH; references is not HTML, so those
+-- entities used to leak through as visible garbage.
 local function decode_numeric_entities(value)
     value = tostring(value or "")
     value = value:gsub("&#(%d+);", function(dec)
@@ -72,9 +76,9 @@ local function decode_numeric_entities(value)
     return value
 end
 
--- Title/author/publisher are already plain XML text after entity decode.
--- Never run htmlToPlainTextIfHtml on them: it strips "<...>" and can eat
--- legitimate title characters like "人生<哲学>".
+-- Title/author/publisher are plain XML text after entity decode. Never run
+-- htmlToPlainTextIfHtml on them: it strips "<...>" and eats titles such as
+-- "人生<哲学>".
 local function xml_text(value)
     value = trim(value)
     if value == "" then return nil end
@@ -485,9 +489,9 @@ function LocalMetadata.merge(book, metadata)
             changed = true
         end
     end
-    -- Identity fields: never overwrite a non-empty title/author already held
-    -- by the account shelf (WeRead API). Desktop Home used to replace them with
-    -- OPF-extracted text and showed garbled titles for some books (#107).
+    -- Never overwrite a non-empty title/author already held by the account
+    -- shelf (WeRead API). Desktop Home used to replace them with OPF-extracted
+    -- text and showed garbled titles for some books.
     local function fill_identity(key, value)
         if value == nil or value == "" then return end
         local current = book[key]
