@@ -780,7 +780,8 @@ local function response_header(headers, name)
 end
 
 function Reader:new(http, store)
-    return setmetatable({http=http, store=store, _renewing_session=false, _transient_image_roots={}}, self)
+    return setmetatable({http=http, store=store, _renewing_session=false,
+        _transient_image_roots={}, _reader_context=nil}, self)
 end
 
 function Reader:cleanup_transient_images()
@@ -859,6 +860,9 @@ function Reader:_recover_login_session()
 
     self._renewing_session = false
     if ok then
+        -- A renewed session invalidates the page load the cached psvts came
+        -- from, so the next chapter must fetch a reader page again.
+        self:forget_reader_context("login renewed")
         logger.info("[MiuRead][Reader] login renewal completed; web credentials present",
             "skills=", tostring(result.skills_verified == true),
             "vid_unchanged=", tostring(before_vid == "" or before_vid == tostring(result.vid or "")))
@@ -874,8 +878,24 @@ function Reader:check_login_session()
     return result
 end
 
+local function reader_page_url(book_id,chapter_uid)
+    if Protocol.is_mp(book_id) then return Protocol.mp_reader_url(book_id) end
+    return Protocol.reader_url(book_id,chapter_uid)
+end
+
+-- How long one reader-page load stays usable. `psvts` identifies a page load,
+-- not a chapter, so the same value signs every chapter's content request.
+--
+-- The content API stops accepting a psvts 300 seconds after its page loaded.
+-- Measured on a 108-chapter download: two chapters answered with an empty body
+-- at 303 s and 303 s of context age, and both returned full content on the
+-- retry that reloaded the page. Note that sync.lua reuses a context for 15
+-- minutes -- the reading-time endpoint is more tolerant than this one, so that
+-- value must not be copied here. Refresh with a margin below the real limit.
+local READER_CONTEXT_MAX_AGE = 240
+
 local function load_reader_context(self,book_id,chapter_uid,require_psvts,keepalive)
-    local url=Protocol.is_mp(book_id) and Protocol.mp_reader_url(book_id) or Protocol.reader_url(book_id,chapter_uid)
+    local url=reader_page_url(book_id,chapter_uid)
     local html,_,final_url=self.http:download(url,{headers={Accept="text/html,application/xhtml+xml"},retries=2,
         keepalive=keepalive==true})
     local page_error=login_page_error(html,final_url)
@@ -911,6 +931,53 @@ end
 -- the four chapter shards back to back against the same origin.
 function Reader:state(book_id,chapter_uid,keepalive)
     return load_reader_context(self,book_id,chapter_uid,true,keepalive)
+end
+
+-- Everything a reader page contributes that belongs to the book rather than to
+-- one chapter. `source` (the whole decoded page bootstrap) is deliberately left
+-- out: nothing outside load_reader_context reads it, and keeping it would pin
+-- the page's entire JSON tree in memory for the length of a download.
+local function book_scoped_context(context)
+    return {
+        psvts=context.psvts, pclts=context.pclts, token=context.token,
+        book=context.book, book_version=context.book_version,
+    }
+end
+
+function Reader:forget_reader_context(reason)
+    if not self._reader_context then return false end
+    logger.info("[MiuRead][Reader] reader context dropped","reason=",tostring(reason or ""))
+    self._reader_context=nil
+    return true
+end
+
+-- The per-chapter state table. _epub_once and _txt_once use this table as their
+-- working area -- they write raw_xhtml, coord_html, image_work_root and the
+-- image_archive_* flags into it -- so every chapter must receive its own table.
+-- Only the book-scoped fields are shared, and `url` is rebuilt locally for the
+-- requested chapter instead of being carried over from the cached page.
+function Reader:chapter_state(book_id,chapter_uid,keepalive)
+    local cached=self._reader_context
+    local usable=cached and tostring(cached.book_id)==tostring(book_id)
+        and os.time()-(tonumber(cached.fetched_at) or 0) < READER_CONTEXT_MAX_AGE
+        and optional_value(cached.context.psvts)
+    if not usable then
+        self._reader_context={
+            book_id=tostring(book_id),
+            context=book_scoped_context(self:state(book_id,chapter_uid,keepalive)),
+            fetched_at=os.time(),
+        }
+        cached=self._reader_context
+    end
+    local state={}
+    for key,value in pairs(cached.context) do state[key]=value end
+    state.url=reader_page_url(book_id,chapter_uid)
+    -- When the page was actually loaded, not when this chapter asked for it.
+    -- The download record carries psvts forward to the reading-time and
+    -- progress workers, which decide from this stamp whether to reload; a
+    -- cached context must not be able to present itself as newly fetched.
+    state.context_fetched_at=cached.fetched_at
+    return state
 end
 
 function Reader:catalog(book_id, request_options)
@@ -973,7 +1040,7 @@ function Reader:_txt_once(book, chapter, opt, state)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
-    state = state or self:state(id, uid, opt.keepalive)
+    state = state or self:chapter_state(id, uid, opt.keepalive)
     local a = self:shard("/web/book/chapter/t_0", id, uid, state.psvts, false, opt.keepalive)
     local ok_b, b = pcall(self.shard, self, "/web/book/chapter/t_1", id, uid, state.psvts, false, opt.keepalive)
     if not ok_b then b = "" end
@@ -991,7 +1058,7 @@ function Reader:_epub_once(book, chapter, opt, state)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
-    state = state or self:state(id, uid, opt.keepalive)
+    state = state or self:chapter_state(id, uid, opt.keepalive)
 
     local a = self:shard("/web/book/chapter/e_0", id, uid, state.psvts, false, opt.keepalive)
     if a:match("^%s*{") and a:find('"bookId"', 1, true) then
@@ -1121,7 +1188,7 @@ function Reader:_chapter_once(book, chapter, format, opt)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
     local uid = chapter.chapterUid or chapter.uid
-    local state = self:state(id, uid, opt.keepalive)
+    local state = self:chapter_state(id, uid, opt.keepalive)
 
     if format == "txt" then
         local ok, a, b, c, d = pcall(self._txt_once, self, book, chapter, opt, state)
@@ -1154,6 +1221,12 @@ function Reader:chapter(book, chapter, format, opt)
         local ok, a, b, c, d = pcall(self._chapter_once, self, book, chapter, format, opt)
         if ok then return a, b, c, d end
         last = a
+        -- Any failure may be the cached reader context's fault: a stale psvts
+        -- makes the content API answer with an empty body, and three of those
+        -- would silently turn a real chapter into a blank structure page. Drop
+        -- it so the next attempt loads a fresh page, which is what every
+        -- attempt did before the context was cached.
+        self:forget_reader_context("chapter attempt failed")
         local control_error=tostring(a or "")
         if control_error:find("__MIUREAD_HIBERNATE__",1,true)
             or control_error:lower():find("download cancelled",1,true) then
