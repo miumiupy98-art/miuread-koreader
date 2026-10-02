@@ -4543,7 +4543,8 @@ function Plugin:_home_note_interaction(first,kind)
         local active=self.background_scheduler.active
         if active and active.user_requested~=true
             and (active.key=="home_stats" or active.key=="sync_summary" or active.key=="home_shelf"
-                or active.key=="home_metadata" or active.key=="home_cover" or active.key=="home_cover_render") then
+                or active.key=="home_metadata" or active.key=="home_cover" or active.key=="home_cover_render"
+                or active.key=="home_progress") then
             self:_background_cancel_worker(active.key,"home interaction")
             self.background_scheduler:force_release("home interaction")
         end
@@ -5002,7 +5003,7 @@ function Plugin:_home_refresh_remote(force,user_requested)
 end
 
 function Plugin:_home_schedule_progress()
-    if not HomeView.is_shown() or self:_active_reader_ui() or self:_home_background_blocked()
+    if not HomeView.is_shown() or self:_active_reader_ui() or self:_home_ui_busy()
         or not self:logged_in() or self:_network_radio_hint()==false
         or not self.home_progress_async or not self.home_progress_async:available()
         or self.home_progress_async:busy() or self._home_remote_refreshing then return false end
@@ -5054,6 +5055,10 @@ function Plugin:_home_schedule_progress()
             or tostring((auth.account or {}).vid or (auth.cookies or {}).wr_vid or "")
                 ~=tostring((current_auth.account or {}).vid or (current_auth.cookies or {}).wr_vid or "")
             or not HomeView.is_shown() or self:_active_reader_ui() then return end
+        if self:_home_ui_busy() then
+            self:_home_resume_visible_work_after_idle()
+            return
+        end
         for _,id in ipairs(ids) do self._home_progress_attempts[id]=os.time() end
         local value=result and result.ok==true and result.value or nil
         if type(value)=="table" then
@@ -5078,13 +5083,14 @@ end
 
 function Plugin:_home_apply_shelf_progress(updates)
     local sessions=self.store:get("sessions",{})
-    local seen={}
+    local seen,changed={},{}
     local function apply(book)
         if type(book)~="table" or seen[book] or UnifiedLibrary.canonical_source(book)~="weread" then return end
         seen[book]=true
         local id=tostring(book.bookId or book.book_id or "")
         local update=updates[id]
         if not update then return end
+        local progress,finished,status=book.progress,book.finished,book.status_text
         book.cloud_progress=update.percent
         book.remote_progress=update.percent
         book.remote_progress_known=true
@@ -5092,6 +5098,7 @@ function Plugin:_home_apply_shelf_progress(updates)
         book.progress_updated_at=update.updated_at
         ShelfProgress.display(book,sessions[id])
         book.status_text=self:_shelf_status_text(book)
+        if progress~=book.progress or finished~=book.finished or status~=book.status_text then changed[id]=true end
     end
     -- Update raw rows as well as prepared pages: a source/group switch must
     -- retain the newly fetched percentage and the pending local override.
@@ -5100,14 +5107,9 @@ function Plugin:_home_apply_shelf_progress(updates)
     for _,pages in pairs(self._home_cloud_page_cache or {}) do
         for _,page in pairs(pages) do for _,book in ipairs(page.rows or {}) do apply(book) end end
     end
-    if next(updates) then
-        for _,section in ipairs({"shelf","device","recent"}) do self:_home_bump_section_revision(section) end
-    end
-    for id in pairs(updates) do
-        self:_home_mutate_book_rows(id,apply)
-        HomeView.update_book(id)
-    end
-    if self._home_hero and updates[tostring(self._home_hero.bookId or self._home_hero.book_id or "")] then
+    for id in pairs(updates) do self:_home_mutate_book_rows(id,apply) end
+    for id in pairs(changed) do HomeView.update_book(id) end
+    if self._home_hero and changed[tostring(self._home_hero.bookId or self._home_hero.book_id or "")] then
         HomeView.update_hero(self._home_hero)
     end
 end

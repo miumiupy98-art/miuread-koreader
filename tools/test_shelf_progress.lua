@@ -76,20 +76,23 @@ assert(Progress.display({cloud_progress=32}, {progress_local_percent=68,
 
 local cache={books={},raw_books={}}
 local store={sessions={}}
+local cache_flushes=0
 function store:shelf_cache() return copy(cache) end
-function store:save_shelf_cache(v) cache=copy(v); return true end
+function store:save_shelf_cache(v) cache_flushes=cache_flushes+1; cache=copy(v); return true end
 function store:preferences() return {shelf_filter={enabled=false}} end
 function store:save_preferences() return true end
 function store:get(key,default) return key=='sessions' and self.sessions or copy(default) end
-function store:set_deferred() end
+function store:set_deferred(key,value) if key=='shelf_cache' then cache=copy(value) end end
 function store:auth() return {login_session_id='login',api_key='key'} end
 local lib=Library:new({}, {}, store)
 local rows=lib:_apply_stream_response{books={{bookId='a',finishReading=1},{bookInfo={bookId='b',finishReading=1},progress=15}},archive={}}
 assert(rows[1].finished and rows[2].finished,'finishReading was ignored')
 assert(rows[1].progress==nil and not rows[1].remote_progress_known,'missing shelf percentage became zero')
 assert(not lib:account_row(rows[1],nil).downloaded,'cloud-only book became downloaded')
+local flushes=cache_flushes
 lib:apply_shelf_progress{a={percent=57,updated_at=10,fetched_at=20},b={percent=15,fetched_at=20}}
 assert(cache.books[1].progress==57 and cache.books[1].finished)
+assert(cache_flushes==flushes,'presentation batch flushed the entire settings file')
 local changed,accepted=lib:apply_shelf_progress{a={percent=11,updated_at=9,fetched_at=21}}
 assert(not changed and accepted.a==nil and cache.books[1].progress==57,'older cloud response regressed the cache')
 rows=lib:_apply_stream_response{books={{bookId='a',finishReading=0},{bookId='b',finishReading=1}},archive={}}
@@ -129,7 +132,7 @@ _G.__MIUREAD_POSITION_RESOLUTION=previous_resolver
 -- Exercise the actual Home orchestration without KOReader widgets or network.
 local file=assert(io.open(ROOT..'main.lua','rb')); local source=file:read('*a'); file:close()
 local Plugin={}
-local shown,offline,available=true,false,true
+local shown,offline,available,busy=true,false,true,false
 local view={opts={shelf_books={}}}
 local updated={}
 local HomeView={is_shown=function() return shown end,current=function() return view end,
@@ -147,6 +150,7 @@ function worker:finish()
     local cb=self.callback; self.callback=nil
     cb({ok=true,value=self.fn()})
 end
+function worker:cancel() self.callback=nil end
 local network_calls={}
 local child_api={web_progress=function(_,id) network_calls[#network_calls+1]=id; return {bookId=id,progress=45} end}
 local env=setmetatable({Plugin=Plugin,HomeView=HomeView,UIManager=UIManager,U=U,Protocol=Protocol,
@@ -158,12 +162,16 @@ local function load_method(name)
     local stop=source:find('\nfunction Plugin:',start+1,true) or #source
     local chunk=assert(loadstring(source:sub(start,stop-1))); setfenv(chunk,env); chunk()
 end
-load_method('_home_schedule_progress'); load_method('_home_apply_shelf_progress'); load_method('_home_bump_section_revision')
+load_method('_home_schedule_progress'); load_method('_home_apply_shelf_progress')
 local p=setmetatable({store=store,library=lib,home_progress_async=worker,_shelf_refresh_generation=1,
-    _home_unified_all={},_home_unified_raw={},_home_cloud_page_cache={}}, {__index=Plugin})
+    _home_unified_all={},_home_unified_raw={},_home_cloud_page_cache={},
+    _home_section_revisions={shelf=2,device=4,recent=6}}, {__index=Plugin})
 function p:_active_reader_ui() return false end
 function p:_home_background_blocked() return false end
 function p:_home_relink_generated_files() end
+function p:_home_ui_busy() return busy end
+local idle_resumes=0
+function p:_home_resume_visible_work_after_idle() idle_resumes=idle_resumes+1 end
 function p:logged_in() return true end
 function p:_network_radio_hint() return not offline end
 function p:_background_claim() return 1 end
@@ -200,6 +208,13 @@ assert(p:_home_schedule_progress() and #network_calls==0,'network ran in the UI 
 worker:finish()
 assert(#network_calls==2 and view.opts.shelf_books[1].progress==45 and not view.opts.shelf_books[1].downloaded)
 assert(updated.a and updated.b,'cards were not updated')
+assert(p._home_section_revisions.shelf==2 and p._home_section_revisions.device==4
+    and p._home_section_revisions.recent==6,'progress update invalidated every shelf section')
+updated.a,updated.b=nil,nil
+local revision=p._home_section_revisions.shelf
+p:_home_apply_shelf_progress{a={percent=45,fetched_at=os.time()+1},b={percent=45,fetched_at=os.time()+1}}
+assert(not updated.a and not updated.b and revision==p._home_section_revisions.shelf,
+    'unchanged percentages rebuilt cards and invalidated cached pages')
 assert(p:_home_schedule_progress()); worker:finish()
 assert(#network_calls==3 and network_calls[3]=='c','query was not bounded to visible WeRead books')
 assert(not p:_home_schedule_progress(),'fresh page was fetched again')
@@ -235,6 +250,44 @@ child_api.web_progress=function() error('offline') end
 view.opts.shelf_books={book('e')}; view.opts.shelf_books[1].progress=20
 assert(p:_home_schedule_progress()); worker:finish()
 assert(view.opts.shelf_books[1].progress==20 and not p:_home_schedule_progress())
+
+-- Input takes priority over both starting and applying presentation reads.
+child_api.web_progress=function(_,id) return {bookId=id,progress=45} end
+view.opts.shelf_books={book('busy')}; busy=true
+assert(not p:_home_schedule_progress(),'progress query started during interaction')
+busy=false; assert(p:_home_schedule_progress()); busy=true
+worker:finish()
+assert(view.opts.shelf_books[1].progress==nil and idle_resumes==1,'result repainted while the user was interacting')
+busy=false
+assert(p:_home_schedule_progress()); worker:finish()
+assert(view.opts.shelf_books[1].progress==45,'query did not resume after interaction')
+
+-- Exercise the actual gesture/page path with an in-flight presentation read.
+load_method('_home_note_interaction'); load_method('_background_cancel_worker')
+load_method('_home_cancel_visible_page_work'); load_method('_home_change_page')
+env.Config={}; env.monotonic_wall_time=os.clock; env.logger=require('logger')
+env.Time={now=os.time}
+function p:_home_clear_lockscreen_visual_hold() end
+function p:_home_bump_interaction_generation() end
+view.opts.shelf_books={book('turn')}
+assert(p:_home_schedule_progress())
+local late=worker.callback
+local released=0
+p.background_scheduler={active={key='home_progress'},set_foreground_barrier=function() end,
+    force_release=function(self) self.active=nil; released=released+1 end,cancel_key=function() end}
+p:_home_note_interaction(false,'page-next')
+assert(not worker:busy() and released==1,'gesture left presentation query competing with a page turn')
+local home={page_by_section={shelf=1}}
+p._home_active_section='shelf'; p._home_sections={shelf={rows={}}}
+function p:_home_preferences() return home,{} end
+function p:_home_page_limit() return 8 end
+function p:_home_preview_page(_,_,page) return {},page,2 end
+function p:_save_home_preferences_deferred() end
+local rendered=false
+function p:_home_apply_section() rendered=true; assert(not worker:busy()); return true end
+assert(p:_home_change_page(1) and home.page_by_section.shelf==2 and rendered,'page turn waited for progress query')
+late({ok=true,value={updates={turn={percent=99}}}})
+assert(view.opts.shelf_books[1].progress==nil,'retired page query overwrote the new page')
 
 -- Verify the manual Refresh button still drives the cloud-shelf refresh path.
 load_method('_home_manual_refresh')
@@ -376,6 +429,25 @@ function p:_home_all_books_state() return {source='all',status='unread',sort='ti
 assert(#p:_home_all_books_apply(states)==1,'finished book appeared as unread')
 function p:_home_all_books_state() return {source='all',status='reading',sort='title'} end
 assert(#p:_home_all_books_apply(states)==1,'finished book appeared as reading')
+
+-- Updating one book invalidates only inactive rendered layers containing it.
+file=assert(io.open(ROOT..'miuread/home_view.lua','rb')); local widget_source=file:read('*a'); file:close()
+local widget_start=assert(widget_source:find('function HomeWidget:updateBook(',1,true))
+local widget_stop=assert(widget_source:find('\nfunction ',widget_start+1,true))
+local HomeWidget={}
+local widget_chunk=assert(loadstring(widget_source:sub(widget_start,widget_stop-1)))
+setfenv(widget_chunk,setmetatable({HomeWidget=HomeWidget},{__index=_G})); widget_chunk()
+local freed={}
+local function layer(name) return {free=function() freed[name]=true end} end
+local active,affected,unrelated=layer('active'),layer('affected'),layer('unrelated')
+local layers={active={layer=active,slots={a={}}},affected={layer=affected,slots={a={}}},
+    unrelated={layer=unrelated,slots={c={}}}}
+local widget=setmetatable({_section_layer=active,_section_layer_cache=layers,_section_book_slots={}},
+    {__index=HomeWidget})
+widget:updateBook('a')
+assert(layers.active and layers.unrelated and not layers.affected and freed.affected
+    and not freed.active and not freed.unrelated,'book update discarded unrelated or active rendered layers')
+widget:updateBook('missing'); assert(layers.unrelated,'unknown book discarded a cached layer')
 
 -- Reading verification updates the cloud cache without erasing an independent
 -- phone finishReading flag, even when the reader is below 100%.
