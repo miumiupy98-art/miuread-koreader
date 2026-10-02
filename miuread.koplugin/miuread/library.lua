@@ -703,7 +703,10 @@ function Library:apply_shelf_progress(updates)
             end
         end
     end
-    if changed then self.store:save_shelf_cache(cache) end
+    -- Percentages are a disposable display cache. Keep them in shared settings
+    -- for the next normal flush; saving the entire library for every batch
+    -- stalls the UI thread on e-ink devices.
+    if changed then self.store:set_deferred("shelf_cache",cache) end
     return changed,accepted
 end
 
