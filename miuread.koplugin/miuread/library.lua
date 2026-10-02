@@ -2,10 +2,12 @@ local Protocol=require("miuread.protocol")
 local Codec=require("miuread.codec")
 local U=require("miuread.util")
 local DownloadResult=require("miuread.download_result")
+local ShelfProgress=require("miuread.shelf_progress")
+local FinishedStatus=require("miuread.finished_status")
 local logger=require("logger")
 local Library={}; Library.__index=Library
 function Library:new(api,http,store)
-    return setmetatable({api=api,http=http,store=store,_sort_cache={}},self)
+    return setmetatable({api=api,http=http,store=store,finished_status=FinishedStatus:new(store),_sort_cache={}},self)
 end
 
 local COVER_MAX_BYTES=12*1024*1024
@@ -129,6 +131,9 @@ local function book(row,raw_index,archive_map)
         row.shelfOrder,row.shelfIndex,row.bookOrder,row.sortOrder,row.displayOrder,
         b.shelfOrder,b.shelfIndex,b.bookOrder,b.sortOrder,b.displayOrder
     )
+    local progress=ShelfProgress.percent(row.progress or row.readingProgress or b.progress)
+    local finished=ShelfProgress.finished_flag(row)
+    if finished==nil then finished=ShelfProgress.finished_flag(b) end
     return {
         bookId=id,
         title=b.title or row.title or "未命名",
@@ -140,8 +145,10 @@ local function book(row,raw_index,archive_map)
         version=tonumber(b.version or b.bookVersion or b.book_version
             or row.version or row.bookVersion or row.book_version),
         updateTime=tonumber(row.updateTime or b.updateTime or row.bookUpdateTime or 0) or 0,
-        progress=tonumber(row.progress or row.readingProgress or b.progress or 0) or 0,
-        finished=(row.finished==true or tonumber(row.progress or row.readingProgress or 0)>=100),
+        progress=progress or 0,
+        cloud_progress=progress,
+        cloud_finished=finished,
+        finished=finished==true or (finished==nil and (progress or 0)>=100),
         isTop=truthy(top_value),
         rawIndex=tonumber(raw_index) or 0,
         explicitOrder=explicit_order,
@@ -561,7 +568,7 @@ local function attach_group_snapshot(rows,groups)
     return rows
 end
 
-function Library:_apply_stream_response(data)
+function Library:_apply_stream_response(data,finished_snapshot)
     data=type(data)=="table" and data or {}
     local stream=type(data._miuread_stream)=="table" and data._miuread_stream or nil
     -- beta.4 makes Home navigation fully local. A streamed/partial response can
@@ -579,6 +586,21 @@ function Library:_apply_stream_response(data)
         return books,mp,false,true
     end
     local raw_books,mp,groups=self:_normalize_full(data)
+    -- shelf/sync often omits percentages. Retain the last successful progress
+    -- read while marking it due for renewal after this shelf refresh.
+    local previous={}
+    local cache=self.store:shelf_cache()
+    for _,row in ipairs(cache.raw_books or cache.books or {}) do previous[tostring(row.bookId)]=row end
+    for _,row in ipairs(raw_books) do
+        local old=previous[tostring(row.bookId)]
+        if old and row.cloud_finished==nil then row.cloud_finished=old.cloud_finished end
+        if row.cloud_progress==nil and old then
+            row.cloud_progress=tonumber(old.cloud_progress)
+            row.progress=row.cloud_progress or tonumber(old.progress) or 0
+            row.progress_updated_at=old.progress_updated_at
+        end
+        self.finished_status:reconcile(row,finished_snapshot)
+    end
     local response_group_authoritative=groups.authoritative==true
     local filter=current_filter(self.store)
     if not response_group_authoritative then
@@ -652,6 +674,37 @@ end
 
 function Library:last_refresh_meta()
     return U.copy(type(self.last_shelf_refresh_meta)=="table" and self.last_shelf_refresh_meta or {})
+end
+
+function Library:apply_shelf_progress(updates)
+    local cache=self.store:shelf_cache()
+    local accepted=U.copy(updates)
+    for _,rows in ipairs({cache.raw_books or {},cache.books or {}}) do
+        for _,row in ipairs(rows) do
+            local id=tostring(row.bookId or row.book_id or "")
+            local update=accepted[id]
+            if update and (tonumber(update.updated_at) or 0)>0
+                and (tonumber(row.progress_updated_at) or 0)>tonumber(update.updated_at) then
+                accepted[id]=nil
+            end
+        end
+    end
+    local changed=false
+    for _,rows in ipairs({cache.raw_books or {},cache.books or {}}) do
+        for _,row in ipairs(rows) do
+            local update=accepted[tostring(row.bookId or row.book_id or "")]
+            if update and tonumber(update.percent) then
+                row.cloud_progress=update.percent
+                row.progress=update.percent
+                row.progress_updated_at=update.updated_at
+                row.progress_fetched_at=update.fetched_at
+                self.finished_status:overlay(row)
+                changed=true
+            end
+        end
+    end
+    if changed then self.store:save_shelf_cache(cache) end
+    return changed,accepted
 end
 
 function Library:large_shelf_group_hint(threshold)
@@ -866,7 +919,7 @@ local function merge_local_metadata(remote,local_book)
     remote.access=U.copy(local_book.access or {})
     remote.content_type=remote.content_type or local_book.content_type
     remote.local_record=local_book.local_record
-    if (tonumber(remote.progress or 0) or 0)<=0 then remote.progress=local_book.progress end
+    if remote.cloud_progress==nil and (tonumber(remote.progress or 0) or 0)<=0 then remote.progress=local_book.progress end
     return remote
 end
 
@@ -880,6 +933,7 @@ function Library:account_row(remote,local_book)
     b.in_account_shelf=true
     b.remote_status_known=true
     if local_book then merge_local_metadata(b,local_book) else b.downloaded=false end
+    self.finished_status:overlay(b)
     return b
 end
 
@@ -895,6 +949,7 @@ function Library:account_rows(remote_rows,local_rows)
 end
 
 function Library:generated_rows(remote_books,remote_mp,local_books,local_mp,remote_status_known)
+    local sessions=self.store:get("sessions",{})
     local remote_index={}
     for _,row in ipairs(remote_books or {}) do remote_index[tostring(row.bookId or "")]=row end
     for _,row in ipairs(remote_mp or {}) do remote_index[tostring(row.bookId or "")]=row end
@@ -913,8 +968,15 @@ function Library:generated_rows(remote_books,remote_mp,local_books,local_mp,remo
                 b.archiveNames=remote.archiveNames
                 b.inArchive=remote.inArchive==true
                 b.cloudOrder=remote.cloudOrder
-                if (tonumber(b.progress or 0) or 0)<=0 then b.progress=remote.progress end
+                b.cloud_progress=remote.cloud_progress
+                b.cloud_finished=remote.cloud_finished
+                b.progress_fetched_at=remote.progress_fetched_at
+                b.progress_updated_at=remote.progress_updated_at
+                if b.cloud_progress~=nil then b.progress=b.cloud_progress
+                elseif (tonumber(b.progress or 0) or 0)<=0 then b.progress=remote.progress end
             end
+            self.finished_status:overlay(b)
+            ShelfProgress.display(b,sessions[id])
             out[#out+1]=b
         end
     end
@@ -955,7 +1017,7 @@ local function shelf_rows_fingerprint(rows,section)
             tostring(row.cloudOrder or ""), tostring(row.readUpdateTime or ""),
             tostring(row.explicitOrder or ""), tostring(row.rawIndex or ""),
             tostring(row.downloadedAt or row.downloaded_at or ""),
-            tostring(row.progress or ""), tostring(row.status_text or row.download_status or ""),
+            tostring(row.progress or ""), tostring(row.finished==true), tostring(row.status_text or row.download_status or ""),
             row.isTop==true and "1" or "0",
             row.in_account_shelf==true and "1" or "0",
             row.generated==true and "1" or "0",
