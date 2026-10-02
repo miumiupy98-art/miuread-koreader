@@ -366,14 +366,15 @@ function Api:search(q, offset, count)
 end
 function Api:book(id) return self:call("/book/info", {bookId=tostring(id)}) end
 function Api:chapters(id) return self:call("/book/chapterinfo", {bookId=tostring(id)}) end
-function Api:progress(id) return self:call("/book/getprogress", {bookId=tostring(id), _t=os.time()}) end
-function Api:web_progress(id)
+function Api:progress(id,options) return self:call("/book/getprogress", {bookId=tostring(id), _t=os.time()},options) end
+function Api:web_progress(id,options)
+    options=type(options)=="table" and options or {}
     id=tostring(id or "")
     if id=="" then error("invalid book id") end
     local url="https://weread.qq.com/web/book/getProgress?bookId="
         ..Protocol.escape(id).."&_="..tostring(os.time())..tostring(math.random(1000,9999))
     local request_options={
-        auth=true,retries=0,timeout={8,15},
+        auth=true,retries=0,timeout=options.timeout or {8,15},
         headers={
             Accept="application/json, text/plain, */*",
             Referer=Protocol.reader_url(id),
@@ -383,12 +384,38 @@ function Api:web_progress(id)
     }
     local data=self:_recover_web_once("progress",function()
         return self.http:get_json(url,request_options)
-    end,true)
+    end,options.no_auth_recovery~=true)
     if type(data)=="table" then
         data._progress_source="web_cookie"
         data._progress_fetched_at=os.time()
     end
     return data
+end
+
+function Api:book_read_info(id)
+    id=tostring(id or "")
+    if id=="" or Protocol.is_mp(id) or Protocol.is_mp_account(id) then error("invalid book id") end
+    local url="https://weread.qq.com/web/book/readInfo?bookId="..Protocol.escape(id)
+        .."&finishedBookCount=1&finishedBookIndex=1&finishedDate=1&_="
+        ..tostring(os.time())..tostring(math.random(1000,9999))
+    return self:_recover_web_once("reading_status",function()
+        return self.http:get_json(url,{auth=true,retries=0,timeout={5,8},
+            headers={Accept="application/json, text/plain, */*",Referer=Protocol.reader_url(id),
+                ["Cache-Control"]="no-cache, no-store, max-age=0",Pragma="no-cache"}})
+    end)
+end
+
+function Api:mark_book_finished(id,finished)
+    id=tostring(id or "")
+    if id=="" or type(finished)~="boolean" or Protocol.is_mp(id) or Protocol.is_mp_account(id) then
+        error("invalid reading status")
+    end
+    -- The web reader uses this separate flag; it does not submit a position.
+    -- Never replay a POST after an ambiguous transport/authentication failure.
+    return self.http:post_json("https://weread.qq.com/web/book/markStatus",{
+        bookId=id,status=4,isCancel=finished and 0 or 1,finishInfo=finished and 1 or 0,
+    },{auth=true,retries=0,rate_limit_retries=0,rate_limit_fail_fast=true,timeout={5,8},
+        headers={Accept="application/json, text/plain, */*",Origin="https://weread.qq.com",Referer=Protocol.reader_url(id)}})
 end
 
 function Api:_translation_web_call(path, id, payload, raw_body)
