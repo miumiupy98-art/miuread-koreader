@@ -23,7 +23,6 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local U = require("miuread.util")
-local ShelfProgress = require("miuread.shelf_progress")
 local Config = require("miuread.config")
 local UiScale = require("miuread.ui_scale")
 local Ui = require("miuread.ui_components")
@@ -618,7 +617,7 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
         or book.downloaded == true or tostring(book.shelf_section or "") == "generated"
         or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
     local reading_badge = ""
-    if ShelfProgress.is_finished(book) then reading_badge = "已读完"
+    if progress >= 100 then reading_badge = "已读"
     elseif progress > 0 then reading_badge = tostring(math.floor(progress + .5)) .. "%" end
 
     local download_active = book.download_active == true
@@ -1872,15 +1871,6 @@ end
 function HomeWidget:updateBook(book_id)
     local key=tostring(book_id or "")
     if key=="" then return false end
-    -- The active layer is patched below. Only other cached layers containing
-    -- this book need rebuilding; unrelated shelves keep their rendered cards.
-    local cache=type(self._section_layer_cache)=="table" and self._section_layer_cache or {}
-    for id,entry in pairs(cache) do
-        if entry.layer~=self._section_layer and entry.slots and entry.slots[key] then
-            cache[id]=nil
-            if entry.layer and entry.layer.free then pcall(entry.layer.free,entry.layer) end
-        end
-    end
     local slots=type(self._section_book_slots)=="table" and self._section_book_slots or {}
     local slot=slots[key]
     if not slot or not slot.parent or not slot.index then return false end

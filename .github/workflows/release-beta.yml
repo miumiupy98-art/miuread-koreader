@@ -250,6 +250,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lua5.1 luajit
           find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+          lua5.1 tools/test_bookstore.lua
+          lua5.1 tools/test_bookstore_ui.lua
+          lua5.1 tools/test_shelf_client.lua
+          luajit tools/test_bookstore.lua
+          luajit tools/test_bookstore_ui.lua
+          luajit tools/test_shelf_client.lua
           lua5.1 tools/test_position_resolution.lua
           lua5.1 tools/test_position_state_hotfix.lua
           lua5.1 tools/test_open_sync_contract.lua

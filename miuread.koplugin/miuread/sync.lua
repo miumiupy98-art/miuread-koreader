@@ -120,8 +120,9 @@ local function progress_from_node(node, expected_book_id)
     local p = tonumber(rawget(node, "progress") or rawget(node, "readingProgress")
         or rawget(node, "progressPercent") or rawget(node, "bookProgress"))
     if p == nil then return nil end
-    -- API progress fields use 0-100 percentages. A value below 1 still means
-    -- less than 1%; it cannot be distinguished from a ratio by magnitude.
+    -- The Web API normally returns 0-100. Only true fractions are expanded;
+    -- a literal 1 must remain 1%, not be mistaken for 100%.
+    if p > 0 and p < 1 then p = p * 100 end
     return {
         percent = U.clamp(p, 0, 100),
         chapter_uid = rawget(node, "chapterUid") or rawget(node, "chapterId") or rawget(node, "chapter_uid"),
