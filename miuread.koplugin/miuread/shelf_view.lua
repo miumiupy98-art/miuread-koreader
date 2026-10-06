@@ -376,7 +376,7 @@ function ShelfView.show(opts)
     for _, book in ipairs(opts.books or {}) do
         items[#items + 1] = {
             book_id=book.bookId or book.book_id,
-            title=book.display_title or book.title,
+            title=book.title,
             author=book.author,
             status=status_text(book),
             cover_path=book.cover_path,

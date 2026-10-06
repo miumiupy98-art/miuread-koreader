@@ -161,16 +161,16 @@ local HOME_SECTION_ORDER={"shelf","device","recent"}
 -- fully configurable.
 -- Frontlight is no longer a homepage shortcut candidate. It lives only in the
 -- pull-down direct-control section (and the reader controls).
-local HOME_ACTION_ITEM_ORDER={"refresh","bookstore","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"}
-local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=false,bookstore=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false}
-local HOME_ACTION_LAYOUT_VERSION=7
+local HOME_ACTION_ITEM_ORDER={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"}
+local HOME_ACTION_ITEM_DEFAULT={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false}
+local HOME_ACTION_LAYOUT_VERSION=6
 local HOME_ACTION_MAX_VISIBLE=6
 -- Keep the full pull-down control-center candidate pool, but render at most
 -- eight supported/selected controls in one compact row. The display limit is
 -- intentionally separate from the candidate-pool size so new controls do not
 -- force another layout rewrite.
-local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","mp","bookstore","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"}
-local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=false,rotate=true,mp=true,bookstore=false,screenshot=false,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false}
+local HOME_PANEL_ITEM_ORDER={"wifi","bluetooth","rotate","mp","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"}
+local HOME_PANEL_ITEM_DEFAULT={wifi=true,bluetooth=false,rotate=true,mp=true,screenshot=false,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false}
 local HOME_PANEL_LAYOUT_VERSION=7
 local HOME_PANEL_MAX_VISIBLE=8
 -- ReaderUI and FileManager create separate plugin instances. Keep navigation
@@ -1272,10 +1272,6 @@ local function interactive_child_store(auth,data_dir,temp_dir)
     return store
 end
 
-function Plugin:_interactive_child_store(auth,data_dir,temp_dir)
-    return interactive_child_store(auth,data_dir,temp_dir)
-end
-
 function Plugin:_interactive_network_context()
     return {
         reader_file=normalized_reader_file(self:_current_document_path()),
@@ -1327,10 +1323,7 @@ end
 function Plugin:_cancel_interactive_network(reason)
     self._interactive_network_generation=(tonumber(self._interactive_network_generation) or 0)+1
     self._interactive_network_key=nil
-    local cancel=self._interactive_network_cancel
-    self._interactive_network_cancel=nil
     if self.interactive_network_async then self.interactive_network_async:cancel(reason or "cancelled") end
-    if cancel then pcall(cancel) end
     return true
 end
 
@@ -1357,7 +1350,6 @@ function Plugin:_run_interactive_network(key,label,worker,callback,options)
     self._interactive_network_generation=(tonumber(self._interactive_network_generation) or 0)+1
     local generation=self._interactive_network_generation
     self._interactive_network_key=key
-    self._interactive_network_cancel=options.on_cancel
     local context=options.context or self:_interactive_network_context()
     local started_at=monotonic_wall_time()
     if options.status_title and options.status_text and options.silent~=true then
@@ -1367,11 +1359,8 @@ function Plugin:_run_interactive_network(key,label,worker,callback,options)
     local started,err=async:run(label,worker,function(result)
         if generation~=self._interactive_network_generation then return end
         self._interactive_network_key=nil
-        local cancel=self._interactive_network_cancel
-        self._interactive_network_cancel=nil
         local network_ms=math.floor((monotonic_wall_time()-started_at)*1000+.5)
         if not self:_interactive_network_context_valid(context) then
-            if cancel then pcall(cancel) end
             logger.info("[MiuRead][NetTask] stale result dropped","key=",key,"network_ms=",tostring(network_ms))
             return
         end
@@ -1383,10 +1372,7 @@ function Plugin:_run_interactive_network(key,label,worker,callback,options)
             "ok=",tostring(result and result.ok==true))
     end,tonumber(options.timeout) or 35)
     if not started then
-        if generation==self._interactive_network_generation then
-            self._interactive_network_key=nil
-            self._interactive_network_cancel=nil
-        end
+        if generation==self._interactive_network_generation then self._interactive_network_key=nil end
         if options.silent~=true then self:info("无法启动后台网络任务：\n"..tostring(err or "未知错误")) end
         return false,err
     end
@@ -1790,7 +1776,6 @@ function Plugin:confirm_logout()
         if downloading and self.download_task then self.download_task:cancel() end
         self.auth_flow:cancel()
         self:_cancel_interactive_network("logout")
-        if self._bookstore or self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end
         self._auth_transitioning=true
         if self.sync and self.sync.invalidate_login_session then
             pcall(self.sync.invalidate_login_session,self.sync,"logout")
@@ -1810,7 +1795,6 @@ function Plugin:on_auth_replaced(old_auth,new_auth)
     local new_vid=tostring((new_auth.account or {}).vid or (new_auth.cookies or {}).wr_vid or "")
     local same_account=old_vid~="" and new_vid~="" and old_vid==new_vid
     self:_cancel_interactive_network(same_account and "auth refreshed" or "account changed")
-    if self._bookstore or self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end
     self._auth_transitioning=true
     if self.sync and self.sync.invalidate_login_session then
         self.sync:invalidate_login_session(same_account and "login_refreshed" or "account_changed")
@@ -1937,7 +1921,6 @@ function Plugin:home_menu()
         out[#out+1]={text="返回觅阅主页",callback=self:safe("home-ui",function() self:_return_to_configured_home() end)}
     end
     out[#out+1]={text="微信书架",callback=self:safe("shelf",function() self:show_shelf(false,false,"account") end)}
-    out[#out+1]={text="微信读书书城",callback=self:safe("bookstore",function() self:show_bookstore() end)}
     local trailing={
         {text="搜索书籍",callback=self:safe("search",function() self:search_dialog() end)},
         {text=self:_download_menu_text(),callback=self:safe("downloads",function() self:show_downloads() end)},
@@ -3401,49 +3384,6 @@ function Plugin:_home_preferences()
         end
         if table.concat(normalized,"|")~=table.concat(home[order_key],"|") then changed=true end
         home[order_key]=normalized
-    end
-    if type(home.action_items)~="table" then home.action_items={}; changed=true end
-    local saved=self.store:get("preferences",{})
-    local saved_home=type(saved)=="table" and type(saved.home_ui)=="table" and saved.home_ui or {}
-    if (tonumber(home.action_layout_version) or 0)<7
-        or (type(saved_home.action_items)=="table" and tonumber(saved_home.action_layout_version)==nil) then
-        -- Replace Search only for the untouched recommended bar. New optional
-        -- candidates belong beside their related action, not at the old tail.
-        if type(saved_home.action_items)=="table" and saved_home.action_items.search==nil then
-            home.action_items.search=true
-        end
-        if home.action_items.bookstore==nil then home.action_items.bookstore=false end
-        local order=U.copy(type(saved_home.action_order)=="table" and saved_home.action_order or home.action_order or {})
-        local old_order,expected_order,seen={},{},{}
-        local bookstore_position,search_position
-        for index,key in ipairs(order) do
-            if key=="bookstore" then bookstore_position=index
-            elseif not seen[key] then seen[key]=true; old_order[#old_order+1]=key end
-            if key=="search" then search_position=index end
-        end
-        for _,key in ipairs(HOME_ACTION_ITEM_ORDER) do
-            if key~="bookstore" then expected_order[#expected_order+1]=key end
-        end
-        local untouched=table.concat(old_order,"|")==table.concat(expected_order,"|")
-            and (not bookstore_position or bookstore_position==#order
-                or (search_position and math.abs(bookstore_position-search_position)==1))
-        for key,enabled in pairs(HOME_ACTION_ITEM_DEFAULT) do
-            local expected=enabled
-            if key=="search" then expected=true elseif key=="bookstore" then expected=false end
-            local actual=home.action_items[key]==true
-            if key=="sleep" and not Device:canSuspend() then actual=false; expected=false end
-            if actual~=expected then untouched=false end
-        end
-        if untouched then
-            home.action_items.search=false
-            home.action_items.bookstore=true
-            order=U.copy(HOME_ACTION_ITEM_ORDER)
-        elseif not bookstore_position or bookstore_position==#order then
-            if bookstore_position then table.remove(order,bookstore_position) end
-            table.insert(order,search_position or 1,"bookstore")
-        end
-        home.action_order=order
-        changed=true
     end
     if home.action_items.mp~=nil then home.action_items.mp=nil; changed=true end
     normalize_quick_group("action_items","action_order","action_layout_version",HOME_ACTION_LAYOUT_VERSION,HOME_ACTION_ITEM_ORDER,HOME_ACTION_ITEM_DEFAULT)
@@ -5858,12 +5798,12 @@ end
 -- selection belongs to the local filter popup instead of persistent tabs.
 
 local HOME_ACTION_LABELS={
-    refresh="刷新",search="搜索",bookstore="书城",downloads="下载",sync="同步",sleep="休眠",
+    refresh="刷新",search="搜索",downloads="下载",sync="同步",sleep="休眠",
     miuread_settings="觅阅设置",all_books="全部书籍",history="阅读历史",file_manager="文件管理",screenshot="截图",
     extensions="插件与扩展",
 }
 local HOME_PANEL_LABELS={
-    wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",mp="公众号",bookstore="书城",screenshot="截图",full_refresh="全屏刷新",
+    wifi="Wi-Fi",bluetooth="蓝牙",rotate="方向锁定",mp="公众号",screenshot="截图",full_refresh="全屏刷新",
     downloads="下载",sync="同步",miuread_settings="觅阅设置",koreader_settings="KOReader 设置",
     koreader_file_manager="KOReader 文件管理",return_koreader="返回 KOReader",quit="退出 KOReader",
     restart="重启 KOReader",sleep="休眠",reboot="重启设备",poweroff="关机",
@@ -9538,9 +9478,8 @@ function Plugin:_show_home_search_popup(anchor)
         preferred_direction="below",
         width_ratio=.62,
         title="搜索",
-        subtitle="找新书或搜索已有书籍",
+        subtitle="只保留真正的搜索入口",
         actions={
-            {icon="library",label="浏览微信读书书城",detail="推荐 排行榜与分类",callback=function() self:show_bookstore() end},
             {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
             {icon="▦",label="搜索我的书架",detail="本地搜索统一书架中的现有内容",callback=function() self:show_home_search_dialog("shelf") end},
             {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
@@ -9577,8 +9516,7 @@ function Plugin:_show_home_quick_notice(anchor,title,subtitle,delay)
 end
 
 function Plugin:_home_action_function_actions(key,anchor)
-    if key=="search" or key=="bookstore" then return {
-        {icon="library",label="浏览微信读书书城",detail="推荐 排行榜与分类",callback=function() self:show_bookstore() end},
+    if key=="search" then return {
         {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
         {icon="▦",label="搜索我的书架",detail="本地搜索统一书架中的现有内容",callback=function() self:show_home_search_dialog("shelf") end},
         {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
@@ -9798,13 +9736,6 @@ function Plugin:_home_hold_book(book,anchor)
         end}
     end
     actions[#actions+1]={icon="i",label="书籍详情",detail="简介、作者与出版信息",callback=function() self:book_details(target) end}
-    if unified_source=="weread" and not Protocol.is_mp(id) then
-        local shelf_action=require("miuread.bookstore").shelf_action(self,target)
-        if shelf_action then
-            actions[#actions+1]={icon="library",label=shelf_action.text,
-                detail="同步微信书架，保留本机文件",callback=shelf_action.callback}
-        end
-    end
     ActionSheet.show{
         anchor=anchor,
         preferred_direction="above",
@@ -9846,7 +9777,6 @@ function Plugin:_home_action_entries()
     local definitions={
         refresh={icon="↻",icon_key="refresh",label="刷新",callback=function() self:_home_complete_refresh(true) end},
         search={icon="⌕",icon_key="search",label="搜索",callback=function() self:search_dialog("搜索微信读书") end},
-        bookstore={icon="library",icon_key="library",label="书城",callback=function() self:show_bookstore() end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function() self:show_downloads() end},
         sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function()
             -- beta.11: every manual Sync entry reaches the same progress
@@ -12422,7 +12352,6 @@ function Plugin:show_home_quick_panel(more_expanded)
             hold_callback=function() self:_show_orientation_panel() end
         },
         mp={icon="公众号",icon_key="book",label="公众号",detail="",callback=function() self:show_mp_shelf(false) end},
-        bookstore={icon="library",icon_key="library",label="书城",detail="推荐与榜单",callback=function() self:show_bookstore() end},
         screenshot={icon="▣",icon_key="screenshot",label="截图",detail="",callback=function(anchor) ScreenshotMode.start(self,anchor) end},
         full_refresh={icon="▤",icon_key="full-refresh",label="全屏刷新",detail="",callback=function() self:_home_full_refresh() end},
         downloads={icon="⇩",icon_key="download",label="下载",detail="",callback=function() self:show_downloads() end},
@@ -18079,10 +18008,6 @@ function Plugin:return_to_miuread_home(reason)
     return true
 end
 
-function Plugin:show_bookstore()
-    return require("miuread.bookstore").open(self)
-end
-
 function Plugin:search_dialog(title)
     if not self:require_login() then return end
     local d
@@ -18515,26 +18440,11 @@ function Plugin:open_mp_neighbor(delta)
     self:open_or_download_mp_article({bookId=context.bookId,title=context.account_title or "公众号",author="公众号"},target)
 end
 
-function Plugin:_confirm_shelf_removal(book,callback)
-    TransientGuard.close_all()
-    UIManager:show(ConfirmBox:new{
-        text="从微信书架移除《"..tostring(book.title or "本书").."》？\n\n本机已下载的文件会保留。",
-        ok_text="移除",cancel_text="取消",ok_callback=callback,
-    })
-end
-
-function Plugin:book_menu(b,back_callback)
+function Plugin:book_menu(b)
     local original=type(b)=="table" and b or {}
     b=U.merge(original,normalize(original))
     if Protocol.is_mp_account(b.bookId) then self:mp_account(b); return end
     local items={}
-    if not Protocol.is_mp(b.bookId) then
-        local action=require("miuread.bookstore").shelf_action(self,b)
-        if action then items[#items+1]=action end
-        items[#items+1]={text="相似推荐",callback=function()
-            require("miuread.bookstore").similar(self,b,function() self:book_menu(b,back_callback) end)
-        end}
-    end
     local records={{kind="clean",label="纯净版"},{kind="notes",label="划线与想法版"},
         {kind="range_clean",label="章节版 · 纯净版"},{kind="range_notes",label="章节版 · 划线与想法版"},
         {kind="preview_clean",label="试读版 · 纯净版"},{kind="preview_notes",label="试读版 · 划线与想法版"}}
@@ -18554,7 +18464,6 @@ function Plugin:book_menu(b,back_callback)
         items[#items+1]={text="本机文件",callback=function() BookLocalFilesDialog.open_generated(self,tostring(b.bookId)) end}
     end
     items[#items+1]={text="书籍详情",callback=function() self:book_details(b) end}
-    if back_callback then items[#items+1]={text="返回列表",callback=back_callback} end
     self:list(b.title,items)
 end
 
@@ -27524,7 +27433,6 @@ function Plugin:show_about()
         .."\n\n非官方社区项目，与微信读书及 KOReader 无官方隶属或合作关系。")
 end
 function Plugin:onExit()
-    if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end
     BookExcerptDialog.close("exit")
     self:_cancel_interactive_network("exit")
     if not HOME_EXITING then self:_begin_koreader_exit("external exit") end
@@ -27553,10 +27461,6 @@ function Plugin:onToggleMiuReadTimeSync()
 end
 function Plugin:onShowMiuReadDownloads()
     self:show_downloads()
-    return true
-end
-function Plugin:onShowMiuReadBookstore()
-    self:show_bookstore()
     return true
 end
 function Plugin:onShowMiuReadSyncStatus()
@@ -30799,7 +30703,6 @@ function Plugin:onNotCharging()
 end
 
 function Plugin:onSuspend()
-    if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end
     -- 书摘局域网传输只属于前台交互。任何 Suspend 边沿都先关闭它，
     -- 不申请下载/同步的后台保活，也不会在 Resume 后自动恢复。
     BookExcerptDialog.close("suspend")
@@ -31548,7 +31451,6 @@ function Plugin:_schedule_post_reader_work(reason,delay,phase)
 end
 
 function Plugin:onCloseDocument()
-    if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end
     BookExcerptDialog.close("document close")
     local closing_path=normalized_reader_file(self:_current_document_path())
         or normalized_reader_file(HOME_SESSION.reader_session_file)

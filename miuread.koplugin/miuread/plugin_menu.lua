@@ -19,7 +19,6 @@ function M.home(plugin)
     plugin:maybe_auto_check_update(false)
     return {
         {text="微信书架",callback=plugin:safe("shelf",function() plugin:show_shelf(false,false,"account") end)},
-        {text="微信读书书城",callback=plugin:safe("bookstore",function() plugin:show_bookstore() end)},
         {text="搜索书籍",callback=plugin:safe("search",function() plugin:search_dialog() end)},
         {text=plugin:_download_menu_text(),callback=plugin:safe("downloads",function() plugin:show_downloads() end)},
         {text=plugin:_sync_menu_text(),sub_item_table_func=function() return PluginSettings.sync(plugin) end},
@@ -49,7 +48,6 @@ function M.reader(plugin)
     local rows={
         {text="当前书籍",sub_item_table_func=function() return plugin:current_book_menu() end},
         {text="打开觅阅书架",callback=plugin:safe("shelf",function() plugin:show_shelf(false,false,"account") end)},
-        {text="微信读书书城",callback=plugin:safe("bookstore",function() plugin:show_bookstore() end)},
         {text=plugin:_sync_menu_text(),sub_item_table_func=function() return PluginSettings.sync(plugin) end},
         {text=plugin:_download_menu_text(),callback=function() plugin:show_downloads() end},
         {text="评论与想法",sub_item_table_func=function() return comment_and_thought_menu(plugin) end},
