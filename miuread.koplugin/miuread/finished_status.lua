@@ -33,10 +33,8 @@ function FinishedStatus:snapshot()
     return U.copy(self.store:get(KEY,{}))
 end
 
-function FinishedStatus:_save(id,row)
+function FinishedStatus:_save_all(all)
     local old = self.store:get(KEY,{})
-    local all = U.copy(old)
-    all[id] = row
     local saved = self.store:set(KEY,all)
     if saved~=true then
         -- Store:set updates live settings before flushing. Roll back that
@@ -45,6 +43,12 @@ function FinishedStatus:_save(id,row)
         return false
     end
     return true
+end
+
+function FinishedStatus:_save(id,row)
+    local all = U.copy(self.store:get(KEY,{}))
+    all[id] = row
+    return self:_save_all(all)
 end
 
 function FinishedStatus:request(id,finished)
@@ -71,18 +75,26 @@ function FinishedStatus:overlay(row)
     return row
 end
 
-function FinishedStatus:reconcile(row,snapshot)
-    local id = tostring(row.bookId or row.book_id or "")
-    local entry = self:entry(id)
-    local started = type(snapshot)=="table" and snapshot[id] or nil
-    -- A shelf request started before this write cannot undo its confirmation.
-    if entry and entry.phase=="verified" and row.cloud_finished~=nil
-        and (snapshot==nil or (started and started.sequence==entry.sequence and started.phase=="verified")) then
-        local observed = U.copy(entry)
-        observed.phase,observed.observed = "observed",row.cloud_finished
-        self:_save(id,observed)
+function FinishedStatus:reconcile(rows,snapshot)
+    local updates
+    for _,row in ipairs(rows) do
+        local id = tostring(row.bookId or row.book_id or "")
+        local entry = self:entry(id)
+        local started = type(snapshot)=="table" and snapshot[id] or nil
+        -- A shelf request started before this write cannot undo its confirmation.
+        if entry and entry.phase=="verified" and row.cloud_finished~=nil
+            and (snapshot==nil or (started and started.sequence==entry.sequence and started.phase=="verified")) then
+            updates = updates or U.copy(self.store:get(KEY,{}))
+            local observed = U.copy(entry)
+            observed.phase,observed.observed = "observed",row.cloud_finished
+            updates[id] = observed
+        end
     end
-    return self:overlay(row)
+    -- Retire confirmed intents once per shelf snapshot, rather than flushing
+    -- the complete settings file for each book on the UI thread.
+    if updates then self:_save_all(updates) end
+    for _,row in ipairs(rows) do self:overlay(row) end
+    return rows
 end
 
 function FinishedStatus:_cache(id)

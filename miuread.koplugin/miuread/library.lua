@@ -610,7 +610,6 @@ function Library:_apply_stream_response(data,finished_snapshot)
             row.progress_known=row.progress~=nil
             row.progress_updated_at=old.progress_updated_at
         end
-        self.finished_status:reconcile(row,finished_snapshot)
     end
     local response_group_authoritative=groups.authoritative==true
     local filter=current_filter(self.store)
@@ -639,6 +638,7 @@ function Library:_apply_stream_response(data,finished_snapshot)
             attach_group_snapshot(raw_books,groups)
         end
     end
+    self.finished_status:reconcile(raw_books,finished_snapshot)
     self:_reconcile_group_preferences(groups)
     filter=current_filter(self.store)
     local books,filtered=apply_filter(filter,raw_books)

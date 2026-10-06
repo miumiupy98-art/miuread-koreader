@@ -38,6 +38,7 @@ local function store(disk)
     function s:auth() return {account={vid=self.vid},login_session_id='session',api_key='key'} end
     function s:get(key,default) return self.data[key] or copy(default) end
     function s:set(key,value)
+        self.saves=(self.saves or 0)+1
         self.data[key]=value
         if self.fail_save then return false end
         self.disk[key]=copy(value); return true
@@ -110,11 +111,42 @@ assert(status:entry('a').phase=='verified' and writes==1 and remote)
 assert(s.cache.raw_books[1].progress==33 and s.cache.raw_books[1].cloud_finished==true)
 assert(s.data.sessions.a.chapter==7 and s.data.sessions.a.co==12345 and s.data.sessions.a.progress==33)
 local old_shelf={bookId='a',cloud_finished=false,progress=33}
-status:reconcile(old_shelf,baseline)
+status:reconcile({old_shelf},baseline)
 assert(old_shelf.finished and status:entry('a').phase=='verified','late shelf read undid mark')
 local fresh=status:snapshot()
-status:reconcile({bookId='a',cloud_finished=false},fresh)
+status:reconcile({{bookId='a',cloud_finished=false}},fresh)
 assert(status:entry('a').phase=='observed','later phone change could never replace local mark')
+
+-- A shelf refresh retires all acknowledged intents with one settings save.
+local batch_store=store({finished_status={}})
+local batch=Finished:new(batch_store)
+local batch_rows={}
+for i=1,12 do
+    local id=tostring(i)
+    batch_store.data.finished_status[id]={account='user',desired=true,sequence=1,
+        phase='verified',requested_at=clock,retry_at=0}
+    batch_rows[i]={bookId=id,cloud_finished=false}
+end
+batch_store.disk=copy(batch_store.data)
+batch:reconcile(batch_rows,batch:snapshot())
+assert(batch_store.saves==1,'shelf reconciliation flushed settings per book')
+for _,row in ipairs(batch_rows) do
+    assert(not row.finished and batch_store.disk.finished_status[row.bookId].phase=='observed',
+        'batched reconciliation lost a phone change')
+end
+batch:reconcile(batch_rows,batch:snapshot())
+assert(batch_store.saves==1,'unchanged shelf reconciliation saved settings')
+
+-- A failed batch flush preserves every confirmed local intent in memory and on disk.
+for _,entry in pairs(batch_store.data.finished_status) do entry.phase='verified' end
+batch_store.disk=copy(batch_store.data)
+batch_store.fail_save=true
+batch:reconcile(batch_rows,batch:snapshot())
+for _,row in ipairs(batch_rows) do
+    assert(row.finished and batch:entry(row.bookId).phase=='verified'
+        and batch_store.disk.finished_status[row.bookId].phase=='verified',
+        'failed batch flush retired a confirmed intent')
+end
 
 remote=true
 assert(status:request('a',false)); assert(status:pump(make_request,changed)); w:finish(); w:finish()
@@ -211,7 +243,7 @@ function plugin:list(_,items) self.items=items end
 local action=plugin:_finished_status_action({bookId='a'})
 action.callback(); plugin.items[1].callback(); assert(plugin.requested.desired==true)
 plugin.items[2].callback(); assert(plugin.requested.desired==false)
-status:reconcile({bookId='a',cloud_finished=false},nil)
+status:reconcile({{bookId='a',cloud_finished=false}},nil)
 local entry=copy(status:entry('a')); entry.phase='verified'; entry.desired=false; status:_save('a',entry)
 s.cache.raw_books[1]={bookId='a',progress=100,cloud_finished=false}
 action=plugin:_finished_status_action({bookId='a'})

@@ -23012,16 +23012,7 @@ function Plugin:_recover_pending_progress_coordinate(item,callback)
             callback(true,"recovered_waiting_network",position)
             return
         end
-        self:_submit_recovered_progress_snapshot(book_id,position,{
-            detached=true,reason="coordinate_catalog_recovered",
-            pending_reason="upload_queued",pending_already_saved=true,
-            uploading_message="整书位置已恢复，正在上传阅读进度",
-            verifying_message="阅读进度已提交，等待微信确认",
-            unconfirmed_message="阅读进度已提交，仍等待微信确认",
-            failed_message="整书位置已保存，上传稍后继续",
-            record_override=record_snapshot,record_snapshot=record_snapshot,
-            verify_delays={3,10,24},
-        },function(ok,remote,submit_error)
+        self:_submit_saved_pending_progress({book_id=book_id},function(ok,submit_error,remote)
             callback(ok,submit_error,position,remote)
         end)
     end)
@@ -23085,6 +23076,10 @@ function Plugin:_submit_saved_pending_progress(item,callback)
     self:_save_progress_state(book_id,"checking","重新读取云端位置后再决定是否上传本机进度",
         localp,nil,position.progress_sequence)
     local started,remote_start_error=self.sync:remote(book_id,function(remote,remote_err)
+        if not self:_progress_snapshot_current(book_id,position) then
+            callback(false,"superseded",remote)
+            return
+        end
         if not remote then
             self:_save_progress_state(book_id,"waiting_network","暂时无法确认云端位置；本机精确位置继续保留",
                 localp,nil,position.progress_sequence)
@@ -23165,39 +23160,6 @@ function Plugin:_submit_saved_pending_progress(item,callback)
     end,{raw_coordinate=true,update_cloud_anchor=false,detached=true,record_snapshot=record_snapshot})
     if started==false then callback(false,remote_start_error or "remote_check_busy") end
     return started~=false
-end
-
-function Plugin:_submit_recovered_progress_snapshot(book_id,position,options,callback)
-    local session=(self:_persisted_sessions()[book_id]) or self.store:session(book_id) or {}
-    local baseline=U.copy(session.cloud_anchor or {})
-    self.sync:remote(book_id,function(remote,err)
-        if not self:_progress_snapshot_current(book_id,position) then
-            callback(false,nil,"superseded")
-            return
-        end
-        if not remote then
-            self:_save_progress_state(book_id,"waiting_network","补传前无法读取云端位置，已保留本机位置",
-                tonumber(position.progress),nil,position.progress_sequence)
-            callback(false,nil,err or "remote_unavailable")
-            return
-        end
-        local matches=self:_remote_matches(remote,position)
-        local baseline_uid=tostring(baseline.chapter_uid or "")
-        local unchanged=baseline_uid~="" and baseline_uid==tostring(remote.chapter_uid or "")
-            and tonumber(baseline.chapter_offset)~=nil and tonumber(baseline.chapter_offset)==tonumber(remote.offset)
-        if remote.conflict or (not matches and not unchanged) then
-            self:_save_pending_progress(book_id,position,"remote_position_changed","verification_required")
-            self.store:save_session(book_id,{progress_upload_state="conflict",progress_resubmit_allowed=true})
-            self:_clear_progress_resolution(book_id)
-            self:_save_progress_state(book_id,"verification_required","云端位置已有变化，请打开本书选择本机或云端位置",
-                tonumber(position.progress),tonumber(remote.percent),position.progress_sequence)
-            callback(false,remote,"remote_position_changed")
-            return
-        end
-        if matches then options=U.copy(options); options.verify_first=true end
-        self:_submit_progress_snapshot(book_id,position,options,callback)
-    end,{detached=true,record_snapshot=options.record_snapshot,raw_coordinate=true,update_cloud_anchor=false})
-    return true
 end
 
 function Plugin:_submit_all_saved_pending_progress(items,on_done)

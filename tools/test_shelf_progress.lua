@@ -348,57 +348,104 @@ recovery:_schedule_home_progress_recovery(2.4); tick()
 assert(#timers==0,'offline recovery kept scheduling network work')
 offline=false; env.os=nil
 
--- Replay checks the phone first, so an offline Kindle transaction cannot
--- silently overwrite reading done on the phone while it was disconnected.
-load_method('_submit_recovered_progress_snapshot')
-local replay_session={progress_epoch=1,cloud_anchor={chapter_uid='8',chapter_offset=100}}
-local remote_callback,submitted,submission_options,replay_error,choice_cleared
+-- Catalog recovery uses the same latest-reading-event decision as other unsent progress.
+load_method('_recover_pending_progress_coordinate')
+load_method('_submit_saved_pending_progress')
+load_method('_progress_snapshot_current')
+_G.__MIUREAD_POSITION_RESOLUTION=require('miuread.position_resolution')
+local replay_session
+local remote_callback,submitted,submission_options,replay_error,replay_result,verified
 local replay=setmetatable({sync={}}, {__index=Plugin})
 function replay:_persisted_sessions() return {a=replay_session} end
 replay.store={save_session=function(_,_,update) for k,v in pairs(update) do replay_session[k]=v end end}
+function replay:logged_in() return true end
+function replay:_network_radio_hint() return not offline end
+function replay:_stored_progress_record() return {book={book_id='a'}} end
+function replay:_progress_snapshot_replayable() return true end
+function replay:_prepare_progress_snapshot(_,position) return copy(position) end
+function replay.sync:recover_partial_coordinate(_,_,done)
+    done({chapter_uid='8',offset=200,progress=20,updated_at=200,
+        native_offset=true,offset_basis='wr_data_co'})
+    return true
+end
 function replay.sync:remote(_,done,opt)
     assert(opt.detached and opt.raw_coordinate and opt.update_cloud_anchor==false)
     remote_callback=done
 end
-function replay:_progress_snapshot_current() return true end
 function replay:_remote_matches(remote,position)
     return not remote.conflict and remote.chapter_uid==position.chapter_uid and remote.offset==position.offset
 end
 function replay:_save_pending_progress(_,position,reason,state)
-    replay_session.pending_progress=copy(position); replay_session.progress_sync_state=state
+    replay_session.pending_progress=copy(position)
+    replay_session.progress_sync_state=state
+    replay_session.progress_upload_state='pending_send'
 end
 function replay:_save_progress_state(_,state) replay_session.progress_sync_state=state end
-function replay:_clear_progress_resolution() choice_cleared=true end
-function replay:_submit_progress_snapshot(_,_,options) submitted=true; submission_options=options end
-local replay_position={chapter_uid='8',offset=200,progress=20,captured_at=100}
-local function check_replay(remote)
-    submitted=false; choice_cleared=false; replay_error=nil; submission_options=nil
-    replay:_submit_recovered_progress_snapshot('a',replay_position,{},function(_,_,err) replay_error=err end)
-    assert(not submitted,'upload started before the cloud read')
+function replay:_clear_progress_resolution() end
+function replay:_clear_progress_write_fence() end
+function replay:_clear_pending_progress() replay_session.pending_progress=false end
+function replay.sync:set_cloud_anchor() end
+function replay.sync:mark_verified() verified=true end
+function replay:_commit_progress_verified() self:_clear_pending_progress() end
+function replay:_submit_progress_snapshot(_,position,options,done)
+    submitted=true; submission_options=options
+    done(true,{chapter_uid=position.chapter_uid,offset=position.offset})
+    return true
+end
+local replay_position={chapter_uid='8',offset=200,progress=20,captured_at=200,updated_at=200,
+    progress_sequence=2,progress_epoch=1,native_offset=true,offset_basis='wr_data_co'}
+local function start_recovery()
+    replay_session={progress_epoch=1,progress_latest_sequence=2,progress_verified_sequence=1,
+        verified_chapter_uid='8',verified_chapter_offset=100,local_read_event_at=200,
+        pending_progress_coordinate=copy(replay_position)}
+    remote_callback=nil; submitted=false; submission_options=nil; verified=false
+    replay_error=nil; replay_result=nil
+    assert(replay:_recover_pending_progress_coordinate({book_id='a'},function(ok,err,position,remote)
+        replay_error=err; replay_result={ok=ok,position=position,remote=remote}
+    end))
+end
+local function check_replay(remote,before_reply)
+    start_recovery()
+    assert(not submitted and remote_callback,'catalog recovery skipped the fresh cloud read')
+    if before_reply then before_reply() end
     remote_callback(remote)
 end
-check_replay({chapter_uid='8',offset=100,updated_at=120,percent=10})
+check_replay({chapter_uid='8',offset=100,updated_at=100,percent=10})
 assert(submitted,'unchanged phone position blocked a safe replay')
-check_replay({chapter_uid='8',offset=300,updated_at=120,percent=30})
-assert(not submitted and replay_error=='remote_position_changed' and choice_cleared)
-assert(replay_session.progress_upload_state=='conflict','phone change did not block automatic replay')
-check_replay({chapter_uid='8',offset=200,updated_at=120,percent=20})
-assert(submitted and submission_options.verify_first,'already accepted position was sent again')
+assert(replay_result.ok and replay_result.position.progress_sequence==2
+    and replay_result.remote.offset==200,'catalog recovery changed the callback contract')
+check_replay({chapter_uid='8',offset=300,updated_at=100,percent=30})
+assert(submitted and submission_options.force_write,'newer Kindle reading was blocked by an older phone change')
+check_replay({chapter_uid='8',offset=300,updated_at=300,percent=30})
+assert(not submitted and replay_result.ok and replay_error=='remote_newer_local_unsent_dropped'
+    and replay_session.pending_progress==false,'older Kindle reading overwrote newer phone reading')
+check_replay({chapter_uid='8',offset=200,updated_at=300,percent=20})
+assert(not submitted and verified and replay_error=='already_aligned','already accepted position was sent again')
+check_replay({chapter_uid='8',offset=300,updated_at=220,percent=30})
+assert(not submitted and replay_error=='freshness_conflict' and replay_session.pending_progress
+    and replay_session.progress_sync_state=='deferred','ambiguous reading events were uploaded')
 check_replay({conflict=true,percent=20})
-assert(not submitted,'disagreeing cloud sources were overwritten')
+assert(not submitted and replay_error=='remote_source_conflict','disagreeing cloud sources were overwritten')
 check_replay(nil)
 assert(not submitted and replay_session.progress_sync_state=='waiting_network','failed read dispatched the pending write')
-replay_session.cloud_anchor=nil
-check_replay({chapter_uid='8',offset=100,updated_at=90,percent=10})
-assert(not submitted,'device clock ordering allowed replay without a cloud baseline')
-check_replay({chapter_uid='8',offset=300,updated_at=120,percent=30})
-assert(not submitted,'legacy replay overwrote a newer cloud position')
-check_replay({chapter_uid='8',offset=100,percent=10})
-assert(not submitted,'unknown cloud ordering allowed automatic replay')
-function replay:_progress_snapshot_current() return false end
-check_replay({chapter_uid='8',offset=100,updated_at=90,percent=10})
+check_replay({chapter_uid='8',offset=100,updated_at=100,percent=10},function()
+    replay_session.progress_epoch=2
+    replay_session.progress_sync_state='remote_selected'
+    replay_session.pending_progress=false
+end)
 assert(not submitted and replay_error=='superseded','stale recovery uploaded a replaced transaction')
-function replay:_progress_snapshot_current() return true end
+assert(replay_session.progress_sync_state=='remote_selected','stale recovery changed the selected cloud state')
+check_replay({chapter_uid='8',offset=300,updated_at=300,percent=30},function()
+    replay_session.progress_latest_sequence=3
+    replay_session.pending_progress={progress_sequence=3,progress_epoch=1,progress=40}
+end)
+assert(replay_error=='superseded' and replay_session.pending_progress.progress_sequence==3,
+    'stale cloud decision cleared a newer local transaction')
+offline=true; start_recovery()
+assert(not remote_callback and replay_result.ok and replay_error=='recovered_waiting_network'
+    and replay_session.pending_progress,'offline catalog recovery lost its pending upload')
+offline=false
+_G.__MIUREAD_POSITION_RESOLUTION=previous_resolver
 
 -- Confirmed cloud selection invalidates the old pending transaction, so its
 -- callback cannot later upload the position the user just discarded.
