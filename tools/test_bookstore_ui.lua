@@ -144,6 +144,7 @@ local home_method=assert(source:match('function Plugin:_home_hold_book%(book,anc
 local home_methods,last_home_sheet=assert(loadstring([[
 local Plugin={}
 local U=require('miuread.util')
+local ShelfProgress=require('miuread.shelf_progress')
 local Protocol={is_mp=function(id) return id:match('^MP_')~=nil end,
     is_mp_account=function(id) return id:match('^MP_WXS_')~=nil end}
 local UnifiedLibrary={canonical_source=function(book) return book.unified_source or 'local' end}
@@ -153,7 +154,8 @@ local LocalLibrary={normalize=tostring}
 local lfs={attributes=function() return 'file' end}
 local sheet
 local ActionSheet={show=function(opts) sheet=opts end}
-]]..home_method..'\n'..assert(source:match('(function Plugin:_home_action_function_actions%(key,anchor%).-\nend)'))
+]]..home_method..'\n'..assert(source:match('(function Plugin:_finished_status_action%(book%).-\nend)'))
+    ..'\n'..assert(source:match('(function Plugin:_home_action_function_actions%(key,anchor%).-\nend)'))
     ..'\nreturn Plugin,function() return sheet end'))()
 
 local function plugin()
@@ -504,6 +506,9 @@ assert(#auth_flows==flow_count and api.writes==writes and not p.job)
 p=plugin(); p.settings.shelf_cache={books={book}}
 assert(M.shelf_action(p,book).text=='从微信书架移除','legacy effective shelf lost the removal entrance')
 p._home_hold_book=home_methods._home_hold_book
+p._finished_status_action=home_methods._finished_status_action
+function p:logged_in() return true end
+function p:_request_finished_status(target,desired) self.finished_request={id=target.bookId,desired=desired} end
 function p:_local_entry_mode() return '',nil end
 function p:_home_attach_local_record() end
 function p:_preferred_record() return nil end
@@ -512,11 +517,15 @@ function p:_download_state() return {} end
 function p:_home_variant_download_context() return {} end
 function p:_home_variant_download_action() return {label='下载'} end
 p:_home_hold_book({bookId='remove',title='Remove me',unified_source='weread'})
-local home_action
+local home_action,finished_action
 for _,row in ipairs(last_home_sheet().actions) do
     if row.label=='从微信书架移除' then home_action=row end
+    if row.label=='标记为已读完' then finished_action=row end
 end
 assert(home_action,'Home long-press menu omitted shelf management')
+assert(finished_action,'Home long-press menu omitted reading status alongside shelf management')
+finished_action.callback()
+assert(p.finished_request.id=='remove' and p.finished_request.desired==true)
 writes=api.writes; home_action.callback()
 assert(stack[#stack].widget.ok_text=='移除' and not p.job and api.writes==writes)
 for _,other in ipairs({{unified_source='local'},{unified_source='zlibrary'},
@@ -525,6 +534,7 @@ for _,other in ipairs({{unified_source='local'},{unified_source='zlibrary'},
     p:_home_hold_book(other)
     for _,row in ipairs(last_home_sheet().actions) do
         assert(row.label~='从微信书架移除' and row.label~='加入微信书架','another provider exposed WeRead shelf mutation')
+        assert(row.label~='标记为已读完' and row.label~='取消读完标记','another provider exposed WeRead reading status')
     end
 end
 

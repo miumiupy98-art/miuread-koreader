@@ -21,6 +21,7 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local U = require("miuread.util")
+local ShelfProgress = require("miuread.shelf_progress")
 local UiScale = require("miuread.ui_scale")
 
 local Screen = Device.screen
@@ -31,7 +32,7 @@ local function status_text(book)
     if book.status_text and tostring(book.status_text)~="" then return tostring(book.status_text) end
     if book.download_status and tostring(book.download_status)~="" then return tostring(book.download_status) end
     local progress = tonumber(book.progress or 0) or 0
-    if progress >= 100 then return "已读完" end
+    if ShelfProgress.is_finished(book) then return "已读完" end
     if progress > 0 then return "阅读 " .. tostring(math.floor(progress + .5)) .. "%" end
     return "未开始"
 end
