@@ -229,11 +229,23 @@ assert(Membership.run(api,'a',false,false).state=='blocked' and http.delete_coun
 assert(store.current.native_shelf.accessToken==previous.accessToken,'wrong-account renewal replaced native credential')
 http.wrong_account=false
 
--- The default Web login still uses its existing flow and replacement boundary.
-store=new_store(); h=host(); flow=Auth:new(http,store,h)
+-- Same-account Web re-login preserves the independently granted Native shelf
+-- authorization; a real account switch must not carry it across accounts.
+store=new_store()
+store.current.native_shelf={vid='alice',accessToken='native-token',refreshToken='native-refresh',deviceId='native-device'}
+store.persisted=copy(store.current)
+h=host(); flow=Auth:new(http,store,h)
 name=flow:_finish({webLoginVid='alice',accessToken='web-new',refreshToken='web-new-refresh'})
 assert(name=='Alice' and store.current.cookies.wr_skey=='web-new'
     and store.current.api_key=='new-skills-key' and store.current.login_session_id=='web-session-new')
+assert(store.current.native_shelf and store.current.native_shelf.accessToken=='native-token',
+    'same-account Web QR discarded Native shelf authorization')
+store=new_store()
+store.current.native_shelf={vid='alice',accessToken='native-token',refreshToken='native-refresh',deviceId='native-device'}
+store.persisted=copy(store.current)
+h=host(); flow=Auth:new(http,store,h)
+name=flow:_finish({webLoginVid='bob',accessToken='web-bob',refreshToken='web-bob-refresh'})
+assert(name=='Alice' and not store.current.native_shelf,'account switch carried Native shelf authorization')
 for _,line in ipairs(logs) do
     for _,secret in ipairs({'uuid-secret','code-secret','ticket-secret','native-token','native-refresh'}) do
         assert(not line:find(secret,1,true),'QR or native credential leaked into logs')

@@ -315,6 +315,17 @@ end
 function Auth:_save_login(new_auth,display_name)
     local old_auth=self.store:auth()
     local old_revision=math.max(0,tonumber(old_auth.auth_revision or 0) or 0)
+    -- A same-account Web QR refresh must not silently discard the separate
+    -- Native shelf-management authorization. Account switches still start
+    -- clean, and Native QR commits already merge against the current Web auth.
+    if not self.backend and type(old_auth.native_shelf)=="table" then
+        local old_vid=tostring((old_auth.account or {}).vid or (old_auth.cookies or {}).wr_vid or "")
+        local new_vid=tostring(((new_auth or {}).account or {}).vid or (((new_auth or {}).cookies or {}).wr_vid) or "")
+        local native_vid=tostring(old_auth.native_shelf.vid or "")
+        if old_vid~="" and new_vid==old_vid and native_vid==new_vid then
+            new_auth.native_shelf=Util.copy(old_auth.native_shelf)
+        end
+    end
     local committed,commit_error=self:_commit_auth(new_auth,old_revision)
     if committed~=true then
         self.pending_auth=Util.copy(new_auth)

@@ -1852,6 +1852,32 @@ local function account_channel_text(row)
     end
     return "将在实际使用时验证"
 end
+function Plugin:_shelf_management_authorized()
+    local ok,client=pcall(require,"miuread.shelf_client")
+    return ok and client and client.credentials(self.store:auth())~=nil
+end
+function Plugin:confirm_clear_shelf_management_auth()
+    if not self:_shelf_management_authorized() then
+        self:toast("当前没有书架管理授权",3)
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        text="取消书架管理授权？\n\n不会退出微信读书主账号。之后再次从微信书架移除书籍时，需要重新扫码授权。",
+        ok_text="取消授权",
+        ok_callback=function()
+            if self._bookstore_shelf_auth then
+                self._bookstore_shelf_auth:cancel()
+                self._bookstore_shelf_auth=nil
+            end
+            local saved,err=self.store:clear_native_shelf_auth()
+            if saved==true then
+                self:status_toast("书架管理","授权已取消",4)
+            else
+                self:info("取消书架管理授权失败："..tostring(err or "无法保存设置"))
+            end
+        end,
+    })
+end
 function Plugin:_account_details_text()
     local auth=self.store:auth()
     local health=self:_auth_health()
@@ -1863,6 +1889,7 @@ function Plugin:_account_details_text()
         return table.concat(lines,"\n")
     end
     lines[#lines+1]="基础登录：正常"
+    lines[#lines+1]="书架管理授权："..(self:_shelf_management_authorized() and "已授权" or "未授权")
     lines[#lines+1]="在线功能："..(health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证"))
     lines[#lines+1]=""
     for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
@@ -1982,6 +2009,8 @@ function Plugin:show_account_status()
             {text="基础登录",post_text=self:logged_in() and "正常" or "尚未登录",enabled=false},
         }
         if self:logged_in() then
+            local shelf_authorized=self:_shelf_management_authorized()
+            rows[#rows+1]={text="书架管理授权",post_text=shelf_authorized and "已授权" or "未授权",enabled=false}
             local online_label=health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
             rows[#rows+1]={text="在线功能",post_text=online_label,enabled=false}
             for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
@@ -1991,6 +2020,9 @@ function Plugin:show_account_status()
             rows[#rows+1]={text="账号操作",separator=true,enabled=false}
             rows[#rows+1]={text="重新检查状态",callback=function() self:check_account_status() end}
             rows[#rows+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
+            if shelf_authorized then
+                rows[#rows+1]={text="取消书架管理授权",callback=function() self:confirm_clear_shelf_management_auth() end}
+            end
             rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end}
         else
             rows[#rows+1]={text="账号操作",separator=true,enabled=false}
@@ -2004,6 +2036,11 @@ function Plugin:show_account_status()
     if self:logged_in() then
         buttons[#buttons+1]={{text="重新检查状态",callback=function() UIManager:close(dialog); self:check_account_status() end}}
         buttons[#buttons+1]={{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
+        if self:_shelf_management_authorized() then
+            buttons[#buttons+1]={{text="取消书架管理授权",callback=function()
+                UIManager:close(dialog); self:confirm_clear_shelf_management_auth()
+            end}}
+        end
         buttons[#buttons+1]={{text="退出登录",callback=function()
             UIManager:close(dialog); self:confirm_logout()
         end}}
@@ -5355,12 +5392,6 @@ function Plugin:_home_cancel_visible_page_work(reason)
     return self._home_visible_page_generation
 end
 
-function Plugin:_home_stream_prefetch_page(section,page)
-    -- beta.4: navigation never performs network hydration. Remote data is
-    -- refreshed only by the normal full-shelf refresh path.
-    return false
-end
-
 function Plugin:_home_change_page(delta)
     local section=self._home_active_section or "shelf"
     local selected=self._home_sections and self._home_sections[section]
@@ -7507,21 +7538,6 @@ end
 
 
 
-function Plugin:_home_local_inline_title()
-    -- The selected top tab already says “本地书库”; repeating it above the
-    -- root grid wastes a row.  Child directories show their own name in the
-    -- dedicated browser header instead.
-    return ""
-end
-
-function Plugin:_home_local_empty_text()
-    if self:_home_root()=="" then
-        return "请先设置书籍和分类所在文件夹\n\n位置：觅阅设置 → 阅读与书库 → 本地书库\n\n点击这里去设置"
-    end
-    if self._home_local_inline_loading==true then return "正在读取本地书库…" end
-    return "这个文件夹中暂无可显示的本地书"
-end
-
 
 
 function Plugin:_home_local_source_filename_key(path)
@@ -7679,40 +7695,6 @@ function Plugin:_home_local_rows(home)
     }
 end
 
-function Plugin:_home_local_shelf_tabs(home)
-    home=type(home)=="table" and home or self:_home_preferences()
-    local root=LocalLibrary.normalize(self:_home_root())
-    if root=="" then return {} end
-    local entry=self._home_sections and self._home_sections["local"] or nil
-    local counts=entry and entry.local_counts or {}
-    local mode=self:_home_local_shelf_mode(home)
-    local show_folders=home.local_shelf_show_folders==true
-    local show_books=home.local_shelf_show_books==true
-    local path=self:_home_local_current_folder(home,root)
-
-    if mode=="folders" and path~=root then
-        local relative=self:_home_local_relative_path(path,root)
-        relative=U.utf8_truncate(relative~="" and relative or LocalLibrary.basename(path),28,"…")
-        local tabs={{title="‹ "..relative,selected=true,on_tap=function() self:_home_local_go_up() end}}
-        if show_books then
-            tabs[#tabs+1]={title="全部书籍",count=tonumber(counts.books) or 0,selected=false,on_tap=function()
-                self:_set_home_local_shelf_mode("books")
-            end}
-        end
-        return tabs
-    end
-
-    if not (show_folders and show_books) then return {} end
-    return {
-        {title="文件夹",count=tonumber(counts.folders) or 0,selected=mode=="folders",on_tap=function()
-            self:_set_home_local_shelf_mode("folders")
-        end},
-        {title="全部书籍",count=tonumber(counts.books) or 0,selected=mode=="books",on_tap=function()
-            self:_set_home_local_shelf_mode("books")
-        end},
-    }
-end
-
 function Plugin:_home_local_set_folder_path(path,force_refresh)
     local root=LocalLibrary.normalize(self:_home_root())
     path=LocalLibrary.normalize(path)
@@ -7780,26 +7762,6 @@ function Plugin:_set_home_local_shelf_mode(mode)
             end
         end
     end
-    return true
-end
-
-function Plugin:_toggle_home_local_shelf_view(kind)
-    local home,preferences=self:_home_preferences()
-    local key=kind=="folders" and "local_shelf_show_folders" or "local_shelf_show_books"
-    local other=kind=="folders" and "local_shelf_show_books" or "local_shelf_show_folders"
-    local next_value=home[key]~=true
-    if not next_value and home[other]~=true then
-        self:toast("本地书库至少保留一个入口",2)
-        return false
-    end
-    home[key]=next_value
-    if not next_value and home.local_shelf_mode==kind then
-        home.local_shelf_mode=kind=="folders" and "books" or "folders"
-    end
-    home.page_by_section=type(home.page_by_section)=="table" and home.page_by_section or {}
-    home.page_by_section["local"]=1
-    self:_save_home_preferences(home,preferences)
-    if self._home_sections then self:_home_apply_local_inline_section(true) end
     return true
 end
 
@@ -7976,7 +7938,6 @@ function Plugin:_home_set_library_filter(section,key,value)
     return true
 end
 
-function Plugin:_home_library_filter_count(section) return 0 end
 function Plugin:_home_library_sort_label(section)
     local state=self:_home_library_filter_state(section)
     local labels=UnifiedLibrary.sort_labels()
@@ -9676,139 +9637,8 @@ function Plugin:_home_force_refresh_current_cover(book,on_done)
     return started==true
 end
 
-function Plugin:_home_refresh_current_network_metadata(book)
-    if type(book)~="table" then return false end
-    if self:_network_radio_hint()==false then
-        self:toast("当前未联网，无法更新书籍信息和封面",2)
-        return false
-    end
-
-    self:toast("正在后台更新这本书的信息和封面…",2)
-    local state={metadata_done=false,metadata_ok=false,metadata_partial=false,cover_done=false,cover_ok=false,cover_unchanged=false,finished=false}
-    local function finish()
-        if state.finished or not state.metadata_done or not state.cover_done then return end
-        state.finished=true
-        if state.cover_unchanged then
-            if state.metadata_ok then
-                self:toast(state.metadata_partial
-                    and "书籍信息已刷新，部分资料暂未找到；未发现更高清封面"
-                    or "书籍信息已更新；未发现更高清封面",2)
-            else
-                self:toast("未发现更高清封面，网络书籍信息更新失败",2)
-            end
-        elseif state.metadata_ok and state.cover_ok then
-            self:toast(state.metadata_partial
-                and "封面和书籍信息已刷新，部分资料暂未找到"
-                or "书籍信息和封面已更新",2)
-        elseif state.cover_ok then
-            self:toast("封面已更新，网络书籍信息更新失败",2)
-        elseif state.metadata_ok then
-            self:toast(state.metadata_partial
-                and "书籍信息已刷新，部分资料暂未找到；封面更新失败"
-                or "书籍信息已更新，封面更新失败",2)
-        else
-            self:toast("当前书籍更新失败，请稍后重试",2)
-        end
-    end
-
-    local metadata_started=self:_home_schedule_network_metadata(book,true,true,function(ok,_,detail)
-        state.metadata_done=true
-        state.metadata_ok=ok==true
-        state.metadata_partial=type(detail)=="table" and detail.partial==true
-        finish()
-    end,true)==true
-    if not metadata_started then state.metadata_done=true end
-
-    local cover_started=self:_home_force_refresh_current_cover(book,function(ok,detail)
-        state.cover_done=true
-        state.cover_ok=ok==true
-        state.cover_unchanged=type(detail)=="table" and detail.reason=="not_better"
-        finish()
-    end)==true
-    if not cover_started then state.cover_done=true end
-
-    if metadata_started or cover_started then
-        finish()
-        return true
-    end
-    if self.home_metadata_async and self.home_metadata_async:busy() then
-        self:toast("已有图书信息任务正在进行，请稍后再试",2)
-    elseif self.home_cover_async and self.home_cover_async:busy() then
-        self:toast("已有封面任务正在进行，请稍后再试",2)
-    elseif tostring(book.cover or book.coverUrl or "")=="" then
-        self:toast("当前书籍没有可更新的网络封面",2)
-    else
-        self:toast("当前暂时无法开始更新",2)
-    end
-    return false
-end
 
 
-
-
-function Plugin:_show_home_download_popup(anchor)
-    ActionSheet.show{
-        cache_key="home_download",
-        anchor=anchor,
-        preferred_direction="below",
-        title="下载",
-        subtitle=self:_download_menu_text(),
-        actions={
-            {icon="⇩",label="下载任务",detail="查看进度 排队和失败重试",callback=function() self:show_downloads() end},
-            {icon="⚙",label="下载设置",detail="下载策略 目录与提醒",callback=function()
-                self:_show_standalone_menu("下载设置",self:download_settings_menu())
-            end},
-        },
-    }
-end
-
-function Plugin:_show_home_sync_popup(anchor)
-    local summary=self:_home_sync_summary()
-    local subtitle=self:_home_sync_status_label()
-    if summary.total>0 then
-        subtitle=subtitle.."  ·  进度 "..tostring(summary.progress)
-            .."  时间 "..tostring(summary.time)
-            .."  划线 "..tostring(summary.highlight)
-            .."  想法 "..tostring(summary.thought)
-    end
-    local actions={}
-    if (tonumber(summary.annotation_action_required or 0) or 0)>0 then
-        actions[#actions+1]={icon="warning",label="批注同步失败",
-            detail=tostring(summary.annotation_action_required).." 条 · 查看具体书籍和原因",
-            callback=function() self:show_annotation_sync_issues() end}
-    end
-    actions[#actions+1]={icon="⇅",label="重新同步失败内容",detail="进度、时间与批注",callback=function() self:_sync_home_pending() end}
-    actions[#actions+1]={icon="i",label="查看同步详情",detail="阅读时间、进度和批注状态",callback=function() self:show_sync_status(false) end}
-    actions[#actions+1]={icon="⚙",label="自动同步设置",detail="时间 进度 批注",callback=function()
-        self:_show_standalone_menu("自动同步设置",self:sync_settings_menu())
-    end}
-    ActionSheet.show{
-        cache_key="home_sync",
-        anchor=anchor,
-        preferred_direction="below",
-        title="同步",
-        subtitle=subtitle,
-        actions=actions,
-        wide_last=true,
-    }
-end
-
-function Plugin:_show_home_search_popup(anchor)
-    ActionSheet.show{
-        cache_key="home_search",
-        anchor=anchor,
-        preferred_direction="below",
-        width_ratio=.62,
-        title="搜索",
-        subtitle="找新书或搜索已有书籍",
-        actions={
-            {icon="library",label="浏览微信读书书城",detail="推荐 排行榜与分类",callback=function() self:show_bookstore() end},
-            {icon="⌕",label="搜索微信读书",detail="全库搜索，未加入书架也能下载",callback=function() self:search_dialog("搜索微信读书") end},
-            {icon="▦",label="搜索我的书架",detail="本地搜索统一书架中的现有内容",callback=function() self:show_home_search_dialog("shelf") end},
-            {icon="highlight",label="搜索批注",detail="全部划线、想法和书签",callback=function() self:show_annotation_search_dialog() end},
-        },
-    }
-end
 
 
 function Plugin:_show_home_settings_center()
@@ -10435,16 +10265,6 @@ function Plugin:_home_scan_local(force,user_requested)
     logger.info("[MiuRead][Home] local-library refresh",
         "root=",tostring(self:_home_root()),"recursive=true","started=",tostring(started))
     return started
-end
-
-function Plugin:_home_refresh_recent_history(user_requested)
-    local ok_history,history=pcall(require,"readhistory")
-    if ok_history and history and type(history.reload)=="function" then pcall(history.reload,history,true) end
-    self._home_recent_read_dirty=true
-    HOME_SESSION.recent_read_dirty=true
-    if HomeView.is_shown() and not self:_active_reader_ui() then self:_home_refresh_recent_hero_cached() end
-    if user_requested==true then self:toast("最近阅读已刷新",1.5) end
-    return true
 end
 
 
@@ -18471,13 +18291,6 @@ function Plugin:_variant_exists(book_id,kind)
     local r=self.store:variant(book_id,kind)
     return r and r.file and U.file_exists(r.file) and r or nil
 end
-function Plugin:_book_has_cache(book_id)
-    local stored=self.store:book(book_id)
-    if not stored then return false end
-    for _,r in pairs(stored.variants or {}) do if r.file and U.file_exists(r.file) then return true end end
-    for _,row in pairs(stored.chapters or {}) do for _,r in pairs(row or {}) do if r.file and U.file_exists(r.file) then return true end end end
-    return false
-end
 function Plugin:_preferred_record(book_id)
     local session=self.store:session(book_id) or {}
     local last=tostring(session.last_read_path or "")
@@ -23944,10 +23757,6 @@ function Plugin:_retry_all_progress_failures(silent,on_done)
     return phase_coordinate()
 end
 
-function Plugin:_reprocess_home_sync_failures()
-    return self:_sync_home_pending()
-end
-
 -- beta.11: Home quick Sync, Sync Status -> 全部重新同步 and
 -- Progress -> 全部重新同步 share this exact durable-progress recovery pass.
 -- The helper does not bypass login/network policy; callers gate before entry.
@@ -24421,13 +24230,6 @@ function Plugin:_clear_progress_resolution(book_id)
         progress_resolution_at=false,
     })
     return true
-end
-
-function Plugin:_local_progress_choice_matches(book_id,position)
-    local session=(self:_persisted_sessions()[tostring(book_id or "")]) or self.store:session(tostring(book_id or "")) or {}
-    if tostring(session.progress_resolution_choice or "")~="local" then return false end
-    local expected=tostring(session.progress_resolution_fingerprint or "")
-    return expected~="" and expected==self:_progress_position_fingerprint(position)
 end
 
 function Plugin:_resume_remembered_local_progress(book_id)
@@ -26667,13 +26469,6 @@ function Plugin:_home_lockscreen_style_label(home)
     if home.lockscreen_recent==false then return "KOReader 原锁屏" end
     local labels={frame="画框",fit="完整",fill="铺满"}
     return "书籍封面 · "..(labels[self:_home_native_lockscreen_style(home)] or "画框")
-end
-
-function Plugin:_set_home_lockscreen_style(style)
-    if style=="receipt" then return self:_request_lockscreen_provider("inkstain") end
-    if style=="dash" then return self:_request_lockscreen_provider("dashwallpaper") end
-    if style~="frame" and style~="fit" and style~="fill" then style="frame" end
-    return self:_activate_native_lockscreen(style)
 end
 
 function Plugin:_inkstain_open_settings()
@@ -32009,14 +31804,6 @@ function Plugin:_inkstain_status()
         active=cover:find("/inkstain",1,true)~=nil or dir:find("/inkstain",1,true)~=nil
     end
     return {installed=installed,loaded=instance~=nil,enabled=enabled,active=active}
-end
-
-function Plugin:_inkstain_enabled()
-    return self:_inkstain_status().enabled==true
-end
-
-function Plugin:_inkstain_active()
-    return self:_inkstain_status().active==true
 end
 
 function Plugin:_inkstain_ensure_or_prompt(require_loaded)

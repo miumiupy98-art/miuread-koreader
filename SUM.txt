@@ -1,1 +1,3 @@
-5.9.1-beta.1：修复 beta.19 精确进度快照遗漏安全标记导致的“final_position_captured → position_unavailable / 失败记录无法继续”问题，并一次性修复现有精确 pending。新增持久化 Progress Recovery Capsule，Reader 关闭后 Home 仍可利用退出前保存的 source anchor 后台恢复 chapter/co，不再把重新打开书作为正常恢复步骤。ReadReport 主动停止与真实异常退出分离；latest-wins、remote-first、ProgressFence、exact cloud readback 与 fail-closed 安全规则保持不变。Schema 136。
+6.0.0-beta.1：6.0 Beta 基线，继承 5.9.1-beta.4 的减重与体验收口结果。
+主登录与书架管理授权保持两套独立凭证；同账号重登保留 Native 书架授权，可单独取消。
+书城轻量整理、低价值 StorePerf 日志降噪继续保留；同步主链路与 Schema 136 不变。

@@ -10,7 +10,7 @@ local sync=read("miuread.koplugin/miuread/sync.lua")
 local store=read("miuread.koplugin/miuread/store.lua")
 local worker=read("miuread.koplugin/miuread/legacy/read_report_worker.lua")
 
-assert(config:find('VERSION = "5.9.1-beta.1"',1,true),"5.9.1-beta.1 version missing")
+assert(config:find('VERSION = ',1,true),"version identity missing while validating 5.9.1 beta.1+ recovery contract")
 assert(config:find('SCHEMA = 136',1,true),"schema unexpectedly changed")
 
 -- Exact native beta.19 snapshots must be replayable after Reader close.

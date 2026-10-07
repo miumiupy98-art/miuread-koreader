@@ -1,17 +1,17 @@
 {
-  "version": "5.9.1-beta.1",
-  "name": "觅阅 · 微信读书助手 5.9.1-beta.1 内测版",
+  "version": "6.0.0-beta.1",
+  "name": "觅阅 · 微信读书助手 6.0.0-beta.1 内测版",
   "channel": "beta",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.1-beta.1/miuread-v5.9.1-beta.1-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.1-beta.1/miuread-v5.9.1-beta.1-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.1-beta.1/miuread-v5.9.1-beta.1-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.1-beta.1/miuread-v5.9.1-beta.1-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.1-beta.1/miuread-v5.9.1-beta.1-full.zip"
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip"
   ],
-  "size": 2038518,
-  "sha256": "33d5e5664a16e565a599b71b4efbc984dfe1c742015bc80fefa08c97cac5818b",
-  "summary": "修复 beta.19 精确快照遗漏安全标记导致的退出后 position_unavailable/失败记录卡住；新增持久化恢复锚点，Home 可后台恢复精确 chapter/co，无需重新打开书。",
-  "notes": "5.9.1-beta.1 收口 ReadingEnd 与进度失败恢复：原生 wr_data_co 快照统一补齐 safe/coordinate_safe/precise，并一次性修复现有 beta.19 exact pending；source mapping 失败时持久化退出前 immutable source anchor/XPointer/sequence，Home 优先恢复锚点后再 fresh GET 云端并按既有 latest-wins 决策。进度失败列表新增可执行的“恢复精确位置”，旧无恢复材料记录明确可清理。ReadReport 主动停止不再误报 unexpected。remote_wire fresh GET、ProgressFence、rollback、30 秒 clock-skew、exact cloud readback 与 fail-closed 不变。Schema 136。"
+  "size": 1763687,
+  "sha256": "e76d72257a1ea63f142a3cca1ada40699d2d035119b52908327bf73988bb30ff",
+  "summary": "6.0.0-beta.1：以 5.9.1-beta.4 收口版作为 6.0 Beta 基线，功能与 Schema 136 保持不变。\n延续减重、双登录授权收口、书城轻量整理与日志降噪，并修正历史回归测试的版本硬编码。",
+  "notes": "- 以 5.9.1-beta.4 的已收口代码作为 6.0 Beta 基线；Schema 136、同步主链路与主页结构保持不变。\n- 延续减重后的发布包：stillness 背景压缩，`native/` 编译源码不进入安装包，运行时 codec 与平台支持不变。\n- 主登录与书架管理授权继续独立；同账号重新扫码保留书架管理授权，并可单独取消该授权。\n- 延续书城轻量整理与日志降噪；修正历史回归测试的旧版本硬编码，便于 6.0 系列持续发布。"
 }

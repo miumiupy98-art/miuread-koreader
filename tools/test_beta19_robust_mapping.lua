@@ -11,7 +11,7 @@ local posmap=read("miuread.koplugin/miuread/annotations/posmap.lua")
 local main=read("miuread.koplugin/main.lua")
 local worker=read("miuread.koplugin/miuread/legacy/read_report_worker.lua")
 
-assert(config:find('VERSION = "5.9.0-beta.19"',1,true) or config:find('VERSION = "5.9.1-beta.1"',1,true),"beta.19 mapping contract version")
+assert(config:find('VERSION = ',1,true),"version identity missing while validating beta.19 mapping contract")
 assert(precise:find('SOURCE_ANCHOR_WORDS = {24, 16, 12}',1,true),"multi-level source anchor sizes missing")
 assert(precise:find('anchor_candidates = anchor_candidates',1,true),"captured anchor set missing")
 assert(precise:find('candidate_reason = tostring(reason or "neighbor")',1,true),"bounded chapter candidate reason missing")

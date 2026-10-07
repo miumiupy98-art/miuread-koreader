@@ -128,14 +128,14 @@ function M.open(plugin)
     state(plugin)
     close_view(plugin)
     if plugin._shelf_view then plugin:_close_current_shelf() end
-    return plugin:list("微信读书书城",{
-        {text="为你推荐",post_text="根据你的阅读记录推荐",callback=function()
+    return plugin:list("微信读书 · 书城",{
+        {text="为你推荐",post_text="根据阅读记录发现可能喜欢的书",callback=function()
             if plugin:require_login() then M.browse(plugin,{kind="recommend",title="为你推荐"}) end
         end},
-        {text="排行榜",post_text="总榜 飙升 新书与热门榜单",callback=function() M.categories(plugin,true) end},
-        {text="分类浏览",post_text="按分类与子分类找书",callback=function() M.categories(plugin,false) end},
-        {text="搜索微信读书",post_text="全库搜索",callback=function() plugin:search_dialog("搜索微信读书") end},
-        {text="微信书架",callback=function() plugin:show_shelf(false,false,"account") end},
+        {text="排行榜",post_text="总榜 · 飙升 · 新书 · 热门",callback=function() M.categories(plugin,true) end},
+        {text="分类浏览",post_text="按主题与子分类浏览",callback=function() M.categories(plugin,false) end},
+        {text="搜索微信读书",post_text="搜索全部图书",callback=function() plugin:search_dialog("搜索微信读书") end},
+        {text="微信书架",post_text="查看已加入的图书",callback=function() plugin:show_shelf(false,false,"account") end},
     })
 end
 
@@ -186,8 +186,9 @@ end
 
 local function book_status(book)
     local parts={}
-    if book.newRating then parts[#parts+1]=string.format("推荐值 %.1f%%",book.newRating) end
-    if book.reason~="" then parts[#parts+1]=book.reason end
+    if book.newRating then parts[#parts+1]=string.format("推荐 %.0f%%",book.newRating) end
+    local reason=U.trim(tostring(book.reason or "")):gsub("[%c]+"," ")
+    if reason~="" then parts[#parts+1]=U.utf8_truncate(reason,32,"…") end
     return table.concat(parts," · ")
 end
 
@@ -202,14 +203,14 @@ local function show_page(plugin,s,spec,page,cached)
         if spec.rank and book.searchIdx then book.display_title=tostring(book.searchIdx)..". "..book.title end
         if show_covers then book.cover_path=plugin.library:cached_cover_path(book.bookId,cover_index) end
     end
-    local title=spec.title.." · 第 "..tostring(spec.page or 1).." 批"..(cached and " · 缓存" or "")
+    local title=spec.title.." · 第 "..tostring(spec.page or 1).." 页"..(cached and " · 缓存" or "")
     local function previous()
         local previous_spec=spec.previous
         if previous_spec then M.browse(plugin,U.copy(previous_spec))
-        else plugin:toast("已是第一批",2) end
+        else plugin:toast("已是第一页",2) end
     end
     local function next_page()
-        if not page.has_more then plugin:toast("已是最后一批",2); return end
+        if not page.has_more then plugin:toast("已是最后一页",2); return end
         local next_spec=U.copy(spec)
         next_spec.previous=U.copy(spec)
         next_spec.cursor=page.next_cursor
@@ -224,9 +225,9 @@ local function show_page(plugin,s,spec,page,cached)
     end
     if #books==0 then
         plugin:list(title,{
-            {text="暂时没有找到书籍",enabled=false},
+            {text="这一页暂无书籍",enabled=false},
             {text="返回",callback=back},
-            {text="上一批",callback=previous},
+            {text="上一页",callback=previous},
             {text="刷新",callback=function() M.browse(plugin,U.copy(spec),true) end},
         })
         return
@@ -235,8 +236,8 @@ local function show_page(plugin,s,spec,page,cached)
     s.view=ShelfView.show{
         title=title,books=books,show_covers=show_covers,selected_tab="",
         tabs={{id="back",label="返回",callback=back},
-            {id="previous",label="上一批",callback=previous},
-            {id="next",label=page.has_more and "下一批" or "已到底",callback=next_page}},
+            {id="previous",label="上一页",callback=previous},
+            {id="next",label=page.has_more and "下一页" or "已到底",callback=next_page}},
         left_action_label="搜索微信读书",right_action_label="刷新",
         on_search=function() close_view(plugin); plugin:search_dialog("搜索微信读书") end,
         on_refresh=function() M.browse(plugin,U.copy(spec),true) end,

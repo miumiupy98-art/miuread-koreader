@@ -1654,6 +1654,13 @@ end
 function Store:auth_revision()
     return math.max(0,tonumber(self:auth().auth_revision or 0) or 0)
 end
+function Store:clear_native_shelf_auth()
+    local auth=self:auth()
+    if type(auth.native_shelf)~="table" then return true end
+    local revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    auth.native_shelf=nil
+    return self:save_auth(auth,{expected_revision=revision})
+end
 function Store:generate_login_session_id() return generate_login_session_id() end
 function Store:ensure_login_session_id()
     local auth=self:auth()
@@ -2798,8 +2805,11 @@ function Store:flush(reason)
     -- mutate nested settings and detached workers may advance progress on disk.
     if disk_data and settings_equal(self.db.data,disk_data) then
         self._pending_home_navigation=nil
-        logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
-            "elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)))
+        local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
+        if elapsed_ms>=250 then
+            logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
+                "elapsed_ms=",tostring(elapsed_ms))
+        end
         return true
     end
     local previous_path=self.settings_path..".previous"
@@ -2869,10 +2879,13 @@ function Store:flush(reason)
     end
     self._validated_settings={payload=payload,data=validated_data}
     self._pending_home_navigation=nil
-    logger.info("[MiuRead][StorePerf] full settings flush",
-        "reason=",reason,
-        "elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)),
-        "bytes=",tostring(U.file_size(self.settings_path) or 0))
+    local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
+    if elapsed_ms>=250 or reason=="set:auth" then
+        logger.info("[MiuRead][StorePerf] full settings flush",
+            "reason=",reason,
+            "elapsed_ms=",tostring(elapsed_ms),
+            "bytes=",tostring(U.file_size(self.settings_path) or 0))
+    end
     return true
 end
 function Store:reload()

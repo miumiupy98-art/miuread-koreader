@@ -1,3 +1,25 @@
+## 6.0.0-beta.1 - 6.0 Beta Baseline
+
+- 以 5.9.1-beta.4 的已收口代码作为 6.0 Beta 基线；不新增实验性认证桥接，不改变 Schema 136、同步主链路或主页结构。
+- 延续安装包减重结果：压缩 stillness 背景，发布包继续排除仅用于编译的 `native/` 源码，运行时 codec 与 Kindle/Kobo/Android 支持保持不变。
+- 延续双登录收口：主登录与书架管理授权继续独立；同账号重新扫码保留既有书架管理授权，并支持单独取消该授权。
+- 延续书城轻量整理与日志降噪；同时修正两条历史回归测试的版本硬编码，使 6.0 系列继续验证功能契约而不是旧版本号。
+
+## 5.9.1-beta.4 - Lean Packaging & UX Polish
+
+- 安装包减重：压缩 stillness 背景，发布包排除仅用于编译的 `native/` 源码；运行时 codec 与平台支持不变。
+- 清理 `main.lua` 中 17 个无生产引用的私有遗留方法和 34 个旧 verifier，保留正式回归测试，不改主页结构和同步主链路。
+- 双登录体验收口：同一微信读书账号重新扫码时保留既有“书架管理授权”；账号状态显示授权状态，并支持只取消书架管理授权、不退出主账号。
+- 书城做轻量文字与分页层级整理，不重做 ShelfView；同时减少低价值 `StorePerf` 正常日志，WARN/ERROR 与认证写入日志继续保留。
+
+## 5.9.1-beta.3 - WeRead Store & Shelf State Sync
+
+- 新增微信读书书城：支持推荐、排行榜、分类、搜索结果衔接、相似书籍与分页浏览，并保留缓存和电子墨水屏交互优化。
+- 新增微信书架管理：可加入/移出微信书架；移出操作使用独立 Native 授权并进行同账号校验，写操作采用回读确认，避免网络异常下重复提交。
+- 完善书架阅读状态：未下载书籍也可在后台刷新阅读百分比，识别手机端独立“已读完”标记，并支持 Kindle 端标记/取消已读完后回写微信读书。
+- 增加离线与竞态保护：读完操作可持久化等待恢复；书架进度读取在用户交互时主动让路，过期回调、账号切换和旧进度事务不能覆盖当前状态。
+- 保留 5.9.1-beta.1 的 Progress Recovery、exact cloud readback、remote-first freshness、ProgressFence、rollback 与 fail-closed 规则。Schema 保持 136。
+
 ## 5.9.1-beta.1 - Progress Transaction Recovery
 
 - 修复 beta.19 `passive_exact_cache` 的原生 `chapterUid + wr_data_co` 快照遗漏 `safe=true`：此前同一精确位置可能先记录 `final_position_captured`，Reader 关闭后又被 `upload_progress()` 判成 `position_unavailable`，并留下“有失败记录但没有可执行动作”的 pending；本版统一恢复 `safe / coordinate_safe / precise` 语义，并在启动时一次性修复现有 beta.19 精确 pending。

@@ -309,7 +309,7 @@ p:finish()
 assert(api.reader and api.reader.store==api.store,'bookstore worker omitted login recovery')
 local first=views[#views]
 assert(first.opts.books[1].bookId=='book0' and first.opts.books[1].display_title=='20. Title 0')
-assert(first.opts.books[1].status_text:find('89.0',1,true))
+assert(first.opts.books[1].status_text:find('89%',1,true))
 first.opts.tabs[3].callback(); p:finish()
 assert(api.last_cursor==20 and first._miu_closed)
 local second=views[#views]
