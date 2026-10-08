@@ -17153,14 +17153,20 @@ function Plugin:_complete_reader_close(generation,reason)
     self:_set_foreground("home_pending")
 
     local shown=false
+    local home_plugin=self
     if HomeView.is_shown() then
-        local recent_owner=home_owner() or self
+        home_plugin=home_owner() or self
+        home_plugin._desktop_frozen=false
+        home_plugin._home_background_stopped_for_reader=false
+        home_plugin:_home_clear_lockscreen_visual_hold("reader close completed")
+        logger.info("[MiuRead][ReaderClose] retained home owner thawed","separate_instance=",tostring(home_plugin~=self))
+        local recent_owner=home_plugin
         if recent_owner and type(recent_owner._home_apply_recent_snapshot_to_home)=="function" then
             local ok_recent,recent_err=pcall(recent_owner._home_apply_recent_snapshot_to_home,recent_owner,"reader_close_first_frame")
             if not ok_recent then logger.warn("[MiuRead][Recent] first-frame apply failed",tostring(recent_err)) end
         end
         HomeView.unpark(true,{
-            on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
+            on_interaction=function(first,kind) home_plugin:_home_note_interaction(first,kind) end,
         })
         HomeView.raise(true)
         UIManager:setDirty(HomeView.current(),"ui")
@@ -17189,8 +17195,8 @@ function Plugin:_complete_reader_close(generation,reason)
     self._home_book_open_lock=nil
     self:_close_reader_recovery_surface()
     self:_release_reader_transition_guard("home restored after stable close")
-    self:_home_enter_post_reader_priority_window(4.0,"stable reader close")
-    self:_resume_home_preferences_flush(4.6)
+    home_plugin:_home_enter_post_reader_priority_window(4.0,"stable reader close")
+    home_plugin:_resume_home_preferences_flush(4.6)
     self:_finish_page_transition(.18,"home restored after stable close")
     -- Queue/install/download maintenance must not race the first usable Home
     -- surface. Let the interaction quiet window release before post-reader work.
@@ -17732,12 +17738,16 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         -- snapshot before the first Home repaint, then restore the parked surface
         -- with one bounded UI repaint instead of rebuilding/full-refreshing.
         local recent_owner=home_owner() or self
+        recent_owner._desktop_frozen=false
+        recent_owner._home_background_stopped_for_reader=false
+        recent_owner:_home_clear_lockscreen_visual_hold("home revealed after reader close")
+        logger.info("[MiuRead][ReaderClose] retained home owner thawed","separate_instance=",tostring(recent_owner~=self))
         if recent_owner and type(recent_owner._home_apply_recent_snapshot_to_home)=="function" then
             local ok_recent,recent_err=pcall(recent_owner._home_apply_recent_snapshot_to_home,recent_owner,"home_reveal_first_frame")
             if not ok_recent then logger.warn("[MiuRead][Recent] reveal apply failed",tostring(recent_err)) end
         end
         HomeView.unpark(true,{
-            on_interaction=function(first,kind) self:_home_note_interaction(first,kind) end,
+            on_interaction=function(first,kind) recent_owner:_home_note_interaction(first,kind) end,
         })
         HomeView.raise(true)
         UIManager:setDirty(HomeView.current(),"ui")
@@ -17747,10 +17757,11 @@ function Plugin:_restore_home_after_reader_close(attempt,generation)
         persist_home_session()
         self:_set_foreground("home")
         self._home_book_open_lock=nil
-        self:_home_schedule_clock()
+        recent_owner:_home_schedule_clock()
         self:_close_reader_recovery_surface()
         self:_release_reader_transition_guard("home already visible")
-        self:_home_enter_post_reader_priority_window(4.0,"home revealed")
+        recent_owner:_home_enter_post_reader_priority_window(4.0,"home revealed")
+        recent_owner:_resume_home_preferences_flush(4.6)
         self:_finish_page_transition(.18,"home revealed")
         self:_resume_pending_post_reader_work("home revealed",2.0)
         HOME_SESSION.home_restore_active=false
