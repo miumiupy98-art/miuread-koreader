@@ -1920,6 +1920,9 @@ function Downloader:_book_once(input, opt, progress)
                     failure_map[uid] = nil
                     restricted_map[uid] = nil
                     chapters_from_checkpoint = chapters_from_checkpoint + 1
+                    -- Verifying a long completed checkpoint can outlast the stall
+                    -- window; report each reused chapter so the parent sees progress.
+                    progress("resume", index, expected, chapter.title, {message="正在校验已完成章节"})
                     return true
                 end
                 cached_style="完成章节结构无效："..tostring(validation_error)
