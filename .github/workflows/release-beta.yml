@@ -250,6 +250,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lua5.1 luajit
           find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+          lua5.1 tools/test_bookstore.lua
+          lua5.1 tools/test_bookstore_ui.lua
+          lua5.1 tools/test_shelf_client.lua
+          lua5.1 tools/test_finished_status.lua
+          lua5.1 tools/test_shelf_progress.lua
+          luajit tools/test_bookstore.lua
+          luajit tools/test_bookstore_ui.lua
+          luajit tools/test_shelf_client.lua
+          luajit tools/test_finished_status.lua
+          luajit tools/test_shelf_progress.lua
           lua5.1 tools/test_position_resolution.lua
           lua5.1 tools/test_position_state_hotfix.lua
           lua5.1 tools/test_open_sync_contract.lua
@@ -257,6 +267,7 @@ jobs:
           lua5.1 tools/test_beta7_sync_contract.lua
           lua5.1 tools/test_beta8_home_translation_contract.lua
           lua5.1 tools/test_beta19_robust_mapping.lua
+          lua5.1 tools/test_591_beta1_progress_recovery.lua
           lua5.1 tools/test_cloud_mirror_contract.lua
           lua5.1 tools/test_long_book_anchor.lua
           lua5.1 tools/test_terminal_progress_guard.lua
@@ -269,7 +280,7 @@ jobs:
           luajit tools/test_translation_fetch.lua
           luajit tools/test_internal_links.lua
           python3 tools/test_extension_center_ux.py
-          python3 tools/verify_590_beta19.py
+          python3 tools/verify_600_beta1.py
 
       - name: Ensure release tag
         shell: bash
@@ -327,15 +338,17 @@ jobs:
           excluded_suffixes = {".md", ".epub", ".log"}
 
           def excluded(path):
+              relative = path.relative_to(root)
               return (
                   "__MACOSX" in path.parts
+                  or (relative.parts and relative.parts[0] == "native")
                   or path.name in excluded_names
                   or path.suffix.lower() in excluded_suffixes
               )
 
           with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
               directories = [root] + sorted(
-                  [path for path in root.rglob("*") if path.is_dir()],
+                  [path for path in root.rglob("*") if path.is_dir() and not excluded(path)],
                   key=lambda path: path.as_posix(),
               )
               for path in directories:
@@ -414,6 +427,7 @@ jobs:
           }
           forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
           forbidden_suffixes = {".md", ".epub", ".log"}
+          forbidden_prefixes = {"miuread.koplugin/native/"}
 
           with ZipFile(package) as archive:
               names = archive.namelist()
@@ -434,6 +448,7 @@ jobs:
                   path.name in forbidden_names
                   or path.suffix.lower() in forbidden_suffixes
                   or "__MACOSX" in path.parts
+                  or any(name.startswith(prefix) for prefix in forbidden_prefixes)
               ):
                   errors.append(f"不应进入安装包：{name}")
 

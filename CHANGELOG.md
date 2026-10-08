@@ -1,5 +1,44 @@
 # Changelog
 
+## 6.0.0 - Stable Release
+
+- 正式版基于 6.0.0-beta.1 收口，继承 5.9.1-beta.4 的功能与修复；Schema 保持 136，不把 Beta 发布通道变成正式版通道。
+- 保留 5.9 多设备精确阅读进度、云端/本地新旧判断、冲突保护、断线恢复、Progress Recovery Capsule 以及严格的 fail-closed 行为。
+- 纳入微信读书书城、搜索与推荐、书架添加/移除、后台书架进度更新、已读完状态双向同步和书架管理授权。
+- 主登录与书架管理授权继续使用两套独立凭证；同账号主登录刷新保留书架管理凭证，允许单独撤销书架管理授权。不声称已经完成真正的单凭证统一。
+- 保留外文翻译原文/双语/仅译文、书内链接修复、连接复用、扩展中心与 Kindle/Kobo/Android 兼容路径。
+- 发布包切换为正式版 6.0.0，默认 OTA 指向 stable-channel/update.json；Beta 发布配置仍只用于内测分支。
+
+## 6.0.0-beta.1 - 6.0 Beta Baseline
+
+- 以 5.9.1-beta.4 的已收口代码作为 6.0 Beta 基线；不新增实验性认证桥接，不改变 Schema 136、同步主链路或主页结构。
+- 延续安装包减重结果：压缩 stillness 背景，发布包继续排除仅用于编译的 `native/` 源码，运行时 codec 与 Kindle/Kobo/Android 支持保持不变。
+- 延续双登录收口：主登录与书架管理授权继续独立；同账号重新扫码保留既有书架管理授权，并支持单独取消该授权。
+- 延续书城轻量整理与日志降噪；同时修正两条历史回归测试的版本硬编码，使 6.0 系列继续验证功能契约而不是旧版本号。
+
+## 5.9.1-beta.4 - Lean Packaging & UX Polish
+
+- 安装包减重：压缩 stillness 背景，发布包排除仅用于编译的 `native/` 源码；运行时 codec 与平台支持不变。
+- 清理 `main.lua` 中 17 个无生产引用的私有遗留方法和 34 个旧 verifier，保留正式回归测试，不改主页结构和同步主链路。
+- 双登录体验收口：同一微信读书账号重新扫码时保留既有“书架管理授权”；账号状态显示授权状态，并支持只取消书架管理授权、不退出主账号。
+- 书城做轻量文字与分页层级整理，不重做 ShelfView；同时减少低价值 `StorePerf` 正常日志，WARN/ERROR 与认证写入日志继续保留。
+
+## 5.9.1-beta.3 - WeRead Store & Shelf State Sync
+
+- 新增微信读书书城：支持推荐、排行榜、分类、搜索结果衔接、相似书籍与分页浏览，并保留缓存和电子墨水屏交互优化。
+- 新增微信书架管理：可加入/移出微信书架；移出操作使用独立 Native 授权并进行同账号校验，写操作采用回读确认，避免网络异常下重复提交。
+- 完善书架阅读状态：未下载书籍也可在后台刷新阅读百分比，识别手机端独立“已读完”标记，并支持 Kindle 端标记/取消已读完后回写微信读书。
+- 增加离线与竞态保护：读完操作可持久化等待恢复；书架进度读取在用户交互时主动让路，过期回调、账号切换和旧进度事务不能覆盖当前状态。
+- 保留 5.9.1-beta.1 的 Progress Recovery、exact cloud readback、remote-first freshness、ProgressFence、rollback 与 fail-closed 规则。Schema 保持 136。
+
+## 5.9.1-beta.1 - Progress Transaction Recovery
+
+- 修复 beta.19 `passive_exact_cache` 的原生 `chapterUid + wr_data_co` 快照遗漏 `safe=true`：此前同一精确位置可能先记录 `final_position_captured`，Reader 关闭后又被 `upload_progress()` 判成 `position_unavailable`，并留下“有失败记录但没有可执行动作”的 pending；本版统一恢复 `safe / coordinate_safe / precise` 语义，并在启动时一次性修复现有 beta.19 精确 pending。
+- 新增 ReadingEnd `Progress Recovery Capsule`：精确 source mapping 失败时，把 Reader 仍存活时捕获的 immutable source anchor、XPointer、显示进度、sequence/epoch 持久化；Home 可直接用保存的锚点重跑本地 source cache / fresh Web Reader source，无需为了新产生的失败记录重新打开书。
+- `pending_unresolved_position` 正式进入进度恢复状态机：Home/“全部重新同步”优先执行 saved-anchor recovery，再补全整书坐标、fresh GET 云端、按既有 latest-wins 规则发送或验证；失败详情新增“恢复精确位置”。任何旧记录若缺少安全重放坐标和恢复锚点，会明确作为可清理失效记录，不再出现 `items=1` 但 send/verify/resubmit/coordinate 全为 0 的无解释状态。
+- ReadReport 生命周期区分主动停止与真实异常退出：ReadingEnd/进度优先抢占后 worker 正常退出不再记为 `unexpected`，也不会被无意义拉起；Reader 活跃期间真实异常退出仍保留一次自动重启。
+- 不改变 beta.19 的多锚点精确映射、beta.18 fresh context、beta.17 progress epoch/conflict lifecycle、beta.15/16 `remote_wire_anchor + fresh GET before POST`、exact cloud readback、remote-first freshness resolver、ProgressFence 与 rollback。网络或 source mapping 暂不可用时继续 fail closed：最多延迟同步，不允许用近似百分比或未知远端状态覆盖云端。Schema 保持 136。
+
 ## 5.9.0 - 2026-10-04
 
 - 正式版基于 5.9.0-beta.19 收口，不改变 beta.19 已验证的运行逻辑；插件版本切换为 `5.9.0`，默认更新通道切换为 `stable-channel/update.json`，Schema 保持 136。
@@ -118,6 +157,8 @@
 - 主页快捷“同步”、主页控制面板“同步”和进度失败页“全部重新同步”统一进入同一 recovery pipeline；用户主动点击时优先处理 durable progress，不再先等待同步摘要缓存。
 - 开书同步增加明确终态反馈：冲突、云端检查失败、云端精确坐标缺失和较新云端结果返回过晚都会明确提示；正常 aligned 仍保持轻量。
 - 保留 beta.6 的 session-scoped fence、UNSENT/SUBMITTED_UNVERIFIED 区分、remote scalarization、`local_read_event_at`、raw-percent 隔离和 StoreRepair；Schema 仍为 136。
+
+# Changelog
 
 ## 5.9.0-beta.6 — Sync Regression Recovery & Minimal Reconciliation
 
@@ -698,6 +739,8 @@
 - 普通本地书不再显示微信读书划线开关；插件设置中的名称改为“显示微信读书划线”。
 - 成功的 catalog 登录恢复改记 INFO；阅读时间 worker 的 stale 登录状态日志补充 revision / vid 等真实不一致原因，减少误导性 WARN。
 - 保持 PR #67 的撤回结果，不重新引入 CSS 背景分部图修复；下载核心、精确进度、阅读时间协议、锁屏和本地书扫描逻辑不变。
+
+# Changelog
 
 ## 5.4.0-beta.5 - 2026-08-28
 
@@ -1432,6 +1475,7 @@ Fixes #43
 - 修复云端 `chapterOffset` 被错误按章节 `wordCount` 截断的问题；原生 `co` 保持 raw-XHTML UTF-16 坐标，并在后台反向映射成精确 fractional progress，避免 5993/8325 被误读成 5531。
 - 所有进度提交无论接口是否显式 accepted 都执行云端回读确认；阅读时间 final flush 与阅读进度结果拆分日志/状态，未确认进度保留为 pending，不再被“final upload success”掩盖。
 - 删除“回到阅读处/回到当前位置”及 GoBackLink 入口，原位置改为“返回主页”；连续进度模式只有取得原生精确坐标时才上传进度，否则该周期仅上传阅读时间。
+
 ## 4.6.0-beta.5 - 2026-08-16
 
 - 修复最近阅读延迟：Reader 确认当前书后立即写入统一会话快照并同步锁屏目标；返回主页前局部替换“最近阅读”卡片，不再依赖整页刷新或后台书架重算。

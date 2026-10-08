@@ -1,11 +1,13 @@
-# 5.9.0
+# 5.9.1-beta.1
 
-5.9.0 是从 `5.9.0-beta.19` 直接收口的正式版本。正式化过程不修改 beta.19 已验证的同步算法，只统一正式版本号、默认 OTA 通道与发布文档，因此运行行为与 beta.19 保持一致。
+本版不重写 5.9 的进度同步协议，而是针对真机 crash 暴露的 ReadingEnd / pending recovery 边缘状态做收口。
 
-本版的核心是多设备阅读进度安全。开书时以可信 verified anchor、同步因果、真实阅读事件和云端更新时间判断本机/云端哪一侧更新；远端尚未确认、远端更新、冲突或远端精确坐标未解析时，progress write fence 会阻止旧本机位置自动写回。失败恢复继续采用 verify-first，并保留 progress epoch、clean-state migration、ghost-write guard，以及“以云端为准 / 以本机为准”的显式处理。
+最明确的根因来自 beta.19 的被动精确缓存：缓存已经保存原生 `chapterUid + wr_data_co`、`native_offset=true` 与整书进度，但行记录遗漏 `safe=true / coordinate_safe=true / precise=true`。因此退出阅读时它可以先被记录为 `final_position_captured`，进入 detached upload 后又被安全校验拒绝为 `position_unavailable`；Home 随后虽然看见一条 pending，却可能没有 send / verify / resubmit / coordinate 动作。5.9.1-beta.1 统一原生 exact snapshot 的安全语义，并对已存在的 beta.19 精确 pending 做一次性迁移修复。
 
-精确位置仍以微信原生 `chapter_uid + co` 为最终验收。本地→云端使用围绕同一 XPointer 的 `forward/backward 24、16、12` 多级 immutable anchors，并可在旧 source cache 失败后获取 fresh Web Reader context/source 再映射。只有唯一正文锚点能够导出一致的 native `wr_data_co` 才允许上传；多个锚点导出不同坐标、正文不唯一或 source 无法可靠恢复时都继续 fail closed。
+对于真正无法在退出瞬间完成 source mapping 的情况，本版新增 `Progress Recovery Capsule`。Reader 仍存活时捕获的 immutable source anchor、XPointer、显示进度和 progress sequence/epoch 会写入 `pending_unresolved_position`。回到 Home 后，恢复流程先利用持久化锚点尝试本地 exact source，再在允许联网时 fresh 获取对应 Web Reader source；恢复出 native chapter/co 后仍须 fresh GET 云端并通过现有 freshness resolver 决定是否发送，已提交事务仍只做 readback verify。
 
-云端→本地保留 `chapter rescue -> text anchor -> exact verify` 主链。当 text anchor 已唯一命中正确章节正文时，导航落点本身被视为可靠，不再因为反向 local→co 暂时无法完成而显示误导性的“精确位置未确认”，也不再让 percent correction 覆盖已经成功的正文落点。内部 `remote_exact_unresolved` write fence 仍然存在，因此可靠导航与允许回写云端仍是两个独立条件。
+进度失败列表现在能区分“保存了退出锚点、可后台恢复”和“旧记录确实缺少恢复材料”。前者可直接在 Home 选择“恢复精确位置”，并被自动恢复流程优先处理；后者明确显示为失效记录，可由用户清除，不再留下无动作的模糊 pending。
 
-5.9.0 同时纳入外文翻译三态、安全译文 EPUB 替换、主页刷新/同步入口统一、同步失败闭环，以及 5.8 后期已经整合的扩展中心、下载与设备体验改进。ReadReport 保持 v30，阅读时间继续 fresh-GET-before-POST；Schema 保持 136。
+ReadReport 也收紧了生命周期日志：ReadingEnd 或 progress-priority 主动停止 worker 后的正常退出不再标记为 `unexpected`，且不会为了已请求停止的 worker 重新拉起；阅读期间真实异常退出仍保留一次自动重启。
+
+本版不放宽精确性要求：不会用百分比近似替代 native `wr_data_co`，不会因为网络暂不可用而假定本机更新，也不修改 30 秒时钟偏差保护。beta.19 多锚点、beta.18 fresh context、progress epoch、remote-wire fresh GET、ProgressFence、rollback 与 exact cloud readback 全部保留。

@@ -359,7 +359,8 @@ function U.shell_quote(s) return "'"..tostring(s):gsub("'","'\\''").."'" end
 function U.redact_url(value)
     local text=tostring(value or "")
     local sensitive={uid=true,otp=true,token=true,ticket=true,session=true,skey=true,
-        wr_skey=true,wr_ticket=true,wr_wrpa=true,access_token=true,refresh_token=true}
+        wr_skey=true,wr_ticket=true,wr_wrpa=true,wr_rt=true,access_token=true,refresh_token=true,
+        uuid=true,signature=true,wx_code=true,code=true,accesstoken=true,refreshtoken=true}
     text=text:gsub("([?&])([^=&#%s]+)=([^&#%s]*)",function(prefix,name,content)
         if sensitive[tostring(name):lower()] then return prefix..name.."=***" end
         return prefix..name.."="..content

@@ -23,7 +23,7 @@ Verified on KPW6 with beta22:
 
 - Five regression scripts pass, including navigation after a pending real
   setting, stale timers, persistence failure/retry, and empty document paths.
-- `python tools/verify_beta22.py`: 292 checks pass.
+- The historical beta22 aggregate verifier has been retired; keep these device regression scripts for targeted KPW6 checks.
 - Existing `test_online_comment_likes.lua`, `test_extension_download.lua`,
   `test_extension_install.lua`, `test_store_shared.lua`, and
   `test_readtime_recovery.lua` pass. On KOReader, the installer test needs

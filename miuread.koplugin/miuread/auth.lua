@@ -34,9 +34,9 @@ local function is_login_timeout(value)
         or text:find("登录超时",1,true)
         or text:find("二维码已过期",1,true)
 end
-function Auth:new(http,store,host)
+function Auth:new(http,store,host,backend)
     return setmetatable({
-        http=http, store=store, host=host, generation=0, jar={}, dialog=nil,
+        http=http, store=store, host=host, backend=backend, generation=0, jar={}, dialog=nil,
         retry_dialog=nil, started=0, active=false, closing=false, poll_failures=0,
         refresh_count=0, pending_auth=nil, pending_name="", pending_expected_revision=nil,
     },self)
@@ -77,6 +77,7 @@ function Auth:cancel()
     self.pending_expected_revision=nil
 end
 function Auth:_uid()
+    if self.backend then return self.backend:uid() end
     local _,code,h=self.http:request{url=BASE.."/r/weread-skills",method="GET",auth=false,headers={Referer=BASE.."/"}}
     if code<200 or code>=400 then error("login page HTTP "..tostring(code)) end
     self.jar=Cookies.session_absorb({},header_value(h,"set-cookie"))
@@ -86,6 +87,7 @@ function Auth:_uid()
     return data.uid
 end
 function Auth:_poll(uid,otp)
+    if self.backend then return self.backend:poll(uid) end
     local url=BASE.."/api/auth/getLoginInfo?uid="..Protocol.escape(uid).."&otp"
     if type(otp)=="string" and otp~="" then url=url.."="..Protocol.escape(otp) end
     local data,headers=self.http:get_json(url,{auth=false,timeout={5,9},headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
@@ -114,11 +116,16 @@ function Auth:_persisted_auth_matches(expected)
         or tostring(persisted_cookies.wr_skey or "")~=tostring(expected_cookies.wr_skey or "") then
         return false,"core cookie mismatch"
     end
+    if self.backend then return self.backend:persisted_matches(expected,persisted) end
     return true
 end
 
 function Auth:_commit_auth(auth,expected_revision)
-    local saved,save_error=self.store:save_auth(auth,{expected_revision=expected_revision,replace_login=true})
+    if self.backend then
+        local valid,err=self.backend:validate_commit(auth)
+        if not valid then return false,err end
+    end
+    local saved,save_error=self.store:save_auth(auth,{expected_revision=expected_revision,replace_login=self.backend==nil})
     if saved~=true then return false,save_error or "settings write failed" end
     local verified,verify_error=self:_persisted_auth_matches(auth)
     if verified~=true then
@@ -179,7 +186,9 @@ function Auth:_show_commit_retry(detail)
                     self:_begin(0)
                     return
                 end
+                local generation=self.generation
                 UIManager:scheduleIn(.05,function()
+                    if generation~=self.generation then return end
                     local old_auth=self.store:auth()
                     local saved,save_error=self:_commit_auth(pending,pending_expected_revision)
                     if saved==true then
@@ -222,6 +231,10 @@ function Auth:_show_commit_retry(detail)
 end
 
 function Auth:_finish(data)
+    if self.backend then
+        local auth,name=self.backend:finish(data)
+        return self:_save_login(auth,name)
+    end
     local vid=tostring(data.webLoginVid or ""); local key=tostring(data.accessToken or ""); local refresh=tostring(data.refreshToken or "")
     if vid=="" or key=="" then error("login credentials missing") end
 
@@ -291,10 +304,29 @@ function Auth:_finish(data)
             },
         },
     }
+    logger.info("[MiuRead][Auth] QR session finalized",
+        "session_cookies=",tostring(cookie_count(session)),
+        "persistent_cookies=",tostring(#Cookies.names(jar)),
+        "renewal_ok=",tostring(renewal_ok),"renewal_succ=",tostring(renewal_succ),
+        "ticket=",tostring(wr_ticket~=""),"wrpa=",tostring(wr_wrpa~=""))
+    return self:_save_login(new_auth,account_name~="" and account_name or vid)
+end
+
+function Auth:_save_login(new_auth,display_name)
     local old_auth=self.store:auth()
     local old_revision=math.max(0,tonumber(old_auth.auth_revision or 0) or 0)
+    -- A same-account Web QR refresh must not silently discard the separate
+    -- Native shelf-management authorization. Account switches still start
+    -- clean, and Native QR commits already merge against the current Web auth.
+    if not self.backend and type(old_auth.native_shelf)=="table" then
+        local old_vid=tostring((old_auth.account or {}).vid or (old_auth.cookies or {}).wr_vid or "")
+        local new_vid=tostring(((new_auth or {}).account or {}).vid or (((new_auth or {}).cookies or {}).wr_vid) or "")
+        local native_vid=tostring(old_auth.native_shelf.vid or "")
+        if old_vid~="" and new_vid==old_vid and native_vid==new_vid then
+            new_auth.native_shelf=Util.copy(old_auth.native_shelf)
+        end
+    end
     local committed,commit_error=self:_commit_auth(new_auth,old_revision)
-    local display_name=account_name~="" and account_name or vid
     if committed~=true then
         self.pending_auth=Util.copy(new_auth)
         self.pending_name=display_name
@@ -306,14 +338,7 @@ function Auth:_finish(data)
         local replaced,replace_error=pcall(self.host.on_auth_replaced,self.host,old_auth,self.store:auth())
         if not replaced then logger.warn("[MiuRead][Auth] post-commit transition failed",tostring(replace_error)) end
     end
-    logger.info("[MiuRead][Auth] QR session finalized",
-        "session_cookies=",tostring(cookie_count(session)),
-        "persistent_cookies=",tostring(#Cookies.names(jar)),
-        "renewal_ok=",tostring(renewal_ok),
-        "renewal_succ=",tostring(renewal_succ),
-        "ticket=",tostring(wr_ticket~=""),
-        "wrpa=",tostring(wr_wrpa~=""),
-        "persisted=",tostring(true))
+    logger.info("[MiuRead][Auth] QR credentials persisted","native_shelf=",tostring(self.backend~=nil))
     return display_name
 end
 
@@ -379,7 +404,7 @@ function Auth:_begin(refresh_count)
         local size=math.floor(math.min(Device.screen:getWidth(),Device.screen:getHeight())*.72)
         local dialog
         dialog=QRMessage:new{
-            text=BASE.."/web/confirm?uid="..Protocol.escape(uid),
+            text=self.backend and self.backend:qr_url(uid) or BASE.."/web/confirm?uid="..Protocol.escape(uid),
             width=size,height=size,scale_factor=.9,
             dismiss_callback=function()
                 if self.dialog==dialog then self.dialog=nil end
@@ -395,6 +420,10 @@ function Auth:_begin(refresh_count)
     end)
 end
 function Auth:start()
+    if not self.backend and self.host._bookstore_shelf_auth then
+        self.host._bookstore_shelf_auth:cancel()
+        self.host._bookstore_shelf_auth=nil
+    end
     self:_begin(0)
 end
 function Auth:_expire(gen,message)
@@ -433,6 +462,7 @@ function Auth:_schedule(uid,gen,otp)
         if data.succeed==true then
             self.active=false; self:_close_dialog()
             self.host:online(_("QR login"),function()
+                if gen~=self.generation then return end
                 local name,commit_error=self:_finish(data)
                 if not name then
                     self:_show_commit_retry(commit_error)
@@ -445,6 +475,8 @@ function Auth:_schedule(uid,gen,otp)
         local code=tostring(data.logicCode or "")
         if code=="NEED_OTP" or code=="OTP_NOT_MATCH" then
             local d=self.dialog; self.dialog=nil; if d then UIManager:close(d) end; self:_otp(uid,gen,code=="OTP_NOT_MATCH")
+        elseif code=="LOGIN_DECLINED" then
+            self:_show_retry("手机未确认授权，请重新获取二维码。")
         elseif code=="LOGIN_TIMEOUT" or code=="OTP_EXPIRED" then
             self:_expire(gen,"登录二维码已过期。")
         else

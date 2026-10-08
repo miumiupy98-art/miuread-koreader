@@ -1,1 +1,2 @@
-5.9.0 正式版：基于 beta.19 收口。多设备续读继续以精确 chapter_uid + co 为最终验收，本地→云端使用双向 24/16/12 多级唯一正文锚点与 fresh source recovery，无法唯一确认时 fail closed；云端唯一正文锚点命中后不再被 percent correction 覆盖。同步失败恢复、ghost-write guard、ReadReport v30、外文翻译、扩展中心与 5.8 后期性能改进全部保留。Schema 136。
+6.0.0 正式版：精确进度恢复、书城和书架管理、双凭证授权、已读完状态同步。
+继承外文翻译、下载稳定性与 6.0 内测优化；默认使用正式版 OTA，Schema 136。

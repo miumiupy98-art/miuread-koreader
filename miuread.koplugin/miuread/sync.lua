@@ -120,9 +120,8 @@ local function progress_from_node(node, expected_book_id)
     local p = tonumber(rawget(node, "progress") or rawget(node, "readingProgress")
         or rawget(node, "progressPercent") or rawget(node, "bookProgress"))
     if p == nil then return nil end
-    -- The Web API normally returns 0-100. Only true fractions are expanded;
-    -- a literal 1 must remain 1%, not be mistaken for 100%.
-    if p > 0 and p < 1 then p = p * 100 end
+    -- API progress fields use 0-100 percentages. A value below 1 still means
+    -- less than 1%; it cannot be distinguished from a ratio by magnitude.
     return {
         percent = U.clamp(p, 0, 100),
         chapter_uid = rawget(node, "chapterUid") or rawget(node, "chapterId") or rawget(node, "chapter_uid"),
@@ -1496,7 +1495,12 @@ function Sync:_source_position_async(callback, options)
         local normalized=normalize_source_error(detail)
         logger.warn("[MiuRead][ProgressSource] source mapping failed",
             "book=",book_id,"error=",normalized)
-        if callback then callback(nil, normalized) end
+        if callback then callback(nil, normalized,{
+            error_kind="position",
+            anchor=U.copy(anchor),
+            ratio_snapshot=ratio_snapshot,
+            book_id=book_id,
+        }) end
     end
 
     local function on_phase_result(phase,result)
@@ -1566,6 +1570,85 @@ function Sync:_source_position_async(callback, options)
     local started,run_error=launch_local()
     if not started then return false,run_error end
     return true
+end
+
+-- 5.9.1-beta.1: resolve a previously captured immutable Reader anchor after
+-- ReaderUI has already closed. This is the Home-side half of the durable
+-- recovery capsule: no ui.document is needed because the XPointer text window
+-- was captured while Reader was alive. Local persisted source is tried first; a
+-- fresh Web Reader source is used only when network recovery is allowed.
+function Sync:resolve_saved_progress_anchor(anchor, record_snapshot, callback, options)
+    callback=type(callback)=="function" and callback or function() end
+    options=type(options)=="table" and options or {}
+    anchor=type(anchor)=="table" and U.copy(anchor) or nil
+    record_snapshot=type(record_snapshot)=="table" and U.copy(record_snapshot) or nil
+    if not anchor or not record_snapshot then return false,"saved_anchor_missing" end
+    if not self.async or not self.async:available() then return false,"source_worker_unavailable" end
+    if self.async:busy() then return false,"source_worker_busy" end
+    local book_id=tostring(record_snapshot.book and record_snapshot.book.book_id or "")
+    local ratio_snapshot=tonumber(options.ratio_snapshot)
+    local reader=self.reader
+    local allow_network=options.allow_network~=false
+
+    local function finish_success(value,phase)
+        local adjusted=self:_prefer_inverse_cloud_mapping(record_snapshot,value,ratio_snapshot)
+        adjusted.captured_at=os.time()
+        adjusted.recovered_from_saved_anchor=true
+        logger.info("[MiuRead][ProgressRecoveryCapsule] source recovered",
+            "book=",book_id,"phase=",phase,
+            "chapter=",tostring(adjusted.chapter_uid or "-"),
+            "co=",tostring(adjusted.chapter_offset or adjusted.offset or "-"))
+        callback(adjusted,nil,{source="saved_anchor",phase=phase})
+    end
+    local function normalize_error(detail)
+        detail=tostring(detail or "saved_anchor_recovery_failed")
+        if detail=="not_found" then return "source_anchor_not_found" end
+        if detail=="ambiguous" then return "source_anchor_ambiguous" end
+        if detail=="coord_cache_missing" then return "source_cache_missing" end
+        if detail:find("^source_network_fetch_failed",1,false) then return detail end
+        return detail
+    end
+    local function network_retryable(detail)
+        detail=tostring(detail or "")
+        return detail=="not_found" or detail=="ambiguous" or detail=="coord_cache_missing"
+            or detail=="source_cache_missing"
+            or detail:find("^source_cache_anchor_mismatch",1,false)~=nil
+            or detail:find("^source_map_build_failed",1,false)~=nil
+    end
+    local launch_network
+    local function on_result(phase,result)
+        local envelope=result and result.ok==true and type(result.value)=="table" and result.value or nil
+        local value=envelope and envelope.position or nil
+        if type(value)=="table" and value.safe==true then
+            finish_success(value,phase)
+            return
+        end
+        local detail=tostring(envelope and envelope.error or (result and result.error) or "saved_anchor_recovery_failed")
+        if phase=="local" and allow_network and network_retryable(detail) then
+            local started,err=launch_network()
+            if started then return end
+            callback(nil,normalize_error(err),{source="saved_anchor",phase="network_start"})
+            return
+        end
+        callback(nil,normalize_error(detail),{source="saved_anchor",phase=phase})
+    end
+    local function launch_local()
+        return self.async:run("progress_saved_anchor_local",function()
+            local value,err=SourcePosition.locate(reader,record_snapshot,anchor,{cache_only=true})
+            return {position=value,error=err}
+        end,function(result) on_result("local",result) end,
+            tonumber(Config.PROGRESS_SOURCE_LOCAL_TIMEOUT_SECONDS) or 10)
+    end
+    launch_network=function()
+        if self.async:busy() then return false,"source_worker_busy" end
+        return self.async:run("progress_saved_anchor_network",function()
+            local value,err=SourcePosition.locate(reader,record_snapshot,anchor,{
+                cache_only=false,force_refresh=true,force_refresh_uid=tostring(anchor.chapter_uid or "")})
+            return {position=value,error=err}
+        end,function(result) on_result("network",result) end,
+            tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
+    end
+    return launch_local()
 end
 
 -- beta.18 display-only precise resolver. It is deliberately cache-only and
@@ -4732,7 +4815,11 @@ function Sync:_schedule_daemon_poll(delay)
         end
         if not process_alive(daemon.pid) then
             local was_active = daemon.active
-            logger.warn("[MiuRead][ReadReport] lightweight service exited unexpectedly")
+            if was_active then
+                logger.warn("[MiuRead][ReadReport] lightweight service exited unexpectedly")
+            else
+                logger.info("[MiuRead][ReadReport] lightweight service exited after requested stop")
+            end
             self:_cleanup_daemon_files(daemon)
             self.daemon = nil
             self.state = "stopped"
@@ -4745,7 +4832,7 @@ function Sync:_schedule_daemon_poll(delay)
                     self.last_stage="本次阅读会话已停止自动重启"
                     logger.warn("[MiuRead][ReadReport] automatic restart suppressed")
                 end
-            else
+            elseif was_active then
                 UIManager:scheduleIn(10, function() self:_ensure_daemon() end)
             end
             return

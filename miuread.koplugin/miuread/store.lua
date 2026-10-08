@@ -9,6 +9,7 @@ local DownloadDatabase=require("miuread.download_database")
 local U=require("miuread.util")
 local Cookies=require("miuread.cookies")
 local logger=require("logger")
+local ShelfProgress=require("miuread.shelf_progress")
 local ok_socket,socket=pcall(require,"socket")
 local function store_perf_clock()
     if ok_socket and socket and type(socket.gettime)=="function" then return socket.gettime() end
@@ -36,10 +37,10 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={},archive_keys={}},shelf_group_hint={accounts={}},home_ui={enabled=false,layout_version=24,layout_style="desk",show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",lockscreen_provider="native",lockscreen_pending_provider="",lockscreen_dash_source="",lockscreen_native_snapshot={},page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="all",kind="all",locality="all",sort="cloud"},device={source="all",kind="all",locality="all",sort="recent"}},weread_group="all",action_items={refresh=true,search=true,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false},action_order={"refresh","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"},action_layout_version=6,panel_items={wifi=true,bluetooth=false,rotate=true,mp=true,screenshot=false,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false},panel_order={"wifi","bluetooth","rotate","mp","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"},panel_layout_version=7,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,online_likes=false,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,auto_latest_position=true,fast_local_fallback=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={},archive_keys={}},shelf_group_hint={accounts={}},home_ui={enabled=false,layout_version=24,layout_style="desk",show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",lockscreen_provider="native",lockscreen_pending_provider="",lockscreen_dash_source="",lockscreen_native_snapshot={},page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="all",kind="all",locality="all",sort="cloud"},device={source="all",kind="all",locality="all",sort="recent"}},weread_group="all",action_items={refresh=true,search=false,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false},action_order={"refresh","bookstore","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"},action_layout_version=7,panel_items={wifi=true,bluetooth=false,rotate=true,mp=true,screenshot=false,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false},panel_order={"wifi","bluetooth","rotate","mp","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"},panel_layout_version=7,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,online_likes=false,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,auto_latest_position=true,fast_local_fallback=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={raw_books={},raw_mp={},books={},mp={},groups={updated_at=0,authoritative=false,list={},book_groups={}},effective_scope={mode="all",fingerprint="all",updated_at=0},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},recent_reads={version=1,items={}},
- prefetch_cache={},
+ prefetch_cache={},finished_status={},
 }
 local function invalidate_report_contexts_table(sessions)
     sessions=type(sessions)=="table" and sessions or {}
@@ -666,6 +667,64 @@ function Store:new(options)
             "books=",tostring(books),"fields=",tostring(fields),
             "actionable_after_reset=",tostring(actionable),
             "preserved=local_display/auth/books/annotations")
+    end
+    -- 5.9.1-beta.1 one-shot repair: beta.19 passive exact-cache rows carried
+    -- native `chapterUid + wr_data_co` but accidentally omitted `safe=true`.
+    -- When such a row became the durable ReadingEnd snapshot, upload rejected
+    -- it as unsafe and Home could show one pending item with no executable
+    -- recovery action. Restore the semantic safety flags only for native exact
+    -- coordinates; approximate/unknown coordinates remain fail-closed.
+    if schema_before>=Config.SCHEMA and o.db:readSetting("progress_exact_snapshot_repair_591b1",false)~=true then
+        local sessions=o.db:readSetting("sessions",{}) or {}
+        local repaired=0
+        local function normalize_exact(row)
+            if type(row)~="table" then return false end
+            local uid=tostring(row.chapter_uid or row.chapterUid or "")
+            local co=tonumber(row.canonical_offset or row.chapter_offset or row.offset)
+            local progress=tonumber(row.progress)
+            local basis=tostring(row.offset_basis or row.position_basis or "")
+            if uid=="" or co==nil or progress==nil or row.native_offset~=true or basis~="wr_data_co" then return false end
+            local changed=row.safe~=true or row.coordinate_safe~=true or row.precise~=true
+            row.safe=true
+            row.coordinate_safe=true
+            row.precise=true
+            row.precision_level=row.precision_level or "exact_cloud"
+            row.canonical_offset=math.max(0,math.floor(co+.5))
+            row.chapter_offset=row.canonical_offset
+            row.offset=row.canonical_offset
+            row.offset_basis="wr_data_co"
+            row.position_basis="wr_data_co"
+            return changed
+        end
+        for _,session in pairs(sessions) do
+            if type(session)=="table" then
+                local changed=false
+                if normalize_exact(session.last_verified_exact_position) then changed=true end
+                local pending=type(session.pending_progress)=="table" and session.pending_progress or nil
+                if pending and normalize_exact(pending) then
+                    changed=true
+                    local submitted_at=tonumber(pending.submitted_at or session.progress_upload_submitted_at or 0) or 0
+                    if submitted_at<=0 then
+                        session.progress_upload_state="pending_send"
+                        session.progress_submission_phase="unsent"
+                        session.progress_worker_active=false
+                        session.progress_worker_updated_at=os.time()
+                        local state=tostring(session.progress_sync_state or "")
+                        if state=="verification_required" or state=="finalizing" or state=="upload_failed" or state=="" then
+                            session.progress_sync_state="deferred"
+                            session.progress_sync_message="已恢复 beta.19 精确位置快照；重新确认云端后再决定是否上传"
+                        end
+                    end
+                end
+                if changed then repaired=repaired+1 end
+            end
+        end
+        o.db:saveSetting("sessions",sessions)
+        o.db:saveSetting("progress_exact_snapshot_repair_591b1",true)
+        o.db:saveSetting("progress_exact_snapshot_repair_591b1_at",os.time())
+        startup_dirty=true
+        logger.info("[MiuRead][StoreRepair] 5.9.1 exact snapshots normalized",
+            "sessions=",tostring(repaired))
     end
     -- Do not rewrite miuread.lua on every plugin construction. Persist only a
     -- real first-run/default/schema migration, and never turn a settings write
@@ -1544,6 +1603,13 @@ local function same_login_cookies(a,b)
     end
     return true
 end
+local function same_native_shelf_credentials(a,b)
+    a=type(a)=="table" and a or {}; b=type(b)=="table" and b or {}
+    for _,key in ipairs({"vid","accessToken","refreshToken","deviceId"}) do
+        if tostring(a[key] or "")~=tostring(b[key] or "") then return false end
+    end
+    return true
+end
 local function same_auth_credentials(a,b)
     a=sanitized_auth(a); b=sanitized_auth(b)
     local aa=type(a.account)=="table" and a.account or {}
@@ -1554,6 +1620,7 @@ local function same_auth_credentials(a,b)
         and tostring(a.wr_ticket or "")==tostring(b.wr_ticket or "")
         and tostring(a.wr_wrpa or "")==tostring(b.wr_wrpa or "")
         and same_login_cookies(a.cookies,b.cookies)
+        and same_native_shelf_credentials(a.native_shelf,b.native_shelf)
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
 function Store:save_auth(v,opt)
@@ -1587,6 +1654,13 @@ end
 function Store:auth_revision()
     return math.max(0,tonumber(self:auth().auth_revision or 0) or 0)
 end
+function Store:clear_native_shelf_auth()
+    local auth=self:auth()
+    if type(auth.native_shelf)~="table" then return true end
+    local revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    auth.native_shelf=nil
+    return self:save_auth(auth,{expected_revision=revision})
+end
 function Store:generate_login_session_id() return generate_login_session_id() end
 function Store:ensure_login_session_id()
     local auth=self:auth()
@@ -1615,6 +1689,7 @@ function Store:update_auth_health(patch)
 end
 function Store:clear_auth() return self:set("auth",U.copy(defaults.auth)) end
 function Store:clear_account_shelf_cache()
+    self:set("finished_status",{})
     local cache=self:shelf_cache()
     cache.raw_books={}; cache.raw_mp={}; cache.books={}; cache.mp={}; cache.updated_at=0
     cache.groups={updated_at=0,authoritative=false,list={},book_groups={}}
@@ -2446,7 +2521,15 @@ function Store:update_cached_progress(id,percent)
         for _,row in ipairs(group) do
             if tostring(row.bookId or row.book_id or "")==id then
                 row.progress=U.clamp(percent,0,100)
-                row.finished=row.progress>=100
+                -- Called after cloud verification; keep the shelf's cloud value
+                -- aligned with the verified reader position.
+                row.cloud_progress=row.progress
+                row.remote_progress=row.progress
+                row.remote_progress_known=true
+                row.progress_known=true
+                row.progress_fetched_at=os.time()
+                row.finished=nil
+                row.finished=ShelfProgress.is_finished(row)
                 changed=true
             end
         end
@@ -2722,8 +2805,11 @@ function Store:flush(reason)
     -- mutate nested settings and detached workers may advance progress on disk.
     if disk_data and settings_equal(self.db.data,disk_data) then
         self._pending_home_navigation=nil
-        logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
-            "elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)))
+        local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
+        if elapsed_ms>=250 then
+            logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
+                "elapsed_ms=",tostring(elapsed_ms))
+        end
         return true
     end
     local previous_path=self.settings_path..".previous"
@@ -2793,10 +2879,13 @@ function Store:flush(reason)
     end
     self._validated_settings={payload=payload,data=validated_data}
     self._pending_home_navigation=nil
-    logger.info("[MiuRead][StorePerf] full settings flush",
-        "reason=",reason,
-        "elapsed_ms=",tostring(math.floor((store_perf_clock()-flush_started)*1000+0.5)),
-        "bytes=",tostring(U.file_size(self.settings_path) or 0))
+    local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
+    if elapsed_ms>=250 or reason=="set:auth" then
+        logger.info("[MiuRead][StorePerf] full settings flush",
+            "reason=",reason,
+            "elapsed_ms=",tostring(elapsed_ms),
+            "bytes=",tostring(U.file_size(self.settings_path) or 0))
+    end
     return true
 end
 function Store:reload()
