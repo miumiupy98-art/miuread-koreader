@@ -122,3 +122,18 @@ switches 178–436 ms and Quick Panel samples 34–103 ms. These log durations e
 physical e-ink refresh and time queued before handlers run; they do not prove an
 upper bound for every tap. The latest stable release v5.7.5 has the same Store
 blob as the beta22 baseline, so this repeated parsing predates the PR.
+
+## Retained Home owner after reader close (2026-10-08)
+
+Home can stay owned by a different plugin instance than the ReaderUI that
+closes. Reader close previously thawed only the ReaderUI instance and pointed
+Home interaction callbacks at it, so the retained Home owner stayed frozen:
+local scans and list rebuilds after deleting or downloading a book were
+deferred indefinitely and paging kept showing the old in-memory list.
+
+`home_owner_return_test.lua <plugin>/main.lua` covers separate/same instance,
+no retained owner, fallback reveal, Reader still active/closing, stale
+generations and the suspend guard. The original source fails the separate
+instance case. On a KPW6 running 5.9.0 with the same change, two real reader
+returns logged `separate_instance=true`; the list then contained the newly
+downloaded book and no longer showed the deleted one, as confirmed by the user.
