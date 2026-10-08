@@ -1,0 +1,67 @@
+name: Validate 6.0.0 release candidate
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'release/6.0.0-rc-merge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 luajit
+      - name: Syntax check every Lua file
+        run: find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+      - name: Verify stable identity and release boundaries
+        run: python3 tools/verify_600_stable.py
+      - name: Core progress, library and translation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            tools/test_bookstore.lua \
+            tools/test_bookstore_ui.lua \
+            tools/test_shelf_client.lua \
+            tools/test_finished_status.lua \
+            tools/test_shelf_progress.lua \
+            tools/test_position_resolution.lua \
+            tools/test_position_state_hotfix.lua \
+            tools/test_open_sync_contract.lua \
+            tools/test_beta6_sync_contract.lua \
+            tools/test_beta7_sync_contract.lua \
+            tools/test_beta8_home_translation_contract.lua \
+            tools/test_beta19_robust_mapping.lua \
+            tools/test_591_beta1_progress_recovery.lua \
+            tools/test_cloud_mirror_contract.lua \
+            tools/test_long_book_anchor.lua \
+            tools/test_terminal_progress_guard.lua \
+            tools/test_finished_resolution.lua \
+            tools/test_store_repair.lua \
+            tools/test_cloud_freshness_contract.lua \
+            tools/test_beta10_translation_dependency_contract.lua \
+            tools/test_progress_ratio.lua \
+            tools/test_clipboard.lua; do
+              lua5.1 "$test"
+          done
+          for test in \
+            tools/test_bookstore.lua \
+            tools/test_bookstore_ui.lua \
+            tools/test_shelf_client.lua \
+            tools/test_finished_status.lua \
+            tools/test_shelf_progress.lua \
+            tools/test_translation.lua \
+            tools/test_translation_generation.lua \
+            tools/test_translation_fetch.lua \
+            tools/test_internal_links.lua; do
+              luajit "$test"
+          done
+          python3 tools/test_extension_center_ux.py

@@ -1,17 +1,17 @@
 {
-  "version": "6.0.0-beta.1",
-  "name": "觅阅 · 微信读书助手 6.0.0-beta.1 内测版",
-  "channel": "beta",
+  "version": "5.9.0",
+  "name": "\u89c5\u9605 \u00b7 \u5fae\u4fe1\u8bfb\u4e66\u52a9\u624b 5.9.0",
+  "channel": "stable",
   "package_type": "full",
-  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
+  "package_url": "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.0/miuread-v5.9.0-full.zip",
   "package_urls": [
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
-    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
-    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip",
-    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v6.0.0-beta.1/miuread-v6.0.0-beta.1-full.zip"
+    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.0/miuread-v5.9.0-full.zip",
+    "https://ghfast.top/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.0/miuread-v5.9.0-full.zip",
+    "https://gh-proxy.com/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.0/miuread-v5.9.0-full.zip",
+    "https://ghproxy.net/https://github.com/miumiupy98-art/miuread-koreader/releases/download/v5.9.0/miuread-v5.9.0-full.zip"
   ],
-  "size": 1763687,
-  "sha256": "e76d72257a1ea63f142a3cca1ada40699d2d035119b52908327bf73988bb30ff",
-  "summary": "6.0.0-beta.1：以 5.9.1-beta.4 收口版作为 6.0 Beta 基线，功能与 Schema 136 保持不变。\n延续减重、双登录授权收口、书城轻量整理与日志降噪，并修正历史回归测试的版本硬编码。",
-  "notes": "- 以 5.9.1-beta.4 的已收口代码作为 6.0 Beta 基线；Schema 136、同步主链路与主页结构保持不变。\n- 延续减重后的发布包：stillness 背景压缩，`native/` 编译源码不进入安装包，运行时 codec 与平台支持不变。\n- 主登录与书架管理授权继续独立；同账号重新扫码保留书架管理授权，并可单独取消该授权。\n- 延续书城轻量整理与日志降噪；修正历史回归测试的旧版本硬编码，便于 6.0 系列持续发布。"
+  "size": 2035231,
+  "sha256": "8572c7bcfc9b57dd5e4c3ac4758f4139625b9e431534cbb85b22a70ad2081cff",
+  "summary": "\u6b63\u5f0f\u7248\u57fa\u4e8e 5.9.0-beta.19 \u6536\u53e3\uff0c\u4e0d\u6539\u53d8 beta.19 \u5df2\u9a8c\u8bc1\u7684\u8fd0\u884c\u903b\u8f91\uff1b\u63d2\u4ef6\u7248\u672c\u5207\u6362\u4e3a `5.9.0`\uff0c\u9ed8\u8ba4\u66f4\u65b0\u901a\u9053\u5207\u6362\u4e3a `stable-channel/update.json`\uff0cSchema \u4fdd\u6301 136\u3002\n\u5b8c\u6210 5.9 \u591a\u8bbe\u5907\u9605\u8bfb\u8fdb\u5ea6\u6a21\u578b\uff1a\u5f00\u4e66\u6309\u53ef\u4fe1\u951a\u70b9\u3001\u540c\u6b65\u56e0\u679c\u4e0e\u771f\u5b9e\u9605\u8bfb\u4e8b\u4ef6\u5224\u65ad\u672c\u673a/\u4e91\u7aef\u65b0\u65e7\uff0c\u4fdd\u7559\u51b2\u7a81\u4fdd\u62a4\u3001\u665a\u5230\u4e91\u7aef\u7ed3\u679c\u9632\u7a81\u8df3\u3001...",
+  "notes": "\u6b63\u5f0f\u7248\u57fa\u4e8e 5.9.0-beta.19 \u6536\u53e3\uff0c\u4e0d\u6539\u53d8 beta.19 \u5df2\u9a8c\u8bc1\u7684\u8fd0\u884c\u903b\u8f91\uff1b\u63d2\u4ef6\u7248\u672c\u5207\u6362\u4e3a `5.9.0`\uff0c\u9ed8\u8ba4\u66f4\u65b0\u901a\u9053\u5207\u6362\u4e3a `stable-channel/update.json`\uff0cSchema \u4fdd\u6301 136\u3002\n\u5b8c\u6210 5.9 \u591a\u8bbe\u5907\u9605\u8bfb\u8fdb\u5ea6\u6a21\u578b\uff1a\u5f00\u4e66\u6309\u53ef\u4fe1\u951a\u70b9\u3001\u540c\u6b65\u56e0\u679c\u4e0e\u771f\u5b9e\u9605\u8bfb\u4e8b\u4ef6\u5224\u65ad\u672c\u673a/\u4e91\u7aef\u65b0\u65e7\uff0c\u4fdd\u7559\u51b2\u7a81\u4fdd\u62a4\u3001\u665a\u5230\u4e91\u7aef\u7ed3\u679c\u9632\u7a81\u8df3\u3001..."
 }

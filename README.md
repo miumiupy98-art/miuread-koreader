@@ -1,35 +1,25 @@
 # MiuRead
 
-> **5.9.0-beta.19 · Robust Local Mapping & Quiet Position Sync**
+> **6.0.0 · Stable Release**
 
-5.9.0 开始把“本机/云端冲突需要用户判断”改为无感云端镜像：打开书籍时自动按同步因果和更新时间选择最新阅读状态，在定位完成前短暂保护翻页；精确 `chapter_uid + co` 仍是最终验收依据。账号书架默认使用微信云端顺序，已读完状态与当前位置分离解析，自动云端跳转可以短时撤回。
+觅阅（MiuRead）是面向 KOReader 的非官方微信读书客户端。
 
-本仓库同时维护正式版与内测版：
+6.0.0 正式版基于 `6.0.0-beta.1` 收口，Schema 为 `136`。发布必须通过回归与真机验证，Git 合并无冲突本身并不构成发布验收。
 
-- `main`：正式版
-- `beta`：内测版
+## 版本与更新通道
+
+- `main`：正式版代码分支
+- `beta`：独立内测通道，6.0.0 的内测基线为 `6.0.0-beta.1`
 - 正式 OTA：`stable-channel/update.json`
 - 内测 OTA：`beta-channel/update-beta.json`
 
-## Versions
+## 6.0.0 主要功能
 
-- 正式版：以 GitHub Releases 中最新的非 Pre-release 为准。
-- 内测版：以 GitHub Releases 中最新的 Pre-release 为准。
-
-完整版本记录见 [`CHANGELOG.md`](CHANGELOG.md)。
-
-当前 beta 开发基线：`5.9.0-beta.19`。本版本以 5.8.0-beta.26 为兼容基线，Schema 升至 136；5.9 beta 阶段对新的 `position_state` 与旧进度字段双写，以便继续验证多设备 latest-wins 而不牺牲回退能力。
-
-
-## 5.9 beta.5 highlights
-
-- 开书立即恢复本机页面，云端 position metadata 在后台确认；已有精确本地快照时先走轻量 freshness 判断，remote 确认更新后才启动重型定位。
-- 删除“用户已经翻页 → local wins”的旧语义；以可信 verified anchor + 真实阅读事件时间统一判断 `LOCAL_NEWER / REMOTE_NEWER / ALIGNED / CONFLICT`。
-- 新增 progress write fence：remote 未确认、remote newer 或 conflict 时禁止自动本机写回，避免旧 Kindle 位置覆盖更新云端。
-- `raw_percent` 仅保留为诊断字段；canonical progress、finished、CloudAnchor 与 ReadReport 均以精确位置状态为准。
-- exact-co 定位加入已验证 XPointer 缓存和 text-anchor rescue，percent correction 最多一次 bounded fallback。
-- 阅读时间改为 best-effort：运行期最多两次尝试，仍失败静默丢弃，不再跨重启持久 pending 或污染主页总体同步状态。
-- Schema 136 与 beta.4 的 position-state stack overflow StoreRepair 保持不变。
+- 5.9 精确进度同步、云端/本地可信锚点判断、失败恢复与旧位置写入保护。
+- 微信读书书城、书籍详情/推荐、书架管理、阅读百分比和“已读完”状态同步。
+- 登录与书架管理授权仍为两套独立凭证；这是已知功能边界，不是单扫码统一。
+- 外文翻译三态、EPUB 安全替换、下载连接复用与插件更新/扩展中心。
+- 6.0 内测已进行安装包减重、UI 与日志整理；正式发布前必须检查完整安装包和设备兼容性。
 
 ## Installation
 
@@ -62,7 +52,7 @@
 - Beta tag：`vX.Y.Z-beta.N`
 - 正式版发布到 `stable-channel`
 - 内测版发布到 `beta-channel`
-- 创建 Tag 后，发布工作流会自动同步分支源码中的版本号、发布通道与 `CHANGELOG.md`，再把 Tag 指向同步后的提交。
+- 正式版工作流会核对并同步正式发布身份；内测版必须预先提交匹配的版本号与 CHANGELOG，才能发布 Beta Tag。
 - Beta Tag 必须创建在 `beta` 最新提交；Stable Tag 必须创建在 `main` 最新提交。
 - 最终分支源码、Tag 源码、Release 安装包与 OTA 清单保持同一版本。
 

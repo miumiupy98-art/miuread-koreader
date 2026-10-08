@@ -1,3 +1,14 @@
+# Changelog
+
+## 6.0.0 - Stable Release
+
+- 正式版基于 6.0.0-beta.1 收口，继承 5.9.1-beta.4 的功能与修复；Schema 保持 136，不把 Beta 发布通道变成正式版通道。
+- 保留 5.9 多设备精确阅读进度、云端/本地新旧判断、冲突保护、断线恢复、Progress Recovery Capsule 以及严格的 fail-closed 行为。
+- 纳入微信读书书城、搜索与推荐、书架添加/移除、后台书架进度更新、已读完状态双向同步和书架管理授权。
+- 主登录与书架管理授权继续使用两套独立凭证；同账号主登录刷新保留书架管理凭证，允许单独撤销书架管理授权。不声称已经完成真正的单凭证统一。
+- 保留外文翻译原文/双语/仅译文、书内链接修复、连接复用、扩展中心与 Kindle/Kobo/Android 兼容路径。
+- 发布包切换为正式版 6.0.0，默认 OTA 指向 stable-channel/update.json；Beta 发布配置仍只用于内测分支。
+
 ## 6.0.0-beta.1 - 6.0 Beta Baseline
 
 - 以 5.9.1-beta.4 的已收口代码作为 6.0 Beta 基线；不新增实验性认证桥接，不改变 Schema 136、同步主链路或主页结构。
@@ -27,6 +38,17 @@
 - `pending_unresolved_position` 正式进入进度恢复状态机：Home/“全部重新同步”优先执行 saved-anchor recovery，再补全整书坐标、fresh GET 云端、按既有 latest-wins 规则发送或验证；失败详情新增“恢复精确位置”。任何旧记录若缺少安全重放坐标和恢复锚点，会明确作为可清理失效记录，不再出现 `items=1` 但 send/verify/resubmit/coordinate 全为 0 的无解释状态。
 - ReadReport 生命周期区分主动停止与真实异常退出：ReadingEnd/进度优先抢占后 worker 正常退出不再记为 `unexpected`，也不会被无意义拉起；Reader 活跃期间真实异常退出仍保留一次自动重启。
 - 不改变 beta.19 的多锚点精确映射、beta.18 fresh context、beta.17 progress epoch/conflict lifecycle、beta.15/16 `remote_wire_anchor + fresh GET before POST`、exact cloud readback、remote-first freshness resolver、ProgressFence 与 rollback。网络或 source mapping 暂不可用时继续 fail closed：最多延迟同步，不允许用近似百分比或未知远端状态覆盖云端。Schema 保持 136。
+
+## 5.9.0 - 2026-10-04
+
+- 正式版基于 5.9.0-beta.19 收口，不改变 beta.19 已验证的运行逻辑；插件版本切换为 `5.9.0`，默认更新通道切换为 `stable-channel/update.json`，Schema 保持 136。
+- 完成 5.9 多设备阅读进度模型：开书按可信锚点、同步因果与真实阅读事件判断本机/云端新旧，保留冲突保护、晚到云端结果防突跳、撤回与 write fence，避免旧设备位置静默覆盖更新云端。
+- 精确进度继续以原生 `chapter_uid + co` 为最终验收依据；本地→云端加入 forward/backward 24/16/12 多级唯一正文锚点、fresh Web Reader source recovery、有限标题/邻章候选与格式字符归一化，坐标冲突或无法唯一确认时 fail closed。
+- 云端→本地在唯一正文 text anchor 已命中正确章节时保留真实落点，不再因反向 co 暂未验证而错误回退或用 percent correction 覆盖；只有真正只能定位到章节附近时才显示近似定位提示。
+- 完成 progress failure lifecycle、progress epoch、clean-state migration、ghost-write guard、verify-first recovery，以及“以云端为准 / 以本机为准”显式冲突处理；ReadReport v30 继续在阅读时间写入前 fresh GET 云端位置。
+- 纳入 5.9 外文翻译能力：支持原文 / 双语 / 仅译文三态、官方译文生成、当前章与下一章有界生成、安全 EPUB 替换及阅读位置/划线迁移；非会员或不支持时不破坏原书。
+- 主页“刷新 / 同步”与同步失败恢复入口统一，未知进度不再显示为 0%；扩展中心、下载链路、锁屏与本地书库继续继承 5.8 后期稳定能力。
+- 正式安装包继续只包含一个 `miuread.koplugin/` 根目录，并保留 AGPL-3.0-only、第三方声明、Lua 语法检查及既有 beta 回归测试资产。
 
 ## 5.9.0-beta.19 - Robust Local Mapping & Quiet Position Sync
 
@@ -1453,6 +1475,7 @@ Fixes #43
 - 修复云端 `chapterOffset` 被错误按章节 `wordCount` 截断的问题；原生 `co` 保持 raw-XHTML UTF-16 坐标，并在后台反向映射成精确 fractional progress，避免 5993/8325 被误读成 5531。
 - 所有进度提交无论接口是否显式 accepted 都执行云端回读确认；阅读时间 final flush 与阅读进度结果拆分日志/状态，未确认进度保留为 pending，不再被“final upload success”掩盖。
 - 删除“回到阅读处/回到当前位置”及 GoBackLink 入口，原位置改为“返回主页”；连续进度模式只有取得原生精确坐标时才上传进度，否则该周期仅上传阅读时间。
+
 ## 4.6.0-beta.5 - 2026-08-16
 
 - 修复最近阅读延迟：Reader 确认当前书后立即写入统一会话快照并同步锁屏目标；返回主页前局部替换“最近阅读”卡片，不再依赖整页刷新或后台书架重算。

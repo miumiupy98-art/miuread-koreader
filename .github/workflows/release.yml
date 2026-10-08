@@ -287,15 +287,17 @@ jobs:
           excluded_suffixes = {".md", ".epub", ".log"}
 
           def excluded(path):
+              relative = path.relative_to(root)
               return (
                   "__MACOSX" in path.parts
+                  or (relative.parts and relative.parts[0] == "native")
                   or path.name in excluded_names
                   or path.suffix.lower() in excluded_suffixes
               )
 
           with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
               directories = [root] + sorted(
-                  [path for path in root.rglob("*") if path.is_dir()],
+                  [path for path in root.rglob("*") if path.is_dir() and not excluded(path)],
                   key=lambda path: path.as_posix(),
               )
               for path in directories:
@@ -371,6 +373,7 @@ jobs:
           }
           forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
           forbidden_suffixes = {".md", ".epub", ".log"}
+          forbidden_prefixes = {"miuread.koplugin/native/"}
 
           with ZipFile(package) as archive:
               names = archive.namelist()
@@ -389,6 +392,7 @@ jobs:
                   path.name in forbidden_names
                   or path.suffix.lower() in forbidden_suffixes
                   or "__MACOSX" in path.parts
+                  or any(name.startswith(prefix) for prefix in forbidden_prefixes)
               ):
                   errors.append(f"不应进入安装包：{name}")
           if manifest.get("version") != os.environ["VERSION"]:
