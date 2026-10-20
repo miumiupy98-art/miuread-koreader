@@ -49,7 +49,8 @@ jobs:
             tools/test_cloud_freshness_contract.lua \
             tools/test_beta10_translation_dependency_contract.lua \
             tools/test_progress_ratio.lua \
-            tools/test_clipboard.lua; do
+            tools/test_clipboard.lua \
+            tools/test_updater_manifest_routes.lua; do
               lua5.1 "$test"
           done
           for test in \

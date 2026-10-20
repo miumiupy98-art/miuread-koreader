@@ -74,11 +74,16 @@ function Updater:manifest_urls(channel)
     channel=tostring(channel or self:selected_channel())
     local cfg=self:channel_config(channel)
     local out,seen={},{}
+    -- The manifest carries both the package URLs and their SHA-256, so it is
+    -- the trust root of an update. Fetch it only from the configured official
+    -- URLs; mirrors stay limited to package downloads, which the official
+    -- manifest's digest still verifies. A previously remembered mirror route
+    -- is not in this set and is therefore ignored below (#127).
     local configured=cfg.manifests
     if type(configured)=="table" then
-        for _,url in ipairs(configured) do with_github_mirrors(url,out,seen) end
+        for _,url in ipairs(configured) do append_unique(out,seen,url) end
     else
-        with_github_mirrors(cfg.manifest,out,seen)
+        append_unique(out,seen,cfg.manifest)
     end
     local preferred=tostring(self.store and self.store:get("update_last_good_manifest_url_"..channel,"") or "")
     if preferred=="" then
@@ -100,6 +105,14 @@ function Updater:remember_manifest_route(url,channel)
     url=tostring(url or "")
     if not valid_https(url) or not self.store then return false end
     channel=tostring(channel or self:selected_channel())
+    local official=false
+    for _,candidate in ipairs(self:manifest_urls(channel)) do
+        if candidate==url then official=true; break end
+    end
+    if not official then
+        logger.warn("[MiuRead][Updater] refused to remember non-official manifest route",channel,url)
+        return false
+    end
     self.store:set("update_last_good_manifest_url_"..channel,url)
     logger.info("[MiuRead][Updater] remembered manifest route",channel,url)
     return true
