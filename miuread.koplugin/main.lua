@@ -22217,7 +22217,7 @@ function Plugin:_annotation_issue_actions(item)
 end
 
 function Plugin:show_annotation_sync_issues(book_id)
-    self.store:reload()
+    -- Failure rows come from annotation DBs; a full settings reload is not needed.
     local failures
     if book_id and tostring(book_id)~="" then
         failures=LocalAnnotationDatabase.failures(self.store,tostring(book_id),100) or {}
@@ -23835,13 +23835,21 @@ function Plugin:_sync_home_pending(options)
     local function finish_all()
         self:_invalidate_annotation_sync_summary()
         self:_invalidate_home_sync_status()
-        UIManager:scheduleIn(.55,function()
+        local settle_attempts=0
+        local function settle()
             local summary=self:_home_sync_summary(true)
+            if summary.checking==true and settle_attempts<20 then
+                settle_attempts=settle_attempts+1
+                UIManager:scheduleIn(.5,settle)
+                return
+            end
             local remaining=tonumber(summary.failed_total or 0) or 0
             local progress_items=self:_progress_sync_issue_items()
             local result="failed"
             local result_reason="remaining_items"
-            if remaining<=0 then
+            if summary.checking==true then
+                result="pending"; result_reason="annotation_summary_pending"
+            elseif remaining<=0 then
                 result="success"; result_reason="all_verified"
             elseif #progress_items>0 then
                 local conflict=false
@@ -23855,9 +23863,12 @@ function Plugin:_sync_home_pending(options)
             end
             logger.info("[MiuRead][SyncAction] finish",
                 "source=",source,"result=",result,"reason=",result_reason,
-                "remaining=",tostring(remaining),"progress=",tostring(#progress_items))
+                "remaining=",tostring(remaining),"checking=",tostring(summary.checking==true),
+                "progress=",tostring(#progress_items))
             if not silent then
-                if remaining<=0 then
+                if summary.checking==true then
+                    self:status_toast("同步状态待确认","批注统计仍在检查中，请稍后查看同步状态",4)
+                elseif remaining<=0 then
                     self:status_toast("同步完成","所有可验证项目均已同步",3)
                 elseif #progress_items>0 then
                     if result=="conflict" then
@@ -23870,7 +23881,8 @@ function Plugin:_sync_home_pending(options)
                 end
             end
             release_manual()
-        end)
+        end
+        UIManager:scheduleIn(.55,settle)
     end
 
     local function phase_annotations()
@@ -25883,17 +25895,21 @@ function Plugin:show_sync_status(detail)
         local h_count=tonumber(pending.highlight or 0) or 0
         local t_count=tonumber(pending.thought or 0) or 0
         local b_count=tonumber(pending.bookmark or 0) or 0
-        rows[#rows+1]={text="本地划线",post_text=failed_text(h_count,"已同步"),enabled=h_count>0,
+        local annotation_checking=pending.checking==true
+        local function annotation_text(count)
+            return annotation_checking and "检查中" or failed_text(count,"已同步")
+        end
+        rows[#rows+1]={text="本地划线",post_text=annotation_text(h_count),enabled=h_count>0,
             callback=h_count>0 and function()
                 if (tonumber(pending.annotation_action_highlight or 0) or 0)>0 then self:show_annotation_sync_issues()
                 else self:_sync_home_pending() end
             end or nil}
-        rows[#rows+1]={text="本地想法",post_text=failed_text(t_count,"已同步"),enabled=t_count>0,
+        rows[#rows+1]={text="本地想法",post_text=annotation_text(t_count),enabled=t_count>0,
             callback=t_count>0 and function()
                 if (tonumber(pending.annotation_action_thought or 0) or 0)>0 then self:show_annotation_sync_issues()
                 else self:_sync_home_pending() end
             end or nil}
-        if b_count>0 then rows[#rows+1]={text="本地书签",post_text=failed_text(b_count,"已同步"),enabled=true,
+        if b_count>0 then rows[#rows+1]={text="本地书签",post_text=annotation_text(b_count),enabled=true,
             callback=function()
                 if (tonumber(pending.annotation_action_bookmark or 0) or 0)>0 then self:show_annotation_sync_issues()
                 else self:_sync_home_pending() end
