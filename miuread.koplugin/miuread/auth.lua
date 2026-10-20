@@ -34,6 +34,16 @@ local function is_login_timeout(value)
         or text:find("登录超时",1,true)
         or text:find("二维码已过期",1,true)
 end
+local function login_rate_limit_message(value)
+    local text=tostring(value or "")
+    if not text:find("[MiuReadRateLimit]",1,true) then return nil end
+    local wait=tonumber(text:match("wait_seconds=(%d+)"))
+    if wait and wait>=60 then
+        return "登录请求暂时受限，请约 "..tostring(math.ceil(wait/60)).." 分钟后重试。"
+    end
+    if wait then return "登录请求暂时受限，请 "..tostring(wait).." 秒后重试。" end
+    return "登录请求暂时受限，请稍后重试。"
+end
 function Auth:new(http,store,host,backend)
     return setmetatable({
         http=http, store=store, host=host, backend=backend, generation=0, jar={}, dialog=nil,
@@ -78,10 +88,14 @@ function Auth:cancel()
 end
 function Auth:_uid()
     if self.backend then return self.backend:uid() end
-    local _,code,h=self.http:request{url=BASE.."/r/weread-skills",method="GET",auth=false,headers={Referer=BASE.."/"}}
+    local _,code,h=self.http:request{url=BASE.."/r/weread-skills",method="GET",auth=false,
+        rate_limit_scope="login",pacing=false,rate_limit_retries=0,rate_limit_fail_fast=true,
+        headers={Referer=BASE.."/"}}
     if code<200 or code>=400 then error("login page HTTP "..tostring(code)) end
     self.jar=Cookies.session_absorb({},header_value(h,"set-cookie"))
-    local data,headers=self.http:get_json(BASE.."/api/auth/getLoginUid",{auth=false,headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
+    local data,headers=self.http:get_json(BASE.."/api/auth/getLoginUid",{auth=false,
+        rate_limit_scope="login",pacing=false,rate_limit_retries=0,rate_limit_fail_fast=true,
+        headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
     self.jar=Cookies.session_absorb(self.jar,header_value(headers,"set-cookie"))
     if type(data.uid)~="string" or data.uid=="" then error("login UID missing") end
     return data.uid
@@ -90,7 +104,9 @@ function Auth:_poll(uid,otp)
     if self.backend then return self.backend:poll(uid) end
     local url=BASE.."/api/auth/getLoginInfo?uid="..Protocol.escape(uid).."&otp"
     if type(otp)=="string" and otp~="" then url=url.."="..Protocol.escape(otp) end
-    local data,headers=self.http:get_json(url,{auth=false,timeout={5,9},headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
+    local data,headers=self.http:get_json(url,{auth=false,timeout={5,9},
+        rate_limit_scope="login",pacing=false,rate_limit_retries=0,rate_limit_fail_fast=true,
+        headers={Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(self.jar)}})
     self.jar=Cookies.session_absorb(self.jar,header_value(headers,"set-cookie"))
     return data
 end
@@ -397,7 +413,7 @@ function Auth:_begin(refresh_count)
         local ok,uid=pcall(self._uid,self)
         if not ok then
             logger.warn("[MiuRead][Auth] QR creation failed", Util.first_line(tostring(uid):gsub("[%c]+"," "),180))
-            self:_show_retry("二维码获取失败："..Util.first_line(uid,120))
+            self:_show_retry(login_rate_limit_message(uid) or ("二维码获取失败："..Util.first_line(uid,120)))
             return
         end
         if gen~=self.generation or not self.active then return end
@@ -450,6 +466,12 @@ function Auth:_schedule(uid,gen,otp)
         if not ok then
             if is_login_timeout(data) then
                 self:_expire(gen,"登录已超时。")
+                return
+            end
+            local rate_limit_message=login_rate_limit_message(data)
+            if rate_limit_message then
+                logger.warn("[MiuRead][Auth] login poll rate limited", Util.first_line(tostring(data):gsub("[%c]+"," "),180))
+                self:_show_retry(rate_limit_message)
                 return
             end
             self.poll_failures=(self.poll_failures or 0)+1
