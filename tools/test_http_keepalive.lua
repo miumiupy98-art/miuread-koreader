@@ -138,3 +138,76 @@ assert(source:find('keepalive.received_any ~= true',1,true),'no-response-byte re
 assert(not source:find('method == "POST" or method == "GET"',1,true),'POST was added to transparent pool replay')
 
 print('beta22 HTTP keep-alive: PASS')
+
+-- Native endpoints must participate in the same request cadence as Web.
+local paced=Http:new({})
+paced.min_weread_interval=.8
+paced:_pace('https://weread.qq.com/web/book/chapter/e_0',{})
+local before=now
+paced:_pace('https://i.weread.qq.com/book/chapterInfos',{})
+assert(now-before>=.799,'Native catalog bypassed Web request pacing')
+before=now
+paced:_pace('https://i.weread.qq.com/book/chapterdownload?bookId=b',{})
+assert(now-before>=.799,'Native download bypassed account request pacing')
+before=now
+paced:_pace('https://i.weread.qq.com/shelf/sync',{})
+assert(now-before>=.799,'Native shelf bypassed account request pacing')
+before=now
+paced:_pace('https://res.weread.qq.com/wrepub/image.png',{})
+paced:_pace('https://i.weread.qq.com.example.com/book/info',{})
+assert(now==before,'static media/unrelated domains gained API pacing')
+
+-- Test the real request retry/cooldown loop with a synthetic transport: an
+-- explicit limit stops after one request even when ordinary retries are high.
+local health=require('miuread.network_health')
+health.note_success=function() end; health.note_failure=function() end
+for _,case in ipairs({
+    {code=429,body='limited',delay=120},
+    {code=499,body='limited',delay=120},
+    {code=200,body='{"errCode":-2014}',delay=300},
+    {code=200,body='{"errcode":-10102}',delay=300},
+}) do
+    local shared,requests=nil,0
+    local function client()
+        local c=Http:new({})
+        c.rate_limit_retries=0
+        function c:_shared_rate_limit()
+            return shared and math.max(0,math.ceil(shared.until_at-now)) or 0,shared
+        end
+        function c:_set_shared_rate_limit(seconds,code)
+            shared={until_at=now+seconds,code=code}; return seconds
+        end
+        function c:_request_once(opt)
+            requests=requests+1
+            return case.body,case.code,case.code~=200 and {['Retry-After']='120'} or {},opt.url
+        end
+        return c
+    end
+    local native=client()
+    local ok,err=pcall(native.request,native,{url='https://i.weread.qq.com/book/chapterdownload',retries=5,rate_limit_fail_fast=true})
+    assert(not ok and Http.is_rate_limit_error(err) and requests==1,'rate-limited Native request was retried')
+    assert(shared.until_at-now==case.delay,'server/default cooldown not retained')
+    local web=client()
+    local web_ok,web_err=pcall(web.request,web,{url='https://weread.qq.com/web/book/chapter/e_0',rate_limit_fail_fast=true})
+    assert(not web_ok and Http.is_rate_limit_error(web_err) and requests==1,'Web bypassed Native cooldown')
+    local detail=Http.rate_limit_details(web_err)
+    assert(detail.local_cooldown and detail.code==tonumber(shared.code) and detail.wait_seconds==case.delay)
+    assert(Http.rate_limit_details(err).local_cooldown==false,'a fresh server response was mislabeled as a cached cooldown')
+    local native_ok=pcall(native.request,native,{url='https://i.weread.qq.com/book/info',rate_limit_fail_fast=true})
+    assert(not native_ok and requests==1,'a second Native endpoint bypassed cooldown')
+end
+assert(Http.is_rate_limit_error('微信读书暂时限制了请求频率。插件已停止继续请求'))
+assert(Http.rate_limit_details('客户端授权请求失败 error_code=499').code==499)
+assert(not Http.is_rate_limit_error('error_code=4990'))
+assert(Http.rate_limit_details('ordinary failure')==nil)
+-- Friendly UI copy preserves the cooldown needed by the parent scheduler.
+local task_file=assert(io.open(ROOT..'miuread/download_task.lua','rb'))
+local task_source=task_file:read('*a'); task_file:close()
+local helpers=assert(task_source:match('(local function display_error.-)\n%s*local last_progress_percent'))
+local payload_builder=assert(loadstring('local Http=...\n'..helpers..'\nreturn failure_payload'))(Http)
+local payload=payload_builder('[MiuReadRateLimit] wait_seconds=123\nstack traceback: test')
+assert(payload.ok==false and payload.error_kind=='rate_limit' and payload.wait_seconds==123)
+assert(payload.download_transport==nil and Http.is_rate_limit_error(payload.error))
+local ordinary=payload_builder('ordinary failure')
+assert(ordinary.error_kind==nil and ordinary.wait_seconds==nil)
+print('Web/Native shared pacing, no rate-limit retries and shared cooldown: PASS')

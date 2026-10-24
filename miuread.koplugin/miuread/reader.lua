@@ -35,6 +35,14 @@ local function pause(seconds)
     end
 end
 
+local function propagate_control_error(value)
+    local text=tostring(value or "")
+    if (type(Http.is_rate_limit_error)=="function" and Http.is_rate_limit_error(value))
+        or text:find("[MiuReadRateLimit]",1,true)
+        or text:find("__MIUREAD_HIBERNATE__",1,true)
+        or text:lower():find("download cancelled",1,true) then error(value,0) end
+end
+
 local function scalar(value)
     if type(value) == "string" or type(value) == "number" then return value end
 end
@@ -545,6 +553,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
                 end
             end,
         })
+        if not ok then propagate_control_error(path_or_error) end
         if not ok or not path_or_error or not Util.file_exists(path_or_error) then
             if not ok and is_auth_error(path_or_error) then
                 -- Preserve the original 401/session error so Reader:chapter can
@@ -666,7 +675,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
             summary.required_localized=summary.required_localized+1
             return "<image"..image_set_local_href(attrs,local_src)..">"
         end
-        if was_remote then
+        if was_remote or state.strict_images then
             summary.missing=summary.missing+1
             summary.required_missing=summary.required_missing+1
         else
@@ -711,6 +720,11 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
                 logger.warn("[MiuRead][Reader] CSS image reference unresolved","src=",tostring(clean))
                 return "url('"..clean.."')"
             end
+            if state.strict_images then
+                summary.required_discovered=summary.required_discovered+1
+                summary.required_missing=summary.required_missing+1
+                return "url('"..clean.."')"
+            end
             summary.stale=summary.stale+1
             summary.stale_dropped=summary.stale_dropped+1
             return "url('"..OPTIONAL_IMAGE_PLACEHOLDER.."')"
@@ -733,7 +747,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
     for _, item in ipairs(pending) do
         if not item.remote then local_pending[#local_pending + 1] = item end
     end
-    if #local_pending > 0 and #local_pending == #unused then
+    if not state.strict_images and #local_pending > 0 and #local_pending == #unused then
         for index, item in ipairs(local_pending) do
             local href = unused[index]
             local local_src="../"..href
@@ -751,7 +765,8 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
     for _, item in ipairs(pending) do
         if not item.resolved then
             local replacement
-            local archive_failed = state and state.image_archive_expected == true and state.image_archive_ok ~= true
+            local archive_failed = state and (state.strict_images==true
+                or (state.image_archive_expected == true and state.image_archive_ok ~= true))
             if not item.remote and not archive_failed then
                 local alt = tostring(image_attr(item.attrs, "alt") or ""):gsub("^%s+", ""):gsub("%s+$", "")
                 replacement = alt ~= "" and ('<span class="miu-image-alt">' .. Util.xml(alt) .. "</span>") or ""
@@ -838,6 +853,7 @@ function Reader:_recover_login_session()
         -- session or stop a long background download.
         local skills_ok, skills_result = pcall(self.repair_login_session, self)
         if not skills_ok then
+            propagate_control_error(skills_result)
             logger.warn("[MiuRead][Reader] optional Skills credential refresh failed",
                 tostring(skills_result))
         end
@@ -998,7 +1014,10 @@ function Reader:chapter_state(book_id,chapter_uid,keepalive,fresh)
     return state
 end
 
-function Reader:catalog(book_id, request_options)
+function Reader:catalog(book_id,request_options)
+    return require("miuread.api"):new(self.http,self.store,self):catalog(book_id,request_options)
+end
+function Reader:web_catalog(book_id, request_options)
     request_options=type(request_options)=="table" and request_options or {}
     local function load_catalog()
         -- Catalog is a small control request. beta.24 avoids multiplying a
@@ -1064,7 +1083,7 @@ function Reader:_txt_once(book, chapter, opt, state)
     local context=opt.translation and {translation=true,pclts=state.pclts,compatibility=opt.translation_compatibility} or nil
     local a = self:shard("/web/book/chapter/t_0", id, uid, state.psvts, false, opt.keepalive,context)
     local ok_b, b = pcall(self.shard, self, "/web/book/chapter/t_1", id, uid, state.psvts, false, opt.keepalive,context)
-    if not ok_b then b = "" end
+    if not ok_b then propagate_control_error(b); b = "" end
     local raw_text = Codec.decode_parts({a, b})
     local xhtml = Codec.text_xhtml(raw_text)
     -- WeRead ranges for TXT chapters address the decrypted text itself.
@@ -1102,6 +1121,7 @@ function Reader:_epub_once(book, chapter, opt, state)
 
     local css = "body{line-height:1.7;margin:5%;}img{max-width:100%;height:auto;}"
     local ok_style, style_raw = pcall(self.shard, self, "/web/book/chapter/e_2", id, uid, state.psvts, true, opt.keepalive,context)
+    if not ok_style then propagate_control_error(style_raw) end
     if ok_style and not style_raw:match("^%s*{") then
         local ok, value = pcall(Codec.decode_parts, {style_raw})
         if ok and value ~= "" then css = value end
@@ -1131,6 +1151,7 @@ function Reader:_epub_once(book, chapter, opt, state)
                     end
                 end,
             })
+            if not ok_tar then propagate_control_error(path_or_error) end
             if ok_tar and path_or_error and Util.file_exists(path_or_error) then
                 if type(opt.yield)=="function" then opt.yield("images") end
                 local tar_assets, tar_map, extract_error, extract_status = image_tar_assets_file(path_or_error,work_root,opt)
@@ -1209,6 +1230,86 @@ function Reader:_epub_once(book, chapter, opt, state)
     return xhtml, css, assets, state
 end
 
+function Reader:_eink_style_key(book,opt)
+    local id=tostring(book.bookId or book.book_id)
+    local auth=self.store:auth()
+    return tostring(auth.login_session_id)..":"..tostring((auth.account or {}).vid)..":"..id..":"..tostring(book.version or "")
+        ..":"..tostring(opt.web_catalog_version or "")..":"..tostring(opt.translation==true)
+end
+function Reader:_eink_style(book,chapter,opt)
+    local id=tostring(book.bookId or book.book_id)
+    local key=self:_eink_style_key(book,opt)
+    if self._eink_styles and self._eink_styles.key==key then return self._eink_styles.css end
+    -- Native per-chapter archives need not contain the book-wide stylesheet.
+    -- Fetch that Web resource once; never download Web chapter bodies here.
+    local state=self:chapter_state(id,chapter.chapterUid or chapter.uid,opt.keepalive,opt.translation==true)
+    local context=opt.translation and {translation=true,pclts=state.pclts} or nil
+    local raw=self:shard("/web/book/chapter/e_2",id,chapter.chapterUid or chapter.uid,state.psvts,true,opt.keepalive,context)
+    if raw:match("^%s*{") then error("E-Ink 书籍样式未能获取",0) end
+    local css=Codec.decode_parts({raw})
+    if css=="" then error("E-Ink 书籍样式未能获取",0) end
+    self._eink_styles={key=key,css=css}
+    return css
+end
+
+-- This entry point is used only by the download transport selector. Ordinary
+-- Reader:chapter callers retain Web semantics and coordinate authority.
+function Reader:eink_chapter(book, chapter, format, opt)
+    opt = opt or {}
+    if opt.fresh_context then error("此请求需要 Web 阅读上下文") end
+    local id,uid = tostring(book.bookId or book.book_id),tostring(chapter.chapterUid or chapter.uid)
+    local root = image_work_root(self,id,uid)
+    local native_stage="client_download"
+    local function fetch()
+        local archive = root.."/native.zip"
+        self._eink_client = self._eink_client or require("miuread.eink_client").new(self.http,self.store)
+        if opt.translation then
+            native_stage="translation"
+            self._eink_client:toggle_translate(id,true)
+        end
+        native_stage="chapter_download"
+        local downloaded,envelope,vid = self._eink_client:download(book,chapter,archive,opt)
+        native_stage="decode"
+        local archive_options={}
+        for key,value in pairs(opt) do archive_options[key]=value end
+        archive_options.chapter_uid=uid
+        local html,css,assets = require("miuread.eink_archive").read(downloaded,envelope,vid,root,archive_options)
+        os.remove(archive)
+        if not has_readable_content(html,true) then error("E-Ink 章节正文为空") end
+        if opt.translation and opt.require_translation~=false
+            and not require("miuread.translation_generation").content_ready(Codec.body_fragment(html)) then
+            error("E-Ink 未返回译文正文",0)
+        end
+        if css == "" then
+            native_stage="style"
+            css = format=="txt" and "body{line-height:1.75;margin:5%;}" or self:_eink_style(book,chapter,opt)
+        else
+            self._eink_styles={key=self:_eink_style_key(book,opt),css=css}
+        end
+        local state = {raw_xhtml=html,coord_html=AnnotationCoord.fromDownloadedXhtml(html),content_format=format,
+            source_channel="eink",coordinate_source_authoritative=false,image_work_root=root,
+            url=Protocol.reader_url(id,uid),strict_images=true,
+            image_archive_expected=true,image_archive_ok=true}
+        if opt.images ~= false then
+            native_stage="images"
+            local source_map = {}
+            for _,asset in ipairs(assets) do image_map_add(source_map,asset.source,"../"..asset.href) end
+            html,assets,state.image_summary,css = localize_epub_images(self,html,assets,source_map,state,css,opt)
+            if tonumber(state.image_summary.required_missing or 0)>0 then error("E-Ink 正文图片未完整获取") end
+        end
+        -- A Native result is not a Web login/reporting context.
+        state.url = nil
+        return html,css,assets,state
+    end
+    local ok,a,b,c,d = pcall(fetch)
+    if not ok then
+        Util.remove_tree(root)
+        self._transient_image_roots[root]=nil
+        error(tostring(a).." native_stage="..native_stage,0)
+    end
+    return a,b,c,d
+end
+
 function Reader:_chapter_once(book, chapter, format, opt)
     opt = opt or {}
     local id = tostring(book.bookId or book.book_id)
@@ -1271,7 +1372,10 @@ function Reader:_chapter_once(book, chapter, format, opt)
     error(tostring(epub_error) .. "; TXT fallback: " .. tostring(ta))
 end
 
-function Reader:chapter(book, chapter, format, opt)
+function Reader:chapter(book,chapter,format,opt)
+    return require("miuread.api"):new(self.http,self.store,self):chapter(book,chapter,format,opt)
+end
+function Reader:web_chapter(book, chapter, format, opt)
     local last, renewed, empty_count = nil, false, 0
     local uid = chapter.chapterUid or chapter.uid
     for attempt = 1, 3 do
@@ -1353,6 +1457,9 @@ function Reader:chapter(book, chapter, format, opt)
 end
 
 function Reader:mp_content(review_id, book_id, options)
+    return require("miuread.api"):new(self.http,self.store,self):mp_content(review_id,book_id,options)
+end
+function Reader:web_mp_content(review_id, book_id, options)
     options = options or {}
     local auth = self.store:auth()
     local headers = {
@@ -1442,7 +1549,10 @@ function Reader:repair_login_session()
     end)()}
 end
 
-function Reader:report_payload(payload, referer, retries)
+function Reader:report_payload(payload,referer,retries)
+    return require("miuread.api"):new(self.http,self.store,self):report_payload(payload,referer,retries)
+end
+function Reader:web_report_payload(payload, referer, retries)
     local data, _, meta = self.http:post_json(BASE .. "/web/book/read", payload,
         {headers={Origin=BASE, Referer=referer or BASE .. "/",
             Accept="application/json, text/plain, */*"}, retries=tonumber(retries) or 0})

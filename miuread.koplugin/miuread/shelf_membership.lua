@@ -5,6 +5,7 @@ local M={}
 
 function M.run(api,id,desired,verify_only)
     assert(type(desired)=="boolean","shelf target must be boolean")
+    if type(api.scope)=="function" then api=api:scope() end
     local read,present=pcall(api.book_on_shelf,api,id)
     if not read or type(present)~="boolean" then
         local message=not read and tostring(present) or "shelf membership is unknown"

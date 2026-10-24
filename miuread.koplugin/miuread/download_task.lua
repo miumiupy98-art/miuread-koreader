@@ -2300,6 +2300,12 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
             return display
         end
 
+        local function failure_payload(raw)
+            local limited=Http.is_rate_limit_error(raw)
+            return {ok=false,error=display_error(raw),error_kind=limited and "rate_limit" or nil,
+                wait_seconds=limited and tonumber(tostring(raw):match("wait_seconds=(%d+)")) or nil}
+        end
+
         local last_progress_percent = 0
         local function run_download()
             local ok, value = xpcall(function()
@@ -2453,7 +2459,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     local friendly=display_error(raw_error)
                     emit{stage = UChild.file_exists(cancel_path) and "cancelled" or "error",
                         percent = last_progress_percent, chapter = clean_book.title or "", message = friendly}
-                    payload = {ok = false, error = friendly}
+                    payload = failure_payload(raw_error)
                     append_diagnostic("download_failed",raw_error)
                 end
             end

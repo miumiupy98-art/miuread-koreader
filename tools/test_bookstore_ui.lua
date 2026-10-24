@@ -30,7 +30,7 @@ package.preload['miuread.protocol']=function() return {escape=tostring} end
 local source_file=assert(io.open('miuread.koplugin/main.lua','rb'))
 local source=source_file:read('*a'); source_file:close()
 local child_factory=assert(source:match('(local function interactive_child_store.-\nend)'))
-local child_method=assert(source:match('function Plugin:_interactive_child_store%(auth,data_dir,temp_dir%).-\nend'))
+local child_method=assert(source:match('function Plugin:_interactive_child_store%(auth,data_dir,temp_dir,api_mode%).-\nend'))
 local child_methods=assert(loadstring('local U=require("miuread.util"); local Plugin={}\n'
     ..child_factory..'\n'..child_method..'\nreturn Plugin'))()
 local views={}
@@ -63,10 +63,11 @@ end,show=function(self,widget)
     if widget.buttons then dialogs[#dialogs+1]=widget end
 end,isWidgetShown=function(_,widget) return widget._miu_closed~=true end} end
 local api={page_calls=0,writes=0,reads=0}
+function api:for_channel(channel) self.bound_channel=channel; return self end
 function api:category_books(id,cursor,rank)
     self.page_calls=self.page_calls+1
     self.last_category,self.last_cursor,self.last_rank=id,cursor,rank
-    return {books={{bookInfo={bookId='book'..cursor,title='Title '..cursor,author='Writer',newRating=89},
+    return {_api_channel=self.bound_channel or self.reply_channel,books={{bookInfo={bookId='book'..cursor,title='Title '..cursor,author='Writer',newRating=89},
         searchIdx=cursor+20}},hasMore=cursor<40 and 1 or 0}
 end
 function api:recommend_books(cursor,count)
@@ -83,7 +84,7 @@ function api:similar_books(id,cursor,count,session)
         book={bookInfo={bookId='similar',title='Similar'}}}},hasMore=1}}
 end
 function api:store_categories()
-    return {data={{categories={{CategoryId='all',title='All',type=0},
+    return {_api_channel=self.reply_channel,data={{categories={{CategoryId='all',title='All',type=0},
         {CategoryId='700000',title='Computing',type=0,sublist={{CategoryId='700001',title='Programming',type=0}}}}}}}
 end
 function api:book_on_shelf()
@@ -110,7 +111,7 @@ function api:add_to_shelf()
     if self.lose_reply then error('POST timed out') end
 end
 package.preload['miuread.api']=function() return {new=function(_,http,store,reader)
-    api.store,api.reader=store,reader
+    api.store,api.reader,api.bound_channel=store,reader,nil
     return api
 end} end
 package.preload['miuread.http']=function() return {
@@ -350,6 +351,26 @@ views[#views].opts.tabs[3].callback(); p:finish()
 assert(api.last_similar[1]=='original' and api.last_similar[2]==20 and api.last_similar[4]=='next-session')
 views[#views].opts.tabs[1].callback(); assert(p.returned)
 
+-- A page's cursor and a category's identifier keep their source, even when
+-- automatic routing would now prefer a different backend.
+local routed=plugin()
+api.reply_channel='web'
+M.browse(routed,{kind='category',category_id='all',title='All'}); routed:finish()
+api.reply_channel='eink'
+views[#views].opts.tabs[3].callback(); routed:finish()
+assert(api.bound_channel=='web' and api.last_cursor==20,'next page switched the source of its cursor')
+M.categories(routed,false); routed:finish()
+routed.menu.rows[2].sub_item_table_func()[2].callback(); routed:finish()
+assert(api.bound_channel=='eink','Native category identifier was sent to a different source')
+local native_view=views[#views]
+routed.store.preferences=function() return {api_transport='web'} end
+native_view.opts.tabs[3].callback()
+assert(not routed.job and #routed.info_messages==1,'manual Web reused a Native cursor')
+api.reply_channel='web'
+M.browse(routed,{kind='category',category_id='all',title='All'})
+assert(routed.job,'changing the channel reused a previous mode\'s cached list')
+routed:finish(); api.reply_channel=nil
+
 -- An obsolete page completion cannot replace a later page or cross accounts.
 M.browse(p,{kind='category',category_id='rising',rank=true,title='Rising'})
 local obsolete=p.job
@@ -418,7 +439,14 @@ assert(not p.settings.bookstore_shelf_pending.alice,'worker-start failure left a
 p=plugin(); p.offline=true
 assert(not M.add_to_shelf(p,{bookId='f',title='F'}) and not p.settings.bookstore_shelf_pending)
 p=plugin(); p.auth.cookies.wr_skey=nil
+api.present=false
+assert(M.add_to_shelf(p,{bookId='g',title='G'}) and p.job,'valid Native authorization was blocked by a missing Web cookie')
+p:finish()
+p=plugin(); p.auth.cookies.wr_skey=nil; p.auth.native_shelf=nil
 assert(not M.add_to_shelf(p,{bookId='g',title='G'}) and not p.job)
+p=plugin(); p.auth.cookies.wr_skey=nil
+function p.store:preferences() return {api_transport='web'} end
+assert(not M.add_to_shelf(p,{bookId='g',title='G'}) and not p.job,'manual Web mode ignored its missing Web credential')
 
 p=plugin()
 M.browse(p,{kind='category',category_id='all',rank=true,title='All'})

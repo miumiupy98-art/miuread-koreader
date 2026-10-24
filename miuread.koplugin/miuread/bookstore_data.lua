@@ -53,7 +53,7 @@ function M.page(kind,data,cursor,count)
     local more=container.hasMore
     if more==nil then more=#container.books>=(number(count) or M.PAGE_SIZE) end
     return {
-        books=books, next_cursor=last,
+        books=books, next_cursor=last,channel=data._api_channel,
         has_more=(more==true or tonumber(more)==1) and last>cursor,
         session_id=text(container.sessionId), total=number(container.totalCount),
     }
@@ -72,7 +72,7 @@ function M.categories(data)
         local id=text(row.CategoryId or row.categoryId)
         if id=="" or not id:match("^[%w_%-]+$") then return nil end
         if row.type~=nil and tonumber(row.type)~=0 then return nil end
-        local out={id=id,title=text(row.title),rank=not id:match("^%d+$"),children={}}
+        local out={id=id,title=text(row.title),rank=not id:match("^%d+$"),children={},channel=data._api_channel}
         if out.title=="" then return nil end
         for _,child in ipairs(type(row.sublist)=="table" and row.sublist or {}) do
             local entry=parse(child,depth+1)
@@ -120,7 +120,7 @@ end
 
 function M.key(spec)
     return table.concat({tostring(spec.kind),tostring(spec.category_id or spec.book_id or ""),
-        tostring(spec.cursor or 0),tostring(spec.session_id or "")}, ":")
+        tostring(spec.cursor or 0),tostring(spec.session_id or ""),tostring(spec.channel or "")}, ":")
 end
 
 return M

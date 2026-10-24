@@ -420,6 +420,24 @@ function Auth:_show_retry(message)
     self.retry_dialog=dialog
     UIManager:show(dialog)
 end
+function Auth:_stop_if_rate_limited(value)
+    if not self.backend then return false end
+    local detail=require("miuread.http").rate_limit_details(value)
+    if not detail then return false end
+    self:cancel()
+    local title="E-Ink 客户端授权暂时受限\n\n扫码已停止，请稍后重新授权。"
+    if detail.wait_seconds and detail.wait_seconds>0 then
+        title=title.."\n约 "..tostring(math.ceil(detail.wait_seconds/60)).." 分钟后可重试。"
+    end
+    title=title.."\n\n当前登录状态已保留。"
+    local dialog
+    dialog=ButtonDialog:new{title=title,title_align="center",close_callback=function()
+        if self.retry_dialog==dialog then self.retry_dialog=nil end
+    end,buttons={{{text="关闭",callback=function() self:cancel() end}}}}
+    self.retry_dialog=dialog
+    UIManager:show(dialog)
+    return true
+end
 function Auth:_begin(refresh_count)
     self:cancel()
     self.refresh_count=tonumber(refresh_count) or 0
@@ -438,6 +456,7 @@ function Auth:_begin(refresh_count)
         local ok,uid=pcall(self._uid,self)
         if not ok then
             logger.warn("[MiuRead][Auth] QR creation failed", Util.first_line(tostring(uid):gsub("[%c]+"," "),180))
+            if self:_stop_if_rate_limited(uid) then return end
             self:_show_retry(login_rate_limit_message(uid) or ("二维码获取失败："..Util.first_line(uid,120)))
             return
         end
@@ -489,6 +508,7 @@ function Auth:_schedule(uid,gen,otp)
         if os.time()-self.started>300 then self:_expire(gen,"登录二维码已过期。") return end
         local ok,data=pcall(function() return self:_poll(uid,otp) end)
         if not ok then
+            if self:_stop_if_rate_limited(data) then return end
             if is_login_timeout(data) then
                 self:_expire(gen,"登录已超时。")
                 return
@@ -510,7 +530,11 @@ function Auth:_schedule(uid,gen,otp)
             self.active=false; self:_close_dialog()
             self.host:online(_("QR login"),function()
                 if gen~=self.generation then return end
-                local name,commit_error=self:_finish(data)
+                local finished,name,commit_error=pcall(self._finish,self,data)
+                if not finished then
+                    if self:_stop_if_rate_limited(name) then return end
+                    error(name,0)
+                end
                 if not name then
                     self:_show_commit_retry(commit_error)
                     return

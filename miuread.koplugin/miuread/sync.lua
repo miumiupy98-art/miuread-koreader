@@ -395,6 +395,7 @@ local function catalog_progress_from_remote(remote, chapters)
 end
 
 function Sync:new(reader, api, store, host, async, identity_async)
+    if api and type(api.for_channel)=="function" then api=api:for_channel("web") end
     local object = setmetatable({
         reader=reader, api=api, store=store, host=host, async=async,
         identity_async=identity_async,
@@ -2420,11 +2421,7 @@ function Sync:remote(book_id, callback, options)
     } or nil
     local reader_snapshot=self.reader
     local ok, err = self.async:run("remote_progress", function()
-        local out={}
-        local agent_ok,agent=pcall(self.api.progress,self.api,book_id)
-        if agent_ok then out.agent=agent else out.agent_error=tostring(agent) end
-        local web_ok,web=pcall(self.api.web_progress,self.api,book_id)
-        if web_ok then out.web=web else out.web_error=tostring(web) end
+        local out=self.api:progress_sources(book_id)
 
         local function normalize_native(value,source)
             local progress=sourced_progress(value,book_id,source)

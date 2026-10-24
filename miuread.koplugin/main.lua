@@ -1268,11 +1268,12 @@ function Plugin:_network_radio_hint()
 end
 function Plugin:online(label,fn) if not self:is_online() then self:info(_("Network unavailable")); return end; UIManager:scheduleIn(.05,self:safe(label,fn)) end
 
-local function interactive_child_store(auth,data_dir,temp_dir)
+local function interactive_child_store(auth,data_dir,temp_dir,api_mode)
     local current=U.copy(type(auth)=="table" and auth or {})
     local changed=false
     local store={data_dir=tostring(data_dir or ""),temp_dir=tostring(temp_dir or "")}
     function store:auth() return U.copy(current) end
+    function store:preferences() return {api_transport=api_mode or "auto"} end
     -- The isolated child deliberately keeps the parent's starting revision.
     -- The parent performs the real compare-and-swap when this snapshot returns.
     function store:save_auth(value) current=U.copy(type(value)=="table" and value or {}); changed=true; return true end
@@ -1280,8 +1281,8 @@ local function interactive_child_store(auth,data_dir,temp_dir)
     return store
 end
 
-function Plugin:_interactive_child_store(auth,data_dir,temp_dir)
-    return interactive_child_store(auth,data_dir,temp_dir)
+function Plugin:_interactive_child_store(auth,data_dir,temp_dir,api_mode)
+    return interactive_child_store(auth,data_dir,temp_dir,api_mode)
 end
 
 function Plugin:_interactive_network_context()
@@ -1409,12 +1410,13 @@ function Plugin:_pump_finished_status(force)
     if self:_network_radio_hint()==false then self:_schedule_finished_status(60); return false end
     local started=status:pump(function(mode,book_id,finished)
         local auth=U.copy(self.store:auth())
+        local api_mode=require("miuread.api_transport").preference(self.store)
         local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
         return function()
-            local child_store=interactive_child_store(auth,data_dir,temp_dir)
+            local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
             local child_http=Http:new(child_store)
             local child_reader=Reader:new(child_http,child_store)
-            local api=Api:new(child_http,child_store,child_reader)
+            local api=Api:new(child_http,child_store,child_reader):scope()
             if mode=="write" then
                 local ok,err=pcall(api.mark_book_finished,api,book_id,finished)
                 if not ok then logger.warn("[MiuRead][FinishedStatus] write outcome unconfirmed",U.first_line(err,160)) end
@@ -1536,6 +1538,7 @@ function Plugin:_request_catalog(book,label,on_ready,options)
     local id=tostring(book and (book.bookId or book.book_id) or "")
     if id=="" then return false,"missing book id" end
     local auth=U.copy(self.store:auth())
+    local api_mode=require("miuread.api_transport").preference(self.store)
     local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     label=tostring(label or "catalog")
     local key="catalog:"..id..":"..label
@@ -1543,7 +1546,7 @@ function Plugin:_request_catalog(book,label,on_ready,options)
         local HttpChild=require("miuread.http")
         local ReaderChild=require("miuread.reader")
         local DownloaderChild=require("miuread.downloader")
-        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local child_http=HttpChild:new(child_store)
         local child_reader=ReaderChild:new(child_http,child_store)
         local child_downloader=DownloaderChild:new(child_reader,nil,nil,child_store,child_http)
@@ -1858,11 +1861,11 @@ function Plugin:_shelf_management_authorized()
 end
 function Plugin:confirm_clear_shelf_management_auth()
     if not self:_shelf_management_authorized() then
-        self:toast("当前没有书架管理授权",3)
+        self:toast("当前没有 E-Ink 客户端授权",3)
         return
     end
     UIManager:show(ConfirmBox:new{
-        text="取消书架管理授权？\n\n不会退出微信读书主账号。之后再次从微信书架移除书籍时，需要重新扫码授权。",
+        text="取消 E-Ink 客户端授权？\n\n不会退出微信读书主账号。自动模式将使用 Web；从微信书架移除书籍前，需要重新授权。",
         ok_text="取消授权",
         ok_callback=function()
             if self._bookstore_shelf_auth then
@@ -1871,9 +1874,9 @@ function Plugin:confirm_clear_shelf_management_auth()
             end
             local saved,err=self.store:clear_native_shelf_auth()
             if saved==true then
-                self:status_toast("书架管理","授权已取消",4)
+                self:status_toast("账号","客户端授权已取消",4)
             else
-                self:info("取消书架管理授权失败："..tostring(err or "无法保存设置"))
+                self:info("取消 E-Ink 客户端授权失败："..tostring(err or "无法保存设置"))
             end
         end,
     })
@@ -1889,7 +1892,7 @@ function Plugin:_account_details_text()
         return table.concat(lines,"\n")
     end
     lines[#lines+1]="基础登录：正常"
-    lines[#lines+1]="书架管理授权："..(self:_shelf_management_authorized() and "已授权" or "未授权")
+    lines[#lines+1]="E-Ink 客户端授权："..(self:_shelf_management_authorized() and "已授权" or "未授权")
     lines[#lines+1]="在线功能："..(health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证"))
     lines[#lines+1]=""
     for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
@@ -1912,13 +1915,14 @@ end
 function Plugin:check_account_status()
     if not self:logged_in() then self.auth_flow:start(); return end
     local auth=U.copy(self.store:auth())
+    local api_mode=require("miuread.api_transport").preference(self.store)
     local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     local context=self:_interactive_network_context()
     self:_run_interactive_network("account-status","account-status-check",function()
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
         local ReaderChild=require("miuread.reader")
-        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local child_http=HttpChild:new(child_store)
         local child_reader=ReaderChild:new(child_http,child_store)
         local child_api=ApiChild:new(child_http,child_store,child_reader)
@@ -2010,7 +2014,7 @@ function Plugin:show_account_status()
         }
         if self:logged_in() then
             local shelf_authorized=self:_shelf_management_authorized()
-            rows[#rows+1]={text="书架管理授权",post_text=shelf_authorized and "已授权" or "未授权",enabled=false}
+            rows[#rows+1]={text="E-Ink 客户端授权",post_text=shelf_authorized and "已授权" or "未授权",enabled=false}
             local online_label=health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
             rows[#rows+1]={text="在线功能",post_text=online_label,enabled=false}
             for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
@@ -2021,7 +2025,7 @@ function Plugin:show_account_status()
             rows[#rows+1]={text="重新检查状态",callback=function() self:check_account_status() end}
             rows[#rows+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
             if shelf_authorized then
-                rows[#rows+1]={text="取消书架管理授权",callback=function() self:confirm_clear_shelf_management_auth() end}
+                rows[#rows+1]={text="取消 E-Ink 客户端授权",callback=function() self:confirm_clear_shelf_management_auth() end}
             end
             rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end}
         else
@@ -2037,7 +2041,7 @@ function Plugin:show_account_status()
         buttons[#buttons+1]={{text="重新检查状态",callback=function() UIManager:close(dialog); self:check_account_status() end}}
         buttons[#buttons+1]={{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
         if self:_shelf_management_authorized() then
-            buttons[#buttons+1]={{text="取消书架管理授权",callback=function()
+            buttons[#buttons+1]={{text="取消 E-Ink 客户端授权",callback=function()
                 UIManager:close(dialog); self:confirm_clear_shelf_management_auth()
             end}}
         end
@@ -2263,6 +2267,9 @@ function Plugin:account_menu()
         {text=self:logged_in() and "重新扫码登录" or "扫码登录",callback=self:safe("login",function() self.auth_flow:start() end)},
     }
     if self:logged_in() then
+        out[#out+1]={text="E-Ink 客户端授权",post_text=self:_shelf_management_authorized() and "已授权" or "需微信扫码",callback=function()
+            require("miuread.bookstore").authorize_client(self)
+        end}
         out[#out+1]={text="退出登录",callback=function() self:confirm_logout() end}
     end
     return out
@@ -2292,6 +2299,11 @@ function Plugin:_friendly_remote_error(err, context)
     end
     if text:find("[MiuReadMPInvalidAccount]",1,true) then
         return "公众号信息无效，请刷新微信读书书架。"
+    end
+    if Http.is_rate_limit_error(text) then
+        local wait=tonumber(text:match("wait_seconds=(%d+)"))
+        return "微信读书暂时限制了请求频率，"..(wait and wait>0
+            and ("请约 "..tostring(math.ceil(wait/60)).." 分钟后重试。") or "请稍后重试。")
     end
     if lower:find("参数格式错误",1,true) or lower:find("params error",1,true)
         or lower:find("parameter format",1,true) then
@@ -2407,13 +2419,15 @@ function Plugin:_refresh_shelf_async(on_ready,silent,request_options)
     end
 
     local auth=U.copy(self.store:auth())
+
+    local api_mode=require("miuread.api_transport").preference(self.store)
     local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     logger.info("[MiuRead][Shelf] refresh started","mode=subprocess")
     local started,err=self.shelf_async:run("shelf_refresh",function()
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
         local ReaderChild=require("miuread.reader")
-        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local child_http=HttpChild:new(child_store)
         local child_reader=ReaderChild:new(child_http,child_store)
         local api=ApiChild:new(child_http,child_store,child_reader)
@@ -5127,14 +5141,15 @@ function Plugin:_home_schedule_progress()
     local generation=tonumber(self._home_progress_generation) or 0
     local shelf_generation=self._shelf_refresh_generation
     local auth=U.copy(self.store:auth())
+    local api_mode=require("miuread.api_transport").preference(self.store)
     local sessions=self.store:get("sessions",{})
     local verified={}
     for _,id in ipairs(ids) do verified[id]=ShelfProgress.verification_key(sessions[id]) end
     local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     local started=self.home_progress_async:run("home-shelf-progress",function()
-        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local child_http=Http:new(child_store)
-        local api=Api:new(child_http,child_store)
+        local api=Api:new(child_http,child_store):scope()
         local updates={}
         for _,id in ipairs(ids) do
             local progress=ShelfProgress.fetch(api,id)
@@ -12451,6 +12466,10 @@ end
 function Plugin:maintenance_menu()
     return PluginSettings.system_maintenance(self)
 end
+function Plugin:export_runtime_log()
+    local path,err=require("miuread.diagnostic_log").export(self.store)
+    self:info(path and ("运行日志已导出：\n"..path) or err)
+end
 
 function Plugin:show_home_quick_panel(more_expanded)
     local started=monotonic_wall_time()
@@ -18462,7 +18481,13 @@ function Plugin:search(q)
             self:info(self:_friendly_remote_error(result and result.error or "未知错误","搜索"))
             return
         end
-        local data=result.value or {}
+        local payload=result.value or {}
+        if payload.auth_changed then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
+        if payload.request_ok==false then
+            self:info(self:_friendly_remote_error(payload.error,"搜索"))
+            return
+        end
+        local data=payload.value or payload
         local items={}
         local function add(r)
             local b=normalize(r)
@@ -18490,16 +18515,17 @@ function Plugin:search(q)
     end
 
     local auth=U.copy(self.store:auth())
+    local api_mode=require("miuread.api_transport").preference(self.store)
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     local started,err=self.search_async:run("book_search",function()
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
-        local UtilChild=require("miuread.util")
-        local child_store={
-            auth=function() return UtilChild.copy(auth) end,
-            save_auth=function() end,
-        }
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local api=ApiChild:new(HttpChild:new(child_store),child_store)
-        return api:search(q,0,40)
+        local ok,value=pcall(api.search,api,q,0,40)
+        local current,changed=child_store:snapshot()
+        return {request_ok=ok,value=ok and value or nil,error=not ok and tostring(value) or nil,
+            auth=current,auth_changed=changed}
     end,finish,32)
     if not started then
         logger.warn("[MiuRead][Search] async unavailable; falling back",tostring(err or "worker busy"))
@@ -18865,12 +18891,13 @@ function Plugin:book_details(b)
     local id=tostring(b.bookId or b.book_id or "")
     if id=="" then self:info("当前书籍缺少可查询的图书编号。") return false end
     local auth=U.copy(self.store:auth())
+    local api_mode=require("miuread.api_transport").preference(self.store)
     local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     local context=self:_interactive_network_context()
     return self:_run_interactive_network("book-details:"..id,"details",function()
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
-        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local child_api=ApiChild:new(HttpChild:new(child_store),child_store)
         local request_ok,detail=pcall(child_api.book,child_api,id)
         local child_auth,auth_changed=child_store:snapshot()
@@ -19145,13 +19172,13 @@ function Plugin:_finish_download_runtime(runtime,result)
             return
         end
         local auth_required=Http.is_auth_error(err)
-        local rate_limited=Http.is_rate_limit_error(err)
+        local rate_limited=(result and result.error_kind=="rate_limit") or Http.is_rate_limit_error(err)
         local network_failed=Http.is_network_error and Http.is_network_error(err)
         local content_pending=tostring(err):find("[MiuReadAnnotationPending]",1,true)~=nil
         local image_missing=tostring(err):find("[MiuReadImageMissing]",1,true)~=nil
             or tostring(err):find("[MiuReadImageExternal]",1,true)~=nil
         local validation_failed=tostring(err):find("EPUB 完整性验证失败",1,true)~=nil
-        local wait_seconds=tonumber(tostring(err):match("wait_seconds=(%d+)"))
+        local wait_seconds=tonumber(result and result.wait_seconds) or tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
         self:_write_download_state("failed",{
             title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),
@@ -19174,6 +19201,7 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="微信读书登录凭证暂时未能自动恢复。下载断点已经保留，可稍后继续；若账号状态检查也失败，再重新扫码。"
         elseif rate_limited then
             first="微信读书暂时限制了请求频率。插件已停止继续请求，正文和断点均已保留，请稍后继续下载。"
+            if wait_seconds and wait_seconds>0 then first=first.."\n约 "..tostring(math.ceil(wait_seconds/60)).." 分钟后可重试。" end
         elseif network_failed then
             first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
         elseif image_missing then
@@ -19590,6 +19618,11 @@ function Plugin:_merge_download_result(result,book,opt)
             end
             merged_cookies=Cookies.sanitize(merged_cookies)
             current.cookies=merged_cookies
+            -- The child may renew Native credentials during a download. The
+            -- same-login/revision fence above also protects revocation or a
+            -- new QR authorization in the parent while that child was running.
+            local native=require("miuread.shelf_client").credentials(result.auth)
+            if native then current.native_shelf=native end
             if tostring(result.auth.api_key or "")~="" then current.api_key=result.auth.api_key end
             if child_ticket_time>=current_ticket_time then
                 if tostring(result.auth.wr_ticket or "")~="" then current.wr_ticket=result.auth.wr_ticket end
@@ -27285,6 +27318,23 @@ function Plugin:toggle_memory_mode()
     })
 end
 
+function Plugin:api_transport_menu()
+    local function set(mode)
+        local prefs=self.store:preferences()
+        prefs.api_transport=mode
+        self.store:save_preferences(prefs)
+        self:toast("接口通道设置将在下次操作时生效")
+    end
+    return {
+        {text="自动（E-Ink 优先）",post_text="书架、书城与下载优先 E-Ink",checked_func=function()
+            return require("miuread.api_transport").preference(self.store)~="web"
+        end,callback=function() set("auto") end},
+        {text="Web",post_text="使用 Web 后端",checked_func=function()
+            return require("miuread.api_transport").preference(self.store)=="web"
+        end,callback=function() set("web") end},
+    }
+end
+
 function Plugin:download_settings_menu()
     local policy=tostring(self.store:preferences().download_reader_policy or "ask")
     local policy_label=policy=="allow" and "允许后台下载" or (policy=="after_reading" and "退出阅读后下载" or "每次询问")
@@ -28725,6 +28775,8 @@ function Plugin:_toggle_online_review_like(request,callback)
     end
 
     local auth=U.copy(self.store:auth())
+
+    local api_mode=require("miuread.api_transport").preference(self.store)
     local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
     local known_is_liked=request.is_liked
     if type(known_is_liked)~="boolean" then known_is_liked=nil end
@@ -28735,10 +28787,10 @@ function Plugin:_toggle_online_review_like(request,callback)
         local HttpChild=require("miuread.http")
         local ApiChild=require("miuread.api")
         local ReaderChild=require("miuread.reader")
-        local child_store=interactive_child_store(auth,data_dir,temp_dir)
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local child_http=HttpChild:new(child_store)
         local child_reader=ReaderChild:new(child_http,child_store)
-        local child_api=ApiChild:new(child_http,child_store,child_reader)
+        local child_api=ApiChild:new(child_http,child_store,child_reader):scope()
         local is_liked=known_is_liked
         local likes=cached_likes
         if is_liked==nil then

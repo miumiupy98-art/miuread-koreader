@@ -34,7 +34,11 @@ end
 local function is_weread_api_url(url)
     url = tostring(url or "")
     if not is_weread_url(url) then return false end
-    return url:find("/web/", 1, true) ~= nil
+    -- Native /book/*, /shelf/* and /login live outside /web and /api, but must
+    -- share the same account request cadence as the Web/agent APIs.
+    local host = url:match("^https?://([^/]+)"):lower():gsub(":%d+$", "")
+    return host == "i.weread.qq.com"
+        or url:find("/web/", 1, true) ~= nil
         or url:find("/api/", 1, true) ~= nil
 end
 
@@ -1048,8 +1052,8 @@ function Http:request(opt)
     if shared_remaining>0 then
         local code=shared_state and shared_state.code or "rate_limit"
         if opt.rate_limit_fail_fast==true then
-            error("请求频率暂时受限 [MiuReadRateLimit] error_code="..tostring(code)
-                .." wait_seconds="..tostring(shared_remaining).."：已暂停附加内容请求，请稍后重试。")
+            error("请求频率暂时受限 [MiuReadRateLimit] [MiuReadLocalCooldown] error_code="..tostring(code)
+                .." wait_seconds="..tostring(shared_remaining).."：已暂停请求，请稍后重试。")
         end
         logger.warn("[MiuRead][HTTP] respecting shared rate-limit cooldown",
             "wait=",tostring(shared_remaining),"code=",tostring(code),"url=",Util.redact_url(opt.url or ""))
@@ -1203,6 +1207,8 @@ local function is_rate_limit_error(value)
     local text = tostring(value or "")
     local lower = text:lower()
     return text:find(RATE_LIMIT_MARKER, 1, true) ~= nil
+        or tonumber(auth_error_code(text)) == 429
+        or tonumber(auth_error_code(text)) == 499
         or lower:find("http 429", 1, true) ~= nil
         or lower:find("http 499", 1, true) ~= nil
         or lower:find("error_code=-10102", 1, true) ~= nil
@@ -1211,6 +1217,16 @@ local function is_rate_limit_error(value)
         or lower:find("too many requests", 1, true) ~= nil
         or text:find("请求频率超限", 1, true) ~= nil
         or text:find("请求频率受限", 1, true) ~= nil
+        or text:find("限制了请求频率", 1, true) ~= nil
+end
+
+local function rate_limit_details(value)
+    if not is_rate_limit_error(value) then return nil end
+    local text=tostring(value or "")
+    return {code=tonumber(auth_error_code(text)) or tonumber(text:match("HTTP (%d+)")),
+        wait_seconds=tonumber(text:match("wait_seconds=(%d+)")),
+        local_cooldown=text:find("[MiuReadLocalCooldown]",1,true)~=nil,
+        native_stage=text:match("native_stage=([%w_]+)")}
 end
 
 function Http:json(opt)
@@ -1319,5 +1335,6 @@ Http.is_auth_error = is_auth_error
 Http.is_forbidden_error = is_forbidden_error
 Http.is_network_error = is_network_error
 Http.is_rate_limit_error = is_rate_limit_error
+Http.rate_limit_details = rate_limit_details
 
 return Http

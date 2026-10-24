@@ -20,7 +20,8 @@ package.preload['logger']=function() return {info=function() end,warn=function()
 package.preload['miuread.codec']=function() return {} end
 package.preload['miuread.http']=function() return {is_auth_error=function() return false end} end
 local Data=require('miuread.bookstore_data')
-local Api=require('miuread.api')
+local Api=require('miuread.api_web')
+local Facade=require('miuread.api')
 local Membership=require('miuread.shelf_membership')
 
 local page=Data.page('recommend',{books={
@@ -80,7 +81,9 @@ function http:post_json(url,body,opt)
 end
 local credential={api_key='fake-key',account={vid='alice'},cookies={wr_vid='alice',wr_skey='web-token'},
     native_shelf={vid='alice',accessToken='client-token',refreshToken='client-refresh',deviceId='device'}}
-local api=Api:new(http,{auth=function() return credential end})
+local test_store={auth=function() return credential end}
+local api=Api:new(http,test_store)
+local native_api=Facade:new(http,test_store)
 api:recommend_books(12,20)
 assert(posts[#posts].body.api_name=='/book/recommend' and posts[#posts].body.maxIdx==12)
 api:similar_books('a',7,20,'session')
@@ -104,7 +107,7 @@ local write=posts[#posts]
 assert(write.url=='https://weread.qq.com/web/shelf/add' and write.body.bookIds[1]=='a')
 assert(write.opt.auth and write.opt.redirects==0 and write.opt.retries==0 and write.opt.rate_limit_retries==0)
 assert(not pcall(api.add_to_shelf,api,'MP_WXS_1'))
-api:remove_from_shelf('a')
+native_api:remove_from_shelf('a')
 write=posts[#posts]
 assert(write.url=='https://i.weread.qq.com/shelf/delete' and write.body.bookIds[1]=='a')
 assert(write.opt.auth==false and write.opt.redirects==0 and write.opt.retries==0
@@ -123,22 +126,22 @@ membership={data={{bookId='a',onShelf=1}}}
 for _,response in ipairs({'HTTP 401: {"errcode":-2011}',{}}) do
     native_shelf=response
     local count=#posts
-    local ok,err=pcall(api.remove_from_shelf,api,'a')
+    local ok,err=pcall(native_api.remove_from_shelf,native_api,'a')
     assert(not ok and tostring(err):find('[MiuReadShelfPreflight]',1,true) and #posts==count,
         'rejected/malformed native read permitted a deletion')
-    local rejected=Membership.run(api,'a',false,false)
+    local rejected=Membership.run(native_api,'a',false,false)
     assert(rejected.state=='blocked' and rejected.stage=='credentials' and #posts==count,
         'real API preflight rejection became an uncertain write')
 end
 native_shelf={books={}}
-assert(not pcall(api.remove_from_shelf,api,'MP_WXS_1'))
-assert(not pcall(api.remove_from_shelf,api,''))
+assert(not pcall(native_api.remove_from_shelf,native_api,'MP_WXS_1'))
+assert(not pcall(native_api.remove_from_shelf,native_api,''))
 credential.native_shelf=nil
 local before=#posts
-assert(not pcall(api.remove_from_shelf,api,'a') and #posts==before,'missing credential permitted removal')
+assert(not pcall(native_api.remove_from_shelf,native_api,'a') and #posts==before,'missing credential permitted removal')
 credential.native_shelf={vid='alice',accessToken='renewed-token',refreshToken='refresh',deviceId='device'}
 credential.account.vid=''
-api:remove_from_shelf('a')
+native_api:remove_from_shelf('a')
 assert(posts[#posts].opt.headers.vid=='alice','empty account vid ignored cookie identity')
 assert(posts[#posts].opt.headers.accessToken=='renewed-token','removal captured an obsolete token')
 
@@ -172,7 +175,8 @@ assert(type(repair_api:recommend_books(0,20).books)=='table' and attempts==2 and
 assert(repair_api:book_on_shelf('a')==false and web_reads==2 and web_repaired==1)
 assert(not pcall(repair_api.add_to_shelf,repair_api,'a'))
 assert(attempts==3 and repaired==1 and web_repaired==1,'shelf write invoked credential recovery/replay')
-assert(not pcall(repair_api.remove_from_shelf,repair_api,'a'))
+local repair_native=Facade:new(repair_http,{auth=function() return credential end},repair_reader)
+assert(not pcall(repair_native.remove_from_shelf,repair_native,'a'))
 assert(attempts==4 and repaired==1 and web_repaired==1,'shelf removal invoked credential recovery/replay')
 package.loaded['miuread.http'].is_auth_error=function() return false end
 

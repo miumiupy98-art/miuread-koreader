@@ -589,7 +589,7 @@ local function locate_quote(index, needle, expected)
     return best_a, best_b
 end
 
-local function official_interval(row, data, index, coord_map)
+local function official_interval(row, data, index, coord_map, strict)
     if not coord_map then return nil, nil, "coord_missing" end
     local key = range_key(row)
     local resolved, resolve_error = AnnotationCoord.resolveRangeOnMap(coord_map, key)
@@ -628,6 +628,10 @@ local function official_interval(row, data, index, coord_map)
         context_before = before,
         context_after = after,
     })
+    -- Native API ranges belong to the Native package, independently of Web.
+    -- Without a supplied quote, trust only a reversible same-source range;
+    -- never guess from numeric offsets in the rewritten display body.
+    if strict and roundtrip~=key then return nil,nil,"native_range_unverified" end
 
     return a, b, nil, {
         verified = verified,
@@ -648,7 +652,7 @@ local function numeric_interval(a, b, visible_count, index)
     if b > a then return a, b end
 end
 
-local function intervals(data, visible_count, index, coord_html)
+local function intervals(data, visible_count, index, coord_html, strict)
     local out, unresolved, unresolved_seen = {}, {}, {}
     local stats = {
         official=0, official_verified=0, official_roundtrip=0, official_failed=0,
@@ -683,7 +687,7 @@ local function intervals(data, visible_count, index, coord_html)
         local a, b
         local official_reason, official_meta
         if key ~= "" and coord_map then
-            a, b, official_reason, official_meta = official_interval(row, data, index, coord_map)
+            a, b, official_reason, official_meta = official_interval(row, data, index, coord_map, strict)
             if a then
                 stats.official = stats.official + 1
                 if official_meta and official_meta.verified then
@@ -704,13 +708,15 @@ local function intervals(data, visible_count, index, coord_html)
             local raw_a, raw_b = legacy_parse_range(key)
             if raw_a then
                 for _, quote in ipairs(quote_candidates(row, data)) do
-                    a, b = locate_quote(index, quote, raw_a)
+                    local first=index.text:find(quote,1,true)
+                    local unique=first and not index.text:find(quote,first+1,true)
+                    if not strict or unique then a, b = locate_quote(index, quote, raw_a) end
                     if a then break end
                 end
                 if a then
                     stats.quote_aligned = stats.quote_aligned + 1
                     stats.fallback = stats.fallback + 1
-                else
+                elseif not strict then
                     a, b = numeric_interval(raw_a, raw_b, visible_count, index)
                     if a then
                         stats.numeric = stats.numeric + 1
@@ -788,10 +794,10 @@ local function render_text_token(token, marks, data, anchored)
     return table.concat(out)
 end
 
-local function inject(html, data, coord_html)
+local function inject(html, data, coord_html, options)
     local tokens, visible_count = tokenize(html)
     local index = build_text_index(tokens)
-    local marks, stats = intervals(data, visible_count, index, coord_html)
+    local marks, stats = intervals(data, visible_count, index, coord_html,options and options.native_source==true)
     local rendered = tostring(html or "")
     if #marks > 0 then
         local out = {}
@@ -808,9 +814,9 @@ local function inject(html, data, coord_html)
     return rendered, stats
 end
 
-function Annotations:apply(html, data, coord_html)
+function Annotations:apply(html, data, coord_html, options)
     if not data or data.underline_count == 0 then return html, "", {underlines=0,thoughts=0} end
-    local rendered, alignment = inject(html, data, coord_html)
+    local rendered, alignment = inject(html, data, coord_html,options)
     logger.info("[MiuRead][Annotations] alignment",
         "book=", tostring(data.book_id or ""), "chapter=", tostring(data.chapter_uid or ""),
         "official=", tostring(alignment and alignment.official or 0),

@@ -311,6 +311,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lua5.1 luajit
           find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+          lua5.1 tools/test_api_transports.lua
+          lua5.1 tools/test_diagnostic_log.lua
           lua5.1 tools/test_bookstore.lua
           lua5.1 tools/test_bookstore_ui.lua
           lua5.1 tools/test_shelf_client.lua
@@ -345,6 +347,14 @@ jobs:
           luajit tools/test_internal_links.lua
           python3 tools/test_extension_center_ux.py
           python3 tools/verify_600_beta1.py
+
+      - name: Verify E-Ink archives, annotations and translations offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/miuread-eink-tests"
+          "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m pip install lupa==2.8 cryptography==50.0.2
+          "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_eink_download.py --zlib libz.so.1
 
       - name: Commit prepared beta version and changelog
         if: github.event_name == 'workflow_dispatch'

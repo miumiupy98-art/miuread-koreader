@@ -39,9 +39,7 @@ assert(reader_progress({bookId='a',progress=1},'a').percent==1)
 local calls=0
 local api={
     web_progress=function(_,id,opt)
-        calls=calls+1
-        assert(id=='a' and opt.no_auth_recovery and opt.retries==0)
-        error('expired cookie')
+        error('business layer must not choose a backend')
     end,
     progress=function(_,id,opt)
         calls=calls+1; assert(id=='a' and opt.timeout[2]==5)
@@ -50,9 +48,8 @@ local api={
     chapters=function() error('shelf must not fetch chapters') end,
     book=function() error('shelf must not download books') end,
 }
-assert(Progress.fetch(api,'a').percent==36 and calls==2)
-api.web_progress=function() return {progress=0} end
-api.progress=function() error('valid zero must not fall through') end
+assert(Progress.fetch(api,'a').percent==36 and calls==1)
+api.progress=function() return {progress=0} end
 assert(Progress.fetch(api,'a').percent==0)
 
 local pending={progress_local_percent=68,progress_epoch=2,progress_latest_sequence=9,progress_verified_sequence=8,
@@ -152,7 +149,9 @@ function worker:finish()
 end
 function worker:cancel() self.callback=nil end
 local network_calls={}
-local child_api={web_progress=function(_,id) network_calls[#network_calls+1]=id; return {bookId=id,progress=45} end}
+package.preload['miuread.api_transport']=function() return {preference=function() return 'auto' end} end
+local child_api={progress=function(_,id) network_calls[#network_calls+1]=id; return {bookId=id,progress=45} end}
+function child_api:scope() return self end
 local env=setmetatable({Plugin=Plugin,HomeView=HomeView,UIManager=UIManager,U=U,Protocol=Protocol,
     ShelfProgress=Progress,UnifiedLibrary={canonical_source=function(b) return b.source end},
     interactive_child_store=child_store,Http={new=function() return {} end},Api={new=function() return child_api end}},
@@ -246,13 +245,13 @@ assert(view.opts.shelf_books[1].progress==69,'in-flight shelf read overwrote a v
 
 -- Failure must retain the last percentage and avoid an immediate retry loop.
 function store:auth() return {login_session_id='login',api_key='key'} end
-child_api.web_progress=function() error('offline') end
+child_api.progress=function() error('offline') end
 view.opts.shelf_books={book('e')}; view.opts.shelf_books[1].progress=20
 assert(p:_home_schedule_progress()); worker:finish()
 assert(view.opts.shelf_books[1].progress==20 and not p:_home_schedule_progress())
 
 -- Input takes priority over both starting and applying presentation reads.
-child_api.web_progress=function(_,id) return {bookId=id,progress=45} end
+child_api.progress=function(_,id) return {bookId=id,progress=45} end
 view.opts.shelf_books={book('busy')}; busy=true
 assert(not p:_home_schedule_progress(),'progress query started during interaction')
 busy=false; assert(p:_home_schedule_progress()); busy=true

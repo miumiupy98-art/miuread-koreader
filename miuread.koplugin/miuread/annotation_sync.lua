@@ -571,6 +571,7 @@ function AnnotationSync:_save_coordinate_diagnostics(book_id, chapters)
 end
 
 function AnnotationSync:new(api, reader, store)
+    if api and type(api.for_channel)=="function" then api=api:for_channel("web") end
     return setmetatable({api=api, reader=reader, store=store}, self)
 end
 
@@ -610,7 +611,7 @@ function AnnotationSync:_book_version(book_id, book, record, chapter_uid_value)
     end
 
     if self.reader and type(self.reader.catalog) == "function" then
-        local catalog_ok, catalog = pcall(self.reader.catalog, self.reader, target)
+        local catalog_ok, catalog = pcall(self.reader.catalog, self.reader, target,{fresh_context=true})
         if catalog_ok and type(catalog) == "table" then
             local n = find_book_version(catalog, target)
             if n then return n, "catalog" end
@@ -638,7 +639,7 @@ function AnnotationSync:_coord_map_for_chapter(book, row, candidate, cache)
         title=book.title, author=book.author,
     }
     local ok, downloaded, style, assets, state = pcall(self.reader.chapter, self.reader,
-        book_arg, chapter, "epub", {images=false})
+        book_arg, chapter, "epub", {images=false,fresh_context=true})
     if not ok then return nil, "coord_fetch_failed:" .. tostring(downloaded) end
     local coord_html = type(state) == "table" and tostring(state.coord_html or "") or ""
     if coord_html == "" then return nil, "coord_html_missing" end

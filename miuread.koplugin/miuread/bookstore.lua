@@ -28,10 +28,11 @@ end
 
 local function state(plugin)
     local vid,session=identity(plugin)
+    local mode=require("miuread.api_transport").preference(plugin.store)
     local current=plugin._bookstore
-    if not current or current.vid~=vid or current.session~=session then
+    if not current or current.vid~=vid or current.session~=session or current.mode~=mode then
         M.reset(plugin)
-        current={vid=vid,session=session,cache={},order={},generation=0}
+        current={vid=vid,session=session,mode=mode,cache={},order={},generation=0}
         plugin._bookstore=current
     end
     return current
@@ -81,8 +82,9 @@ local function request(plugin,key,label,fn,callback,timeout)
     }
     s.loading=dialog
     UIManager:show(dialog)
+    local api_mode=require("miuread.api_transport").preference(plugin.store)
     local started,err=plugin:_run_interactive_network("bookstore:"..key,label,function()
-        local store=plugin:_interactive_child_store(auth,data_dir,temp_dir)
+        local store=plugin:_interactive_child_store(auth,data_dir,temp_dir,api_mode)
         local Api=require("miuread.api")
         local Http=require("miuread.http")
         local Reader=require("miuread.reader")
@@ -145,6 +147,7 @@ local function category_rows(plugin,entries)
         local current=entry
         local function browse()
             M.browse(plugin,{kind="category",category_id=current.id,rank=current.rank,title=current.title,
+                channel=current.channel,
                 on_back=function() M.categories(plugin,current.rank) end})
         end
         if #current.children>0 then
@@ -195,6 +198,7 @@ end
 local function show_page(plugin,s,spec,page,cached)
     TransientGuard.close_all()
     close_view(plugin)
+    spec.channel=page.channel or spec.channel
     local books=U.copy(page.books)
     local show_covers=not plugin._shelf_covers_enabled or plugin:_shelf_covers_enabled()
     local cover_index=plugin.store:get("cover_index",{})
@@ -262,6 +266,10 @@ end
 function M.browse(plugin,spec,force)
     local s=state(plugin)
     spec=U.copy(spec)
+    if spec.channel=="eink" and s.mode=="web" then
+        plugin:info("接口设置已变化，请重新打开书城后重试。")
+        return false
+    end
     spec.cursor=spec.cursor or 0
     spec.page=spec.page or 1
     local key=Data.key(spec)
@@ -271,8 +279,11 @@ function M.browse(plugin,spec,force)
         return true
     end
     local query={kind=spec.kind,category_id=spec.category_id,rank=spec.rank,book_id=spec.book_id,
-        cursor=spec.cursor,session_id=spec.session_id}
+        cursor=spec.cursor,session_id=spec.session_id,channel=spec.channel}
     return request(plugin,"page:"..key,spec.title,function(api)
+        -- Category IDs, cursors and recommendation sessions belong to the
+        -- source that produced them. A fresh list can choose another source.
+        if query.channel then api=api:for_channel(query.channel) end
         local raw
         if query.kind=="recommend" then raw=api:recommend_books(query.cursor,Data.PAGE_SIZE)
         elseif query.kind=="similar" then raw=api:similar_books(query.book_id,query.cursor,Data.PAGE_SIZE,query.session_id)
@@ -354,11 +365,12 @@ local function shelf_error_message(plugin,value,desired)
     return error_message(plugin,value,"书架确认")
 end
 
-local function authorize_shelf(plugin,detail)
+local function authorize_shelf(plugin,detail,client_access)
     local vid,session=identity(plugin)
     local dialog
     dialog=ButtonDialog:new{
-        title="书架管理需要客户端授权\n\n请使用微信扫描二维码，并选择与觅阅相同的微信读书账号。授权后，再重新选择移除。"
+        title=(client_access and "E-Ink 客户端授权\n\n请使用微信扫描二维码，并选择与觅阅相同的微信读书账号。授权后，在自动模式下优先使用 E-Ink。"
+            or "书架管理需要客户端授权\n\n请使用微信扫描二维码，并选择与觅阅相同的微信读书账号。授权后，再重新选择移除。")
             ..(detail and ("\n\n接口错误："..shelf_error_summary(detail)) or ""),title_align="center",
         buttons={{{text="微信扫码授权",callback=function()
             UIManager:close(dialog)
@@ -375,7 +387,7 @@ local function authorize_shelf(plugin,detail)
                 toast=function(_,text,duration) plugin:toast(text,duration) end,
                 info=function(_,text) plugin:info(text) end,
                 on_auth_success=function()
-                    plugin:info("书架管理授权已保存。请重新选择要移除的书籍。")
+                    plugin:info(client_access and "E-Ink 客户端授权已保存。自动模式下，书架、书城、批注读取及下载将优先使用 E-Ink。" or "书架管理授权已保存。请重新选择要移除的书籍。")
                 end,
             }
             local Client=require("miuread.shelf_client")
@@ -390,10 +402,17 @@ local function authorize_shelf(plugin,detail)
     return true
 end
 
+function M.authorize_client(plugin)
+    if not plugin:require_login() then return false end
+    return authorize_shelf(plugin,nil,true)
+end
+
 local function change_shelf(plugin,book,desired,confirmed)
     if not plugin:require_login() then return false end
     local auth=plugin.store:auth()
-    if tostring((auth.cookies or {}).wr_skey or "")=="" then
+    local native=require("miuread.api_transport").preference(plugin.store)~="web"
+        and require("miuread.shelf_client").credentials(auth)
+    if not native and tostring((auth.cookies or {}).wr_skey or "")=="" then
         plugin:info("管理微信书架需要网页登录，请先扫码登录或修复登录。")
         return false
     end

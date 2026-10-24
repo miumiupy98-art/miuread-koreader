@@ -22,8 +22,17 @@ package.preload['logger']=function() return {
     info=function(...) logs[#logs+1]=table.concat({...},' ') end,
     warn=function(...) logs[#logs+1]=table.concat({...},' ') end,
 } end
+-- Use production error classifiers without importing socket transports.
+local error_file=assert(io.open('miuread.koplugin/miuread/http.lua','rb'))
+local error_source=error_file:read('*a'); error_file:close()
+local error_helpers=assert(loadstring('local RATE_LIMIT_MARKER="[MiuReadRateLimit]"\n'
+    ..assert(error_source:match('(local function auth_error_code%(value%).-\nend)'))..'\n'
+    ..assert(error_source:match('(local function is_rate_limit_error%(value%).-\nend)'))..'\n'
+    ..assert(error_source:match('(local function rate_limit_details%(value%).-\nend)'))..'\n'
+    ..'return {auth_error_code=auth_error_code,is_rate_limit_error=is_rate_limit_error,rate_limit_details=rate_limit_details}'))()
 package.preload['miuread.http']=function() return {
-    auth_error_code=function(v) return tostring(v):match('error_code=(%-?%d+)') end,
+    auth_error_code=error_helpers.auth_error_code,
+    is_rate_limit_error=error_helpers.is_rate_limit_error,rate_limit_details=error_helpers.rate_limit_details,
     is_auth_error=function(v) return tostring(v):find('HTTP 401',1,true)~=nil end,
 } end
 package.preload['miuread.cookies']=function() return {
@@ -83,6 +92,7 @@ local store=new_store()
 local http={poll_code=408,gets={},posts={},present=true,delete_count=0,refresh_count=0}
 function http:get_json(url,opt)
     self.gets[#self.gets+1]={url=url,opt=copy(opt)}
+    if self.limit_at and url:find(self.limit_at,1,true) then error(self.limit_error..' uuid-secret code-secret ticket-secret native-token native-refresh') end
     if not url:find('https://weread.qq.com/',1,true) then assert(opt.retries==0 and opt.auth==false) end
     if url:find('/wxticket?',1,true) then return {signature='ticket-secret',timeStamp=12345} end
     if url:find('/connect/sdk/qrconnect?',1,true) then
@@ -96,7 +106,7 @@ function http:get_json(url,opt)
         if self.expired_reads and self.expired_reads>0 then
             self.expired_reads=self.expired_reads-1; error('HTTP 401 [MiuReadAuth] error_code=-2012')
         end
-        return self.bad_shelf and {} or {books={}}
+        return self.bad_shelf and {} or {books=self.present and {{bookId='a'}} or {}}
     end
     if url:find('/web/shelf/bookIds?',1,true) then return {data={{bookId='a',onShelf=self.present and 1 or 0}}} end
     if url:find('/api/userInfo?',1,true) then return {name='Alice'} end
@@ -105,6 +115,7 @@ function http:get_json(url,opt)
 end
 function http:post_json(url,body,opt)
     self.posts[#self.posts+1]={url=url,body=copy(body),opt=copy(opt)}
+    if self.limit_at and url:find(self.limit_at,1,true) then error(self.limit_error..' uuid-secret code-secret ticket-secret native-token native-refresh') end
     if url=='https://i.weread.qq.com/login' then
         assert(opt.auth==false and opt.redirects==0 and opt.retries==0 and opt.rate_limit_retries==0)
         assert(body.deviceType==3 and body.deviceName=='BOOX')
@@ -228,6 +239,67 @@ local previous=copy(store.current.native_shelf)
 assert(Membership.run(api,'a',false,false).state=='blocked' and http.delete_count==deletes+1)
 assert(store.current.native_shelf.accessToken==previous.accessToken,'wrong-account renewal replaced native credential')
 http.wrong_account=false
+
+-- A server rejection and a cached cooldown retain distinct typed errors at
+-- every native authorization step; never echo QR tickets, codes or tokens.
+for _,case in ipairs({
+    {at='/wxticket',stage='qr_ticket',call=function(b) return b:uid() end},
+    {at='/connect/sdk/qrconnect',stage='qr_connect',call=function(b) return b:uid() end},
+    {at='/connect/l/qrconnect',stage='qr_poll',call=function(b) return b:poll('uuid-secret') end},
+    {at='/login',stage='login',call=function(b) return b:finish({wx_code='code-secret'}) end},
+    {at='/shelf/sync',stage='shelf_verify',call=function(b) return b:finish({wx_code='code-secret'}) end},
+    {at='/login',stage='refresh',call=function() return Client.refresh(http,store) end},
+}) do
+    for _,local_cooldown in ipairs({false,true}) do
+        store=new_store()
+        store.current.native_shelf={vid='alice',accessToken='native-token',refreshToken='native-refresh',deviceId='native-device'}
+        store.persisted=copy(store.current)
+        backend=Client.new(http,store)
+        http.limit_at=case.at
+        http.limit_error='[MiuReadRateLimit]'..(local_cooldown and ' [MiuReadLocalCooldown]' or '')..' error_code=499 wait_seconds=123'
+        local passed,raw=pcall(case.call,backend)
+        assert(not passed and error_helpers.is_rate_limit_error(raw))
+        local detail=error_helpers.rate_limit_details(raw)
+        assert(detail.code==499 and detail.wait_seconds==123 and detail.local_cooldown==local_cooldown and detail.native_stage==case.stage)
+        local event=logs[#logs]
+        assert(event:find('operation=client_authorization',1,true) and event:find('native_stage='..case.stage,1,true)
+            and event:find('outcome=rate_limited',1,true) and event:find('code=499',1,true),
+            'authorization failure did not reach the shared operation log')
+        assert(not tostring(raw):find('shelf_client.lua:',1,true))
+        for _,secret in ipairs({'uuid-secret','code-secret','ticket-secret','native-token','native-refresh'}) do
+            assert(not tostring(raw):find(secret,1,true),'native authorization error leaked a secret')
+        end
+        assert(store.writes==0 and store.current.cookies.wr_skey=='web-only')
+    end
+end
+http.limit_at=nil
+
+-- The real Auth controller must stop on rejection at QR creation, polling or
+-- the confirmed login exchange. No polling, QR refresh or token save follows.
+for _,stage in ipairs({'ticket','poll','login'}) do
+    clear_queue(); store=new_store(); backend=Client.new(http,store); h=host(); flow=Auth:new(http,store,h,backend)
+    http.limit_at=stage=='ticket' and '/wxticket' or (stage=='poll' and '/connect/l/qrconnect' or '/login')
+    http.limit_error='[MiuReadRateLimit] error_code=499 wait_seconds=123'
+    http.poll_code=405
+    flow:start(); step()
+    if stage~='ticket' then step() end
+    if stage=='login' then table.remove(h.online_queue,1)() end
+    assert(not flow.active and #queue==0 and #h.online_queue==0 and store.writes==0)
+    local notice=shown[#shown]
+    assert(notice.title:find('授权暂时受限',1,true) and notice.title:find('约 3 分钟',1,true))
+    assert(not notice.title:find('499',1,true) and not notice.title:find('发生阶段',1,true))
+    assert(#notice.buttons==1 and #notice.buttons[1]==1 and notice.buttons[1][1].text=='关闭')
+    assert(not notice.title:find('重新获取',1,true))
+    local requests=#http.gets+#http.posts
+    notice.buttons[1][1].callback()
+    assert(#http.gets+#http.posts==requests)
+end
+http.limit_at=nil; clear_queue()
+store=new_store(); backend=Client.new(http,store); h=host(); flow=Auth:new(http,store,h,backend)
+assert(flow:_stop_if_rate_limited('[MiuReadRateLimit] [MiuReadLocalCooldown] native_stage=qr_ticket error_code=499 wait_seconds=88'))
+assert(shown[#shown].title:find('约 2 分钟',1,true) and shown[#shown].title:find('当前登录状态已保留',1,true))
+assert(not shown[#shown].title:find('499',1,true) and not shown[#shown].title:find('发生阶段',1,true))
+flow:cancel(); clear_queue()
 
 -- Same-account Web re-login preserves the independently granted Native shelf
 -- authorization; a real account switch must not carry it across accounts.

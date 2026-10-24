@@ -136,13 +136,8 @@ end
 function M.fetch(api, book_id)
     local options = {retries = 0, timeout = {3, 5}, no_auth_recovery = true}
     -- These are presentation reads only: no chapter downloads or session writes.
-    for _, method in ipairs({"web_progress", "progress"}) do
-        if type(api[method]) == "function" then
-            local ok, data = pcall(api[method], api, book_id, options)
-            local parsed = ok and M.parse(data, book_id) or nil
-            if parsed then return parsed end
-        end
-    end
+    local ok,data=pcall(api.progress,api,book_id,options)
+    return ok and M.parse(data,book_id) or nil
 end
 
 return M

@@ -80,7 +80,7 @@ do
         if attempts==1 then error('session expired -2012') end
         return {data={isPaying=true}}
     end
-    api.reader={_recover_login_session=function() recoveries=recoveries+1; return true end}
+    api=Api.bind(api,{_recover_login_session=function() recoveries=recoveries+1; return true end})
     assert(api:translation_member_summary(book_id).isPaying and attempts==2 and recoveries==1)
     function http:json() attempts=attempts+1; error('paid member required') end
     attempts,recoveries=0,0

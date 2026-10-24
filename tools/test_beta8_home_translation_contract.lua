@@ -4,7 +4,7 @@ local function read(path)
     local f=assert(io.open(root.."/"..path,"rb")); local s=f:read("*a"); f:close(); return s
 end
 local main=read("miuread.koplugin/main.lua")
-local api=read("miuread.koplugin/miuread/api.lua")
+local api=read("miuread.koplugin/miuread/api_web.lua")
 local gen=read("miuread.koplugin/miuread/translation_generation.lua")
 local translation=read("miuread.koplugin/miuread/translation.lua")
 
