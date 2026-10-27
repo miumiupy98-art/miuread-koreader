@@ -871,6 +871,15 @@ function Sync:_partial_progress_record(record)
     return mode=="standalone" or (record.record and record.record.partial_range==true)
 end
 
+-- last_stage is a display-only label. Rewriting an unchanged label still
+-- serializes and flushes the whole settings file, so retry loops must skip
+-- the no-op write instead of re-persisting it on every round.
+function Sync:_save_session_stage(book_id,stage)
+    local row=self.store:session(book_id)
+    if type(row)=="table" and row.last_stage==stage then return end
+    self.store:save_session(book_id,{last_stage=stage})
+end
+
 function Sync:_persist_confirmed_progress_catalog(record,catalog,source)
     if not self:_partial_progress_record(record) then return false,"not_partial" end
     catalog=type(catalog)=="table" and catalog or {}
@@ -891,6 +900,22 @@ function Sync:_persist_confirmed_progress_catalog(record,catalog,source)
     end
     local catalog_hash=BookIntegrity.core_map_hash(book_id,catalog,{})
     if catalog_hash=="" then return false,"catalog_hash_missing" end
+    -- Retry rounds reach this with the same confirmed catalog; rewriting it
+    -- only refreshes catalog_recovered_at and rewrites the whole settings
+    -- file. When the stored book row already carries this exact catalog,
+    -- the durable state is already correct.
+    local stored=self.store:book(book_id)
+    if type(stored)=="table" and stored.catalog_complete==true
+        and stored.core_catalog_hash==catalog_hash
+        and tonumber(stored.catalog_chapter_count or 0)==#catalog then
+        if type(record.book)=="table" then
+            record.book.catalog=U.copy(catalog)
+            record.book.catalog_complete=true
+            record.book.catalog_chapter_count=#catalog
+            record.book.core_catalog_hash=catalog_hash
+        end
+        return true
+    end
     local patch={
         catalog=U.copy(catalog),catalog_complete=true,catalog_chapter_count=#catalog,
         core_catalog_hash=catalog_hash,catalog_recovered_at=os.time(),
@@ -1155,13 +1180,27 @@ function Sync:_prepare_progress_catalog(callback, options)
         if not detached or (current_after and tostring(current_after.book and current_after.book.book_id or "")==book_id) then
             self.daemon_context = U.copy(context)
         end
-        self.store:save_session(book_id,{
-            legacy_report_context=U.copy(context),
-            report_login_session_id=login_snapshot,
-            report_core_map_hash=core_hash,
-            book_core_map_hash=core_hash,
-            last_stage="完整章节信息已准备",
-        })
+        -- The retry loop re-enters this callback on every round, and the
+        -- worker stamps context_updated_at per fetch, so an unconditional
+        -- rewrite always looks changed and rewrites the whole settings file.
+        -- While the login session and the core catalog hash on the persisted
+        -- row are unchanged, that row already is the confirmed reporting
+        -- baseline; skip the rewrite instead.
+        local baseline=self.store:session(book_id)
+        if not (type(baseline)=="table"
+            and baseline.report_login_session_id==login_snapshot
+            and baseline.report_core_map_hash==core_hash
+            and baseline.book_core_map_hash==core_hash
+            and type(baseline.legacy_report_context)=="table"
+            and baseline.legacy_report_context.catalog_complete==true) then
+            self.store:save_session(book_id,{
+                legacy_report_context=U.copy(context),
+                report_login_session_id=login_snapshot,
+                report_core_map_hash=core_hash,
+                book_core_map_hash=core_hash,
+                last_stage="完整章节信息已准备",
+            })
+        end
         logger.info("[MiuRead][ProgressMap] catalog ready", "book=",book_id,
             "chapters=",tostring(#context.chapters),"source=context_only")
         if callback then callback(context.chapters, nil, {source="context_only"}) end
@@ -3040,7 +3079,7 @@ function Sync:repair_current(callback)
     local function verify(result,position,value,attempt)
         if not active() then return end
         attempt=tonumber(attempt) or 1
-        self.store:save_session(book_id,{last_stage="正在回读微信读书云端位置确认修复结果"})
+        self:_save_session_stage(book_id,"正在回读微信读书云端位置确认修复结果")
         UIManager:scheduleIn(attempt==1 and 1.4 or 2.4,function()
             if finished or not active() then return end
             local current=self:record()
@@ -3075,7 +3114,7 @@ function Sync:repair_current(callback)
         if not active() then return false end
         logger.info("[MiuRead][SyncRepair] "..tostring(label or "testing context"),
             "book=",book_id,"core=",core_hash:sub(1,12))
-        self.store:save_session(book_id,{last_stage=force_context and "正在重新建立当前书籍章节同步信息" or "正在验证原有章节同步信息"})
+        self:_save_session_stage(book_id,force_context and "正在重新建立当前书籍章节同步信息" or "正在验证原有章节同步信息")
         if force_context then
             self.daemon_context=nil
             if daemon and daemon.paths and daemon.paths.context then os.remove(daemon.paths.context) end
@@ -3119,7 +3158,7 @@ function Sync:repair_current(callback)
     if needs_auth_check then
         logger.info("[MiuRead][SyncRepair] explicit login renewal requested","book=",book_id,
             "previous_kind=",prior_kind~="" and prior_kind or "unknown")
-        self.store:save_session(book_id,{last_stage="正在验证微信读书登录状态"})
+        self:_save_session_stage(book_id,"正在验证微信读书登录状态")
         local started=self:_recover_auth_once("read_report",prior_error,function(recovered,detail)
             if not active() then return end
             if recovered then after_auth()

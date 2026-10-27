@@ -19625,7 +19625,22 @@ function Plugin:_write_download_state(status,patch,force)
     local now=os.time()
     local stage=patch and patch.stage
     local running_state=status=="active" or status=="prefetch"
-    if not force and running_state and now-(self._download_state_last_write or 0)<2 and stage==self._download_state_last_stage then return end
+    local identity
+    if not force then
+        -- Progress callbacks re-report the same held state (hibernate waits,
+        -- rate-limit countdowns, alternating stage labels) many times over.
+        -- A payload identical to the last persisted one adds nothing, and the
+        -- stage-only throttle below cannot see alternating duplicates.
+        identity=table.concat({
+            tostring(status),tostring(stage),
+            tostring(patch and patch.current),tostring(patch and patch.total),
+            tostring(patch and patch.chapter),tostring(patch and patch.message),
+            tostring(patch and patch.paused),tostring(patch and patch.waiting_network),
+            tostring(patch and patch.hibernate_reason),tostring(patch and patch.wait_seconds),
+        },"|")
+        if identity==self._download_state_last_identity then return end
+        if running_state and now-(self._download_state_last_write or 0)<2 and stage==self._download_state_last_stage then return end
+    end
     local state
     if force or not running_state then state=U.copy(patch or {})
     else state=U.merge(self.store:download_state(),patch or {}) end
@@ -19634,6 +19649,7 @@ function Plugin:_write_download_state(status,patch,force)
     self.store:save_download_state(state)
     self._download_state_last_write=now
     self._download_state_last_stage=stage
+    self._download_state_last_identity=identity
 end
 function Plugin:_active_download_payload(runtime,state)
     local task=(self.download_task and self.download_task:descriptor()) or runtime.task
