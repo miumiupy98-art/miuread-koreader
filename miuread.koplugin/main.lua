@@ -23582,12 +23582,19 @@ function Plugin:_recover_pending_progress_coordinate(item,callback)
                 local count=(type(state)=="table" and tonumber(state.count) or 0)+1
                 self._coordinate_recovery_failures=self._coordinate_recovery_failures or {}
                 if count>=3 then
+                    -- Escalating backoff: the mismatch is deterministic, so
+                    -- each further failure doubles the cooldown up to a
+                    -- ceiling. Probes stay alive (server catalog changes,
+                    -- re-downloads or a manual reset can heal the mismatch)
+                    -- but the per-day waste shrinks to a handful of forks.
+                    local cooldown=COORDINATE_RECOVERY_SUSPEND_SECONDS
+                        *math.min(8,2^(count-3))
                     self._coordinate_recovery_failures[book_id]={
-                        count=count,suspended_until=os.time()+COORDINATE_RECOVERY_SUSPEND_SECONDS,
+                        count=count,suspended_until=os.time()+cooldown,
                     }
                     logger.warn("[MiuRead][ProgressRetry] coordinate recovery suspended",
                         "book=",book_id,"failures=",count,
-                        "resume_after_s=",COORDINATE_RECOVERY_SUSPEND_SECONDS,
+                        "resume_after_s=",cooldown,
                         "reason=",tostring(err))
                 else
                     self._coordinate_recovery_failures[book_id]={count=count}
