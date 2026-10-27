@@ -220,7 +220,7 @@ local d2=assert(download_source:find('function DownloadTask:_restart_interrupted
 local download_methods=download_source:sub(d1,d2-1)
 local env={DownloadTask={},RuntimePressure=sandbox.RuntimePressure,
     Config=config,DownloadAdmission=Admission,logger=sandbox.logger,
-    serializable_copy=function(x) return x end,os={remove=function() end},
+    serializable_copy=function(x) return x end,os={remove=function() end,time=function() return 0 end},
     tonumber=tonumber,type=type,tostring=tostring,math=math}
 compile(download_methods,'@resume_fork_admission',env)()
 test('hibernated task cannot fork at 85 MiB',function()
@@ -236,6 +236,14 @@ test('fork-time pressure race still retains hibernation descriptor',function()
     local h={book={bookId='x'},options={},restart_count=0}
     local dt=setmetatable({hibernated=h,heavy_watch_path='/fake'}, {__index=env.DownloadTask})
     function dt:start() return false,'low_memory' end
+    local yes,why=dt:resume_hibernated('test')
+    eq(yes,false);eq(why,'low_memory');eq(dt.hibernated,h)
+end)
+test('hibernated task stays parked during cooldown window',function()
+    used_mem=110*1024
+    local h={book={bookId='x'},options={},restart_count=0,cooldown_until=100}
+    local dt=setmetatable({hibernated=h,heavy_watch_path='/fake'}, {__index=env.DownloadTask})
+    function dt:start() error('must not fork during cooldown') end
     local yes,why=dt:resume_hibernated('test')
     eq(yes,false);eq(why,'low_memory');eq(dt.hibernated,h)
 end)
