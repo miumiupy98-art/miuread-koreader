@@ -1128,10 +1128,27 @@ function Sync:_prepare_progress_catalog(callback, options)
             end
         end
         if self:_partial_progress_record(record) then
-            local persisted,persist_error=self:_persist_confirmed_progress_catalog(record,context.chapters,"context_only")
-            if not persisted then
-                logger.warn("[MiuRead][ProgressCatalog] confirmed catalog not persisted",
-                    "book=",book_id,"reason=",tostring(persist_error or "unknown"))
+            local suspended=self._catalog_persist_suspended
+            if type(suspended)=="table" and suspended[book_id] then
+                -- local_chapter_missing_from_catalog is a deterministic
+                -- data-shape failure: the unchanged local chapter map can
+                -- never satisfy the remote catalog, yet each retry logged a
+                -- warning and re-saved the session (a full settings flush).
+                -- Suspend per book for this process; a restart or a catalog
+                -- change clears the suspension naturally.
+            else
+                local persisted,persist_error=self:_persist_confirmed_progress_catalog(record,context.chapters,"context_only")
+                if not persisted then
+                    if persist_error=="local_chapter_missing_from_catalog" then
+                        self._catalog_persist_suspended=self._catalog_persist_suspended or {}
+                        self._catalog_persist_suspended[book_id]=true
+                        logger.warn("[MiuRead][ProgressCatalog] catalog persist suspended for this session",
+                            "book=",book_id,"reason=",tostring(persist_error))
+                    else
+                        logger.warn("[MiuRead][ProgressCatalog] confirmed catalog not persisted",
+                            "book=",book_id,"reason=",tostring(persist_error or "unknown"))
+                    end
+                end
             end
         end
         local current_after=self:record()
