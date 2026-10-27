@@ -15,6 +15,10 @@ local SourcePosition = require("miuread.source_position")
 local U = require("miuread.util")
 local Digests = require("miuread.digests")
 local SubprocessHygiene = require("miuread.subprocess_hygiene")
+-- Optional so sandboxed contract tests that preload only the sync module
+-- keep loading without the pressure helper; the memory gate below is
+-- skipped when the require fails.
+local RuntimePressureOK,RuntimePressure=pcall(require,"miuread.runtime_pressure")
 
 local Sync = {}
 Sync.__index = Sync
@@ -1026,6 +1030,22 @@ function Sync:_prepare_progress_catalog(callback, options)
     local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local vid_snapshot = tostring(account.vid or "")
     if login_snapshot == "" or vid_snapshot == "" then return false, "authentication_required" end
+
+    -- Forking the catalog worker duplicates the resident process page
+    -- tables and boots a fresh interpreter. On small-memory devices a fork
+    -- below the native hibernate line can stall the whole system instead of
+    -- merely failing (observed: device-wide freeze at ~55 MiB free). Every
+    -- caller treats a false start as retryable, so defer instead of fork.
+    if RuntimePressureOK then
+        local memory=RuntimePressure.memory_snapshot(true)
+        local available=memory and tonumber(memory.available_kb or 0) or 0
+        local floor_kb=tonumber(RuntimePressure.thresholds().native_hibernate) or 0
+        if available>0 and floor_kb>0 and available<floor_kb then
+            logger.info("[MiuRead][ProgressMap] catalog prepare deferred for memory",
+                "book=",book_id,"memory_kb=",available,"floor_kb=",floor_kb)
+            return false,"low_memory"
+        end
+    end
 
     local worker
     if self.identity_async and self.identity_async:available() and not self.identity_async:busy() then

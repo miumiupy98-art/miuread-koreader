@@ -23535,6 +23535,19 @@ function Plugin:_recover_all_pending_progress_anchors(items,on_done)
     return true
 end
 
+-- Mapping-family failures are data-shape deterministic: the unchanged local
+-- chapter map can never satisfy the current catalog, so retrying every round
+-- only re-forks the catalog worker (observed: 76 forks in 24 minutes
+-- bleeding the system to a device-wide freeze). After three consecutive
+-- deterministic failures the per-book recovery cools down; a success, a
+-- coordinate reset, or the timeout clears it naturally.
+local COORDINATE_RECOVERY_SUSPEND_SECONDS=900
+local function coordinate_failure_deterministic(err)
+    return err=="whole_progress_unavailable" or err=="whole_progress_missing"
+        or err=="full_catalog_missing" or err=="local_chapter_missing_from_catalog"
+        or err=="chapter_coordinate_incomplete" or err=="position_missing"
+        or err=="current_chapter_not_in_full_catalog" or err=="catalog_word_counts_missing"
+end
 function Plugin:_recover_pending_progress_coordinate(item,callback)
     callback=type(callback)=="function" and callback or function() end
     item=type(item)=="table" and item or {}
@@ -23542,7 +23555,18 @@ function Plugin:_recover_pending_progress_coordinate(item,callback)
     local sessions=self:_persisted_sessions()
     local session=type(sessions[book_id])=="table" and sessions[book_id] or {}
     local coordinate=type(session.pending_progress_coordinate)=="table" and U.copy(session.pending_progress_coordinate) or nil
-    if book_id=="" or not coordinate then callback(true,"no_coordinate"); return true end
+    if book_id=="" or not coordinate then
+        if type(self._coordinate_recovery_failures)=="table" then
+            self._coordinate_recovery_failures[book_id]=nil
+        end
+        callback(true,"no_coordinate"); return true
+    end
+    local failures=type(self._coordinate_recovery_failures)=="table"
+        and self._coordinate_recovery_failures[book_id] or nil
+    if type(failures)=="table" and tonumber(failures.suspended_until or 0)>os.time() then
+        callback(false,"coordinate_recovery_suspended")
+        return false
+    end
     local record_snapshot,record_error=self:_stored_progress_record(book_id)
     if not record_snapshot then
         self:_save_progress_state(book_id,"verification_required","需要打开本书恢复整书目录",nil,nil,coordinate.progress_sequence)
@@ -23552,9 +23576,29 @@ function Plugin:_recover_pending_progress_coordinate(item,callback)
     self:_save_progress_state(book_id,"mapping_preparing","精确章节位置已保存，正在补全整书位置",nil,nil,coordinate.progress_sequence)
     local started=self.sync:recover_partial_coordinate(record_snapshot,coordinate,function(position,err)
         if not position then
+            if coordinate_failure_deterministic(err) then
+                local state=type(self._coordinate_recovery_failures)=="table"
+                    and self._coordinate_recovery_failures[book_id] or nil
+                local count=(type(state)=="table" and tonumber(state.count) or 0)+1
+                self._coordinate_recovery_failures=self._coordinate_recovery_failures or {}
+                if count>=3 then
+                    self._coordinate_recovery_failures[book_id]={
+                        count=count,suspended_until=os.time()+COORDINATE_RECOVERY_SUSPEND_SECONDS,
+                    }
+                    logger.warn("[MiuRead][ProgressRetry] coordinate recovery suspended",
+                        "book=",book_id,"failures=",count,
+                        "resume_after_s=",COORDINATE_RECOVERY_SUSPEND_SECONDS,
+                        "reason=",tostring(err))
+                else
+                    self._coordinate_recovery_failures[book_id]={count=count}
+                end
+            end
             self:_save_progress_state(book_id,"mapping_preparing","精确章节位置已保存，整书目录稍后继续恢复",nil,nil,coordinate.progress_sequence)
             callback(false,err or "catalog_recovery_pending")
             return
+        end
+        if type(self._coordinate_recovery_failures)=="table" then
+            self._coordinate_recovery_failures[book_id]=nil
         end
         position.progress_sequence=tonumber(coordinate.progress_sequence or 0) or nil
         position.progress_epoch=tonumber(coordinate.progress_epoch)
