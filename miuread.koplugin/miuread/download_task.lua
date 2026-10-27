@@ -1116,6 +1116,11 @@ function DownloadTask:hibernated_reason()
     return self.hibernated and tostring(self.hibernated.reason or "") or nil
 end
 
+function DownloadTask:hibernated_cooldown_remaining()
+    local h=self.hibernated
+    return h and math.max(0,(tonumber(h.cooldown_until) or 0)-os.time()) or 0
+end
+
 function DownloadTask:stage()
     local state=self.job and self.job.last_progress_state or nil
     return tostring((state and state.stage) or (self.hibernated and self.hibernated.stage) or "unknown")
@@ -1391,8 +1396,8 @@ function DownloadTask:_handle_hibernated(job,result)
     local hibernate_messages={
         network_offline="网络长时间不可用，下载断点已保存；联网后继续",
         low_battery="设备电量较低，下载断点已保存；唤醒后可继续",
-        restart_fuse="多次自动恢复未成功，断点已保留；设备空闲时将自动继续",
-        memory_pressure="设备内存紧张，已保存断点；空闲时自动继续",
+        restart_fuse="下载多次中断，已保存断点；冷却结束后自动继续",
+        memory_pressure="内存不足，下载已暂停，等待恢复",
         typography_low_memory="排版重整需要内存，下载已让路；完成后自动继续",
         typography_heavy_stage="排版重整需要内存，下载已让路；完成后自动继续",
         native_low_memory="打开其他界面需要内存，下载已让路；返回后自动继续",
@@ -1616,14 +1621,17 @@ end
 function DownloadTask:resume_hibernated(reason)
     local h=self.hibernated
     if not h then return false,"not_hibernated" end
+    if type(h.book)~="table" or tostring(h.book.bookId or "")=="" then
+        return false,"missing_book_identity"
+    end
     local cooldown_until=tonumber(h.cooldown_until) or 0
-    if cooldown_until>os.time() then return false,"low_memory" end
+    if cooldown_until>os.time() then return false,"cooldown_active" end
     local memory=RuntimePressure.memory_snapshot(true)
     local allowed,reason,minimum,available=DownloadAdmission.check(memory,Config,true)
     if not allowed then
         logger.info("[MiuRead][HeavyGuard] hibernated download remains parked",
             "reason=",tostring(reason),"memory_kb=",tostring(available),"minimum_kb=",tostring(minimum))
-        return false,"low_memory"
+        return false,reason or "low_memory"
     end
     self.hibernated=nil
     local options=serializable_copy(h.options or {}) or {}
@@ -1711,18 +1719,21 @@ function DownloadTask:_restart_interrupted(job,stall_recovery)
             -- The restart was deferred only because memory is tight. Keep the
             -- checkpoint parked for the idle pump instead of reporting failure.
             local now=os.time()
+            local parked_reason="memory_pressure"
+            local park_seconds=math.max(0,tonumber(Config.DOWNLOAD_MEMORY_HIBERNATE_MIN_PARK_SECONDS) or 90)
+            local message="内存不足，下载已暂停，等待恢复"
             self.hibernated={book=book,options=options,on_progress=on_progress,on_done=on_done,
                 restart_count=count+1,stall_restart_count=stall_count,backgrounded=self.backgrounded==true,
-                reason="restart_fuse",stage="unknown",started_at=now,
-                cooldown_until=now+math.max(0,tonumber(Config.DOWNLOAD_FUSE_COOLDOWN_SECONDS) or 900),
-                last_state={stage="hibernated",hibernated=true,hibernate_reason="restart_fuse",
-                    message="多次自动恢复未成功，断点已保留；设备空闲时将自动继续",updated_at=now}}
+                reason=parked_reason,stage="unknown",started_at=now,
+                cooldown_until=now+park_seconds,
+                last_state={stage="hibernated",hibernated=true,hibernate_reason=parked_reason,
+                    cooldown_until=now+park_seconds,message=message,updated_at=now}}
             self:_clear_lockscreen_network("download_restart_parked")
             U.atomic_write(self.heavy_watch_path,Json.encode({updated_at=now,owner="download",
-                hibernated=true,reason="restart_fuse"}),true)
+                hibernated=true,reason=parked_reason}),true)
             if on_progress then pcall(on_progress,self.hibernated.last_state) end
             logger.warn("[MiuRead][HeavyGuard] automatic restart parked for memory",
-                "book=",tostring(book and book.bookId or ""))
+                "reason=",parked_reason,"book=",tostring(book and book.bookId or ""))
             pcall(PseudoLockscreen.background_task_done, "download_restart_parked")
             return true
         end
@@ -2192,7 +2203,16 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
     -- its setup cost, so it only needs the (lower) resume threshold.
     collectgarbage("collect")
     local memory=RuntimePressure.memory_snapshot(true)
-    local from_checkpoint=(options or {})._from_checkpoint==true
+    -- A retry flag alone is not proof that checkpoint data exists. The
+    -- downloader validates cached chapters before reusing them; at the fork
+    -- boundary use the lower resume gate only when a partial cache is present.
+    local requested_checkpoint=(options or {})._from_checkpoint==true
+    local cache_present=false
+    if requested_checkpoint and book and type(self.store.book_has_partial_cache)=="function" then
+        local cache_ok,present=pcall(self.store.book_has_partial_cache,self.store,book.bookId)
+        cache_present=cache_ok and present==true
+    end
+    local from_checkpoint=requested_checkpoint and cache_present
     local allowed,reason,minimum,available=DownloadAdmission.check(memory,Config,from_checkpoint)
     if not allowed then
         RuntimePressure.activate("download_start_low_memory",

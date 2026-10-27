@@ -25,7 +25,7 @@ end
 
 local SPECS={
     start_min={"HEAVY_DOWNLOAD_START_RATIO","HEAVY_DOWNLOAD_START_FLOOR_KB","HEAVY_DOWNLOAD_START_MIN_KB",96*1024},
-    resume_min={"HEAVY_DOWNLOAD_RESUME_RATIO","HEAVY_DOWNLOAD_RESUME_FLOOR_KB","HEAVY_DOWNLOAD_RESUME_MIN_KB",72*1024},
+    resume_min={"HEAVY_DOWNLOAD_RESUME_RATIO","HEAVY_DOWNLOAD_RESUME_FLOOR_KB","HEAVY_DOWNLOAD_RESUME_MIN_KB",96*1024},
     running_min={"HEAVY_DOWNLOAD_RUNNING_RATIO","HEAVY_DOWNLOAD_RUNNING_FLOOR_KB","HEAVY_DOWNLOAD_RUNNING_MIN_KB",72*1024},
     native_hibernate={"HEAVY_NATIVE_HIBERNATE_RATIO","HEAVY_NATIVE_HIBERNATE_FLOOR_KB","HEAVY_NATIVE_HIBERNATE_KB",96*1024},
     native_critical={"HEAVY_NATIVE_CRITICAL_RATIO","HEAVY_NATIVE_CRITICAL_FLOOR_KB","HEAVY_NATIVE_CRITICAL_KB",64*1024},
@@ -78,13 +78,13 @@ assert(not config:find("BACKGROUND_MEMORY_CRITICAL_KB",1,true),"old fixed critic
 assert(runtime_pressure:find("function RuntimePressure.compute_thresholds",1,true),"compute_thresholds missing")
 assert(runtime_pressure:find("function RuntimePressure.total_kb",1,true),"total_kb missing")
 assert(runtime_pressure:find("function RuntimePressure.tier",1,true),"tier missing")
-assert(runtime_pressure:find("local thresholds=RuntimePressure.thresholds()"),"memory_snapshot not using scaled levels")
+assert(runtime_pressure:find("local thresholds=RuntimePressure.thresholds()",1,true),"memory_snapshot not using scaled levels")
 
 -- download_task consumes the admission module; absolute keys survive only as caps.
 assert(download_task:find("DownloadAdmission.check(memory,Config,from_checkpoint)",1,true),"start admission missing checkpoint flag")
 assert(download_task:find("DownloadAdmission.check(memory,Config,true)",1,true),"resume admission missing checkpoint flag")
-assert(download_task:find("RuntimePressure.thresholds().running_min"),"running guard not scaled")
-assert(download_task:find("RuntimePressure.thresholds().native_hibernate"),"heavy watch native line not scaled")
+assert(download_task:find("RuntimePressure.thresholds().running_min",1,true),"running guard not scaled")
+assert(download_task:find("RuntimePressure.thresholds().native_hibernate",1,true),"heavy watch native line not scaled")
 assert(not download_task:find("Config.HEAVY_DOWNLOAD_START_MIN_KB",1,true),"start gate still uses the absolute key")
 assert(download_task:find('err=="low_memory"',1,true),"machine-readable low_memory mapping missing")
 local admission=assert(io.open(root.."/miuread.koplugin/miuread/download_admission.lua","rb")):read("*a")
@@ -98,22 +98,22 @@ assert(download_task:find("DOWNLOAD_FUSE_COOLDOWN_SECONDS"),"fuse cooldown not a
 assert(download_task:find(',"low_memory"',1,true),"machine-readable low_memory error code missing")
 assert(download_task:find("/proc/self/oom_score_adj",1,true),"worker oom_score_adj write missing")
 
-assert(main_lua:find("thresholds().cover_coexist"),"cover coexist gate not scaled")
-assert(main_lua:find("thresholds().native_critical"),"native critical line not scaled")
+assert(main_lua:find("thresholds().cover_coexist",1,true),"cover coexist gate not scaled")
+assert(main_lua:find("thresholds().native_critical",1,true),"native critical line not scaled")
 assert(main_lua:find("native_thresholds.native_hibernate"),"native hibernate line not scaled")
 assert(main_lua:find("function Plugin:_download_idle_pump_ensure"),"idle pump missing")
 assert(main_lua:find("function Plugin:_download_idle_pump_stop"),"idle pump stop missing")
 assert(main_lua:find("idle memory window"),"idle pump window log missing")
-assert(main_lua:find("[MiuRead][MemoryProfile]"),"memory profile telemetry missing")
+assert(main_lua:find("[MiuRead][MemoryProfile]",1,true),"memory profile telemetry missing")
 assert(download_task:find("first_effective_progress_at"),"progress-earned restart budget missing")
 assert(download_task:find("restart budget reset"),"restart budget reset log missing")
 assert(main_lua:find("exit_forced_stop"),"forced-stop exit must park as hibernated")
 
-assert(main_lua:find("thresholds().typography_critical"),"typography critical line not scaled")
-assert(main_lua:find("thresholds().typography_hibernate"),"typography hibernate line not scaled")
+assert(main_lua:find("thresholds().typography_critical",1,true),"typography critical line not scaled")
+assert(main_lua:find("thresholds().typography_hibernate",1,true),"typography hibernate line not scaled")
 local downloader=assert(io.open(root.."/miuread.koplugin/miuread/downloader.lua","rb")):read("*a")
 assert(downloader:find("package aborted by hibernate marker",1,true),"package hibernate-marker guard missing")
 assert(downloader:find("package aborted for memory",1,true),"package memory-floor guard missing")
 assert(downloader:find("__MIUREAD_HIBERNATE__:package",1,true),"package abort sentinel missing")
-assert(main_lua:find("排版重整需要内存",1,true),"typography hibernate message not differentiated")
+assert(download_task:find("排版重整需要内存",1,true),"typography hibernate message not differentiated")
 print("memory profile contract: PASS")

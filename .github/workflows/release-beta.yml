@@ -101,6 +101,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'
+          python3 -m unittest discover -s tools -p 'test_beta_release_workflow.py'
+          python3 -m unittest discover -s tools -p 'test_beta11_release_guard.py' 
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
@@ -366,6 +368,12 @@ jobs:
           luajit tools/test_internal_links.lua
           python3 tools/test_extension_center_ux.py
           python3 tools/verify_600_beta1.py
+          python3 tools/verify_memory_profile.py
+          python3 tools/test_beta11_download_resume.py
+          lua5.1 tools/test_beta11_download_resume_policy.lua
+          lua5.1 tools/test_beta11_resume_coordinator.lua
+          luajit tools/test_beta11_download_resume_policy.lua
+          luajit tools/test_beta11_resume_coordinator.lua
 
       - name: Verify E-Ink archives, annotations and translations offline
         shell: bash

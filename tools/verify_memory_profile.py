@@ -157,7 +157,7 @@ for needle in ("DownloadAdmission.check(memory,Config,from_checkpoint)",
                "DownloadAdmission.check(memory,Config,true)",
                "RuntimePressure.thresholds().running_min",
                "RuntimePressure.thresholds().native_hibernate",
-               "_from_checkpoint", "_park_after_restart_fuse",
+               "_from_checkpoint", "book_has_partial_cache", "_park_after_restart_fuse",
                "oom_score_adj", "cooldown_until", ',"low_memory"', 'err=="low_memory"'):
     check(needle in download_task, "download_task.lua contains %s" % needle)
 

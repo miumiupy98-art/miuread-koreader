@@ -17150,40 +17150,48 @@ function Plugin:_navigation_token_valid(token,allowed_states)
     return false
 end
 
+-- One resume coordinator owns the timer. UI events and the idle check both
+-- call this entry point; neither is permitted to create a second recovery
+-- attempt. The download task itself retains the fork/owner and checkpoint
+-- guards and returns machine-readable reasons.
 function Plugin:_schedule_hibernated_download_resume(reason)
-    if self._hibernated_download_resume_task then
-        UIManager:unschedule(self._hibernated_download_resume_task)
-        self._hibernated_download_resume_task=nil
-    end
     if not self.download_task or not self.download_task:is_hibernated() then return false end
-    -- Any resume scheduling implies a parked task exists; keep the idle pump
-    -- armed so a missed UI event (for example after a device wake) cannot
-    -- strand the task without a retry loop.
-    self:_download_idle_pump_ensure(reason)
-    local generation=tonumber(NAVIGATION.generation) or 0
+    if self._hibernated_download_resume_task then return true end
+    local retry_count=math.min(5,math.max(0,tonumber(self._hibernated_low_memory_retry_count) or 0))
+    local hibernate_reason=self.download_task:hibernated_reason()
+    local hibernation=self.download_task.hibernated
+    local policy=require("miuread.download_resume_policy")
+    local delay=policy.next_delay(hibernate_reason,retry_count,
+        self.download_task:hibernated_cooldown_remaining(),Config)
     local task
     task=function()
         if self._hibernated_download_resume_task~=task then return end
         self._hibernated_download_resume_task=nil
+        if not self.download_task or not self.download_task:is_hibernated() then return end
+        -- A canceled task may already have been replaced before this timer
+        -- fires. An old callback must never revive a different book.
+        if self.download_task.hibernated~=hibernation then
+            self:_schedule_hibernated_download_resume("hibernation identity changed")
+            return
+        end
         local state=self:_navigation_state()
-        if generation~=(tonumber(NAVIGATION.generation) or 0) or state=="native" or state=="native_menu"
-            or state=="suspended" or state=="opening_reader" or state=="closing_reader" then
-            self:_download_idle_pump_ensure("navigation blocked")
+        if state=="exiting" or state=="suspended" or state=="native" or state=="native_menu" then
+            -- Wake / foreground change explicitly rearms the coordinator.
             return
         end
-        local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
-            and self.download_task:hibernated_reason() or nil
-        if hibernate_reason=="network_offline" and self:_network_radio_hint()==false then
-            logger.info("[MiuRead][DownloadTask] network-hibernated task remains parked",
-                "reason=offline","navigation=",state)
-            self:_schedule_hibernated_download_resume("network restored")
+        if state=="opening_reader" or state=="closing_reader" then
+            self:_schedule_hibernated_download_resume("navigation blocked")
             return
         end
-        local ok,err=self.download_task:resume_hibernated(reason or "foreground stable")
+        local current_reason=self.download_task:hibernated_reason()
+        if current_reason=="network_offline" and self:_network_radio_hint()==false then
+            self:_schedule_hibernated_download_resume("network offline")
+            return
+        end
+        -- No duplicate memory sampler: admission and the cooldown both live
+        -- inside resume_hibernated and are evaluated just before the fork.
+        local ok,err=self.download_task:resume_hibernated(reason or "idle memory window")
         if ok then
-            -- Flip the shelf card and the persisted state off the stale
-            -- "hibernated" badge immediately; the child's first heartbeat may
-            -- be seconds or a whole rate-limit cooldown away.
             self._hibernated_low_memory_retry_count=0
             local runtime=self._download_runtime
             if runtime then
@@ -17194,71 +17202,43 @@ function Plugin:_schedule_hibernated_download_resume(reason)
                 resumed.updated_at=os.time()
                 self:_on_download_progress(runtime,resumed)
             end
-        elseif err=="low_memory" then
+            return
+        end
+        if err=="low_memory" then
             self._hibernated_low_memory_retry_count=math.min(5,
                 (tonumber(self._hibernated_low_memory_retry_count) or 0)+1)
-            self:_schedule_hibernated_download_resume(reason or "foreground stable")
-            -- The exponential backoff above caps at 60s; the idle pump keeps
-            -- sampling memory on its own cadence so a stretch of low memory
-            -- cannot strand the parked task between UI events.
-            self:_download_idle_pump_ensure("low memory backoff")
-        elseif not ok then
-            self._hibernated_low_memory_retry_count=0
+        elseif err~="cooldown_active" then
+            -- Bounded retries remain visible in diagnostics; keep the
+            -- checkpoint and do not change an uncertain failure into success.
+            self._hibernated_low_memory_retry_count=math.min(5,
+                (tonumber(self._hibernated_low_memory_retry_count) or 0)+1)
             logger.warn("[MiuRead][DownloadTask] hibernated resume failed",
-                "reason=",tostring(hibernate_reason or "unknown"),"error=",tostring(err or "unknown"))
-        else
-            self._hibernated_low_memory_retry_count=0
+                "reason=",tostring(current_reason or "unknown"),"error=",tostring(err or "unknown"))
         end
+        self:_schedule_hibernated_download_resume("resume retry")
     end
     self._hibernated_download_resume_task=task
-    local hibernate_reason=type(self.download_task.hibernated_reason)=="function"
-        and self.download_task:hibernated_reason() or nil
-    local retry_count=math.min(5,math.max(0,tonumber(self._hibernated_low_memory_retry_count) or 0))
-    local delay=hibernate_reason=="network_offline" and 8
-        or math.min(60,math.max(2.0,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5)
-            *(2^retry_count))
     UIManager:scheduleIn(delay,task)
     return true
 end
 
 function Plugin:_download_idle_pump_stop()
+    -- The idle pump is now an alias of the single coordinator, not an
+    -- independent timer that may race a foreground retry.
     if self._download_idle_pump_task then
         UIManager:unschedule(self._download_idle_pump_task)
         self._download_idle_pump_task=nil
     end
+    if self._hibernated_download_resume_task then
+        UIManager:unschedule(self._hibernated_download_resume_task)
+        self._hibernated_download_resume_task=nil
+    end
     return true
 end
 
--- A hibernated download used to wait for a UI event (returning from native,
--- typography settling) to revive. On a small-memory device those windows are
--- rare, so this slow self-looping pump keeps sampling for any memory window
--- that is large enough to restart the checkpointed worker.
 function Plugin:_download_idle_pump_ensure(reason)
-    if self._download_idle_pump_task then return true end
-    if not self.download_task or not self.download_task:is_hibernated() then return false end
-    local task
-    task=function()
-        if self._download_idle_pump_task~=task then return end
-        self._download_idle_pump_task=nil
-        if not self.download_task or not self.download_task:is_hibernated() then return end
-        local state=self:_navigation_state()
-        if state~="native" and state~="native_menu" and state~="suspended"
-            and state~="opening_reader" and state~="closing_reader" and state~="exiting" then
-            local memory=RuntimePressure.memory_snapshot(true)
-            local resume_min=RuntimePressure.thresholds().resume_min
-            if memory and tonumber(memory.available_kb or 0)>=resume_min then
-                logger.info("[MiuRead][DownloadTask] idle memory window",
-                    "memory_kb=",tostring(memory.available_kb),
-                    "resume_min_kb=",tostring(resume_min),
-                    "reason=",tostring(reason or "pump"))
-                self:_schedule_hibernated_download_resume("idle memory window")
-            end
-        end
-        self:_download_idle_pump_ensure("pump tick")
-    end
-    self._download_idle_pump_task=task
-    UIManager:scheduleIn(math.max(15,tonumber(Config.DOWNLOAD_IDLE_PUMP_SECONDS) or 75),task)
-    return true
+    -- idle memory window: this entry remains for existing callers and tests.
+    return self:_schedule_hibernated_download_resume(reason or "idle memory window")
 end
 
 function Plugin:_set_foreground(owner)
@@ -19278,8 +19258,11 @@ function Plugin:_on_download_progress(runtime,state)
                     self:_schedule_hibernated_download_resume("network restored")
                 end
             elseif state.hibernate_reason=="restart_fuse" then
-                self:_update_open_shelf_download_status(runtime.book.bookId,"多次中断 · 稍后自动继续")
+                self:_update_open_shelf_download_status(runtime.book.bookId,"多次中断 · 冷却后自动继续")
                 self:_download_idle_pump_ensure("task parked by restart fuse")
+            elseif state.hibernate_reason=="memory_pressure" then
+                self:_update_open_shelf_download_status(runtime.book.bookId,"内存不足 · 等待自动恢复")
+                self:_download_idle_pump_ensure("task parked by memory")
             else
                 self:_update_open_shelf_download_status(runtime.book.bookId,"已安全释放资源 · 稍后继续")
                 self:_download_idle_pump_ensure("task hibernated")

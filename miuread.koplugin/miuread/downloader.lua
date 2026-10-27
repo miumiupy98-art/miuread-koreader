@@ -1110,9 +1110,9 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     local RuntimePressureWorker=require("miuread.runtime_pressure")
     local package_abort_kb=RuntimePressureWorker.thresholds().package_abort
     local package_guard_count=0
-    local function package_guard()
+    local function package_guard(force)
         package_guard_count=package_guard_count+1
-        if package_guard_count%16~=0 then return end
+        if not force and package_guard_count%16~=0 then return end
         if type(opt.hibernating)=="function" and opt.hibernating() then
             logger.warn("[MiuRead][Download] package aborted by hibernate marker")
             error("__MIUREAD_HIBERNATE__:package")
@@ -1151,6 +1151,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
             })
         end
     end
+    -- Check the very first package step, even for books with <16 callbacks.
+    package_guard(true)
     local built,build_error=pcall(Epub.build,temp_path,book,chapters,css,assets,cover,{
         schema=8,book_id=book.bookId,title=book.title,author=book.author,
         variant=storage_kind,base_variant=kind,standalone=standalone,chapter_uid=opt.chapter_uid,
@@ -1184,6 +1186,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
     },package_progress)
     if not built then os.remove(temp_path); error(build_error) end
+    local boundary_ok,boundary_error=pcall(package_guard,true)
+    if not boundary_ok then os.remove(temp_path); error(boundary_error,0) end
     ensure_not_cancelled()
     if type(progress)=="function" then
         progress("package",1,1,book.title,{
@@ -1211,7 +1215,13 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
             })
         end
     end
-    local valid,validation_error=EpubInstaller.validate(temp_path,validation_options)
+    -- validate() can throw when its progress callback detects hibernation.
+    -- That exception must not leave a half-validated .miuread-new-*.epub.
+    local validation_call_ok,valid,validation_error=pcall(EpubInstaller.validate,temp_path,validation_options)
+    if not validation_call_ok then
+        os.remove(temp_path)
+        error(valid,0)
+    end
     if not valid then
         logger.warn("[MiuRead][Download] EPUB validation failed",tostring(validation_error))
         os.remove(temp_path)
@@ -1277,6 +1287,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         end
         opt.translation_batch_summary=total>0 and {total=total,available=available} or nil
     end
+    local preinstall_ok,preinstall_error=pcall(package_guard,true)
+    if not preinstall_ok then os.remove(temp_path); error(preinstall_error,0) end
     logger.info("[MiuRead][Download] low-memory EPUB package completed",
         "bytes=",tostring(U.file_size(temp_path) or 0),
         "memory_kb=",tostring(math.floor(collectgarbage("count"))))

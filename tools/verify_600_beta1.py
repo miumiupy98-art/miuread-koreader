@@ -88,7 +88,12 @@ ok(all(name not in main for name in dead_methods),'17 unreferenced private legac
 ok('(relative.parts and relative.parts[0] == "native")' in workflow,'release package excludes native build source')
 ok('forbidden_prefixes = {"miuread.koplugin/native/"}' in workflow,'release verifier rejects native build source')
 verifiers=sorted((root/'tools').glob('verify_*.py'))
-ok([p.name for p in verifiers]==['verify_600_beta1.py'],'historical verifier scripts pruned from current source tree')
+required_verifiers={'verify_600_beta1.py','verify_memory_profile.py'}
+legacy_verifiers={'verify_590_beta19.py','verify_590_beta18.py'}
+ok(required_verifiers.issubset({p.name for p in verifiers}),
+   'current baseline and memory-profile verifiers are retained')
+ok(not (legacy_verifiers & {p.name for p in verifiers}),
+   'obsolete historical verifier scripts remain pruned')
 native_dir=root/'miuread.koplugin/native'
 ok((native_dir/'miucodec.cpp').is_file() and (native_dir/'build.sh').is_file(),'native build source retained in source repository')
 stillness=root/'miuread.koplugin/miuread/book_excerpt_card/assets/cards/stillness'
