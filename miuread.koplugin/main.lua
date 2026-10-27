@@ -22580,6 +22580,12 @@ function Plugin:_sync_user_issue(status, session)
     if progress_state=="waiting_network" or kind=="transport" then
         return {label="同步失败",reason="当前网络暂时无法连接微信读书",advice="网络恢复后点“重新同步”即可继续",action="progress"}
     end
+    local suspension=type(self._coordinate_recovery_failures)=="table"
+        and self._coordinate_recovery_failures[book_id] or nil
+    if type(suspension)=="table" and tonumber(suspension.suspended_until or 0)>os.time() then
+        return {label="同步失败",reason="本书章节目录与微信读书不一致，自动恢复已暂停",
+            advice="在书籍菜单中“重置阅读进度同步状态”后可恢复",action="none"}
+    end
     if session.sync_repair_required==true or status.state=="repair_required" or kind=="context" or kind=="position" then
         return {label="同步失败",reason="当前书籍的章节位置无法可靠对应",advice="检查并修复当前书籍同步",action="repair"}
     end
@@ -23596,6 +23602,13 @@ function Plugin:_recover_pending_progress_coordinate(item,callback)
                         "book=",book_id,"failures=",count,
                         "resume_after_s=",cooldown,
                         "reason=",tostring(err))
+                    -- Surface the suspension on the book itself instead of
+                    -- failing silently: the generic "resync will retry the
+                    -- mapping" advice cannot fix a data-shape mismatch, the
+                    -- reset entry in the book menu can.
+                    self:_save_progress_state(book_id,"mapping_failed",
+                        "本书章节目录与微信读书不一致，自动恢复已暂停；可在书籍菜单重置阅读进度同步",
+                        nil,nil,coordinate.progress_sequence)
                 else
                     self._coordinate_recovery_failures[book_id]={count=count}
                 end
