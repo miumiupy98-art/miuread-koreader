@@ -700,6 +700,15 @@ function Store:new(options)
         logger.info("[MiuRead][StoreRepair] 5.9.1 exact snapshots normalized",
             "sessions=",tostring(repaired))
     end
+    -- Promote the device-tested outbox without changing the user's master
+    -- switch. The v1 SQLite ledger is upgraded lazily and never reset here.
+    if o.db:readSetting("readtime_outbox_v2")~=true then
+        local preferences=o.db:readSetting("preferences",{})
+        if type(preferences.sync)=="table" then preferences.sync.offline_time_enabled=nil end
+        o.db:saveSetting("preferences",preferences)
+        o.db:saveSetting("readtime_outbox_v2",true)
+        startup_dirty=true
+    end
     -- Do not rewrite miuread.lua on every plugin construction. Persist only a
     -- real first-run/default/schema migration, and never turn a settings write
     -- failure into a plugin-load failure.

@@ -209,4 +209,21 @@ print('beta19 targeted progress abandonment with time-debt preservation: PASS')
 
 local loader,err=loadfile(TMP..'/settings.lua'); assert(loader,err)
 local ok,data=pcall(loader); assert(ok and type(data)=='table','compacted settings file is not valid Lua')
+
+-- Promoting the statistics outbox must preserve either master-switch choice,
+-- safe legacy carry and an existing test-version ledger without rewriting it.
+local ledger=TMP..'/data/readtime-outbox.sqlite3'
+local marker=assert(io.open(ledger,'wb'));marker:write('existing-ledger-fixture');marker:close()
+SEED.schema=135 -- already at this fixture's current schema; no ancient reset
+for _,enabled in ipairs({false,true}) do
+    SEED.preferences.sync={time_enabled=enabled,offline_time_enabled=true}
+    SEED.sessions.book2={pending_report_safe=true,pending_report_seconds=90}
+    local upgraded=Store:new{isolated=true,data_dir=TMP..'/data',settings_path=TMP..'/upgrade.lua'}
+    assert(upgraded:preferences().sync.time_enabled==enabled,'outbox promotion changed the master switch')
+    assert(upgraded:preferences().sync.offline_time_enabled==nil,'obsolete experimental switch survived')
+    assert(upgraded:get('readtime_outbox_v2',false)==true,'outbox migration marker missing')
+    assert(upgraded:session('book2').pending_report_seconds==90 and upgraded:session('book2').pending_report_safe,
+        'outbox promotion dropped safe legacy carry')
+    local f=assert(io.open(ledger,'rb'));assert(f:read('*a')=='existing-ledger-fixture');f:close()
+end
 print('store compaction + schema134/135 shelf recovery migration: PASS')

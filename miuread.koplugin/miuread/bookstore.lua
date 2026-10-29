@@ -387,6 +387,7 @@ local function authorize_shelf(plugin,detail,client_access)
                 toast=function(_,text,duration) plugin:toast(text,duration) end,
                 info=function(_,text) plugin:info(text) end,
                 on_auth_success=function()
+                    if plugin.sync and plugin.sync.wake_offline_reading_time then plugin.sync:wake_offline_reading_time() end
                     plugin:info(client_access and "E-Ink 客户端授权已保存。自动模式下，书架、书城、批注读取及下载将优先使用 E-Ink。" or "书架管理授权已保存。请重新选择要移除的书籍。")
                 end,
             }

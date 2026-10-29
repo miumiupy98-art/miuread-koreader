@@ -1027,6 +1027,11 @@ function Plugin:init()
     end
     self.auth_flow=Auth:new(self.http,self.store,self)
     self.sync=Sync:new(self.reader,self.api,self.store,self,self.async,self.identity_async)
+    UIManager:scheduleIn(2,function()
+        if self.sync and not self.sync.quiescing and not self.sync.suspended then
+            self.sync:wake_offline_reading_time()
+        end
+    end)
     self._suspended_at=nil
     self._cover_generation=0
     self._cover_refresh_task=nil
@@ -16087,7 +16092,9 @@ function Plugin:_show_reader_sync_settings_panel(back_callback)
             local sync=self.store:preferences().sync or {}
             return {
                 {title="自动同步",rows={
-                    {label="阅读时间",value=sync.time_enabled==true and "已开启 · 结束阅读后上报" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_sync() end},
+                    {label="阅读时长同步",value=self:reading_time_status_label(),value_bold=true,keep_open=true,callback=function()
+                        self:_show_reader_menu_table("阅读时长同步",self:reading_time_menu(),return_here)
+                    end},
                     {label="阅读进度",value=self:progress_upload_mode()=="manual" and "仅手动" or "结束阅读时同步",value_bold=true,callback=function() self:_show_reader_menu_table("阅读进度",self:progress_upload_mode_menu(),return_here) end},
                     {label="批注",value=self:_annotation_close_upload_enabled() and "结束阅读时同步" or "仅手动",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_close_upload() end},
                     {label="自动同步最新阅读位置",value=(sync.auto_latest_position~=false and sync.pull_on_open~=false) and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_pull_on_open() end},
@@ -25178,6 +25185,7 @@ function Plugin:_sync_home_pending(options)
     end
 
     local function phase_time()
+        self.sync:wake_offline_reading_time()
         local items=self:_reading_time_sync_issue_items()
         if #items<=0 then return phase_annotations() end
         local started=self:_retry_all_safe_reading_time(items,true,function()
@@ -25289,7 +25297,8 @@ function Plugin:sync_settings_menu()
     local prefs=self.store:preferences()
     local sync=prefs.sync or {}
     return {
-        {text="阅读时间",post_text=sync.time_enabled==true and "已开启 · 结束阅读后上报" or "已关闭",checked_func=function() return (self.store:preferences().sync or {}).time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="阅读时长同步",post_text=self:reading_time_status_label(),
+            sub_item_table_func=function() return self:reading_time_menu() end},
         {text="阅读进度",post_text=self:progress_upload_mode_label(),sub_item_table_func=function() return self:progress_upload_mode_menu() end},
         {text="批注",post_text=self:_annotation_close_upload_enabled() and "结束阅读时同步" or "仅手动",checked_func=function() return self:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() self:toggle_annotation_close_upload() end},
         {text="自动同步最新阅读位置",post_text=(sync.auto_latest_position~=false and sync.pull_on_open~=false) and "已开启" or "已关闭",checked_func=function() local s=(self.store:preferences().sync or {}); return s.auto_latest_position~=false and s.pull_on_open~=false end,keep_menu_open=true,callback=function() self:toggle_pull_on_open() end},
@@ -25313,6 +25322,110 @@ function Plugin:sync_menu()
     return rows
 end
 
+local function reading_time_duration(seconds)
+    seconds=math.max(0,tonumber(seconds) or 0)
+    return seconds<60 and (tostring(seconds).." 秒") or (string.format("%.1f",seconds/60).." 分钟")
+end
+function Plugin:reading_time_status_label()
+    if (self.store:preferences().sync or {}).time_enabled~=true then return "已关闭" end
+    local backend=self.sync.reading_time_backend or require("miuread.api_transport").new(self.store).selected
+    if backend=="web" then return self:_reading_time_status_label() end
+    local controller=self.sync:offline_time_controller()
+    local summary=controller and controller:summary() or {}
+    if summary.error then return summary.error=="ledger_full" and "本地记录已满" or "本地记录异常" end
+    if summary.blocked then return "已暂停 · 请核对云端位置" end
+    if (summary.unknown or 0)>0 then return "有待确认记录" end
+    if (summary.in_flight or 0)>0 then return "正在同步" end
+    if (summary.control or {}).reason=="authentication" then return "需要授权" end
+    if (summary.pending or 0)>0 then
+        return "待同步 "..reading_time_duration(summary.pending)
+    end
+    if summary.capture_error=="statistics_unavailable" then return "请开启 KOReader 阅读统计" end
+    return summary.last_success_at and "已同步" or "已开启 · 自动记录与同步"
+end
+function Plugin:reading_time_unknown_menu(offset)
+    local controller=self.sync:offline_time_controller()
+    local groups=controller and controller:unknown()
+    if not groups then return {{text="本地记录读取失败，请导出运行日志",enabled=false}} end
+    if #groups==0 then return {{text="没有待确认记录",enabled=false}} end
+    local rows={}
+    offset=offset or 1
+    for i=offset,math.min(#groups,offset+49) do
+        local group=groups[i]
+        local book=self.store:book(group.book_id)
+        local title=book and (book.title or (book.book or {}).title) or group.book_id
+        rows[#rows+1]={text=tostring(title),post_text=reading_time_duration(group.seconds),sub_item_table_func=function()
+            return {
+                {text=os.date("%Y-%m-%d %H:%M",group.start_time).." — "..os.date("%H:%M",group.end_time),enabled=false},
+                {text="时长："..reading_time_duration(group.seconds),enabled=false},
+                {text="请求已发出，但未收到明确回执",enabled=false},
+                {text="请先在微信读书核对时长；此记录不会自动重发",enabled=false},
+                {text="忽略该记录",callback=function()
+                    UIManager:show(ConfirmBox:new{
+                        text="忽略这条 "..reading_time_duration(group.seconds).." 的待确认记录？\n\n忽略后不会补传，KOReader 阅读统计仍保留。",
+                        ok_text="忽略记录",cancel_text="保留",ok_callback=function()
+                            local seconds,err=controller:ignore(group)
+                            self:info(seconds and "已忽略该记录。" or err)
+                        end,
+                    })
+                end},
+            }
+        end}
+    end
+    if #groups>offset+49 then rows[#rows+1]={text="更多待确认记录",sub_item_table_func=function() return self:reading_time_unknown_menu(offset+50) end} end
+    return rows
+end
+function Plugin:reading_time_menu()
+    local prefs=self.store:preferences().sync or {}
+    local controller=self.sync:offline_time_controller()
+    local summary=controller and controller:summary() or {pending=0,unknown=0,in_flight=0}
+    local rows={
+        {text="阅读时长同步",post_text=self:reading_time_status_label(),checked_func=function()
+            return (self.store:preferences().sync or {}).time_enabled==true
+        end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="待同步："..reading_time_duration(summary.pending),enabled=false},
+        {text="待确认："..reading_time_duration(summary.unknown),enabled=(summary.unknown or 0)>0,
+            sub_item_table_func=function() return self:reading_time_unknown_menu() end},
+        {text="立即同步",enabled=prefs.time_enabled==true and not summary.blocked,callback=function()
+            self.sync:wake_offline_reading_time()
+            self:toast("已安排后台同步；若正在等待重试，将按原定间隔继续。",3)
+        end},
+    }
+    local control=summary.control or {}
+    local reasons={authentication="登录或授权需要恢复",network="网络暂不可用",rate_limited="接口限频，正在等待冷却",
+        prepare_failed="上传准备失败，将自动重试",config_token_missing="服务端未返回签名配置，将自动重试",
+        signature_token_invalid="服务端签名配置异常，将自动重试",web_request_failed="Web 上传准备失败，将自动重试",
+        worker_unavailable="后台任务暂不可用；可稍后点击立即同步重试"}
+    if control.reason then rows[#rows+1]={text=reasons[control.reason] or "等待下次同步",enabled=false} end
+    if (tonumber(control.next_send) or 0)>os.time() then rows[#rows+1]={text="下次尝试："..os.date("%m-%d %H:%M",control.next_send),enabled=false} end
+    if summary.blocked then rows[#rows+1]={text="核对云端位置并恢复补传",callback=function()
+        self:toast("正在核对云端位置…",2)
+        controller:check_and_resume(self,function(_,message) self:info(message) end)
+    end} end
+    if summary.error or summary.capture_error then rows[#rows+1]={text="查看记录问题",callback=function()
+        local reason=summary.error or summary.capture_error
+        local messages={statistics_unavailable="请在 KOReader 的工具菜单中开启阅读统计，然后重新打开书籍。只记录开启同步后的阅读，不会上传历史统计。",
+            ledger_full="本地待同步记录已达到容量上限，新记录暂未收集。请联网同步，或核对并忽略待确认记录，再重新打开书籍。",
+            clock_moved_backwards="设备时间向后变化，已暂停收集。请校准系统日期和时间，再重新打开书籍。"}
+        self:info(messages[reason] or "本地阅读时长记录无法保存或读取。请检查剩余空间及文件权限，并导出运行日志排查。已有队列不会自动清空。")
+    end} end
+    if not self:_shelf_management_authorized() then rows[#rows+1]={text="授权 E-Ink 离线补传",callback=function()
+        require("miuread.bookstore").authorize_client(self)
+    end}
+    elseif control.reason=="authentication" then rows[#rows+1]={text="检查账号与授权",callback=function() self:show_account_status() end} end
+    if self.store:preferences().api_transport=="web" then rows[#rows+1]={text="历史时长等待切回自动接口后补传",enabled=false} end
+    rows[#rows+1]={text="使用说明",callback=function()
+        self:info("自动接口且 E-Ink 已授权时，请开启 KOReader 阅读统计；本次阅读时长先保存到本机，联网后经 E-Ink 补传。\n\nWeb 沿用原有在线周期上报与关书尾段流程，不补传离线队列。每次开书固定一种计时来源，修改通道或授权后下次开书生效。\n\n待确认记录不会自动重发，可先在微信读书核对后忽略。关闭同步会保留已有队列。")
+    end}
+    rows[#rows+1]={text="详细诊断日志",checked_func=function() return (self.store:preferences().sync or {}).time_diagnostics==true end,
+        keep_menu_open=true,callback=function()
+            local p=self.store:preferences(); p.sync.time_diagnostics=not p.sync.time_diagnostics
+            self:_save_ui_preferences(p,"readtime_diagnostics")
+        end}
+    rows[#rows+1]={text="导出运行日志",callback=function() self:export_runtime_log() end}
+    return rows
+end
+
 function Plugin:toggle_time_sync(confirmed)
     local current=self.store:preferences()
     if current.sync.time_enabled==true and confirmed~=true then
@@ -25326,10 +25439,11 @@ function Plugin:toggle_time_sync(confirmed)
     self:_save_ui_preferences(p,"time_sync_toggle")
     if p.sync.time_enabled then
         self.sync:start("enabled")
+        self.sync:wake_offline_reading_time()
         if self:_original_weread_plugin_present() then
-            self:info("阅读时间同步已开启。阅读期间仅记录时长，在结束阅读后后台上报。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。若两边都开启阅读时间同步，可能重复上报；建议只保留一边。")
+            self:info("阅读时长同步已开启，E-Ink 离线记录需要开启 KOReader 阅读统计。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。若两边都开启阅读时间同步，可能重复上报；建议只保留一边。")
         else
-            self:status_toast("自动上传阅读时间","已开启 · 60 秒",3)
+            self:status_toast("阅读时长同步","已开启",3)
         end
     else
         self.sync:stop("disabled")
@@ -27288,8 +27402,6 @@ function Plugin:show_sync_status(detail)
     end
     local issue=self:_sync_user_issue(s,current_session)
     local time_text=self:_reading_time_status_label()
-    if s.time_enabled and s.record and s.state=="paused" and not issue then time_text="已暂停" end
-    if s.time_enabled and s.record and s.state=="uploading" and not issue then time_text="正在同步" end
 
     if HomeView.is_shown() and not self:_active_reader_ui() then
         local pending=self:_home_sync_summary(true)
@@ -27303,6 +27415,7 @@ function Plugin:show_sync_status(detail)
                 self:progress_sync_label())
         local rows={
             {text="手动同步",sub_item_table_func=function() return self:sync_now_menu() end},
+            {text="阅读时长",post_text=time_text,sub_item_table_func=function() return self:reading_time_menu() end},
         }
         local total_failed=tonumber(pending.failed_total or 0) or 0
         if total_failed>0 then
@@ -27362,8 +27475,8 @@ function Plugin:show_sync_status(detail)
     if detail then
         lines[#lines+1]=""
         lines[#lines+1]="详细信息"
-        lines[#lines+1]="常规阅读时间上报周期：约 60 秒"
-        lines[#lines+1]="历史失败/休眠时长：不补传"
+        lines[#lines+1]="阅读时长先保存到本机，联网后自动同步"
+        lines[#lines+1]="离线片段等待 E-Ink 补传；休眠期间不计时"
         lines[#lines+1]="后台服务版本："..tostring(s.service_version or "—")
         if s.last_elapsed then lines[#lines+1]="上次提交时长："..tostring(s.last_elapsed).." 秒" end
         if s.last_stage then lines[#lines+1]="当前阶段："..U.first_line(s.last_stage,160) end
@@ -27449,7 +27562,7 @@ function Plugin:on_auth_required(channel,err)
     local notify=tostring(channel or "")~="read_report"
     local marked=self:_mark_auth_problem(channel,err,notify)
     if marked and not notify then
-        self:status_toast("阅读时间上传","登录验证暂时失败，本次时间不补传；下载不受影响",5)
+        self:status_toast("阅读时长同步","登录验证暂时失败，时长已保留，请恢复登录后重试",5)
     end
     return marked
 end
@@ -28451,6 +28564,7 @@ function Plugin:api_transport_menu()
         local prefs=self.store:preferences()
         prefs.api_transport=mode
         self.store:save_preferences(prefs)
+        self.sync:wake_offline_reading_time()
         self:toast("接口通道设置将在下次操作时生效")
     end
     return {
@@ -31364,6 +31478,7 @@ function Plugin:onNetworkConnected()
     local generation=self._network_recovery_generation
     UIManager:scheduleIn(.8,function()
         if generation~=tonumber(self._network_recovery_generation) then return end
+        self.sync:wake_offline_reading_time()
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self:_sync_home_pending({silent=true,source="network_restored"})
             if tostring(self._home_active_section or "shelf")=="shelf" then self:_home_refresh_remote(false,false) end
@@ -31523,9 +31638,9 @@ function Plugin:_reading_end_sync(reason,options,callback)
         transfer_priority_started=self:_critical_transfer_begin("reading_end")~=false
     end
 
-    -- One durable control write hands the final time segment to the long-lived
-    -- service. The service owns the clock and computes `now-last_report_at`.
-    -- Home/close never waits for the writer to finish or exit.
+    -- Seal KOReader statistics into the durable outbox. Any old service still
+    -- being retired keeps its existing writer barrier; new captures never use
+    -- that service's wall clock. Home/close does not wait for outbox uploads.
     local time_handoff=self.sync:stop_fast("reading_end:"..reason,nil)
     self.sync.reading_end_finalized=true
 
@@ -31566,7 +31681,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         return true
     end
     local task_states={
-        time=time_handoff and "后台处理" or "无需补传",
+        time=time_handoff and "后台处理" or self:reading_time_status_label(),
         progress=need_progress and "正在保存最终位置" or "仅手动",
         annotations=need_annotations and "后台同步" or "无变化",
     }

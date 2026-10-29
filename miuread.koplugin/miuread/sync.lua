@@ -3594,10 +3594,18 @@ function Sync:retry_safe_reading_time(book_id,record_override,position_override,
     return send_next()
 end
 
-function Sync:begin_progress_write(reason, callback)
+function Sync:begin_progress_write(reason, callback,reading_time_granted)
     callback=type(callback)=="function" and callback or function() end
+    self:offline_time_controller()
+    if self.offline_time and reading_time_granted~=true then
+        return self.offline_time:yield_to_progress(self,function(ok)
+            if ok then self:begin_progress_write(reason,callback,true)
+            else callback(false,{state="offline_time_writer_busy"}) end
+        end)
+    end
     reason=tostring(reason or "progress_write")
     if self.progress_write_fence==true then
+        if self.offline_time then self.offline_time:release_progress(self) end
         callback(false,{state="progress_fence_busy"})
         return false
     end
@@ -3648,6 +3656,7 @@ function Sync:begin_progress_write(reason, callback)
             waiting=false
             if notice_task then UIManager:unschedule(notice_task); notice_task=nil end
             if not ok then
+                if self.offline_time then self.offline_time:release_progress(self) end
                 self.progress_write_fence=false
                 self.progress_write_fence_seq=0
                 self:_write_daemon_control(true,true,{progress_fence=false})
@@ -3685,6 +3694,7 @@ function Sync:begin_progress_write(reason, callback)
 end
 
 function Sync:end_progress_write(reason)
+    if self.offline_time then self.offline_time:release_progress(self) end
     local had_fence=self.progress_write_fence==true
     if had_fence then
         self.progress_write_fence=false
@@ -4979,6 +4989,13 @@ function Sync:_start_daemon(reason)
         self.last_stage = "当前文件未启用阅读时间同步"
         return false, "当前文件未启用阅读时间同步"
     end
+    -- A session has exactly one clock owner. Keep the upstream Web service
+    -- unchanged; only Native sessions use the historical statistics outbox.
+    if self.reading_time_backend=="eink" then
+        local controller=self:offline_time_controller()
+        if self.suspended or not controller:enabled() then return false end
+        return controller:start(self,record)
+    end
     local book_id = tostring(record.book.book_id or "")
     local core_hash=self:_core_map_hash(record)
     local time_only=not self:periodic_progress_enabled()
@@ -5358,6 +5375,19 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     return barrier_seq
 end
 
+function Sync:offline_time_controller()
+    if not self.offline_time then
+        self.offline_time=require("miuread.readtime_controller").new(self.store)
+    end
+    return self.offline_time
+end
+
+function Sync:wake_offline_reading_time()
+    if (self.store:preferences().sync or {}).time_enabled~=true then return end
+    local controller=self:offline_time_controller()
+    if controller then controller:wake(self.host) end
+end
+
 function Sync:start(reason)
     if self.quiescing==true then
         self.state="stopped"
@@ -5388,6 +5418,7 @@ function Sync:start(reason)
     local enabled = prefs.time_enabled == true
     self.time_enabled = enabled
     if not enabled then
+        if self.offline_time then self.offline_time:stop(self,"disabled",false) end
         self.progress_hold = false
         self.state = "stopped"
         self.last_stage = "阅读时间同步已关闭"
@@ -5408,6 +5439,20 @@ function Sync:start(reason)
             "book=",tostring(record.book and record.book.book_id or ""))
         return false,"当前文件未启用阅读时间同步"
     end
+    if not self.reading_time_backend then
+        self.reading_time_backend=require("miuread.api_transport").new(self.store).selected
+    end
+    if self.reading_time_backend=="eink" then
+        -- Pin the clock owner until the next document session. Auth/settings
+        -- changes cannot count an existing Native interval again through Web.
+        if self.suspended then return false,"设备已休眠" end
+        if self.daemon and self.daemon.active then self:_stop_daemon("statistics_time_mode",true,0) end
+        local ok,err=self:offline_time_controller():start(self,record)
+        self.state=ok and "waiting" or "paused"
+        self.last_stage=ok and "本地记录阅读时长，联网后补传" or err
+        self.last_error=nil
+        return ok,err
+    end
     if enabled and self:periodic_progress_enabled() and not self:is_verified(record.book.book_id) then
         self.progress_hold = true
         self.state = "verification_required"
@@ -5426,9 +5471,11 @@ function Sync:start(reason)
 end
 
 function Sync:stop(reason, flush_elapsed)
+    if self.offline_time then self.offline_time:stop(self,reason,false) end
     self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
     local barrier_seq=self:_stop_daemon(reason, true, flush_elapsed)
     self.async:cancel(reason)
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy = false
     self.progress_hold = false
     self.state = "stopped"
@@ -5438,9 +5485,11 @@ function Sync:stop(reason, flush_elapsed)
 end
 
 function Sync:stop_fast(reason, flush_elapsed)
+    if self.offline_time then self.offline_time:stop(self,reason,false) end
     self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
     local barrier_seq=self:_stop_daemon_fast(reason, flush_elapsed)
     self.async:cancel(reason)
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy = false
     self.progress_hold = false
     self.state = "stopped"
@@ -5485,6 +5534,7 @@ function Sync:preempt_reading_time_for_progress(reason, callback, flush_settled)
     self.progress_write_fence=false
     self.progress_write_fence_seq=0
     if self.async then self.async:cancel(reason) end
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy=false
     self.progress_hold=false
     self.state="stopped"
@@ -5640,6 +5690,14 @@ function Sync:on_reader_ready()
         return true
     end
     local ready_record=self:record()
+    local native_active=self.offline_time and self.offline_time.active
+    if self.reading_time_backend=="eink" and native_active and native_active.sync==self and ready_record
+        and native_active.book_id==tostring(ready_record.book.book_id or "")
+        and tostring(native_active.record.path or "")==tostring(ready_record.path or "") then
+        self.current=ready_record
+        self.suspended=false
+        return
+    end
     local ready_job=self.daemon and read_json_file(self.daemon.paths.job) or {}
     if self.daemon and self.daemon.active and ready_record
         and tostring(self.daemon.book_id or "")==tostring(ready_record.book.book_id or "")
@@ -5665,6 +5723,7 @@ function Sync:on_reader_ready()
     self.last_activity = 0
     self.last_page = nil
     self.session_started_at = os.time()
+    self.reading_time_backend=nil
     self:_ensure_reading_time_ids(true,true)
     self.resume_after_finalizer=false
     self.first_success_notified = false
@@ -5718,6 +5777,8 @@ function Sync:_defer_session_flush(delay)
 end
 
 function Sync:on_suspend(options)
+    self:offline_time_controller()
+    if self.offline_time then self.offline_time:stop(self,"suspend",true) end
     options=type(options)=="table" and options or {}
     local generation=tonumber(options.generation or 0) or 0
     if generation>0 and generation==tonumber(self.suspend_generation or 0) then return true end
@@ -5768,6 +5829,7 @@ function Sync:on_suspend(options)
 end
 
 function Sync:on_resume(_slept)
+    self:wake_offline_reading_time()
     self.quiescing=false
     self:_import_daemon_status(true)
     self.suspended = false
@@ -5796,12 +5858,15 @@ function Sync:resume_after_reading_end()
 end
 
 function Sync:quiesce_for_exit(reason)
+    self:offline_time_controller()
+    if self.offline_time then self.offline_time:stop(self,"exit",true) end
     reason=tostring(reason or "koreader_exit")
     self.quiescing=true
     self:cancel_writer_barrier_waits(reason)
     self:_cancel_record_retry()
     if self.identity_async then self.identity_async:cancel(reason) end
     if self.async then self.async:cancel(reason) end
+    if self.offline_time then self.offline_time:release_progress(self) end
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
     if self.session_flush_task then UIManager:unschedule(self.session_flush_task); self.session_flush_task=nil end
     if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
@@ -5877,11 +5942,14 @@ function Sync:on_close(options)
 end
 
 function Sync:invalidate_login_session(reason)
+    self:offline_time_controller()
+    if self.offline_time then self.offline_time:stop(self,"auth_transition",true) end
     reason=tostring(reason or "auth_transition")
     self.auth_transitioning=true
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
     if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
     if self.async then self.async:cancel(reason) end
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy=false
     self.progress_hold=false
     self.daemon_context=nil
@@ -5949,6 +6017,7 @@ end
 
 function Sync:on_auth_restored()
     self.auth_transitioning=false
+    self:wake_offline_reading_time()
     self.last_error=nil
     self.consecutive_failures=0
     self.failure_notified=false
@@ -5976,6 +6045,7 @@ end
 
 function Sync:status()
     self:_import_daemon_status(false)
+    local offline=self.offline_time and self.offline_time:summary() or nil
     local r = self:record()
     local session = r and self.store:session(r.book.book_id) or {}
     local local_position = self:local_position()
@@ -5991,8 +6061,10 @@ function Sync:status()
         verified_remote_percent=self.verified_remote_percent,
         state=self.state, state_label=self:status_label(),
         progress_hold=self.progress_hold,time_enabled=self.store:preferences().sync.time_enabled,
-        session_uploads=self.session_uploads,last_upload=self.last_upload or (session and session.last_upload) or 0,
-        last_attempt=self.last_attempt or (session and session.last_attempt) or 0,
+        session_uploads=self.session_uploads,last_upload=math.max(tonumber(self.last_upload) or 0,
+            tonumber(session and session.last_upload) or 0,tonumber(offline and offline.last_success_at) or 0),
+        last_attempt=math.max(tonumber(self.last_attempt) or 0,tonumber(session and session.last_attempt) or 0,
+            tonumber(offline and offline.control and offline.control.last_attempt_at) or 0),
         last_error=(self.last_error~=nil and self.last_error or (session and session.last_error)),
         last_error_kind=self.last_error_kind or (session and session.last_error_kind),
         last_path=self.last_path or (session and session.last_path),
@@ -6012,7 +6084,9 @@ function Sync:status()
         service_version=self.daemon and self.daemon.service_version or READ_REPORT_SERVICE_VERSION,
         final_flush_pending=self.daemon and self.daemon.final_flush_pending==true or false,
         last_elapsed=session and session.last_elapsed,
-        pending_report_elapsed=0,
+        pending_report_elapsed=offline and offline.pending or 0,
+        offline_time_unknown=offline and offline.unknown or 0,
+        offline_time_error=offline and offline.error,
         last_report_reason=session and session.last_report_reason,
     }
 end
