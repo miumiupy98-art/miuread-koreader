@@ -1,4 +1,5 @@
 local logger = require("logger")
+local MenuIcons = require("miuread.menu_icons")
 
 local M = {}
 
@@ -128,7 +129,7 @@ function M.rows(owner, items, options)
                 arrow = has_children or source.arrow == true or source.show_chevron == true,
                 keep_open = source.keep_menu_open == true,
             }
-            local icon_key = source.icon_key or source.icon
+            local icon_key = source.icon_key or source.icon or (not source.heading and not source.separator and MenuIcons.key(label))
             if icon_key and tostring(icon_key) ~= "" then row.icon = tostring(icon_key) end
 
             if checked and options.prefix_checked ~= false then

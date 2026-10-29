@@ -39,8 +39,13 @@ class Beta633(unittest.TestCase):
         self.assertIn('菜单暂时无法显示',f)
         self.assertIn('if #rows>=MAX_PRIMARY_ACTIONS then break end',f)
     def test_release_gate_and_metadata(self):
-        for f in ('miuread.koplugin/_meta.lua','miuread.koplugin/miuread/config.lua','CHANGELOG.md'):
-            self.assertIn('6.3.0-beta.3',read(f))
+        from re import search
+        config=read('miuread.koplugin/miuread/config.lua')
+        version=search(r'VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+)"',config)
+        self.assertIsNotNone(version)
+        self.assertIn('version = "'+version.group(1)+'"',read('miuread.koplugin/_meta.lua'))
+        self.assertIn('## '+version.group(1),read('CHANGELOG.md'))
+        self.assertIn('## 6.3.0-beta.3',read('CHANGELOG.md'))
         w=read('.github/workflows/release-beta.yml')
         self.assertIn('test_633_comment_flat_and_modal.py',w)
         self.assertIn('test_633_download_choices.lua',w)

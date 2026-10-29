@@ -110,6 +110,7 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_630_comment_compact_progress.py'
           python3 -m unittest discover -s tools -p 'test_632_home_download_choice.py'
           python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
+          python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
@@ -398,6 +399,11 @@ jobs:
           python3 tools/test_extension_center_ux.py
           python3 tools/verify_600_beta1.py
           python3 tools/test_624_release_verifier_contract.py
+          python3 tools/test_635_eink_only_route.py
+          python3 tools/test_636_smart_time_route.py
+          python3 tools/test_637_menu_icons_and_handoff.py
+          lua5.1 tools/test_637_handoff.lua
+          luajit tools/test_637_handoff.lua
           python3 tools/verify_memory_profile.py
           python3 tools/test_beta11_download_resume.py
           lua5.1 tools/test_beta11_download_resume_policy.lua

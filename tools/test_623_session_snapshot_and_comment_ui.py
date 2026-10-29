@@ -14,7 +14,7 @@ class SnapshotAndUiRegression(unittest.TestCase):
         self.assertNotIn('self:set_remote_wire_anchor(book_id,remote,"remote_observed_wire",true)', sync)
         self.assertIn('remote_wire_fetched_at=anchor.fetched_at', sync)
         self.assertIn('remote_wire_fetched_at=wire_anchor and wire_anchor.fetched_at', sync)
-        self.assertIn('local READ_REPORT_SERVICE_VERSION = 32', sync)
+        self.assertRegex(sync,r'local READ_REPORT_SERVICE_VERSION = (?:3[3-9]|[4-9][0-9])')
 
     def test_web_tuple_reaches_real_legacy_time_writer(self):
         service = content('miuread.koplugin/miuread/read_report_service.lua')

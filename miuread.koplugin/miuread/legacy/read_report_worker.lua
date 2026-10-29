@@ -706,6 +706,13 @@ function Worker.run(job)
     job = job or {}
     local book_id = tostring(job.book_id or "")
     local elapsed_seconds = tonumber(job.elapsed_seconds) or 30
+    if job.web_time_disabled==true and job.context_only~=true
+        and (elapsed_seconds>0 or job.time_only==true
+            or tostring(job.report_mode or "")=="reading_time_compat") then
+        return {accepted=false,ok=false,error="Web reading-time disabled by E-Ink-only mode",
+            error_kind="disabled",request_dispatched=false,
+            meta={request_dispatched=false}}
+    end
     local progress_ratio = normalize_progress_ratio(job.progress_ratio)
     local settings = MemorySettings:new{
         cookies = job.cookies or {},

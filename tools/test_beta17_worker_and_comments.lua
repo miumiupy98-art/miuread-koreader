@@ -99,9 +99,33 @@ local stale=Worker.run{book_id='b',book=book(25,84),cookies={k='v'},
 assert(stale.ok==false and stale.meta.request_dispatched==false,
     'old cross-session Web tuple must not be used')
 
+-- 6.3.0-beta.5: the single-channel E-Ink option must fail closed in the
+-- actual Web writer, not merely hide a menu toggle or cancel a timer.
+local blocked_time=Worker.run{book_id='b',book=book(12,81),cookies={k='v'},
+    core_map_hash='h',elapsed_seconds=47,web_time_disabled=true,
+    time_only=true,report_mode='reading_time_compat',
+    reading_time_session_id=session,cloud_anchor=web_anchor()}
+assert(blocked_time.ok==false and blocked_time.meta.request_dispatched==false and #requests==2,
+    'E-Ink-only must refuse Web time without any network call')
+local blocked_diagnostic=Worker.run{book_id='b',book=book(12,81),cookies={k='v'},
+    core_map_hash='h',elapsed_seconds=30,web_time_disabled=true}
+assert(blocked_diagnostic.ok==false and #requests==2,
+    'manual 30-second Web time must be refused too')
+local blocked_zero_time=Worker.run{book_id='b',book=book(12,81),cookies={k='v'},
+    core_map_hash='h',elapsed_seconds=0,web_time_disabled=true,time_only=true,
+    report_mode='reading_time_compat'}
+assert(blocked_zero_time.ok==false and #requests==2,
+    'zero-second time-only call is not an exact progress transaction')
+
+local exact_progress=Worker.run{book_id='b',book=book(12,81),cookies={k='v'},
+    core_map_hash='h',elapsed_seconds=0,web_time_disabled=true,time_only=false,
+    progress_ratio=.12}
+assert(exact_progress.ok==true and #requests==3 and requests[3].rt==0,
+    'Web exact progress with rt=0 must remain available in E-Ink-only mode')
+
 local nonterminal=Worker.run{book_id='b',book=book(100,99),cookies={k='v'},
     core_map_hash='h',progress_ratio=1,time_only=false}
-assert(nonterminal.ok==false and #requests==2,
+assert(nonterminal.ok==false and #requests==3,
     'a nonfinal chapter must never masquerade as 100% whole-book progress')
 print('PASS 6.2: Web-position time echo, unsafe Web guard, terminal progress isolation')
 

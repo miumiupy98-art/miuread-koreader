@@ -285,6 +285,31 @@ function M:defer(account,now,reason,wait,state)
         return U.copy(data.control),true
     end)
 end
+-- Only an explicit QR authorization success may release this specific
+-- account's authentication cooldown. Other errors/rate limits remain intact.
+function M:clear_auth_retry(account,now)
+    return self:_access(account,function(data)
+        local control=data.control or {}
+        local changed=false
+        if control.reason=="authentication" then
+            data.control={failures=0,next_send=tonumber(now) or os.time(),reason=nil,
+                last_attempt_at=control.last_attempt_at}
+            changed=true
+        end
+        -- Re-enable only authentication-denied rows not currently dispatched.
+        -- Unknown, rate-limited, network and position-protected rows keep
+        -- their original retry/state and are never silently replayed.
+        for _,row in pairs(data.items) do
+            if row.state=="pending" and row.reason=="authentication"
+                and (tonumber(row.retry_at) or 0)>(tonumber(now) or os.time()) then
+                row.retry_at=tonumber(now) or os.time()
+                row.reason=nil
+                changed=true
+            end
+        end
+        return true,changed
+    end)
+end
 function M:unknown(account)
     return self:_access(account,function(data)
         local groups={}

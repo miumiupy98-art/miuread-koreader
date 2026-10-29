@@ -2832,6 +2832,10 @@ function M.menu(plugin)
     if downloads>0 then rows[#rows+1]={text="插件下载任务",separator=true,post_text=tostring(downloads).." 项",sub_item_table_func=function() return extension_download_rows(plugin) end} end
     rows[#rows+1]={text="扩展下载源",separator=downloads==0,post_text=network_mode_label(plugin),sub_item_table_func=function() return download_source_menu(plugin) end}
     rows[#rows+1]={text="关于扩展中心",callback=function() center_about(plugin) end}
+    local MenuIcons=require("miuread.menu_icons")
+    for _,item in ipairs(rows) do
+        if not item.icon_key and not item.separator then item.icon_key=MenuIcons.key(item.text) end
+    end
     return rows
 end
 

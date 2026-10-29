@@ -25,7 +25,7 @@ class Beta2Contracts(unittest.TestCase):
         self.assertIn('if result.accepted and type(result.legacy_context) == "table"',r)
     def test_best_effort_has_no_persisted_replay(self):
         s=read('miuread.koplugin/miuread/sync.lua')
-        self.assertIn('local READ_REPORT_SERVICE_VERSION = 32',s)
+        self.assertRegex(s,r'local READ_REPORT_SERVICE_VERSION = (?:3[3-9]|[4-9][0-9])')
         start=s.index('function Sync:_start_daemon(');end=s.index('function Sync:',start+20)
         a=s[start:end]
         self.assertIn('local carry_elapsed=0',a)

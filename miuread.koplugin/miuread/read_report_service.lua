@@ -224,6 +224,13 @@ function Service.run(job)
         -- reporting depend on foreground position calculation.
         local time_only=current_job.time_only==true or control.time_only==true
         local report_mode=tostring(current_job.report_mode or (time_only and "reading_time_compat" or "progress"))
+        if control.web_time_disabled==true or current_job.web_time_disabled==true then
+            write_service_status({generation=generation,seq=sequence,state="inactive",
+                accepted=false,error_kind="disabled",error="Web reading-time disabled by E-Ink-only mode",
+                elapsed_seconds=0,next_due=0,final_flush=final_flush==true,
+                writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0})
+            return 0
+        end
         if tostring(control.book_id or "")~=tostring(current_job.book_id or "")
             or tostring(control.core_map_hash or "")~=tostring(current_job.core_map_hash or "")
             or tonumber(control.record_generation or -1)~=tonumber(current_job.record_generation or 0)
@@ -630,6 +637,14 @@ function Service.run(job)
                         writer_barrier_reason=tostring(control.writer_barrier_reason or "progress_write_fence"),
                     })
                 end
+            elseif (control.web_time_disabled==true or current_job.web_time_disabled==true) then
+                progress_fence_seq=0
+                last_flush_seq=flush_seq
+                next_due=0
+                carry_remaining=0
+                write_service_status({generation=generation,seq=sequence,state="inactive",
+                    accepted=false,elapsed_seconds=0,next_due=0,
+                    writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0})
             elseif pending_flush then
                 progress_fence_seq=0
                 last_flush_seq = flush_seq

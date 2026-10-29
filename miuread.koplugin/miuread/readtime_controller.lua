@@ -59,14 +59,14 @@ function M:schedule(delay)
         self:send()
         local summary=self:summary()
         local online=self.host and type(self.host.is_online)=="function" and self.host:is_online()
-        if self.active then self:schedule(30)
+        if self.active then self:schedule(60)
         elseif summary.pending>0 and online and not summary.blocked and not summary.error
             and not self.awaiting_authorization and not self.worker_unavailable then
             self:schedule(math.max(10,(tonumber((summary.control or {}).next_send) or 0)-os.time()))
         end
     end
     self.task=task
-    UI:scheduleIn(delay or 30,task)
+    UI:scheduleIn(delay or 60,task)
 end
 function M:start(sync,record,capture_floor)
     self.host,self.sync=sync.host,sync
@@ -187,7 +187,36 @@ function M:wake(host)
     self.suspended=false
     self.awaiting_authorization=false
     self.worker_unavailable=nil
+    -- A pre-existing 60-second timer must not swallow a network-restored
+    -- wake-up. Only scheduler timing is reset: backend cooldowns and row
+    -- retry_at values are still checked by send()/pending().
+    if self.task then UI:unschedule(self.task); self.task=nil end
     self:schedule(2)
+end
+
+function M:authorization_restored(host)
+    self.host=host or self.host
+    local vid=account(self.store)
+    if vid=="" then return false end
+    if self.worker:busy() then
+        self._auth_resume_attempts=(self._auth_resume_attempts or 0)+1
+        if self._auth_resume_attempts<=5 then
+            UI:scheduleIn(2,function()
+                if account(self.store)==vid then self:authorization_restored(host) end
+            end)
+        end
+        return false
+    end
+    self._auth_resume_attempts=0
+    local cleared=self.queue:clear_auth_retry(vid,os.time())
+    if not cleared then return false end
+    self.summary_cache=nil
+    self.awaiting_authorization=false
+    self.worker_unavailable=nil
+    self.suspended=false
+    if self.task then UI:unschedule(self.task);self.task=nil end
+    self:schedule(2)
+    return true
 end
 function M:yield_to_progress(sync,callback)
     if self.progress_owner then callback(false); return false end
@@ -230,8 +259,20 @@ function M:send()
     local host=self.host
     local live_sync=host.sync or self.sync
     local daemon=live_sync and live_sync.daemon
+    local owner_daemon=self.sync and self.sync.daemon
     if daemon and (daemon.active or daemon.final_flush_pending) then return false end
+    if owner_daemon and owner_daemon~=daemon
+        and (owner_daemon.active or owner_daemon.final_flush_pending) then return false end
+    local prefs=self.store:preferences().sync or {}
+    local mode=(live_sync and live_sync.reading_time_mode and live_sync:reading_time_mode())
+        or (prefs.time_eink_only==true and "eink" or prefs.time_route_mode or "legacy")
+    local eink_allowed=mode=="eink" or mode=="smart"
     if live_sync and live_sync.reading_time_backend=="web" and live_sync.current then return false end
+    if self.sync and self.sync.reading_time_backend=="web" and self.sync.current then return false end
+    -- Home and Reader may have separate plugin hosts sharing one Native
+    -- controller. Neither host can dispatch historical time while reading.
+    if mode=="smart" and ((live_sync and live_sync.current)
+        or (self.sync and self.sync.current)) then return false end
     if host._reading_end_sync_active or host._reading_end_finalizer_active
         or (self.sync and (self.sync.busy or self.sync.progress_write_fence)) then return false end
     if type(host.is_online)~="function" or not host:is_online() then
@@ -247,7 +288,7 @@ function M:send()
         self:log("dispatch","waiting",{reason=summary.blocked}); return false
     end
     if os.time()<(tonumber((summary.control or {}).next_send) or 0) then return false end
-    if require("miuread.api_transport").new(self.store).selected~="eink" then
+    if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink" then
         self.awaiting_authorization=true
         return false
     end
@@ -385,6 +426,11 @@ function M:send()
         self.summary_cache=nil
         self.awaiting_authorization=value.error=="authentication"
         if value.state=="confirmed" and type(host.on_auth_channel_ok)=="function" then host:on_auth_channel_ok("read_report") end
+        if value.state=="confirmed" and account(self.store)==vid and mode=="smart"
+            and not (live_sync and live_sync.current)
+            and type(host.on_offline_readtime_uploaded)=="function" then
+            host:on_offline_readtime_uploaded(batch.seconds)
+        end
         if value.state=="confirmed" and self.active and self.active.vid==vid and self.active.book_id==batch.book_id
             and type(host.on_read_report_interval_success)=="function" then
             host:on_read_report_interval_success({elapsed_seconds=batch.seconds})
