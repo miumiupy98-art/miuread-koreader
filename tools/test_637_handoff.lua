@@ -10,7 +10,7 @@ local block=source:sub(a,b-1)
 Sync={}
 logger={info=function() end,warn=function() end}
 UIManager={unschedule=function() end}
-assert(load(block))()
+assert((loadstring or load)(block))()
 local function make()
   local online=false
   local events,starts,stops,callback={}, {}, {}, nil
@@ -73,7 +73,7 @@ do
   local c=assert(code:find('function M:clear_auth_retry(account,now)',1,true))
   local e=assert(code:find('function M:unknown(account)',c,true))
   M={}
-  assert(load(code:sub(c,e-1)))()
+  assert((loadstring or load)(code:sub(c,e-1)))()
   local box=setmetatable({data={control={reason='authentication',next_send=9999},items={
     one={state='pending',reason='authentication',retry_at=9999},
     two={state='unknown',reason='authentication',retry_at=9999},
