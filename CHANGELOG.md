@@ -1,3 +1,11 @@
+## 6.3.1 - 2026-10-30
+
+- feat(readtime): preserve complete offline reading-time upload implementation
+- fix(readtime): adapt Web outbox to upstream and preserve close tails
+- fix(readtime): preserve upstream Web reporting and isolate E-Ink outbox
+- 修复弹窗空白和美化评论获取进度条
+- 实现 Web/E-Ink 智能阅读时间同步与离线补传，修复授权和同步稳定性问题，并全面优化菜单交互逻辑及黑白 SVG 图标体系
+
 ## 6.3.0-beta.7
 
 - 统一阅读时长菜单语义：设置入口与开关分离，E-Ink 授权进入独立管理页，支持扫码、验证及取消授权。
