@@ -547,7 +547,7 @@ jobs:
             echo "::warning::正式清单已由 GitHub API 上传，但当前 runner 暂时无法从公开 CDN 回读。"
           fi
 
-            - name: Sync released main history back to beta
+      - name: Sync released main history back to beta
         shell: bash
         run: |
           set -euo pipefail
