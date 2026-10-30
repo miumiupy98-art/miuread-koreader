@@ -271,8 +271,10 @@ function M:send()
     if self.sync and self.sync.reading_time_backend=="web" and self.sync.current then return false end
     -- Home and Reader may have separate plugin hosts sharing one Native
     -- controller. Neither host can dispatch historical time while reading.
-    if mode=="smart" and ((live_sync and live_sync.current)
-        or (self.sync and self.sync.current)) then return false end
+    -- No E-Ink dispatch during any active reading session, including E-Ink-only.
+    -- The timer may still collect/persist locally; dispatch waits for closing.
+    if self.active or (live_sync and live_sync.current)
+        or (self.sync and self.sync.current) then return false end
     if host._reading_end_sync_active or host._reading_end_finalizer_active
         or (self.sync and (self.sync.busy or self.sync.progress_write_fence)) then return false end
     if type(host.is_online)~="function" or not host:is_online() then

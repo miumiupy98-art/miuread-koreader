@@ -2178,8 +2178,8 @@ function Plugin:on_readtime_route_change(target,previous,reason)
         self:status_toast("阅读时间",previous=="eink" and "网络已恢复，Web 阅读时间同步已启动"
             or "Web 阅读时间同步已启动",3)
     elseif target=="eink" then
-        self:status_toast("阅读时间",previous=="web" and "网络已断开，阅读时间已转为本地记录"
-            or "网络未连接，阅读时间将在本地记录",4)
+        self:status_toast("阅读时间",previous=="web" and "已切换至 E-Ink 离线计时，记录本地保存，联网后补传"
+            or "E-Ink 本地计时已启用，记录联网后补传",4)
     end
 end
 
@@ -10226,6 +10226,19 @@ function Plugin:_home_hold_book(book,anchor)
     return true
 end
 
+-- One common entry for both tap and hold. All nested items retain the
+-- existing synchronization safeguards and use the standard menu renderer.
+function Plugin:_home_sync_management_menu(anchor)
+    return self:_show_standalone_menu("同步管理",{
+        {text="立即同步",post_text="执行符合条件的同步任务",
+            callback=function() self:_sync_home_pending({source="home_quick"}) end},
+        {text="同步状态",post_text="阅读进度、阅读时间与批注",
+            callback=function() self:show_sync_status(false) end},
+        {text="同步设置",post_text="同步策略与自动同步",
+            sub_item_table_func=function() return self:sync_settings_menu() end},
+    },{anchor=anchor})
+end
+
 function Plugin:_home_action_entries()
     local home=self:_home_preferences()
     local download_state=self:_download_state()
@@ -10249,15 +10262,19 @@ function Plugin:_home_action_entries()
     if shown_failed>0 then sync_badge="!"
     elseif shown_total>0 then sync_badge=shown_total>99 and "99+" or tostring(shown_total) end
 
+    -- Home quick actions use the same navigable menu as level-2/3 settings.
+    -- Adapt the old action descriptors without changing their callbacks.
     local function hold_for(key,label)
         return function(anchor)
+            if key=="sync" then return self:_home_sync_management_menu(anchor) end
             local actions=self:_home_action_function_actions(key,anchor)
             for _,entry in ipairs(self:_home_action_edit_actions(key,anchor)) do actions[#actions+1]=entry end
-            ActionSheet.show{
-                cache_key="home_action_functions_"..tostring(key),anchor=anchor,preferred_direction="below",width_ratio=.72,
-                title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),subtitle="操作与快捷栏编辑",
-                actions=actions,wide_last=(#actions%2==1),
-            }
+            local rows={}
+            for _,entry in ipairs(actions) do
+                rows[#rows+1]={text=entry.label,post_text=entry.detail,callback=entry.callback,
+                    enabled=entry.enabled~=false}
+            end
+            return self:_show_standalone_menu(tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),rows,{anchor=anchor})
         end
     end
 
@@ -10266,8 +10283,8 @@ function Plugin:_home_action_entries()
         search={icon="⌕",icon_key="search",label="搜索",callback=function() self:search_dialog("搜索微信读书") end},
         bookstore={icon="library",icon_key="library",label="书城",callback=function() self:show_bookstore() end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function() self:show_downloads() end},
-        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function()
-            return self:show_sync_status(false)
+        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
+            return self:_home_sync_management_menu(anchor)
         end},
         miuread_settings={icon="⚙",icon_key="settings",label="设置",callback=function() self:_show_home_settings_center() end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
@@ -14872,6 +14889,7 @@ function Plugin:_start_comment_range(book,rows,first,last,force)
         self:info("评论章节范围无效，请重新选择。")
         return false
     end
+    self:_cancel_next_comment_preload("manual priority")
     if self._comment_range_task then
         self:_show_comment_range_progress(self._comment_range_task)
         self:toast("已有评论获取任务，请先完成或取消",2)
@@ -14996,17 +15014,99 @@ function Plugin:_choose_comment_range(force,back_callback)
     end,{context=context,status_text="正在后台读取评论目录…"})
 end
 
+-- Low-priority, opt-in next-chapter comment cache warming. No reader-thread network.
+function Plugin:_cancel_next_comment_preload(reason)
+    if self._next_comment_preload_task then
+        UIManager:unschedule(self._next_comment_preload_task)
+        self._next_comment_preload_task=nil
+    end
+    local running=self._next_comment_preload
+    self._next_comment_preload=nil
+    if running and running.async then running.async:cancel(reason or "cancelled") end
+end
+
+function Plugin:_schedule_next_comment_preload(delay)
+    if (self.store:preferences().sync or {}).comment_auto_preload~=true then return false end
+    if self._next_comment_preload_task then UIManager:unschedule(self._next_comment_preload_task) end
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    local task
+    task=function()
+        if self._next_comment_preload_task~=task then return end
+        self._next_comment_preload_task=nil
+        if tonumber(HOME_SESSION.reader_session_generation or 0)~=session
+            or not self:_reader_session_is_weread() or self._comment_range_task
+            or self._next_comment_preload or not self:is_online()
+            or not self:_reader_background_idle() then return end
+        local ctx=self:_chapter_navigation_context(false)
+        if not (ctx and ctx.state=="NEXT" and ctx.catalog_complete==true) then return end
+        local book_id,uid=tostring(ctx.book_id or ""),tostring(ctx.next_uid or "")
+        if book_id=="" or uid=="" then return end
+        local status=self.comment_sync:status(book_id,uid)
+        if status.has_cache and (status.status=="cached" or status.status=="empty") then return end
+        local async=Async:new(self.store,{disable_fallback=true,poll_interval=.35})
+        if not async:available() then return end
+        local runtime={async=async,book_id=book_id,uid=uid,session=session}
+        self._next_comment_preload=runtime
+        local auth=U.copy(self.store:auth())
+        local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+        local api_mode=require("miuread.api_transport").preference(self.store)
+        local started,err=async:run("comment_next_preload",function()
+            local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
+            child_store.cache_books_dir=data_dir.."/books"
+            function child_store:book_cache_path(id)
+                return self.cache_books_dir.."/"..U.id_name(tostring(id or ""))
+            end
+            function child_store:book_dir(id)
+                local path=self:book_cache_path(id);U.mkdir(path);return path
+            end
+            local child_http=Http:new(child_store)
+            local child_reader=Reader:new(child_http,child_store)
+            local child_api=Api:new(child_http,child_store,child_reader):scope()
+            local result,fetch_error=require("miuread.comment_sync"):new(child_api,child_store):fetch(book_id,uid,{force=false})
+            local changed_auth,changed=child_store:snapshot()
+            return {ok=result~=nil,result=result,error=fetch_error,auth=changed_auth,auth_changed=changed}
+        end,function(reply)
+            if self._next_comment_preload~=runtime then return end
+            self._next_comment_preload=nil
+            local value=reply and reply.value or nil
+            if reply and reply.ok==true and type(value)=="table" and value.auth_changed==true then
+                self:_apply_interactive_auth({auth=value.auth,changed=true})
+            end
+            if not (reply and reply.ok==true and value and value.ok==true) then
+                logger.warn("[MiuRead][Comments] next preload failed",tostring(value and value.error or reply and reply.error))
+            end
+        end,180)
+        if not started then
+            self._next_comment_preload=nil
+            logger.warn("[MiuRead][Comments] next preload unavailable",tostring(err))
+        end
+    end
+    self._next_comment_preload_task=task
+    UIManager:scheduleIn(math.max(.5,tonumber(delay) or 3),task)
+    return true
+end
+
 function Plugin:_comment_fetch_mode_menu(back_callback)
     local function select_range(force)
         return self:_choose_comment_range(force,back_callback)
     end
     local rows={
-        {label="当前章节",arrow=true,
-            callback=function() self:_fetch_current_chapter_comments(false,back_callback) end},
-        {label="指定章节范围",arrow=true,callback=function() select_range(false) end},
-        {label="更新当前章节",arrow=true,
+        {label="获取/更新当前章节评论",arrow=true,
             callback=function() self:_fetch_current_chapter_comments(true,back_callback) end},
-        {label="更新指定范围",arrow=true,callback=function() select_range(true) end},
+        {label="获取/更新指定章节范围",arrow=true,
+            callback=function() select_range(true) end},
+        {label="自动预载下一章评论",value=((self.store:preferences().sync or {}).comment_auto_preload==true) and "已开启" or "已关闭",
+            arrow=true,callback=function()
+                local prefs=self.store:preferences();prefs.sync=prefs.sync or {}
+                prefs.sync.comment_auto_preload=not (prefs.sync.comment_auto_preload==true)
+                self:_save_ui_preferences(prefs,"comment_auto_preload")
+                if not prefs.sync.comment_auto_preload then
+                    self:_cancel_next_comment_preload("setting disabled")
+                else
+                    self:_schedule_next_comment_preload(2)
+                end
+                self:_comment_fetch_mode_menu(back_callback)
+            end},
     }
     if self._comment_range_task then
         table.insert(rows,1,{icon="progress",label="评论获取任务",
@@ -21636,6 +21736,7 @@ function Plugin:_schedule_chapter_navigation_context(session,delay)
         end
         self._chapter_navigation_task=nil
         self:_chapter_navigation_context(true)
+        self:_schedule_next_comment_preload(3)
         self:_schedule_reader_toolbar_state_refresh(nil,.05)
     end
     self._chapter_navigation_task=task
@@ -25444,27 +25545,28 @@ function Plugin:reading_time_status_label()
     if (self.store:preferences().sync or {}).time_enabled~=true then return "已关闭" end
     local mode=self.sync:reading_time_mode()
     if self.sync.reading_time_backend=="eink_restart_required" then
-        return "通道设置已变化 · 请重新开书"
+        return "计时方式已修改 · 请重新开书"
     end
     local backend=mode=="eink" and "eink" or self.sync.reading_time_backend
         or (mode=="smart" and (self:is_online() and "web" or "eink"))
         or require("miuread.api_transport").new(self.store).selected
     if backend=="web" then
-        if mode=="smart" then return self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 等待上传服务" end
-        return self:_reading_time_status_label()
+        if self.sync.daemon and self.sync.daemon.active then return "Web · 记录中" end
+        return "Web · "..self:_reading_time_status_label()
     end
     local controller=self.sync:offline_time_controller()
     local summary=controller and controller:summary() or {}
-    if summary.error then return summary.error=="ledger_full" and "本地记录已满" or "本地记录异常" end
-    if summary.blocked then return "已暂停 · 请核对云端位置" end
-    if (summary.unknown or 0)>0 then return "有待确认记录" end
-    if (summary.in_flight or 0)>0 then return "正在同步" end
-    if (summary.control or {}).reason=="authentication" then return "需要授权" end
-    if (summary.pending or 0)>0 then
-        return "待同步 "..reading_time_duration(summary.pending)
-    end
+    local active=controller and controller.active~=nil
+    local prefix=active and "E-Ink · 本地记录中" or "E-Ink · 待开始"
+    if summary.error then return "E-Ink · 本地记录异常" end
     if summary.capture_error=="statistics_unavailable" then return "请开启 KOReader 阅读统计" end
-    return summary.last_success_at and "已同步" or "已开启 · 自动记录与同步"
+    if summary.blocked then return prefix.." · 已暂停同步" end
+    if (summary.unknown or 0)>0 then return prefix.." · 待确认" end
+    if (summary.in_flight or 0)>0 then return prefix.." · 上传中" end
+    if (summary.control or {}).reason=="authentication" then return prefix.." · 需授权" end
+    if (summary.pending or 0)>0 then return prefix.." · 待上传 "..reading_time_duration(summary.pending) end
+    if active then return prefix end
+    return summary.last_success_at and "E-Ink · 已同步" or prefix
 end
 function Plugin:reading_time_unknown_menu(offset)
     local controller=self.sync:offline_time_controller()
@@ -25572,9 +25674,9 @@ end
 
 function Plugin:reading_time_mode_menu()
     local mode=self.sync:reading_time_mode()
-    local labels={smart="智能切换（推荐） · 联网 Web，断网 E-Ink",
-        eink="仅 E-Ink · 全程本地采集和 E-Ink 上传",
-        legacy="原有通道设置 · 兼容旧版"}
+    local labels={smart="智能计时（推荐） · 优先 Web，必要时切换 E-Ink",
+        eink="E-Ink 计时 · 本地记录，支持联网补传",
+        legacy="原有通道设置 · 延续既有接口配置"}
     local rows={}
     for _,value in ipairs({"smart","eink","legacy"}) do
         local selected=value
@@ -28271,10 +28373,13 @@ function Plugin:home_lockscreen_provider_menu()
     local ink=self:_inkstain_status()
     local dash=self:_dashwallpaper_status()
     return {
+        {text="KOReader 原生锁屏",post_text="由 KOReader 管理锁屏样式",radio=true,
+            checked_func=function() local h=self:_home_preferences(); return self:_home_lockscreen_provider(h)=="native" and h.lockscreen_recent==false end,
+            callback=function() self:_home_use_koreader_lockscreen() end},
         {
             text="书籍封面",post_text=self:_home_native_lockscreen_style(home)=="frame" and "画框" or (self:_home_native_lockscreen_style(home)=="fit" and "完整" or "铺满"),
-            radio=true,checked_func=function() return self:_home_lockscreen_provider()=="native" end,
-            callback=function() self:_request_lockscreen_provider("native") end,
+            radio=true,checked_func=function() local h=self:_home_preferences(); return self:_home_lockscreen_provider(h)=="native" and h.lockscreen_recent~=false end,
+            callback=function() self:_activate_native_lockscreen(self:_home_native_lockscreen_style()) end,
         },
         {
             text="墨痕壁纸",post_text=ink.loaded and "已就绪" or (ink.installed and "已安装 · 需重启加载" or "未安装 · 可直接安装"),
@@ -28294,6 +28399,20 @@ function Plugin:home_lockscreen_style_menu()
     return self:home_lockscreen_provider_menu()
 end
 
+-- Delegate native lockscreen configuration to KOReader. Do not overwrite
+-- native screensaver preferences or assume a fixed third-party menu index.
+function Plugin:_home_use_koreader_lockscreen()
+    local home=self:_home_preferences()
+    if self:_home_lockscreen_provider(home)~="native" then
+        if not self:_request_lockscreen_provider("native") then return false end
+        home=self:_home_preferences()
+    end
+    if home.lockscreen_recent~=false then self:_toggle_home_lockscreen() end
+    self:toast("已使用 KOReader 原生锁屏，请在 KOReader 设置中选择锁屏样式",3)
+    UIManager:scheduleIn(.12,function() self:_show_native_koreader_menu() end)
+    return true
+end
+
 function Plugin:home_lockscreen_settings_menu()
     local home=self:_home_preferences()
     local provider=self:_home_lockscreen_provider(home)
@@ -28301,6 +28420,9 @@ function Plugin:home_lockscreen_settings_menu()
         {text="锁屏来源",post_text=self:_home_lockscreen_style_label(home),sub_item_table_func=function() return self:home_lockscreen_provider_menu() end},
     }
     if provider=="native" then
+        rows[#rows+1]={text="KOReader 原生锁屏",post_text=home.lockscreen_recent==false and "使用中" or "使用 KOReader 自带设置",
+            radio=true,checked_func=function() return self:_home_preferences().lockscreen_recent==false end,
+            callback=function() self:_home_use_koreader_lockscreen() end}
         rows[#rows+1]={text="主页锁屏显示最近阅读封面",checked_func=function() return self:_home_preferences().lockscreen_recent~=false end,keep_menu_open=true,callback=function() self:_toggle_home_lockscreen() end}
         rows[#rows+1]={text="书籍封面样式",post_text=({frame="画框",fit="完整",fill="铺满"})[self:_home_native_lockscreen_style(home)] or "画框",enabled_func=function() return self:_home_preferences().lockscreen_recent~=false end,sub_item_table_func=function() return self:home_native_lockscreen_style_menu() end}
     elseif provider=="inkstain" then
@@ -33593,6 +33715,7 @@ function Plugin:_schedule_post_reader_work(reason,delay,phase)
 end
 
 function Plugin:onCloseDocument()
+    self:_cancel_next_comment_preload("document close")
     self:_cancel_comment_range_task("document close",true)
     self:_teardown_comment_overlay()
     if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end

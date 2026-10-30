@@ -86,8 +86,12 @@ function Compact:_build()
         max_width=title_w,truncate_with_ellipsis=true,
     }
     self.count_label=TextWidget:new{
-        text="0/0章 · 0%", face=Font:getFace("x_smallinfofont"),
+        text="0/0章", face=Font:getFace("x_smallinfofont"),
         max_width=count_w,truncate_with_ellipsis=true,
+    }
+    self.detail_label=TextWidget:new{
+        text="准备获取评论",face=Font:getFace("x_smallinfofont"),
+        max_width=content_w,truncate_with_ellipsis=true,
     }
     self.progress=ProgressWidget:new{
         width=content_w,height=bar_h,percentage=0,
@@ -119,6 +123,8 @@ function Compact:_build()
         },
         VerticalSpan:new{width=gap},
         self.progress,
+        VerticalSpan:new{width=gap},
+        self.detail_label,
         VerticalSpan:new{width=gap},
         buttons,
     }
@@ -174,12 +180,18 @@ function Compact:set_state(state)
     local current=number(state.current)
     local total=number(state.total)
     local fraction=total>0 and math.min(1,current/total) or 0
-    local label=tostring(current).."/"..tostring(total).."章 · "..tostring(math.floor(fraction*100+.5)).."%"
-    local signature=(paused and "paused" or "running")..":"..label
+    local single=total==1
+    local label=single and "当前章节" or (tostring(current).."/"..tostring(total).."章")
+    local detail=tostring(state.message or "")
+    if paused then detail="已暂停 · "..detail end
+    if single and current==0 and detail=="" then detail="正在获取评论" end
+    if not single then detail=detail.." · 已保存 "..tostring(number(state.comments)).." 条" end
+    local signature=(paused and "paused" or "running")..":"..label..":"..detail
     if signature==self._last_signature then return end
     self._last_signature=signature
     self.progress:setPercentage(fraction)
     self.count_label:setText(label)
+    self.detail_label:setText(detail)
     self:_redraw()
 end
 
