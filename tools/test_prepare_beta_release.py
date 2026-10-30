@@ -73,6 +73,34 @@ class PrepareBetaReleaseTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "缺少对应版本条目"):
             prepare(self.root, "6.0.1-beta.2", "修复")
 
+    def test_version_can_skip_beta_numbers(self):
+        prepare(self.root, "6.0.0-beta.10", "跳过中间测试版本")
+        self.assertIn('VERSION = "6.0.0-beta.10"', self.config.read_text())
+        self.assertIn('## 6.0.0-beta.10', self.changelog.read_text())
+
+    def test_moves_existing_target_record_to_top(self):
+        self.changelog.write_text(
+            '# Changelog\n\n## 6.0.0-beta.2 - Older\n\n- earlier\n\n'
+            '## 6.0.0-beta.1 - Baseline\n\n- 基线\n')
+        self.config.write_text(self.config.read_text().replace('6.0.0-beta.1', '6.0.0-beta.2'))
+        self.meta.write_text(self.meta.read_text().replace('6.0.0-beta.1', '6.0.0-beta.2'))
+        prepare(self.root, '6.0.0-beta.2', 'new notes')
+        out = self.changelog.read_text()
+        self.assertTrue(out.startswith('# Changelog\n\n## 6.0.0-beta.2'))
+        self.assertEqual(out.count('## 6.0.0-beta.2'), 1)
+        self.assertIn('## 6.0.0-beta.1', out)
+
+    def test_heading_in_middle_is_moved_without_losing_history(self):
+        old = self.changelog.read_text()
+        self.changelog.write_text(old + '\n# Changelog\n\n## Unreleased\n\n- long lived notes\n')
+        prepare(self.root, '6.0.0-beta.8', 'new beta')
+        out = self.changelog.read_text()
+        self.assertTrue(out.startswith('# Changelog\n\n## 6.0.0-beta.8'))
+        self.assertEqual(out.count('# Changelog'), 1)
+        self.assertIn('## Unreleased', out)
+        self.assertIn('- long lived notes', out)
+        self.assertIn('## 6.0.0-beta.1', out)
+
     def test_rejects_rollback_and_invalid_version(self):
         with self.assertRaisesRegex(ValueError, "版本回退"):
             prepare(self.root, "5.9.0-beta.1", "回退")

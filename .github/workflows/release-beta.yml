@@ -124,6 +124,8 @@ jobs:
               exit 1
             fi
             python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"
+            # Fail early if manual release metadata was not prepared correctly.
+            python3 tools/check_beta_release_identity.py --version "$VERSION"
             if [ -n "$EXISTING_TAG_SHA" ] && ! git diff --quiet -- \
                 miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md; then
               echo "::error::发布标签已存在，不能重新修改该标签的版本文件。"

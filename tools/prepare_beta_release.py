@@ -9,7 +9,7 @@ are supported by the workflow and use a separate workspace-only preparation path
 import argparse
 import re
 from pathlib import Path
-from changelog_integrity import normalize_changelog
+from changelog_integrity import canonicalize_changelog
 
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)-beta\.(\d+)$")
 CONFIG_RE = re.compile(r'(?m)^(\s*VERSION\s*=\s*["\'])([^"\']+)(["\'],?\s*)$')
@@ -84,7 +84,7 @@ def prepare(root, version, notes):
     config = config_path.read_text(encoding="utf-8")
     meta = meta_path.read_text(encoding="utf-8")
     original_changelog = changelog_path.read_text(encoding="utf-8")
-    changelog = normalize_changelog(original_changelog)
+    changelog = canonicalize_changelog(original_changelog)
 
     config_version = find_version(config, CONFIG_RE, "config.lua")
     meta_version = find_version(meta, META_RE, "_meta.lua")
@@ -94,49 +94,45 @@ def prepare(root, version, notes):
         raise ValueError(f"禁止版本回退：当前 {config_version}，目标 {version}")
 
     previous_notes = extract_existing_notes(changelog, version)
-    if version == config_version:
-        if previous_notes is None:
-            raise ValueError(f"源码已经是 {version}，但 CHANGELOG 缺少对应版本条目")
-        if previous_notes == bullets:
-            if changelog != original_changelog:
-                changelog_path.write_text(changelog, encoding="utf-8")
-                print(f"Normalized duplicate release notes for {version}")
-                return True
-            print(f"Already prepared: {version} (no changes)")
-            return False
-        # The workflow independently forbids changing an existing immutable tag.
-        # Before tagging, the user may edit the prepared release notes explicitly.
-        lines = changelog.splitlines(keepends=True)
-        start = next((i for i, line in enumerate(lines)
-                      if line.rstrip("\r\n") == f"## {version}"
-                      or line.rstrip("\r\n").startswith((f"## {version} - ", f"## {version} — "))), None)
-        if start is None:
-            raise ValueError(f"CHANGELOG.md 中找不到 {version} 版本标题")
-        end = next((i for i in range(start + 1, len(lines))
-                    if lines[i].startswith("## ")), len(lines))
-        entry = f"## {version} - Beta Update\n\n" + "\n".join(f"- {item}" for item in bullets) + "\n\n"
-        updated = "".join(lines[:start]) + entry + "".join(lines[end:])
-        changelog_path.write_text(updated, encoding="utf-8")
-        print(f"Updated prepared release notes for {version} (version metadata unchanged)")
-        return True
-    if previous_notes is not None:
+    if version == config_version and previous_notes is None:
+        raise ValueError(f"源码已经是 {version}，但 CHANGELOG 缺少对应版本条目")
+    if version != config_version and previous_notes is not None:
         raise ValueError(f"CHANGELOG.md 已存在 {version} 的条目，但源码仍为旧版本；请人工检查")
 
+    if previous_notes is not None:
+        # The target section may be buried underneath older entries. Remove
+        # just that section, then recreate it at the beginning.
+        lines = changelog.splitlines(keepends=True)
+        starts = [i for i, line in enumerate(lines) if
+                  line.rstrip("\r\n") == f"## {version}" or
+                  line.rstrip("\r\n").startswith((f"## {version} - ", f"## {version} — "))]
+        if len(starts) != 1:
+            raise ValueError(f"CHANGELOG.md 中 {version} 记录不唯一")
+        start = starts[0]
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i].startswith("## ")), len(lines))
+        changelog = "".join(lines[:start] + lines[end:])
+
+    # A genuine document header is always kept at the top, not in the
+    # middle of historic release sections.
+    prefix_match = re.match(r"(?i)^# Changelog[ \t]*\n+", changelog)
+    prefix = "# Changelog\n\n" if prefix_match else ""
+    history = changelog[prefix_match.end():] if prefix_match else changelog
+    new_entry = f"## {version} - Beta Update\n\n" + "\n".join(
+        f"- {bullet}" for bullet in bullets) + "\n\n"
+    new_changelog = prefix + new_entry + history.lstrip("\r\n")
     new_config = replace_version(config, CONFIG_RE, version)
     new_meta = replace_version(meta, META_RE, version)
-    new_entry = f"## {version} - Beta Update\n\n" + "\n".join(f"- {bullet}" for bullet in bullets) + "\n\n"
-    # Keep an existing top-level Changelog heading if one is present.
-    header = re.match(r"(# Changelog\s*\n+)", changelog, flags=re.I)
-    if header:
-        new_changelog = header.group(1) + new_entry + changelog[header.end():]
-    else:
-        new_changelog = new_entry + changelog
-
-    # Validate all inputs before writing any files.
+    # All checks above complete before writing anything.
+    changed = (new_config != config or new_meta != meta or
+               new_changelog != original_changelog)
+    if not changed:
+        print(f"Already prepared: {version} (no changes)")
+        return False
     config_path.write_text(new_config, encoding="utf-8")
     meta_path.write_text(new_meta, encoding="utf-8")
     changelog_path.write_text(new_changelog, encoding="utf-8")
-    print(f"Prepared {version}: config.lua, _meta.lua, CHANGELOG.md")
+    print(f"Prepared {version}: version metadata and latest changelog header")
     return True
 
 
