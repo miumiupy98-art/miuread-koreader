@@ -22,7 +22,7 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
     def test_tag_is_immutable_and_uses_tagged_source(self):
         self.assertIn('Tag 必须指向 beta 分支历史中的提交', self.s)
         self.assertIn('GITHUB_SHA', self.s)
-        self.assertIn('Tag 中的源码版本', self.s)
+        self.assertIn('Tag build would rewrite committed release metadata', self.s)
         self.assertIn("if: github.event_name == 'workflow_dispatch'", self.s)
         self.assertNotIn('git push --force', self.s)
 
@@ -46,7 +46,7 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
         check = "python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'"
         check_at = metadata.index(check)
         manual_at = metadata.index('python3 tools/check_beta_release_identity.py --version "$VERSION"')
-        tag_at = metadata.index('python3 tools/ensure_beta_tag_changelog.py')
+        tag_at = metadata.rindex('python3 tools/check_beta_release_identity.py --version "$VERSION"')
         branch_end = metadata.index('          fi\n\n          # Run source regression tests')
         self.assertLess(manual_at, check_at)
         self.assertLess(tag_at, check_at)
@@ -57,6 +57,8 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
                         self.s.index('name: Ensure release tag'))
         self.assertIn('git push origin HEAD:beta', self.s)
         self.assertIn('git push origin "refs/tags/$RELEASE_TAG"', self.s)
+        self.assertLess(self.s.index('name: Verify beta package and manifest'),
+                        self.s.index('name: Ensure release tag'))
         self.assertNotIn('git push --force', self.s)
 
     def test_only_beta_branch(self):

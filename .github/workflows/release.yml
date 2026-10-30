@@ -22,7 +22,7 @@ concurrency:
 jobs:
   release-stable:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 18
     env:
       RELEASE_CHANNEL: stable
       CHANNEL_TAG: stable-channel
@@ -80,8 +80,8 @@ jobs:
               --version "$VERSION" \
               --tag "$RELEASE_TAG"
           else
-            # A tag is immutable: its version/changelog/channel must ALREADY
-            # match. Validation below will reject mismatches without rewriting.
+            # Strict immutable tag: its committed identity must match exactly.
+            # Refuse a mismatched tag instead of silently mutating build files.
             echo "Tag $RELEASE_TAG: 仅校验 Tag 对应源码，不自动修改版本文件。"
           fi
 
@@ -247,18 +247,42 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y lua5.1
+          sudo apt-get install -y lua5.1 luajit
           find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+          sudo apt-get install -y luajit
+          for engine in lua5.1 luajit; do
+            "$engine" tools/test_shelf_progress.lua
+            "$engine" tools/test_641_progress_recovery_behavior.lua
+            "$engine" tools/test_position_resolution.lua
+            "$engine" tools/test_progress_confirmation.lua
+            "$engine" tools/test_finished_status.lua
+          done
+          bash tools/release_preflight.sh stable
+
+      - name: Verify E-Ink and reading-time archives offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/miuread-eink-tests"
+          "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m pip install lupa==2.8 cryptography==50.0.2
+          "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_offline_readtime.py
+          "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_eink_download.py --zlib libz.so.1
+          # Same safety rules as Beta; no Beta-specific version assumptions.
+          lua5.1 tools/test_beta8_sync_behavior.lua
+          luajit tools/test_beta8_sync_behavior.lua
+          lua5.1 tools/test_641_progress_recovery_behavior.lua
+          luajit tools/test_641_progress_recovery_behavior.lua
+          python3 -m unittest discover -s tools -p 'test_642_stable_release_identity.py'
 
       - name: Build stable full package and manifest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
+          python3 tools/build_package.py --channel stable --output "dist/$PACKAGE_NAME"
 
           python3 - <<'PY'
           from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
           import hashlib
           import json
           import os
@@ -266,47 +290,7 @@ jobs:
           version = os.environ["VERSION"]
           package_name = os.environ["PACKAGE_NAME"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          root = Path("miuread.koplugin")
           output = Path("dist") / package_name
-          fixed_time = (2020, 1, 1, 0, 0, 0)
-
-          excluded_names = {
-              ".DS_Store",
-              "miuread.lua",
-              "settings.reader.lua",
-              "NON_COMMERCIAL_NOTICE.txt",
-          }
-          excluded_suffixes = {".md", ".epub", ".log"}
-
-          def excluded(path):
-              return (
-                  "__MACOSX" in path.parts
-                  or path.name in excluded_names
-                  or path.suffix.lower() in excluded_suffixes
-              )
-
-          with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
-              directories = [root] + sorted(
-                  [path for path in root.rglob("*") if path.is_dir()],
-                  key=lambda path: path.as_posix(),
-              )
-              for path in directories:
-                  info = ZipInfo(path.as_posix().rstrip("/") + "/", fixed_time)
-                  info.create_system = 3
-                  info.external_attr = (0o40755 << 16) | 0x10
-                  archive.writestr(info, b"")
-
-              files = sorted(
-                  [path for path in root.rglob("*") if path.is_file() and not excluded(path)],
-                  key=lambda path: path.as_posix(),
-              )
-              for path in files:
-                  info = ZipInfo(path.as_posix(), fixed_time)
-                  info.create_system = 3
-                  info.external_attr = 0o100644 << 16
-                  info.compress_type = ZIP_DEFLATED
-                  archive.writestr(info, path.read_bytes())
-
           payload = output.read_bytes()
           official = (
               f"https://github.com/{repo}/releases/download/"
@@ -341,6 +325,10 @@ jobs:
         run: |
           set -euo pipefail
           unzip -t "dist/$PACKAGE_NAME"
+          python3 tools/release_integrity.py package --channel stable \
+            --proposed "dist/update.json" --package "dist/$PACKAGE_NAME"
+          python3 -m unittest discover -s tools -p 'test_release_integrity.py' 
+          python3 -m unittest discover -s tools -p 'test_release_inventory.py'
 
           python3 - <<'PY'
           from pathlib import Path
@@ -361,8 +349,8 @@ jobs:
               "miuread.koplugin/NOTICE",
               "miuread.koplugin/THIRD_PARTY_NOTICES",
           }
-          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
-          forbidden_suffixes = {".md", ".epub", ".log"}
+          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua", "NON_COMMERCIAL_NOTICE.txt"}
+          forbidden_suffixes = {".md", ".epub", ".log", ".pyc", ".db", ".zip"}
 
           with ZipFile(package) as archive:
               names = archive.namelist()
@@ -381,6 +369,8 @@ jobs:
                   path.name in forbidden_names
                   or path.suffix.lower() in forbidden_suffixes
                   or "__MACOSX" in path.parts
+                  or "native" in path.parts
+                  or "__pycache__" in path.parts
               ):
                   errors.append(f"不应进入安装包：{name}")
           if manifest.get("version") != os.environ["VERSION"]:
@@ -420,7 +410,9 @@ jobs:
           # Avoid modifying a tag even when the release retry uses an old name.
           TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
           if [ -n "$TAG_SHA" ]; then
-            if ! git diff --quiet -- \
+            # Manual releases may not alter an already-owned tag's metadata.
+            # Push-tag runs may have workspace-only normalization above.
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && ! git diff --quiet -- \
                 miuread.koplugin/miuread/config.lua \
                 miuread.koplugin/_meta.lua CHANGELOG.md; then
               echo "::error::$RELEASE_TAG 已存在，不允许修改它的版本文件。"
@@ -465,22 +457,16 @@ jobs:
             gh release edit "$RELEASE_TAG" \
               --title "觅阅 · 微信读书助手 $VERSION" \
               --notes-file "$NOTES_FILE" \
-              --latest
+              --latest=false
           else
             gh release create "$RELEASE_TAG" \
               --verify-tag \
               --title "觅阅 · 微信读书助手 $VERSION" \
               --notes-file "$NOTES_FILE" \
-              --latest
+              --latest=false
           fi
 
-          gh release upload "$RELEASE_TAG" "$FILE" --clobber
-
-          COUNT="$(gh release view "$RELEASE_TAG" --json assets --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length')"
-          if [ "$COUNT" != "1" ]; then
-            echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
-            exit 1
-          fi
+          bash tools/release_asset_guard.sh
 
       - name: Quick-check public download URL
         shell: bash
@@ -528,7 +514,10 @@ jobs:
               --latest=false
           fi
 
-          gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME" --clobber
+          bash tools/publish_channel_manifest.sh
+
+          # Only a successfully promoted stable version becomes GitHub Latest.
+          gh release edit "$RELEASE_TAG" --latest
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$CHANNEL_TAG/$MANIFEST_NAME"
           success=0

@@ -8,6 +8,7 @@ are supported by the workflow and use a separate workspace-only preparation path
 
 import argparse
 import re
+import subprocess
 from pathlib import Path
 from changelog_integrity import canonicalize_changelog
 
@@ -48,6 +49,33 @@ def parse_notes(notes):
     return bullets
 
 
+
+def generated_notes_from_commits(root):
+    """Use recent user-facing source changes when optional notes are empty.
+
+    Never invent detailed fixes from a generic CI or release commit.
+    When no suitable history exists, parse_notes retains its honest generic fallback.
+    """
+    try:
+        result=subprocess.run(
+            ["git", "-C", str(root), "log", "-25", "--no-merges", "--pretty=format:%s", "--", "miuread.koplugin"],
+            text=True, capture_output=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    notes=[]
+    for line in result.stdout.splitlines():
+        line=" ".join(line.strip().split())
+        if not line or len(line)>200 or re.search(r"(?i)^(?:chore\(release\)|chore:|sync beta|merge )",line):
+            continue
+        if line not in notes:
+            notes.append(line)
+        if len(notes)>=5:
+            break
+    return " | ".join(notes)
+
+
 def find_version(contents, pattern, filename):
     matches = list(pattern.finditer(contents))
     if len(matches) != 1:
@@ -78,8 +106,10 @@ def extract_existing_notes(changelog, version):
 
 def prepare(root, version, notes):
     version_target = version_key(version)
-    bullets = parse_notes(notes)
     root = Path(root)
+    if not notes.strip():
+        notes = generated_notes_from_commits(root)
+    bullets = parse_notes(notes)
     config_path = root / "miuread.koplugin/miuread/config.lua"
     meta_path = root / "miuread.koplugin/_meta.lua"
     changelog_path = root / "CHANGELOG.md"

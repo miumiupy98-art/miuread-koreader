@@ -116,7 +116,7 @@ dead_methods = [
 ok(all(name not in main for name in dead_methods),'17 unreferenced private legacy methods removed')
 import runpy
 package_builder=runpy.run_path(str(root/'tools/build_package.py'))
-ok('python3 tools/build_package.py --output "dist/$PACKAGE_NAME"' in workflow
+ok('python3 tools/build_package.py --channel beta --output "dist/$PACKAGE_NAME"' in workflow
    and not package_builder['included'](root/'miuread.koplugin/native/miucodec.cpp'),
    'release package excludes native build source')
 ok('forbidden_prefixes = {"miuread.koplugin/native/"}' in workflow,'release verifier rejects native build source')
