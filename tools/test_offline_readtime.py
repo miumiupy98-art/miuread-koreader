@@ -386,6 +386,19 @@ class OfflineReadtimeTests(unittest.TestCase):
             assert(controller:start(sync,{book={book_id='book'}}))
         ''')
 
+    def test_live_reading_never_dispatches_eink_history_until_closed(self):
+        self.controller_fixture()
+        self.lua.execute('''
+            fake_now=1020;online=true
+            assert(controller:collect(false))
+            assert(controller.active and controller:summary().pending==20)
+            assert(not controller:send() and calls==0)
+            controller:stop(sync,'close',false)
+            assert(controller.active==nil and controller:summary().pending==20)
+            assert(controller:send() and calls==1)
+            assert(controller:summary().pending==0)
+        ''')
+
     def test_controller_collects_offline_then_uploads_and_logs_safely(self):
         self.controller_fixture()
         self.lua.execute('''
@@ -394,11 +407,14 @@ class OfflineReadtimeTests(unittest.TestCase):
             assert(not controller:send() and calls==0)
             assert(controller:summary().pending==20)
             online=true
+            -- The live reader owns the clock; it may queue but never POST.
+            assert(not controller:send() and calls==0)
+            controller:stop(sync,'close',false)
+            assert(controller.active==nil)
             assert(controller:send() and calls==1)
             assert(cloud.readingTime==30 and cloud.chapterOffset==77)
             assert(controller:summary().pending==0)
             assert(not controller:send() and calls==1)
-            controller:stop(sync,'close',false)
             assert(controller.active==nil)
         ''')
         log = (self.root / "miuread.log").read_text(encoding="utf-8")
@@ -410,7 +426,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_controller_missing_feature_uses_client_default(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;no_guest=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;no_guest=true
             controller:send()
             assert(calls==1 and controller:summary().pending==0)
             assert(cloud.readingTime==30)
@@ -426,7 +442,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_controller_invalid_feature_keeps_pending_before_post(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;bad_guest=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;bad_guest=true
             controller:send()
             assert(calls==0 and controller:summary().pending==20)
         ''')
@@ -438,7 +454,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_controller_missing_config_keeps_pending_before_post(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;no_config=true;no_guest=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;no_config=true;no_guest=true
             controller:send()
             assert(calls==0 and controller:summary().pending==20)
         ''')
@@ -472,18 +488,19 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_controller_stops_after_position_change_and_unknown_is_not_replayed(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;change_position=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;change_position=true
             controller:send()
             assert(controller:summary().blocked=='cloud_position_changed')
             fake_now=1040;controller:collect(false)
             assert(not controller:send() and calls==1)
+            assert(controller:summary().blocked=='cloud_position_changed')
         ''')
         self.assertIn("position_unchanged=false", (self.root / "miuread.log").read_text())
 
     def test_controller_transport_failure_is_durable_unknown(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;fail_http=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;fail_http=true
             controller:send()
             assert(controller:summary().unknown==20)
             fake_now=1090;fail_http=false
@@ -502,6 +519,8 @@ class OfflineReadtimeTests(unittest.TestCase):
             controller:yield_to_progress(sync,function(ok) granted=ok end)
             assert(granted==true and not controller:send() and calls==0)
             controller:release_progress(sync)
+            assert(not controller:send() and calls==0) -- still reading
+            controller:stop(sync,'close',false)
             assert(controller:send() and calls==1)
             controller:stop(sync,'suspend',true)
             stat.isEnabledAndNotFrozen=function() return false end
@@ -619,7 +638,7 @@ class OfflineReadtimeTests(unittest.TestCase):
         self.controller_fixture()
         self.lua.execute('''
             prefs.sync.time_diagnostics=false
-            fake_now=1020;controller:collect(false);online=true;controller:send()
+            fake_now=1020;controller:stop(sync,'close',false);online=true;controller:send()
         ''')
         log = (self.root / "miuread.log").read_text(encoding="utf-8")
         self.assertIn("phase=complete", log)
@@ -630,7 +649,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_controller_retry_is_persisted_and_manual_wake_obeys_it(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;no_config=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;no_config=true
             controller:send()
             assert(controller:summary().control.next_send==1080)
             controller:wake(host);no_config=false
@@ -643,10 +662,14 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_position_pause_can_be_checked_and_resumed_without_replay(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;change_position=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;change_position=true
             controller:send()
             assert(controller:summary().blocked=='cloud_position_changed')
-            fake_now=1040;controller:collect(false);change_position=false
+            -- A subsequent session contributes new seconds, with the first
+            -- confirmed batch preserved even while cloud position is blocked.
+            change_position=false
+            assert(controller:start(sync,{book={book_id='book'}}))
+            fake_now=1040;controller:stop(sync,'close',false)
             local resumed
             controller:check_and_resume(host,function(ok) resumed=ok end)
             assert(resumed and not controller:summary().blocked)
@@ -657,7 +680,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_failed_resume_keeps_pause_and_account_switch_cannot_ignore(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;fail_http=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;fail_http=true
             controller:send()
             local group=controller:unknown()[1]
             auth.account.vid='b';auth.native_shelf.vid='b'
@@ -674,7 +697,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_account_switch_during_preflight_never_dispatches(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true
             local client=require('miuread.eink_client')
             local original=client.new
             client.new=function(...)
@@ -769,6 +792,7 @@ class OfflineReadtimeTests(unittest.TestCase):
         self.lua.execute("""
             assert(s:start('open') and s.reading_time_backend=='eink' and daemon_starts==0)
             fake_now=1020;s:stop_fast('close');online=true
+            assert(s.state=='stopped' and s.current~=nil and controller.active==nil)
             assert(queue:summary('a').pending==20 and controller:send() and calls==1)
             assert(cloud.readingTime==30 and cloud.chapterOffset==77)
         """)
@@ -919,7 +943,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_rate_limit_cooldown_survives_restart(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true;bad_guest=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true;bad_guest=true
             require('miuread.http').rate_limit_details=function() return {wait_seconds=7200,code=429} end
             controller:send()
             assert(calls==0 and controller:summary().pending==20)
@@ -929,6 +953,7 @@ class OfflineReadtimeTests(unittest.TestCase):
         self.lua = runtime(self.root)
         self.controller_fixture()
         self.lua.execute('''
+            fake_now=1020;controller:stop(sync,'close',false)
             online=true;fake_now=8219
             assert(not controller:send() and calls==0)
             fake_now=8220
@@ -938,7 +963,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_explicit_receipt_commits_before_optional_position_readback(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1020;controller:collect(false);online=true
+            fake_now=1020;controller:stop(sync,'close',false);online=true
             local client=require('miuread.eink_client')
             local original=client.new
             client.new=function(...)
@@ -1276,8 +1301,9 @@ class OfflineReadtimeTests(unittest.TestCase):
                 end
                 return client
             end
-            fake_now=1030;fake_elapsed=130;controller:collect(false)
+            fake_now=1030;fake_elapsed=130;controller:stop(sync,'close',false)
             online=true;assert(controller:send() and calls==1)
+            assert(controller:start(sync,{book={book_id='book'}}))
             fake_now=1060;fake_elapsed=160;controller:collect(false)
             local batch=controller.queue:pending('a',fake_now)
             assert(batch.seconds==30 and batch.rows[1].risk==1)
@@ -1291,7 +1317,7 @@ class OfflineReadtimeTests(unittest.TestCase):
     def test_clock_metadata_write_failure_stops_preflight_before_post(self):
         self.controller_fixture()
         self.lua.execute('''
-            fake_now=1030;controller:collect(false)
+            fake_now=1030;controller:stop(sync,'close',false)
             controller.queue.server_clock=function() return nil,'ledger_failed' end
             online=true;controller:send()
             assert(calls==0 and controller:summary().pending==30)

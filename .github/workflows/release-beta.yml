@@ -1,8 +1,9 @@
 name: Release beta full package
 
 # Two supported release paths:
-# - A pushed v*-beta.* tag publishes that exact tagged source (no ref rewriting).
-# - Manual dispatch prepares the beta branch and creates a new immutable tag.
+# - A pushed valid Beta tag determines the release version; metadata is generated
+#   inside the build workspace without modifying the source commit or moving Tag.
+# - Manual dispatch prepares/commits metadata and creates an immutable new tag.
 on:
   push:
     tags:
@@ -116,12 +117,15 @@ jobs:
               exit 1
             fi
           else
-            # An immutable tag must exactly describe the code it points to.
-            # Never synthesize version/changelog changes only inside the build.
+            # Tag is authoritative; no prior manual CHANGELOG or config edits.
+            # Do not amend, force-push or move this immutable Git reference.
+            python3 tools/prepare_beta_release.py --version "$VERSION" --notes "" --tag-workspace
             python3 tools/check_beta_release_identity.py --version "$VERSION"
-            if ! git diff --quiet -- \
-                miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md; then
-              echo "::error::Tag build would rewrite committed release metadata."
+            # Only generated release metadata may differ from the Tag checkout.
+            DIRTY_OTHER="$(git diff --name-only -- . ':!CHANGELOG.md' \
+              ':!miuread.koplugin/_meta.lua' ':!miuread.koplugin/miuread/config.lua')"
+            if [ -n "$DIRTY_OTHER" ]; then
+              echo "::error::Tag normalization changed unrelated source files: $DIRTY_OTHER"
               exit 1
             fi
           fi
@@ -131,6 +135,7 @@ jobs:
           # include strict checks against VERSION and must not inspect the
           # pre-release source version when Actions targets a newer version.
           python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'
+          python3 -m unittest discover -s tools -p 'test_beta_tag_workspace.py'
           python3 -m unittest discover -s tools -p 'test_beta_release_workflow.py'
           python3 -m unittest discover -s tools -p 'test_beta11_release_guard.py' 
           python3 -m unittest discover -s tools -p 'test_beta12_release_regression.py'

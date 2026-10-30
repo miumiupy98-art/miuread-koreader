@@ -9,12 +9,14 @@ fi
 python3 -m unittest discover -s tools -p 'test_release_integrity.py'
 python3 -m unittest discover -s tools -p 'test_release_workflows.py'
 python3 -m unittest discover -s tools -p 'test_release_inventory.py'
+python3 -m unittest discover -s tools -p 'test_beta_tag_workspace.py'
 for engine in lua5.1 luajit; do
   "$engine" tools/test_shelf_progress.lua
   "$engine" tools/test_641_progress_recovery_behavior.lua
   "$engine" tools/test_position_resolution.lua
   "$engine" tools/test_finished_status.lua
   "$engine" tools/test_progress_confirmation.lua
+  "$engine" tools/test_readtime_live_dispatch.lua
 done
 if [[ "$channel" == beta ]]; then
   lua5.1 tools/test_beta8_sync_behavior.lua

@@ -22,7 +22,8 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
     def test_tag_is_immutable_and_uses_tagged_source(self):
         self.assertIn('Tag 必须指向 beta 分支历史中的提交', self.s)
         self.assertIn('GITHUB_SHA', self.s)
-        self.assertIn('Tag build would rewrite committed release metadata', self.s)
+        self.assertIn('python3 tools/prepare_beta_release.py --version "$VERSION" --notes "" --tag-workspace',self.s)
+        self.assertIn('Tag normalization changed unrelated source files',self.s)
         self.assertIn("if: github.event_name == 'workflow_dispatch'", self.s)
         self.assertNotIn('git push --force', self.s)
 

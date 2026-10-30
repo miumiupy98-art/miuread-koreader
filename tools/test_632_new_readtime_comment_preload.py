@@ -7,8 +7,9 @@ class NextRelease(unittest.TestCase):
     def test_time_gate_blocks_live_eink_sessions(self):
         ctrl=source("miuread.koplugin/miuread/readtime_controller.lua")
         send=ctrl.split("function M:send()",1)[1].split("function M:summary()",1)[0]
-        self.assertIn("if self.active or (live_sync and live_sync.current)",send)
-        self.assertIn("or (self.sync and self.sync.current) then return false end",send)
+        self.assertIn('if self.active or live_reader(live_sync) or live_reader(self.sync) then return false end',send)
+        self.assertIn('s.current and s.state~="stopped"',send)
+        self.assertIn('host._reading_end_sync_active',send)
     def test_manual_comment_priority_and_preload(self):
         main=source("miuread.koplugin/main.lua")
         self.assertIn("self:_cancel_next_comment_preload(\"manual priority\")",main)

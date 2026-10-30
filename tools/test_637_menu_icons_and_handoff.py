@@ -82,5 +82,5 @@ class MenuAndHandoff(unittest.TestCase):
         self.assertTrue((root/'readtime_outbox.lua').exists())
         self.assertTrue((root/'eink_readtime.lua').exists())
         self.assertTrue((root/'legacy/read_report_worker.lua').exists())
-        self.assertIn('if self.active or (live_sync and live_sync.current)',read('miuread.koplugin/miuread/readtime_controller.lua'))
+        self.assertIn('if self.active or live_reader(live_sync) or live_reader(self.sync)',read('miuread.koplugin/miuread/readtime_controller.lua'))
 if __name__=='__main__':unittest.main()

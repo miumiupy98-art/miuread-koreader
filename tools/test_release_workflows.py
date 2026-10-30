@@ -15,6 +15,8 @@ class ReleaseWorkflows(unittest.TestCase):
                         BETA.index('name: Ensure release tag'))
         self.assertIn('python3 tools/check_beta_release_identity.py --version "$VERSION"', BETA)
         self.assertNotIn('python3 tools/ensure_beta_tag_changelog.py', BETA)
+        self.assertIn('tools/prepare_beta_release.py --version "$VERSION" --notes "" --tag-workspace', BETA)
+        self.assertIn('Tag normalization changed unrelated source files', BETA)
     def test_no_force_move_of_versioned_assets(self):
         for workflow in (BETA, STABLE):
             self.assertIn('bash tools/release_asset_guard.sh', workflow)

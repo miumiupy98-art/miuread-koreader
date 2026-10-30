@@ -35,7 +35,7 @@ class SmartTimeRoute(unittest.TestCase):
         self.assertIn('if self.active then self:schedule(60)',ctrl)
         self.assertIn('UI:scheduleIn(delay or 60,task)',ctrl)
         send=ctrl.split('function M:send()',1)[1].split('function M:summary()',1)[0]
-        self.assertIn('if self.active or (live_sync and live_sync.current)',send)
+        self.assertIn('if self.active or live_reader(live_sync) or live_reader(self.sync)',send)
         self.assertIn('local eink_allowed=mode=="eink" or mode=="smart"',send)
         self.assertIn('if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink"',send)
         self.assertIn('value.state=="confirmed"',send)
