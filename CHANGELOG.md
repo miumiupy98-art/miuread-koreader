@@ -1,6 +1,16 @@
 ## 6.3.2-beta.3 - Beta Update
 
 - 修复评论获取菜单合并后发布回归测试仍引用旧入口的问题，保持评论下载、阅读时间及锁屏功能不变
+## 6.3.2 - 2026-10-30
+
+- feat(readtime): preserve complete offline reading-time upload implementation
+- fix(readtime): adapt Web outbox to upstream and preserve close tails
+- fix(readtime): preserve upstream Web reporting and isolate E-Ink outbox
+- 修复弹窗空白和美化评论获取进度条
+- 实现 Web/E-Ink 智能阅读时间同步与离线补传，修复授权和同步稳定性问题，并全面优化菜单交互逻辑及黑白 SVG 图标体系
+- chore(release): prepare v6.3.0
+- chore(release): prepare v6.3.1
+- 整合优化阅读时间记录与同步、评论下载及下一章自动预载，统一主页快捷操作和多级菜单，并新增 KOReader 原生锁屏支持
 
 ## 6.3.2-beta.2 - 2026-10-30
 
