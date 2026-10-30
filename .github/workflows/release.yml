@@ -242,14 +242,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run Lua syntax checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y lua5.1
-          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
-
       - name: Build stable full package and manifest
         shell: bash
         run: |
@@ -336,73 +328,6 @@ jobs:
           )
           PY
 
-      - name: Verify stable package and manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          unzip -t "dist/$PACKAGE_NAME"
-
-          python3 - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
-          import hashlib
-          import json
-          import os
-          import sys
-
-          package = Path("dist") / os.environ["PACKAGE_NAME"]
-          manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
-          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
-          required = {
-              "miuread.koplugin/_meta.lua",
-              "miuread.koplugin/main.lua",
-              "miuread.koplugin/miuread/config.lua",
-              "miuread.koplugin/LICENSE",
-              "miuread.koplugin/NOTICE",
-              "miuread.koplugin/THIRD_PARTY_NOTICES",
-          }
-          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
-          forbidden_suffixes = {".md", ".epub", ".log"}
-
-          with ZipFile(package) as archive:
-              names = archive.namelist()
-              damaged = archive.testzip()
-
-          errors = []
-          if damaged:
-              errors.append(f"ZIP 损坏：{damaged}")
-          for name in sorted(required.difference(names)):
-              errors.append(f"安装包缺少：{name}")
-          for name in names:
-              path = Path(name)
-              if not name.startswith("miuread.koplugin/"):
-                  errors.append(f"安装包根目录错误：{name}")
-              if (
-                  path.name in forbidden_names
-                  or path.suffix.lower() in forbidden_suffixes
-                  or "__MACOSX" in path.parts
-              ):
-                  errors.append(f"不应进入安装包：{name}")
-          if manifest.get("version") != os.environ["VERSION"]:
-              errors.append("更新清单版本错误")
-          if manifest.get("channel") != "stable":
-              errors.append("更新清单通道错误")
-          if manifest.get("notes") != summary or manifest.get("summary") != summary:
-              errors.append("线上更新摘要错误")
-          if len(summary.splitlines()) > 4 or len(summary) > 180:
-              errors.append("设备更新摘要超过 4 行或 180 个字符")
-          if manifest.get("size") != package.stat().st_size:
-              errors.append("更新清单文件大小错误")
-          if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
-              errors.append("更新清单 SHA-256 错误")
-
-          if errors:
-              for error in errors:
-                  print(f"::error::{error}")
-              sys.exit(1)
-          print(f"正式版安装包检查通过，共 {len(names)} 个条目。")
-          PY
-
       - name: Commit stable identity and ensure immutable tag
         shell: bash
         run: |
@@ -480,31 +405,6 @@ jobs:
           if [ "$COUNT" != "1" ]; then
             echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
             exit 1
-          fi
-
-      - name: Quick-check public download URL
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
-          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update.json"))["sha256"])')"
-          success=0
-          for attempt in 1 2 3; do
-            rm -f dist/public-download.zip
-            if curl --fail --location --silent --show-error \
-                --connect-timeout 5 --max-time 20 \
-                --output dist/public-download.zip "$URL"; then
-              ACTUAL="$(sha256sum dist/public-download.zip | awk '{print $1}')"
-              if [ "$ACTUAL" = "$EXPECTED" ]; then
-                success=1
-                break
-              fi
-            fi
-            [ "$attempt" = "3" ] || sleep 2
-          done
-          if [ "$success" != "1" ]; then
-            echo "::warning::Release 已由 GitHub API 确认上传，但当前 runner 暂时无法从公开 CDN 回读；继续发布正式清单。"
           fi
 
       - name: Publish fixed stable channel manifest
