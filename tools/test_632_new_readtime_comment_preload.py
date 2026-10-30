@@ -23,6 +23,6 @@ class NextRelease(unittest.TestCase):
         self.assertIn('self.on_cancel',ui)
     def test_beta_identity(self):
         config=source("miuread.koplugin/miuread/config.lua")
-        self.assertIn('VERSION = "6.3.2-beta.2"',config)
+        self.assertIn('VERSION = "6.3.2-beta.3"',config)
         self.assertIn('UPDATE_CHANNEL = "beta"',config)
 if __name__=="__main__": unittest.main()

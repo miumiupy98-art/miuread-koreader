@@ -57,7 +57,7 @@ class Beta17Contracts(unittest.TestCase):
         self.assertIn('ignored malformed/extra entries',parser)
         self.assertIn('status.status=="cached" or status.status=="empty"',main)
         self.assertIn('function Plugin:_comment_fetch_mode_menu(',main)
-        self.assertIn('self:_fetch_current_chapter_comments(false,back_callback)',main)
+        self.assertIn('self:_fetch_current_chapter_comments(true,back_callback)',main)
         self.assertIn('self:_fetch_current_chapter_comments(true,back_callback)',main)
 
     def test_other_ux_regressions(self):
