@@ -547,49 +547,121 @@ jobs:
             echo "::warning::正式清单已由 GitHub API 上传，但当前 runner 暂时无法从公开 CDN 回读。"
           fi
 
-      - name: Sync released main history back to beta
+            - name: Sync released main history back to beta
         shell: bash
         run: |
           set -euo pipefail
-
           git fetch origin main beta
           MAIN_SHA="$(git rev-parse origin/main)"
           BETA_SHA="$(git rev-parse origin/beta)"
 
           if [ "$MAIN_SHA" != "$RELEASE_SOURCE_SHA" ]; then
-            echo "::warning::main 已在发布过程中继续前进，跳过自动回同步 beta。"
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              echo "::notice::历史 Tag 重新运行，main 已前进；无需修改 beta。"
+              exit 0
+            fi
+            echo "::error::main 在发布过程中发生变化；回同步未执行，请检查分支。"
+            exit 1
+          fi
+
+          if git merge-base --is-ancestor "$MAIN_SHA" "$BETA_SHA"; then
+            echo "main 已包含在 beta 历史中，无需回同步。"
             exit 0
           fi
 
-          # 只有在 beta 确实已经被本次 main 吸收时才自动回同步。
-          # 若 beta 在发布期间又有新提交，不强行改写，避免覆盖新开发内容。
-          if ! git merge-base --is-ancestor "$BETA_SHA" "$MAIN_SHA"; then
-            echo "::warning::beta 已有未包含在本次正式版中的新提交，跳过自动回同步。"
-            exit 0
-          fi
+          BASE_SHA="$(git merge-base "$MAIN_SHA" "$BETA_SHA")"
+          # 仅自动处理正式版发布生成的版本记录；真实业务修改不自动覆盖。
+          while IFS= read -r subject; do
+            case "$subject" in
+              "chore(release): prepare v"*) ;;
+              *) echo "::error::main 有非发布提交：$subject；请人工审核合并。"; exit 1 ;;
+            esac
+          done < <(git log --no-merges --format=%s "$BASE_SHA..$MAIN_SHA")
 
-          git checkout -B beta-sync "$BETA_SHA"
+          while IFS= read -r file; do
+            case "$file" in
+              CHANGELOG.md|miuread.koplugin/_meta.lua|miuread.koplugin/miuread/config.lua) ;;
+              *) echo "::error::main 修改了其他文件：$file；拒绝自动合并。"; exit 1 ;;
+            esac
+          done < <(git diff --name-only "$BASE_SHA" "$MAIN_SHA")
+
+          git switch -C beta-sync "$BETA_SHA"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # main 相对 beta 只应增加正式版身份/记录及可能的正式热修。
-          # 合并历史后恢复 beta 自身的版本号和默认通道，避免下一次 beta -> main
-          # 因发布身份不同产生重复冲突。
-          git merge --no-ff --no-commit "$MAIN_SHA"
-          git restore --source="$BETA_SHA" --staged --worktree -- \
-            miuread.koplugin/miuread/config.lua \
-            miuread.koplugin/_meta.lua
-
-          if git diff --cached --quiet; then
-            git merge --abort || true
-            echo "beta 已包含正式发布历史，无需回同步。"
-            exit 0
+          if ! git merge --no-ff --no-commit "$MAIN_SHA"; then
+            while IFS= read -r file; do
+              case "$file" in
+                CHANGELOG.md|miuread.koplugin/_meta.lua|miuread.koplugin/miuread/config.lua) ;;
+                *) echo "::error::业务文件存在合并冲突：$file；请人工解决。"; exit 1 ;;
+              esac
+            done < <(git diff --name-only --diff-filter=U)
           fi
 
-          git commit -m "同步正式版 $VERSION 发布记录回 beta" \
-            -m "保留 beta 自身版本与内测通道，仅同步 main 的正式发布历史，减少下一次合并冲突。"
+          export MAIN_SHA BETA_SHA
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
 
-          if ! git push origin "HEAD:beta"; then
-            echo "::warning::beta 在回同步期间发生变化，未覆盖新提交；本次正式版发布不受影响。"
-            exit 0
+          def source(ref, path):
+              return subprocess.check_output(
+                  ["git", "show", f"{ref}:{path}"], text=True
+              )
+
+          beta_sha = os.environ["BETA_SHA"]
+          main_sha = os.environ["MAIN_SHA"]
+          beta_notes = source(beta_sha, "CHANGELOG.md")
+          main_notes = source(main_sha, "CHANGELOG.md")
+          header = re.compile(r"(?m)^## (\d+\.\d+\.\d+)(?:[ \t]+-[^\n]*)?[ \t]*$")
+
+          def stable_sections(text):
+              items = {}
+              for match in header.finditer(text):
+                  next_heading = re.search(r"(?m)^## ", text[match.end():])
+                  end = match.end() + next_heading.start() if next_heading else len(text)
+                  items[match.group(1)] = text[match.start():end].strip()
+              return items
+
+          beta_sections = stable_sections(beta_notes)
+          main_sections = stable_sections(main_notes)
+          version = os.environ["VERSION"]
+          if version not in main_sections:
+              raise SystemExit(f"::error::main 缺少正式发布记录 {version}")
+          for number in main_sections.keys() & beta_sections.keys():
+              if main_sections[number] != beta_sections[number]:
+                  raise SystemExit(f"::error::正式版 {number} 更新记录不一致，请人工合并")
+
+          additions = [section for number, section in main_sections.items()
+                       if number not in beta_sections]
+          if additions:
+              heading = re.search(r"(?m)^# Changelog[ \t]*$", beta_notes)
+              if heading:
+                  place = heading.end()
+                  beta_notes = (beta_notes[:place] + "\n\n" + "\n\n".join(additions)
+                                + "\n" + beta_notes[place:])
+              else:
+                  beta_notes = "\n\n".join(additions) + "\n\n" + beta_notes
+          Path("CHANGELOG.md").write_text(beta_notes, encoding="utf-8")
+          for path in ("miuread.koplugin/_meta.lua",
+                       "miuread.koplugin/miuread/config.lua"):
+              Path(path).write_text(source(beta_sha, path), encoding="utf-8")
+          PY
+
+          git add -- CHANGELOG.md miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::仍存在未解决的合并冲突。"
+            exit 1
           fi
+          git commit -m "merge: sync stable $VERSION history into beta"
+          if ! git push origin HEAD:beta; then
+            echo "::error::beta 在回同步过程中继续前进；未覆盖任何提交，请重新同步。"
+            exit 1
+          fi
+          git fetch origin main beta
+          if ! git merge-base --is-ancestor origin/main origin/beta; then
+            echo "::error::回同步完成后祖先关系检查失败。"
+            exit 1
+          fi
+          echo "已将正式版发布历史安全合入 beta，并保留内测版本与通道。"
