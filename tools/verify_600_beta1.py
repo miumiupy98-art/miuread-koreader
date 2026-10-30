@@ -111,7 +111,11 @@ dead_methods = [
     "_inkstain_enabled", "_inkstain_active",
 ]
 ok(all(name not in main for name in dead_methods),'17 unreferenced private legacy methods removed')
-ok('(relative.parts and relative.parts[0] == "native")' in workflow,'release package excludes native build source')
+import runpy
+package_builder=runpy.run_path(str(root/'tools/build_package.py'))
+ok('python3 tools/build_package.py --output "dist/$PACKAGE_NAME"' in workflow
+   and not package_builder['included'](root/'miuread.koplugin/native/miucodec.cpp'),
+   'release package excludes native build source')
 ok('forbidden_prefixes = {"miuread.koplugin/native/"}' in workflow,'release verifier rejects native build source')
 verifiers=sorted((root/'tools').glob('verify_*.py'))
 required_verifiers={'verify_600_beta1.py','verify_memory_profile.py'}

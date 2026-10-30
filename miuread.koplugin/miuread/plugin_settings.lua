@@ -1,5 +1,6 @@
 local ExtensionCenter=require("miuread.extension_center")
 local M={}
+local MenuIcons=require("miuread.menu_icons")
 
 local function append(rows,items)
     for _,row in ipairs(items or {}) do rows[#rows+1]=row end
@@ -202,8 +203,26 @@ function M.menu(plugin)
         rows[#rows+1]={text="阅读界面",sub_item_table_func=function() return M.plugin_interface(plugin) end}
     end
     rows[#rows+1]={text="运行与兼容",sub_item_table_func=function() return M.runtime_compat(plugin) end}
+    rows[#rows+1]={text="插件与扩展",sub_item_table_func=function() return M.plugins_extensions(plugin) end}
+    rows[#rows+1]={text="系统维护",sub_item_table_func=function() return M.system_maintenance(plugin) end}
     rows[#rows+1]={text="更新与关于",post_text=tostring(plugin.version),sub_item_table_func=function() return M.update_about(plugin) end}
     return rows
 end
 
+-- All public settings menus share the icon vocabulary, including lazy
+-- submenu providers. Preserve callback identity and native checked items.
+local function decorate(items)
+    for _,item in ipairs(items or {}) do
+        if type(item)=="table" and not item.icon_key and not item.separator then
+            item.icon_key=MenuIcons.key(item.text)
+        end
+    end
+    return items
+end
+for _,name in ipairs({"sync","comments","notices","performance","reading_library",
+    "sync_download","home_interface","plugin_interface","runtime_compat",
+    "update_about","plugins_extensions","koreader_tools","system_maintenance","menu"}) do
+    local original=M[name]
+    if original then M[name]=function(plugin) return decorate(original(plugin)) end end
+end
 return M

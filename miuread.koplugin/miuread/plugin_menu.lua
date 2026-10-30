@@ -1,6 +1,7 @@
 local PluginSettings=require("miuread.plugin_settings")
 
 local M={}
+local MenuIcons=require("miuread.menu_icons")
 
 local function comment_and_thought_menu(plugin)
     local rows={
@@ -65,4 +66,18 @@ function M.reader(plugin)
     return rows
 end
 
+-- The traditional KOReader menu receives the same declared icon keys as
+-- custom Home lists. A missing SVG is handled by the shared icon registry.
+local function decorate(items)
+    for _,item in ipairs(items or {}) do
+        if type(item)=="table" and not item.icon_key and not item.separator then
+            item.icon_key=MenuIcons.key(item.text)
+        end
+    end
+    return items
+end
+for _,name in ipairs({"home","reader"}) do
+    local orig=M[name]
+    M[name]=function(plugin) return decorate(orig(plugin)) end
+end
 return M

@@ -369,7 +369,7 @@ local function authorize_shelf(plugin,detail,client_access)
     local vid,session=identity(plugin)
     local dialog
     dialog=ButtonDialog:new{
-        title=(client_access and "E-Ink 客户端授权\n\n请使用微信扫描二维码，并选择与觅阅相同的微信读书账号。授权后，在自动模式下优先使用 E-Ink。"
+        title=(client_access and "E-Ink 客户端授权\n\n请用微信扫码授权与觅阅相同的微信读书账号。智能阅读时间模式下，E-Ink 负责断网时间补传。"
             or "书架管理需要客户端授权\n\n请使用微信扫描二维码，并选择与觅阅相同的微信读书账号。授权后，再重新选择移除。")
             ..(detail and ("\n\n接口错误："..shelf_error_summary(detail)) or ""),title_align="center",
         buttons={{{text="微信扫码授权",callback=function()
@@ -387,7 +387,18 @@ local function authorize_shelf(plugin,detail,client_access)
                 toast=function(_,text,duration) plugin:toast(text,duration) end,
                 info=function(_,text) plugin:info(text) end,
                 on_auth_success=function()
-                    plugin:info(client_access and "E-Ink 客户端授权已保存。自动模式下，书架、书城、批注读取及下载将优先使用 E-Ink。" or "书架管理授权已保存。请重新选择要移除的书籍。")
+                    if plugin.sync and plugin.sync.offline_time_controller then
+                        plugin.sync:offline_time_controller():authorization_restored(plugin)
+                    end
+                    -- QR login has just verified the new credentials through
+                    -- Native /shelf/sync; reflect that check without claiming
+                    -- any reading-time batch has already been uploaded.
+                    local fresh_auth=plugin.store:auth()
+                    plugin._eink_auth_check_vid=tostring((fresh_auth.account or {}).vid or (fresh_auth.cookies or {}).wr_vid or "")
+                    plugin._eink_auth_check_at=os.time()
+                    plugin._eink_auth_check_ok=true
+                    if plugin._refresh_miuread_menu then plugin:_refresh_miuread_menu() end
+                    plugin:info(client_access and "E-Ink 客户端授权已保存；已安排检查待上传的离线阅读时间。" or "书架管理授权已保存。请重新选择要移除的书籍。")
                 end,
             }
             local Client=require("miuread.shelf_client")

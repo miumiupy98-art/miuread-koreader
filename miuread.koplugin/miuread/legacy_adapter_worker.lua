@@ -115,6 +115,7 @@ function Adapter.run(job)
         core_map_hash = job.core_map_hash,
         progress_ratio = job.progress_ratio,
         elapsed_seconds = job.elapsed_seconds,
+        web_time_disabled = job.web_time_disabled==true,
         cookies = copy(job.cookies or {}),
         api_key = job.api_key or "",
         wr_ticket = job.wr_ticket or "",

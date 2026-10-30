@@ -108,6 +108,9 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_623_session_snapshot_and_comment_ui.py'
           python3 -m unittest discover -s tools -p 'test_625_comment_menu_and_sync_notice.py'
           python3 -m unittest discover -s tools -p 'test_630_comment_compact_progress.py'
+          python3 -m unittest discover -s tools -p 'test_632_home_download_choice.py'
+          python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
+          python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
@@ -332,6 +335,12 @@ jobs:
           lua5.1 tools/test_beta17_worker_and_comments.lua
           lua5.1 tools/test_630_comment_compact_ui.lua
           luajit tools/test_630_comment_compact_ui.lua
+          lua5.1 tools/test_632_home_download_choice.lua
+          luajit tools/test_632_home_download_choice.lua
+          lua5.1 tools/test_633_download_choices.lua
+          luajit tools/test_633_download_choices.lua
+          lua5.1 tools/test_633_action_sheet_fallback.lua
+          luajit tools/test_633_action_sheet_fallback.lua
           lua5.1 tools/test_620_readtime_clock.lua
           lua5.1 tools/test_readtime_recovery.lua
           lua5.1 tools/test_beta5_sync_contract.lua
@@ -390,6 +399,11 @@ jobs:
           python3 tools/test_extension_center_ux.py
           python3 tools/verify_600_beta1.py
           python3 tools/test_624_release_verifier_contract.py
+          python3 tools/test_635_eink_only_route.py
+          python3 tools/test_636_smart_time_route.py
+          python3 tools/test_637_menu_icons_and_handoff.py
+          lua5.1 tools/test_637_handoff.lua
+          luajit tools/test_637_handoff.lua
           python3 tools/verify_memory_profile.py
           python3 tools/test_beta11_download_resume.py
           lua5.1 tools/test_beta11_download_resume_policy.lua
@@ -403,6 +417,7 @@ jobs:
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/miuread-eink-tests"
           "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m pip install lupa==2.8 cryptography==50.0.2
+          "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_offline_readtime.py
           "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_eink_download.py --zlib libz.so.1
 
       - name: Commit prepared beta version and changelog
@@ -458,10 +473,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          python3 tools/build_package.py --output "dist/$PACKAGE_NAME"
 
           python3 - <<'PY'
           from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
           import hashlib
           import json
           import os
@@ -469,49 +484,7 @@ jobs:
           version = os.environ["VERSION"]
           package_name = os.environ["PACKAGE_NAME"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          root = Path("miuread.koplugin")
           output = Path("dist") / package_name
-          fixed_time = (2020, 1, 1, 0, 0, 0)
-
-          excluded_names = {
-              ".DS_Store",
-              "miuread.lua",
-              "settings.reader.lua",
-              "NON_COMMERCIAL_NOTICE.txt",
-          }
-          excluded_suffixes = {".md", ".epub", ".log"}
-
-          def excluded(path):
-              relative = path.relative_to(root)
-              return (
-                  "__MACOSX" in path.parts
-                  or (relative.parts and relative.parts[0] == "native")
-                  or path.name in excluded_names
-                  or path.suffix.lower() in excluded_suffixes
-              )
-
-          with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
-              directories = [root] + sorted(
-                  [path for path in root.rglob("*") if path.is_dir() and not excluded(path)],
-                  key=lambda path: path.as_posix(),
-              )
-              for path in directories:
-                  info = ZipInfo(path.as_posix().rstrip("/") + "/", fixed_time)
-                  info.create_system = 3
-                  info.external_attr = (0o40755 << 16) | 0x10
-                  archive.writestr(info, b"")
-
-              files = sorted(
-                  [path for path in root.rglob("*") if path.is_file() and not excluded(path)],
-                  key=lambda path: path.as_posix(),
-              )
-              for path in files:
-                  info = ZipInfo(path.as_posix(), fixed_time)
-                  info.create_system = 3
-                  info.external_attr = 0o100644 << 16
-                  info.compress_type = ZIP_DEFLATED
-                  archive.writestr(info, path.read_bytes())
-
           payload = output.read_bytes()
           official = (
               f"https://github.com/{repo}/releases/download/"
@@ -568,6 +541,15 @@ jobs:
               "miuread.koplugin/LICENSE",
               "miuread.koplugin/NOTICE",
               "miuread.koplugin/THIRD_PARTY_NOTICES",
+              "miuread.koplugin/miuread/readtime_controller.lua",
+              "miuread.koplugin/miuread/readtime_outbox.lua",
+              "miuread.koplugin/miuread/readtime_stats.lua",
+              "miuread.koplugin/miuread/readtime_clock.lua",
+              "miuread.koplugin/miuread/readtime_metadata.lua",
+              "miuread.koplugin/miuread/readtime_protocol.lua",
+              "miuread.koplugin/miuread/eink_readtime.lua",
+              "miuread.koplugin/licenses/weread-omni-MIT.txt",
+              "miuread.koplugin/licenses/moon-GPL-3.0.txt",
           }
           forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
           forbidden_suffixes = {".md", ".epub", ".log"}

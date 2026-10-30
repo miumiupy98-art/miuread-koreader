@@ -1,0 +1,55 @@
+{
+  "reference": "WeRead E-Ink 2.1.2 cached DEX and arm64 libencrypt, inspected 2026-10-25",
+  "scope": "Static client contract; not a captured official HTTP request or a server anti-abuse specification",
+  "source_sha256": {
+    "classes3.dex": "8196ba94523ac721c7b6d266552e7a429c2a1f46a661c806340320865b366250",
+    "classes4.dex": "40cc29222c925d4814f9a2c726de132b758ec36de5f77cdde44f9577085a862e",
+    "classes5.dex": "1712a7699b20798591ba7c6f61b2dfc6df99f083b992f7db2e52b7e0a03f3bb0",
+    "classes6.dex": "f98445758ac17262da64b6a9b81ccd4706eb832212277b6daef732f4b1f9070f",
+    "classes7.dex": "94eaa9a3ff2123bc8a3f432db16203aa06bcf6b7cab08ba7e7c98dd47f78c461",
+    "classes9.dex": "be7f454a4bf8867d491cd564fb3e608a2077e2558c9698ce79d803f61874f1a1",
+    "classes11.dex": "9720cc0f9766c8a48395720b4c1c3e9c0ae0dfcd9ab3f6ae0ac89dbc8fb3c6b7",
+    "classes13.dex": "61c6c680def64948d38a47453cb3da00df0daa658fb0f6d30dc63e118149328b",
+    "libencrypt.so": "f4aeebc402971aead39d199fbcf10bf80c0a9536cef07561c5c84a2bbe8f09a2"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/book/batchUploadProgress",
+    "required_envelope_fields": ["books", "timestamp", "random", "signature"],
+    "optional_envelope_field": "recordCreateTimeZone",
+    "offline_default_omits_optional_field": true,
+    "outer_timestamp_unit": "milliseconds",
+    "book_timestamp_unit": "seconds",
+    "outer_random_separate_draw": true,
+    "random_min": 0,
+    "random_max": 999
+  },
+  "base_book_wire_fields": [
+    "appId", "autoTime", "bookId", "bookVersion", "currentProgress", "deviceId",
+    "finish", "hours", "installId", "isLecture", "isResendReadingInfo",
+    "lectureTextTime", "lectureTime", "novalTime", "progress", "random",
+    "readingTime", "recordCreateTimeZone", "risk", "signature", "summary",
+    "timestamp", "ttsTime"
+  ],
+  "excluded_book_fields": ["inMyShelf", "voiceType", "chapterUid", "chapterIdx", "chapterOffset"],
+  "hour_fields": ["startOfHour", "timeZone", "readingTime", "ttsTime"],
+  "risk_bits": {"time_changed": 1, "time_zone_unusually_changed": 4},
+  "clock_detection": {
+    "clock_drift_min_seconds": 10,
+    "forward_adjustment_alone_sets_time_changed": false,
+    "time_zone_repeat_min_gap_seconds": 3600,
+    "time_zone_trust_seconds": 259200,
+    "server_time_default_max_offset_seconds": 600,
+    "server_time_zero_limit_disables_check": true
+  },
+  "evidence": {
+    "endpoint": "classes3 BaseReportService.batchUploadProgress Retrofit method and parameter annotations",
+    "base_dto": "classes3 ReportService.generateBookReadPostBody sentinel branch 0x0140; BaseBookReadPostBody fields/getters and JSONField annotations",
+    "envelope": "classes3 BaseReportService$DefaultImpls.batchUploadProgress$default 0x000c and ReportService.resendOfflineReadingInfos$lambda-12",
+    "serialization": "classes11 ParameterHandler$JSONField.apply null branch; JSONBody$Builder.build; classes5 JavaBeanProxy.has non-proxy branch; classes6 TypeUtils.computeGetters is-prefix branch 0x04e4",
+    "time_zone": "classes3 Hour$Companion.generateCurrentTimeZone uses TimeZone.getRawOffset",
+    "delta": "classes3 ReportService.updateReadProgress$lambda-6$lambda-3 0x003e adds to OfflineReadingInfo.readingTime; resendOfflineReadingInfos$lambda-12$lambda-11 clears on succ=1",
+    "risk": "classes3 ReportServiceKt.saveHoursTime ORs 1 at 0x003a and 4 at 0x006c; classes4 TimeChangeCheck.recordCurrentTime/checkTimeZone; classes7 ModuleInitializer$initAppService$11.invoke; classes5 FeatureServerTimeMaxOffsetWrapper defaults to 600",
+    "outer_signature": "classes9 AntiReplayAction$DefaultImpls.getAntiReplaySignature and getRandom"
+  }
+}

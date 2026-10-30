@@ -1,5 +1,5 @@
 local Blitbuffer = require("ffi/blitbuffer")
-local ButtonDialog = require("ui/widget/buttondialog")
+local ReaderSettingsDialog = require("miuread.reader_settings_dialog")
 local InfoMessage = require("ui/widget/infomessage")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -554,80 +554,46 @@ function SheetWidget:onCloseWidget()
     DialogTransition.after_close(region, action, "ActionSheet")
 end
 
+-- Independent, page-bounded compatibility surface. Do NOT fall back to the
+-- native ButtonDialog: that was the unreadable white grid on some Kindle ink
+-- transitions. ReaderSettingsDialog supports paginated options and an opaque
+-- label/icon path; it uses DialogTransition for correct stack retirement.
 local function show_fallback(opts, reason)
-    local actions = {}
-    for _, action in ipairs(type(opts.actions) == "table" and opts.actions or {}) do
-        if type(action) == "table" and action.hidden ~= true then
-            actions[#actions + 1] = action
-            if #actions >= MAX_PRIMARY_ACTIONS then break end
-        end
+    logger.warn("[MiuRead][ActionSheet] compatibility menu", tostring(reason or "unknown"))
+    local rows={}
+    local function add(action)
+        if type(action)~="table" or action.hidden==true then return end
+        rows[#rows+1]={
+            label=tostring(action.label or action.text or "操作"),
+            icon=tostring(action.icon or ""),
+            value=tostring(action.detail or ""),
+            enabled=action.enabled~=false,
+            callback=action.callback,
+        }
     end
-    local buttons = {}
-    local dialog
-    for _, action in ipairs(actions) do
-        buttons[#buttons + 1] = {{
-            text = tostring(action.label or action.text or "操作"),
-            enabled = action.enabled ~= false,
-            callback = function()
-                UIManager:close(dialog)
-                if action.enabled ~= false and action.callback then
-                    UIManager:scheduleIn(.04, function()
-                        local ok, err = pcall(action.callback)
-                        if not ok then logger.warn("[MiuRead][ActionSheet] fallback action failed", tostring(err)) end
-                    end)
-                end
-            end,
-        }}
+    for _,action in ipairs(type(opts.actions)=="table" and opts.actions or {}) do
+        add(action)
+        if #rows>=MAX_PRIMARY_ACTIONS then break end
     end
-    local footer_actions = type(opts.footer_actions) == "table" and opts.footer_actions or nil
-    if footer_actions and #footer_actions > 0 then
-        local row = {}
-        for _, footer in ipairs(footer_actions) do
-            if type(footer) == "table" and footer.hidden ~= true and #row < 3 then
-                row[#row + 1] = {
-                    text = tostring(footer.label or footer.text or "更多"),
-                    enabled = footer.enabled ~= false,
-                    callback = function()
-                        UIManager:close(dialog)
-                        if footer.enabled ~= false and footer.callback then
-                            UIManager:scheduleIn(.04, function()
-                                local ok, err = pcall(footer.callback)
-                                if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
-                            end)
-                        end
-                    end,
-                }
-            end
-        end
-        if #row > 0 then buttons[#buttons + 1] = row end
-    else
-        local footer = type(opts.footer_action) == "table" and opts.footer_action or nil
-        if footer then
-            buttons[#buttons + 1] = {{
-                text = tostring(footer.label or footer.text or "更多操作"),
-                enabled = footer.enabled ~= false,
-                callback = function()
-                    UIManager:close(dialog)
-                    if footer.enabled ~= false and footer.callback then
-                        UIManager:scheduleIn(.04, function()
-                            local ok, err = pcall(footer.callback)
-                            if not ok then logger.warn("[MiuRead][ActionSheet] fallback footer failed", tostring(err)) end
-                        end)
-                    end
-                end,
-            }}
-        end
+    if type(opts.footer_actions)=="table" then
+        for _,action in ipairs(opts.footer_actions) do add(action) end
+    elseif type(opts.footer_action)=="table" then
+        add(opts.footer_action)
     end
-    buttons[#buttons + 1] = {{text = "关闭", callback = function() UIManager:close(dialog) end}}
-    local title = tostring(opts.title or "操作")
-    local subtitle = tostring(opts.subtitle or "")
-    if subtitle ~= "" then title = title .. "\n\n" .. subtitle end
-    dialog = ButtonDialog:new{title = title, title_align = "left", buttons = buttons}
-    dialog._miuread_transient = true
-    dialog._miuread_modal_surface = true
-    logger.warn("[MiuRead][ActionSheet] using fallback", tostring(reason or "unknown"))
-    UIManager:show(dialog)
-    return dialog
+    add{icon="close",label=tostring(opts.close_label or "关闭"),callback=function() end}
+    local success,dialog,err=pcall(ReaderSettingsDialog.show,{
+        title=tostring(opts.title or "操作"),
+        subtitle=tostring(opts.subtitle or ""),
+        rows=rows,
+        opaque_fullscreen=false,
+    })
+    if success and dialog then return dialog end
+    logger.warn("[MiuRead][ActionSheet] compatibility menu unavailable",tostring(err or dialog))
+    -- Explicit failure is preferable to a blank, tappable choice grid.
+    local message=InfoMessage:new{text="菜单暂时无法显示，请返回后重试",timeout=3}
+    message._miuread_transient=true
+    UIManager:show(message)
+    return message
 end
 
 local ActionSheet = {}
@@ -665,6 +631,8 @@ function ActionSheet.show(opts)
     local shown, show_err = pcall(UIManager.show, UIManager, sheet, "ui", sheet.bubble_dimen or sheet.panel_dimen)
     if not shown then
         live_sheet = nil
+        -- UIManager.show may have partially registered a widget before throwing.
+        pcall(UIManager.close,UIManager,sheet)
         return show_fallback(opts, show_err)
     end
     local cache_key=tostring(opts.cache_key or "")

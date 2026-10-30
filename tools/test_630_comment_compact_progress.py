@@ -1,5 +1,6 @@
 """6.3.0-beta.1: explicit non-modal compact comment download controls."""
 from pathlib import Path
+import re
 import unittest
 BASE=Path(__file__).resolve().parents[1]
 def read(path):return (BASE/path).read_text(encoding='utf-8')
@@ -27,7 +28,7 @@ class CompactCommentProgress(unittest.TestCase):
         icons=BASE/'miuread.koplugin/resources/icons/miuread'
         for name in ('minimize','pause','play','close','comment'):
             self.assertTrue((icons/(name+'.svg')).is_file(),name)
-        self.assertIn('self:_button("minimize","后台进行"',u)
+        self.assertIn('self:_button("minimize","后台"',u)
         self.assertIn('self:_button(self.paused and "play" or "pause",self.paused and "继续" or "暂停"',u)
         self.assertIn('self:_button("close","取消"',u)
         self.assertIn('if self.on_background then self.on_background() end',u)
@@ -55,9 +56,15 @@ class CompactCommentProgress(unittest.TestCase):
         self.assertNotIn('comment_opaque=true',m)
         self.assertIn('local CommentProgress=require("miuread.comment_progress")',m)
     def test_release_version_and_gate(self):
-        self.assertIn('6.3.0-beta.1',read('miuread.koplugin/_meta.lua'))
-        self.assertIn('6.3.0-beta.1',read('miuread.koplugin/miuread/config.lua'))
-        self.assertIn('## 6.3.0-beta.1',read('CHANGELOG.md'))
+        # The compact UI was introduced in beta.1 and must survive later
+        # 6.3 releases; never hard-code the current release to beta.1.
+        meta=read('miuread.koplugin/_meta.lua')
+        conf=read('miuread.koplugin/miuread/config.lua')
+        m=re.search(r'version\s*=\s*"(6\.3\.0-beta\.(\d+))"',meta)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(int(m.group(2)),1)
+        self.assertIn('VERSION = "'+m.group(1)+'"',conf)
+        self.assertIn('## '+m.group(1),read('CHANGELOG.md'))
         wf=read('.github/workflows/release-beta.yml')
         self.assertIn('test_630_comment_compact_progress.py',wf)
         self.assertIn('workflow_dispatch:',wf)

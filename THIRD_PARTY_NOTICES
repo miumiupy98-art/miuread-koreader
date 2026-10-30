@@ -1,5 +1,20 @@
 Third-Party Notices
 
+E-Ink protocol references and adapted signature code:
+- Project: teng-lin/weread-omni (MIT), Copyright (c) 2026 Teng Lin.
+- Reference revision: 88bd2e095d7d7ee423eaadf8f40653e72c5be6d4.
+- QR login and endpoint contracts are referenced by shelf_client.lua and
+  readtime_protocol.lua. License: miuread.koplugin/licenses/weread-omni-MIT.txt.
+- Project: AnkioTomas/moon (GPL-3.0), revision
+  43b2181da6eb5285b62114da85e1413d2f8464e4.
+- The signature transformation and its reference vector in
+  book.koplugin/source/wechat/app.lua and tests/source/wechat/app_spec.lua were
+  adapted for readtime_protocol.lua and test_offline_readtime.py on 2026-10-25.
+- Source: https://github.com/AnkioTomas/moon
+- License: miuread.koplugin/licenses/moon-GPL-3.0.txt. The GPL-covered portions
+  retain GPL-3.0; the combined work is distributed under AGPL-3.0-only pursuant
+  to GPLv3 section 13 and AGPLv3 section 13.
+
 MiuRead contains or may contain code and assets originating from third-party
 projects. Those portions remain governed by their respective copyright notices
 and license terms.

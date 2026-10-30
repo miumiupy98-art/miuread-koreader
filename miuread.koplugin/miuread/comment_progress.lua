@@ -53,34 +53,31 @@ local function number(v)
     return math.max(0,math.floor(tonumber(v) or 0))
 end
 
+-- A flat touch target: keep the full hit area without drawing three boxes.
 function Compact:_button(icon,label,width,height,callback)
-    local icon_size=math.min(Screen:scaleBySize(17),math.floor(height*.62))
+    local icon_size=math.min(Screen:scaleBySize(17),math.floor(height*.60))
     local content=HorizontalGroup:new{align="center",
         Ui.icon(icon,icon_size,icon_size,icon_size),
         HorizontalSpan:new{width=Screen:scaleBySize(4)},
         TextWidget:new{ text=label, face=Font:getFace("x_smallinfofont"),
-            max_width=math.max(15,width-icon_size-Screen:scaleBySize(15)),
+            max_width=math.max(15,width-icon_size-Screen:scaleBySize(9)),
             truncate_with_ellipsis=true },
     }
-    local frame=FrameContainer:new{
-        background=Blitbuffer.COLOR_WHITE,
-        bordersize=math.max(1,Screen:scaleBySize(1)),
-        radius=Screen:scaleBySize(4),padding=0,margin=0,
-        CenterContainer:new{dimen=Geom:new{w=width-2,h=height-2},content},
-    }
-    return TapBox:new{dimen=Geom:new{w=width,h=height},callback=callback,frame}
+    -- No individual FrameContainer/border: CenterContainer only paints its content.
+    return TapBox:new{dimen=Geom:new{w=width,h=height},callback=callback,
+        CenterContainer:new{dimen=Geom:new{w=width,h=height},content}}
 end
 
 function Compact:_build()
     local sw,sh=Screen:getWidth(),Screen:getHeight()
-    local outer_w=math.min(math.floor(sw*.90),Screen:scaleBySize(500))
+    local outer_w=math.min(math.floor(sw*.88),Screen:scaleBySize(500))
     outer_w=math.max(math.min(sw-12,outer_w),math.min(300,sw-12))
-    local pad=Screen:scaleBySize(8)
-    local content_w=outer_w-2*(pad+1)
-    local line_h=Screen:scaleBySize(25)
-    local button_h=Screen:scaleBySize(30)
-    local bar_h=math.max(3,Screen:scaleBySize(5))
-    local gap=Screen:scaleBySize(4)
+    local pad=Screen:scaleBySize(6)
+    local content_w=outer_w-2*pad
+    local line_h=Screen:scaleBySize(22)
+    local button_h=Screen:scaleBySize(30) -- retain generous touch area
+    local bar_h=math.max(2,math.min(4,Screen:scaleBySize(3)))
+    local gap=Screen:scaleBySize(3)
     local title_w=math.floor(content_w*.55)
     local count_w=content_w-title_w
     self.title_label=TextWidget:new{
@@ -99,7 +96,7 @@ function Compact:_build()
     local bw=math.floor((content_w-gap*2)/3)
     local bw3=content_w-2*bw-2*gap
     local buttons=HorizontalGroup:new{align="center",
-        self:_button("minimize","后台进行",bw,button_h,function()
+        self:_button("minimize","后台",bw,button_h,function()
             if self.on_background then self.on_background() end
         end),
         HorizontalSpan:new{width=gap},
@@ -113,7 +110,11 @@ function Compact:_build()
     }
     local lines=VerticalGroup:new{align="center",
         HorizontalGroup:new{align="center",
-            Ui.align(self.title_label,title_w,line_h,"left","center"),
+            HorizontalGroup:new{align="center",
+                Ui.icon("comment",Screen:scaleBySize(17),line_h,Screen:scaleBySize(16)),
+                HorizontalSpan:new{width=Screen:scaleBySize(4)},
+                Ui.align(self.title_label,title_w-Screen:scaleBySize(21),line_h,"left","center"),
+            },
             Ui.align(self.count_label,count_w,line_h,"right","center"),
         },
         VerticalSpan:new{width=gap},
@@ -123,8 +124,8 @@ function Compact:_build()
     }
     self.frame=FrameContainer:new{
         background=Blitbuffer.COLOR_WHITE,
-        bordersize=math.max(1,Screen:scaleBySize(1)),
-        radius=Screen:scaleBySize(6),padding=pad,margin=0,lines,
+        bordersize=0,
+        radius=Screen:scaleBySize(3),padding=pad,margin=0,lines,
     }
     local size=self.frame:getSize()
     local x=math.floor((sw-size.w)/2)
@@ -159,7 +160,16 @@ function Compact:set_state(state)
     local paused=state.paused==true
     if paused~=self.paused then
         self.paused=paused
+        local old_region=self.popup_dimen and self.popup_dimen:copy() or nil
         self:_build()
+        -- A resized paused/running layout may expose old ink: invalidate both rectangles.
+        if old_region and self:is_shown() then
+            local x=math.min(old_region.x,self.popup_dimen.x)
+            local y=math.min(old_region.y,self.popup_dimen.y)
+            local right=math.max(old_region.x+old_region.w,self.popup_dimen.x+self.popup_dimen.w)
+            local bottom=math.max(old_region.y+old_region.h,self.popup_dimen.y+self.popup_dimen.h)
+            UIManager:setDirty("all","ui",Geom:new{x=x,y=y,w=right-x,h=bottom-y})
+        end
     end
     local current=number(state.current)
     local total=number(state.total)

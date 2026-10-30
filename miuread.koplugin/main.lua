@@ -124,6 +124,7 @@ local ThoughtNativePopup=require("miuread.thought_native_popup")
 local ReaderToolbar=require("miuread.reader_toolbar")
 local ReaderListDialog=require("miuread.reader_list_dialog")
 local PluginMenuAdapter=require("miuread.plugin_menu_adapter")
+local MenuIcons=require("miuread.menu_icons")
 local ReaderControlCenter=require("miuread.reader_control_center")
 local ReaderProgressDialog=require("miuread.reader_progress_dialog")
 local ReaderSettingsDialog=require("miuread.reader_settings_dialog")
@@ -1027,6 +1028,11 @@ function Plugin:init()
     end
     self.auth_flow=Auth:new(self.http,self.store,self)
     self.sync=Sync:new(self.reader,self.api,self.store,self,self.async,self.identity_async)
+    UIManager:scheduleIn(2,function()
+        if self.sync and not self.sync.quiescing and not self.sync.suspended then
+            self.sync:wake_offline_reading_time()
+        end
+    end)
     self._suspended_at=nil
     self._cover_generation=0
     self._cover_refresh_task=nil
@@ -2087,58 +2093,165 @@ function Plugin:on_auth_commit_failed()
     self._auth_transitioning=false
 end
 
-function Plugin:show_account_status()
-    if HomeView.is_shown() and not self:_active_reader_ui() then
-        local auth=self.store:auth()
-        local health=self:_auth_health(); self:_recompute_auth_health(health)
-        local account=type(auth.account)=="table" and auth.account or {}
-        local name=U.trim(tostring(account.name or ""))
-        local rows={
-            {text="账号",post_text=name~="" and name or "—",enabled=false},
-            {text="基础登录",post_text=self:logged_in() and "正常" or "尚未登录",enabled=false},
-        }
-        if self:logged_in() then
-            local shelf_authorized=self:_shelf_management_authorized()
-            rows[#rows+1]={text="E-Ink 客户端授权",post_text=shelf_authorized and "已授权" or "未授权",enabled=false}
-            local online_label=health.state=="ok" and "全部正常" or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
-            rows[#rows+1]={text="在线功能",post_text=online_label,enabled=false}
-            for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
-                rows[#rows+1]={text=AUTH_CHANNEL_LABELS[channel],post_text=account_channel_text((health.channels or {})[channel]),enabled=false}
-            end
-            rows[#rows+1]={text="最后检查",post_text=self:_relative_time(health.last_checked_at),enabled=false}
-            rows[#rows+1]={text="账号操作",separator=true,enabled=false}
-            rows[#rows+1]={text="重新检查状态",callback=function() self:check_account_status() end}
-            rows[#rows+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
-            if shelf_authorized then
-                rows[#rows+1]={text="取消 E-Ink 客户端授权",callback=function() self:confirm_clear_shelf_management_auth() end}
-            end
-            rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end}
-        else
-            rows[#rows+1]={text="账号操作",separator=true,enabled=false}
-            rows[#rows+1]={text="扫码登录",callback=function() self.auth_flow:start() end}
-        end
-        return self:_show_miuread_menu("账号状态",rows,{page_size=7})
-    end
+function Plugin:_eink_auth_status_text(summary)
+    summary=summary or (self.sync and self.sync:offline_time_controller():summary()) or {}
+    if not self:_shelf_management_authorized() then return "需要授权" end
+    local auth=self.store:auth()
+    local vid=tostring((auth.account or {}).vid or (auth.cookies or {}).wr_vid or "")
+    local control=summary.control or {}
+    local checked=self._eink_auth_check_vid==vid and tonumber(self._eink_auth_check_at or 0)>0
+    if control.reason=="authentication" and (not checked or
+        self._eink_auth_check_at<tonumber(control.last_attempt_at or 0)) then return "需要重新授权" end
+    if checked then return self._eink_auth_check_ok and "已验证" or "验证失败" end
+    if tonumber(summary.last_success_at or 0)>0 then return "曾上传成功 · 待验证" end
+    return "本地凭证待验证"
+end
 
-    local dialog
-    local buttons={}
-    if self:logged_in() then
-        buttons[#buttons+1]={{text="重新检查状态",callback=function() UIManager:close(dialog); self:check_account_status() end}}
-        buttons[#buttons+1]={{text="重新扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
-        if self:_shelf_management_authorized() then
-            buttons[#buttons+1]={{text="取消 E-Ink 客户端授权",callback=function()
-                UIManager:close(dialog); self:confirm_clear_shelf_management_auth()
-            end}}
-        end
-        buttons[#buttons+1]={{text="退出登录",callback=function()
-            UIManager:close(dialog); self:confirm_logout()
-        end}}
-    else
-        buttons[#buttons+1]={{text="扫码登录",callback=function() UIManager:close(dialog); self.auth_flow:start() end}}
+function Plugin:confirm_eink_authorization()
+    -- QR confirmation belongs only to the explicit action inside authorization
+    -- management; never interpret tapping status as an implicit login request.
+    return require("miuread.bookstore").authorize_client(self)
+end
+
+function Plugin:check_eink_authorization()
+    if not self:_shelf_management_authorized() then
+        self:info("当前没有 E-Ink 客户端授权，请先扫码。")
+        return false
     end
-    buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
-    dialog=ButtonDialog:new{title=self:_account_details_text(),title_align="left",buttons=buttons}
-    UIManager:show(dialog)
+    local auth=U.copy(self.store:auth())
+    local vid=tostring((auth.account or {}).vid or (auth.cookies or {}).wr_vid or "")
+    local session=tostring(auth.login_session_id or "")
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local context=self:_interactive_network_context()
+    return self:_run_interactive_network("eink-authorization-status","eink-shelf-check",function()
+        local Shelf=require("miuread.shelf_client")
+        local ChildHttp=require("miuread.http")
+        local child_store=interactive_child_store(auth,data_dir,temp_dir,"auto")
+        local credential=Shelf.credentials(child_store:auth())
+        if not credential then return {authorized=false,reason="missing_credentials"} end
+        local http=ChildHttp:new(child_store)
+        local ok,value=pcall(http.get_json,http,"https://i.weread.qq.com/shelf/sync",
+            Shelf.request_options(credential,{5,10}))
+        return {authorized=ok and type(value)=="table" and type(value.books)=="table",
+            reason=ok and "unexpected_response" or tostring(value)}
+    end,function(result)
+        local now_auth=self.store:auth()
+        local now_vid=tostring((now_auth.account or {}).vid or (now_auth.cookies or {}).wr_vid or "")
+        if now_vid~=vid or tostring(now_auth.login_session_id or "")~=session then return end
+        local value=result and result.ok and result.value or nil
+        self._eink_auth_check_vid=vid
+        self._eink_auth_check_at=os.time()
+        self._eink_auth_check_ok=type(value)=="table" and value.authorized==true
+        if self._eink_auth_check_ok then
+            self:status_toast("E-Ink 授权","服务器验证成功",3)
+        else
+            self:status_toast("E-Ink 授权","验证失败，请重新扫码或稍后重试",4)
+        end
+        self:_refresh_miuread_menu()
+    end,{context=context,timeout=22,status_title="E-Ink 授权",status_text="正在验证客户端授权"})
+end
+
+function Plugin:eink_authorization_menu()
+    local summary=self.sync and self.sync:offline_time_controller():summary() or {}
+    local status=self:_eink_auth_status_text(summary)
+    local rows={
+        {text="授权状态",post_text=status,enabled=false,icon_key=status=="需要重新授权" and "shield-alert" or "shield-check"},
+        {text=self:_shelf_management_authorized() and "重新扫码授权" or "扫码授权",icon_key="qr-code",
+            callback=function() self:confirm_eink_authorization() end},
+        {text="检查授权状态",icon_key="refresh",callback=function() self:check_eink_authorization() end},
+    }
+    if self:_shelf_management_authorized() then
+        rows[#rows+1]={text="取消 E-Ink 客户端授权",icon_key="power-off",
+            callback=function() self:confirm_clear_shelf_management_auth() end}
+    end
+    return rows
+end
+
+function Plugin:on_offline_readtime_uploaded(seconds)
+    self:status_toast("阅读时间","离线阅读时间已上传（"..tostring(math.floor(tonumber(seconds) or 0)).." 秒）",3)
+end
+
+function Plugin:on_readtime_route_change(target,previous,reason)
+    if target=="unavailable" then
+        self:status_toast("阅读时间","离线记录不可用，请检查 KOReader 阅读统计",4)
+    elseif target=="web" then
+        self:status_toast("阅读时间",previous=="eink" and "网络已恢复，Web 阅读时间同步已启动"
+            or "Web 阅读时间同步已启动",3)
+    elseif target=="eink" then
+        self:status_toast("阅读时间",previous=="web" and "网络已断开，阅读时间已转为本地记录"
+            or "网络未连接，阅读时间将在本地记录",4)
+    end
+end
+
+function Plugin:_schedule_smart_readtime_route(online,reason)
+    if not self.sync or self.sync:reading_time_mode()~="smart" then return end
+    self._smart_route_generation=(tonumber(self._smart_route_generation) or 0)+1
+    local generation=self._smart_route_generation
+    UIManager:scheduleIn(4,function()
+        if generation~=self._smart_route_generation then return end
+        if self.sync:reading_time_mode()~="smart" then return end
+        -- These checks are local and never perform blocking DNS on the UI.
+        local actual=self:is_online()
+        if actual~=online then return end
+        local ok,err=self.sync:switch_smart_time_backend(online,reason)
+        if ok==false and err then
+            logger.warn("[MiuRead][ReadTimeRoute] switch deferred",tostring(err))
+        end
+    end)
+end
+
+function Plugin:show_account_status()
+    -- Use the same bounded, scrollable list in the reader and on the home
+    -- screen. Never put long multiline account details in ButtonDialog.title.
+    local auth=self.store:auth()
+    local health=self:_auth_health(); self:_recompute_auth_health(health)
+    local account=type(auth.account)=="table" and auth.account or {}
+    local name=U.trim(tostring(account.name or ""))
+    local authorized=self:_shelf_management_authorized()
+    local prefs=self.store:preferences().sync or {}
+    local summary=self.sync and self.sync:offline_time_controller():summary() or {}
+    local function seconds_label(value)
+        return tostring(math.max(0,math.floor(tonumber(value) or 0))).." 秒"
+    end
+    local active_backend=self.sync and self.sync.reading_time_backend or nil
+    local label
+    if prefs.time_enabled~=true then label="已关闭"
+    elseif self.sync:reading_time_mode()=="eink" then label="仅 E-Ink"
+    elseif self.sync:reading_time_mode()=="smart" then label="智能 · "..(active_backend=="eink" and "本地记录" or active_backend=="web" and "Web" or "待开书")
+    elseif active_backend=="eink" then label="E-Ink"
+    elseif active_backend=="web" then label="Web"
+    else label="自动选择（下次开书）" end
+    local online_label=health.state=="ok" and "全部正常"
+        or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
+    local rows={
+        {text="账号",post_text=name~="" and name or "—",enabled=false},
+        {text="基础登录",post_text=self:logged_in() and "正常" or "尚未登录",enabled=false},
+    }
+    if self:logged_in() then
+        rows[#rows+1]={text="E-Ink 客户端授权",post_text=self:_eink_auth_status_text(summary),icon_key="shield-check",
+            sub_item_table_func=function() return self:eink_authorization_menu() end}
+        rows[#rows+1]={text="在线功能",post_text=online_label,enabled=false}
+        for _,channel in ipairs(AUTH_CHANNEL_ORDER) do
+            rows[#rows+1]={text=AUTH_CHANNEL_LABELS[channel],post_text=account_channel_text((health.channels or {})[channel]),enabled=false}
+        end
+        rows[#rows+1]={text="阅读时间",separator=true,enabled=false}
+        rows[#rows+1]={text="上传方式",post_text=label,enabled=false}
+        rows[#rows+1]={text="待同步",post_text=seconds_label(summary.pending),enabled=false}
+        rows[#rows+1]={text="待确认",post_text=seconds_label(summary.unknown),enabled=false}
+        local reason=summary.blocked or summary.capture_error or summary.error
+            or ((summary.control or {}).reason)
+        if reason then rows[#rows+1]={text="阻塞原因",post_text=tostring(reason),enabled=false} end
+        rows[#rows+1]={text="最后检查",post_text=self:_relative_time(health.last_checked_at),enabled=false}
+        rows[#rows+1]={text="账号操作",separator=true,enabled=false}
+        rows[#rows+1]={text="重新检查状态",callback=function() self:check_account_status() end}
+        rows[#rows+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
+        -- E-Ink revoke is within the authorization submenu, never duplicated here.
+        rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end}
+    else
+        rows[#rows+1]={text="账号操作",separator=true,enabled=false}
+        rows[#rows+1]={text="扫码登录",callback=function() self.auth_flow:start() end}
+    end
+    return self:_show_miuread_menu("账号状态",rows,{page_size=7})
 end
 
 function Plugin:on_auth_success(name)
@@ -2347,9 +2460,8 @@ function Plugin:account_menu()
         {text=self:logged_in() and "重新扫码登录" or "扫码登录",callback=self:safe("login",function() self.auth_flow:start() end)},
     }
     if self:logged_in() then
-        out[#out+1]={text="E-Ink 客户端授权",post_text=self:_shelf_management_authorized() and "已授权" or "需微信扫码",callback=function()
-            require("miuread.bookstore").authorize_client(self)
-        end}
+        out[#out+1]={text="E-Ink 客户端授权",post_text=self:_eink_auth_status_text(),icon_key="shield-check",
+            sub_item_table_func=function() return self:eink_authorization_menu() end}
         out[#out+1]={text="退出登录",callback=function() self:confirm_logout() end}
     end
     return out
@@ -9000,11 +9112,11 @@ function Plugin:_home_variant_download_action(target,annotations,context)
         label=annotations and "继续下载带评论版" or "继续下载正文"
         detail="上次任务未完成，点击继续"
         local options=b4_content_only_options((task and task.options) or (repair and repair.options))
-        callback=function() self:choose_download_mode(target,options,false) end
+        callback=function() self:choose_download_mode(target,options,false,{home_sheet=true}) end
     else
         label=annotations and "下载正文与公开想法" or "下载正文"
         detail=annotations and "另存带评论 EPUB，本机纯正文版不受影响" or "只下载正文，评论在阅读时按需获取"
-        callback=function() self:choose_download_mode(target,{annotations=annotations==true},false) end
+        callback=function() self:choose_download_mode(target,{annotations=annotations==true},false,{home_sheet=true}) end
     end
 
     return {
@@ -15213,6 +15325,8 @@ function Plugin:_reader_menu_rows_from_table(source,title,back_callback)
                         value=checked and ((value and tostring(value)~="") and (tostring(value).." · ✓") or "✓") or tostring(value or ""),
                         checked=checked, enabled=enabled,
                         keep_open=item.keep_menu_open==true,
+                        icon=item.icon_key or item.icon or (not item.separator and MenuIcons.key(label)),
+                        arrow=type(submenu)=="table" or type(item.callback)=="function",
                     }
                     if type(submenu)=="table" then
                         row.callback=function()
@@ -16087,7 +16201,9 @@ function Plugin:_show_reader_sync_settings_panel(back_callback)
             local sync=self.store:preferences().sync or {}
             return {
                 {title="自动同步",rows={
-                    {label="阅读时间",value=sync.time_enabled==true and "已开启 · 结束阅读后上报" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_time_sync() end},
+                    {label="阅读时长同步",value=self:reading_time_status_label(),value_bold=true,keep_open=true,callback=function()
+                        self:_show_reader_menu_table("阅读时长同步",self:reading_time_menu(),return_here)
+                    end},
                     {label="阅读进度",value=self:progress_upload_mode()=="manual" and "仅手动" or "结束阅读时同步",value_bold=true,callback=function() self:_show_reader_menu_table("阅读进度",self:progress_upload_mode_menu(),return_here) end},
                     {label="批注",value=self:_annotation_close_upload_enabled() and "结束阅读时同步" or "仅手动",value_bold=true,keep_open=true,callback=function() self:toggle_annotation_close_upload() end},
                     {label="自动同步最新阅读位置",value=(sync.auto_latest_position~=false and sync.pull_on_open~=false) and "已开启" or "已关闭",value_bold=true,keep_open=true,callback=function() self:toggle_pull_on_open() end},
@@ -19667,19 +19783,24 @@ function Plugin:_fetch_book_details_online(b)
         self:info(title.."\n"..author.."\n\n"..tostring(x.intro or x.description or b.intro or b.description or "暂无简介"))
     end,{context=context,timeout=28,status_title="书籍详情",status_text="正在后台获取书籍信息…"})
 end
+-- Download admissions use the same menu family as Home/Reader actions.
+-- The previous ButtonDialog could be shown during a retiring sheet's ink repaint.
 function Plugin:_download_preflight(callback)
     local state=HomeData.device_state(true) or {}
     local function check_battery()
         local battery=tonumber(state.battery)
         if self:_notice_enabled("low_battery") and battery and battery<20 and state.charging~=true then
-            local dialog
-            dialog=ButtonDialog:new{title="当前电量较低。继续下载整本书可能明显缩短使用时间。",title_align="center",buttons={
-                {{text="继续下载",callback=function() UIManager:close(dialog); callback() end}},
-                {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("low_battery",false); callback() end}},
-                {{text="取消",callback=function() UIManager:close(dialog) end}},
-            }}
-            UIManager:show(dialog)
-            return true
+            return ActionSheet.show{
+                title="低电量提醒",subtitle="继续下载整本书可能明显缩短使用时间。",
+                columns=1,width_ratio=.76,
+                actions={
+                    {icon="download",label="继续下载",callback=callback},
+                    {icon="check",label="继续并不再提示",callback=function()
+                        self:_set_notice_enabled("low_battery",false); callback()
+                    end},
+                    {icon="close",label="取消",callback=function() end},
+                },
+            }
         end
         callback()
         return true
@@ -19690,14 +19811,18 @@ function Plugin:_download_preflight(callback)
         return false
     end
     if self:_notice_enabled("low_storage") and free and free>0 and free<256*1024*1024 then
-        local dialog
-        dialog=ButtonDialog:new{title="剩余存储空间较少。下载图片或生成 EPUB 后可能无法正常保存。",title_align="center",buttons={
-            {{text="继续下载",callback=function() UIManager:close(dialog); check_battery() end}},
-            {{text="打开下载管理",callback=function() UIManager:close(dialog); self:show_downloads() end}},
-            {{text="继续并不再提示",callback=function() UIManager:close(dialog); self:_set_notice_enabled("low_storage",false); check_battery() end}},
-        }}
-        UIManager:show(dialog)
-        return true
+        return ActionSheet.show{
+            title="存储空间提醒",subtitle="下载图片或生成 EPUB 后可能无法正常保存。",
+            columns=1,width_ratio=.76,
+            actions={
+                {icon="download",label="继续下载",callback=check_battery},
+                {icon="folder",label="打开下载管理",callback=function() self:show_downloads() end},
+                {icon="check",label="继续并不再提示",callback=function()
+                    self:_set_notice_enabled("low_storage",false); check_battery()
+                end},
+                {icon="close",label="取消",callback=function() end},
+            },
+        }
     end
     return check_battery()
 end
@@ -19717,12 +19842,10 @@ b4_content_only_options=function(options)
     return result
 end
 
-function Plugin:choose_download_mode(b,opt,open_after)
+function Plugin:choose_download_mode(b,opt,open_after,ui_context)
     opt=b4_content_only_options(opt)
-    local dialog
     local function launch(background,defer_until_reader_closed)
         if defer_until_reader_closed==true then
-            if dialog then UIManager:close(dialog) end
             self:_queue_download(b,opt,open_after,{defer_until_reader_closed=true,reason="退出阅读后下载"})
             return
         end
@@ -19731,7 +19854,6 @@ function Plugin:choose_download_mode(b,opt,open_after)
             return
         end
         self._download_launch_pending=true
-        if dialog then UIManager:close(dialog) end
         self:status_toast("觅阅",tostring(b and b.title or "未命名")..
             (background and "正在准备后台下载" or "正在准备下载"),2)
         UIManager:scheduleIn(.20,function()
@@ -19752,25 +19874,35 @@ function Plugin:choose_download_mode(b,opt,open_after)
             launch(true,true)
             return
         end
-        if dialog then UIManager:close(dialog) end
-        dialog=ButtonDialog:new{title="阅读时下载会增加耗电，并可能导致翻页、评论或菜单响应变慢。",title_align="center",buttons={
-            {{text="继续后台下载",callback=function() UIManager:close(dialog); dialog=nil; launch(true) end}},
-            {{text="退出阅读后下载",callback=function() UIManager:close(dialog); dialog=nil; launch(true,true) end}},
-            {{text="取消",callback=function() UIManager:close(dialog) end}},
-        }}
-        UIManager:show(dialog)
+        -- Never open a native ButtonDialog while the previous menu retires.
+        return ActionSheet.show{
+            title="阅读中下载",subtitle="下载可能增加耗电，并降低翻页或菜单响应速度。",
+            columns=1,width_ratio=.76,
+            actions={
+                {icon="cloud",label="继续后台下载",callback=function() launch(true) end},
+                {icon="history",label="退出阅读后下载",callback=function() launch(true,true) end},
+                {icon="close",label="取消",callback=function() end},
+            },
+        }
     end
     local function start(background)
-        if dialog then UIManager:close(dialog); dialog=nil end
         self:_download_preflight(function() begin_after_preflight(background) end)
     end
-    dialog=ButtonDialog:new{title="下载方式",title_align="center",buttons={
-        {{text="后台下载",callback=function() start(true) end}},
-        {{text="留在当前页面下载",callback=function() start(false) end}},
-        {{text="取消",callback=function() UIManager:close(dialog) end}},
-    }}
-    UIManager:show(dialog)
+    -- Home, Reader and range downloads now share the same tested ActionSheet
+    -- family. The original edition, ranges, queue and callbacks are untouched.
+    return ActionSheet.show{
+        title=opt.annotations==true and "下载方式 · 正文与公开想法" or "下载方式 · 正文",
+        width_ratio=.72, columns=1,
+        actions={
+            {icon="cloud",label="后台下载",detail="下载在后台进行",
+                callback=function() start(true) end},
+            {icon="download",label="留在当前页面下载",detail="显示进度与控制按钮",
+                callback=function() start(false) end},
+            {icon="close",label="取消",callback=function() end},
+        },
+    }
 end
+
 function Plugin:choose_download(b,limit,open_after,uid)
     -- The next decision is *how* to download, not a content edition selector.
     return self:choose_download_mode(b,{annotations=false,limit=limit,chapter_uid=uid},open_after)
@@ -23303,7 +23435,7 @@ function Plugin:sync_diagnostics_status_menu()
     return {
         {text="当前书籍",post_text=self:_sync_current_book_label(),enabled=false},
         {text="登录状态",post_text=self:logged_in() and "正常" or "需要检查",callback=function() self:show_account_status() end},
-        {text="阅读时间",post_text=self:_reading_time_status_label(),enabled=false},
+        {text="阅读时间",post_text=self:reading_time_status_label(),enabled=false},
         {text="阅读进度",post_text=self:_progress_status_label(),enabled=false},
         {text="批注",post_text=annotation,callback=action>0 and function() self:show_annotation_sync_issues(id) end or nil},
         {text="高级诊断",post_text="测试与修复",sub_item_table_func=function() return self:sync_diagnostics_menu() end},
@@ -23315,6 +23447,11 @@ function Plugin:sync_diagnostics_menu()
         {text="读取云端进度",callback=function() self:manual_sync() end},
         {text="测试当前进度上传",callback=function() self:upload_local_progress(true) end},
         {text="测试 30 秒阅读时间",callback=function()
+            if self.sync:web_readtime_disabled() then
+                self.sync:wake_offline_reading_time()
+                self:info("当前时间由 E-Ink 负责，不能使用 Web 30 秒时长测试。\n\nE-Ink 记录将在结束阅读后或仅 E-Ink 模式联网时按队列规则上传。")
+                return
+            end
             if not self.sync:record() then self:info("请先打开一本觅阅下载的书籍。") return end
             self:status_toast("阅读时间测试","正在上传 30 秒……",3)
             self.sync:test_upload(function(ok,result,position,value)
@@ -25162,6 +25299,7 @@ function Plugin:_sync_home_pending(options)
     end
 
     local function phase_time()
+        self.sync:wake_offline_reading_time()
         local items=self:_reading_time_sync_issue_items()
         if #items<=0 then return phase_annotations() end
         local started=self:_retry_all_safe_reading_time(items,true,function()
@@ -25273,7 +25411,8 @@ function Plugin:sync_settings_menu()
     local prefs=self.store:preferences()
     local sync=prefs.sync or {}
     return {
-        {text="阅读时间",post_text=sync.time_enabled==true and "已开启 · 结束阅读后上报" or "已关闭",checked_func=function() return (self.store:preferences().sync or {}).time_enabled==true end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="阅读时长同步",post_text=self:reading_time_status_label(),
+            sub_item_table_func=function() return self:reading_time_menu() end},
         {text="阅读进度",post_text=self:progress_upload_mode_label(),sub_item_table_func=function() return self:progress_upload_mode_menu() end},
         {text="批注",post_text=self:_annotation_close_upload_enabled() and "结束阅读时同步" or "仅手动",checked_func=function() return self:_annotation_close_upload_enabled() end,keep_menu_open=true,callback=function() self:toggle_annotation_close_upload() end},
         {text="自动同步最新阅读位置",post_text=(sync.auto_latest_position~=false and sync.pull_on_open~=false) and "已开启" or "已关闭",checked_func=function() local s=(self.store:preferences().sync or {}); return s.auto_latest_position~=false and s.pull_on_open~=false end,keep_menu_open=true,callback=function() self:toggle_pull_on_open() end},
@@ -25297,6 +25436,191 @@ function Plugin:sync_menu()
     return rows
 end
 
+local function reading_time_duration(seconds)
+    seconds=math.max(0,tonumber(seconds) or 0)
+    return seconds<60 and (tostring(seconds).." 秒") or (string.format("%.1f",seconds/60).." 分钟")
+end
+function Plugin:reading_time_status_label()
+    if (self.store:preferences().sync or {}).time_enabled~=true then return "已关闭" end
+    local mode=self.sync:reading_time_mode()
+    if self.sync.reading_time_backend=="eink_restart_required" then
+        return "通道设置已变化 · 请重新开书"
+    end
+    local backend=mode=="eink" and "eink" or self.sync.reading_time_backend
+        or (mode=="smart" and (self:is_online() and "web" or "eink"))
+        or require("miuread.api_transport").new(self.store).selected
+    if backend=="web" then
+        if mode=="smart" then return self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 等待上传服务" end
+        return self:_reading_time_status_label()
+    end
+    local controller=self.sync:offline_time_controller()
+    local summary=controller and controller:summary() or {}
+    if summary.error then return summary.error=="ledger_full" and "本地记录已满" or "本地记录异常" end
+    if summary.blocked then return "已暂停 · 请核对云端位置" end
+    if (summary.unknown or 0)>0 then return "有待确认记录" end
+    if (summary.in_flight or 0)>0 then return "正在同步" end
+    if (summary.control or {}).reason=="authentication" then return "需要授权" end
+    if (summary.pending or 0)>0 then
+        return "待同步 "..reading_time_duration(summary.pending)
+    end
+    if summary.capture_error=="statistics_unavailable" then return "请开启 KOReader 阅读统计" end
+    return summary.last_success_at and "已同步" or "已开启 · 自动记录与同步"
+end
+function Plugin:reading_time_unknown_menu(offset)
+    local controller=self.sync:offline_time_controller()
+    local groups=controller and controller:unknown()
+    if not groups then return {{text="本地记录读取失败，请导出运行日志",enabled=false}} end
+    if #groups==0 then return {{text="没有待确认记录",enabled=false}} end
+    local rows={}
+    offset=offset or 1
+    for i=offset,math.min(#groups,offset+49) do
+        local group=groups[i]
+        local book=self.store:book(group.book_id)
+        local title=book and (book.title or (book.book or {}).title) or group.book_id
+        rows[#rows+1]={text=tostring(title),post_text=reading_time_duration(group.seconds),sub_item_table_func=function()
+            return {
+                {text=os.date("%Y-%m-%d %H:%M",group.start_time).." — "..os.date("%H:%M",group.end_time),enabled=false},
+                {text="时长："..reading_time_duration(group.seconds),enabled=false},
+                {text="请求已发出，但未收到明确回执",enabled=false},
+                {text="请先在微信读书核对时长；此记录不会自动重发",enabled=false},
+                {text="忽略该记录",callback=function()
+                    UIManager:show(ConfirmBox:new{
+                        text="忽略这条 "..reading_time_duration(group.seconds).." 的待确认记录？\n\n忽略后不会补传，KOReader 阅读统计仍保留。",
+                        ok_text="忽略记录",cancel_text="保留",ok_callback=function()
+                            local seconds,err=controller:ignore(group)
+                            self:info(seconds and "已忽略该记录。" or err)
+                        end,
+                    })
+                end},
+            }
+        end}
+    end
+    if #groups>offset+49 then rows[#rows+1]={text="更多待确认记录",sub_item_table_func=function() return self:reading_time_unknown_menu(offset+50) end} end
+    return rows
+end
+function Plugin:reading_time_menu()
+    local prefs=self.store:preferences().sync or {}
+    local controller=self.sync:offline_time_controller()
+    local summary=controller and controller:summary() or {pending=0,unknown=0,in_flight=0}
+    local rows={
+        {text="启用阅读时长同步",icon_key="power",post_text=self:reading_time_status_label(),checked_func=function()
+            return (self.store:preferences().sync or {}).time_enabled==true
+        end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
+        {text="同步方式",icon_key="swap",post_text=({smart="智能切换",eink="仅 E-Ink",legacy="原有通道设置"})[self.sync:reading_time_mode()],
+            sub_item_table_func=function() return self:reading_time_mode_menu() end},
+        {text="当前时间通道",icon_key="wifi",post_text=self.sync.reading_time_backend=="eink" and "E-Ink · 本地记录"
+            or self.sync.reading_time_backend=="web" and (self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 待启动")
+            or self.sync.reading_time_backend=="eink_restart_required" and "请重新开书"
+            or "等待开启书籍",enabled=false},
+        {text="E-Ink 客户端授权",icon_key="shield-check",post_text=self:_eink_auth_status_text(summary),
+            sub_item_table_func=function() return self:eink_authorization_menu() end},
+        {text="离线待上传",icon_key="upload",post_text=reading_time_duration(summary.pending),enabled=false},
+        {text="待确认",icon_key="history",post_text=reading_time_duration(summary.unknown),
+            enabled=(summary.unknown or 0)>0,
+            sub_item_table_func=(summary.unknown or 0)>0 and function() return self:reading_time_unknown_menu() end or nil},
+        {text="同步离线待传时间",icon_key="upload",enabled=prefs.time_enabled==true and not summary.blocked,callback=function()
+            self.sync:wake_offline_reading_time()
+            if self.sync:reading_time_mode()=="smart" and self.sync.current then
+                self:toast("智能模式会在结束阅读后补传离线时间",3)
+            else
+                self:toast("已安排后台同步；如有冷却将按原间隔重试",3)
+            end
+        end},
+    }
+    -- Rare diagnostic/recovery actions are grouped; do not overload everyday settings.
+    rows[#rows+1]={text="诊断与修复",icon_key="diagnostics",
+        sub_item_table_func=function() return self:reading_time_diagnostics_menu() end}
+    return rows
+end
+
+function Plugin:reading_time_diagnostics_menu()
+    local controller=self.sync:offline_time_controller()
+    local summary=controller and controller:summary() or {pending=0,unknown=0}
+    local rows={}
+    local control=summary.control or {}
+    local reasons={authentication="登录或授权需要恢复",network="网络暂不可用",rate_limited="接口限频，正在等待冷却",
+        prepare_failed="上传准备失败，将自动重试",config_token_missing="服务端未返回签名配置，将自动重试",
+        signature_token_invalid="服务端签名配置异常，将自动重试",web_request_failed="Web 上传准备失败，将自动重试",
+        worker_unavailable="后台任务暂不可用；可稍后点击立即同步重试"}
+    if control.reason then rows[#rows+1]={text=reasons[control.reason] or "等待下次同步",enabled=false} end
+    if (tonumber(control.next_send) or 0)>os.time() then rows[#rows+1]={text="下次尝试："..os.date("%m-%d %H:%M",control.next_send),enabled=false} end
+    if summary.blocked then rows[#rows+1]={text="核对云端位置并恢复补传",callback=function()
+        self:toast("正在核对云端位置…",2)
+        controller:check_and_resume(self,function(_,message) self:info(message) end)
+    end} end
+    if summary.error or summary.capture_error then rows[#rows+1]={text="查看记录问题",callback=function()
+        local reason=summary.error or summary.capture_error
+        local messages={statistics_unavailable="请在 KOReader 的工具菜单中开启阅读统计，然后重新打开书籍。只记录开启同步后的阅读，不会上传历史统计。",
+            ledger_full="本地待同步记录已达到容量上限，新记录暂未收集。请联网同步，或核对并忽略待确认记录，再重新打开书籍。",
+            clock_moved_backwards="设备时间向后变化，已暂停收集。请校准系统日期和时间，再重新打开书籍。"}
+        self:info(messages[reason] or "本地阅读时长记录无法保存或读取。请检查剩余空间及文件权限，并导出运行日志排查。已有队列不会自动清空。")
+    end} end
+    if self.store:preferences().api_transport=="web" and self.sync:reading_time_mode()=="legacy" then
+        rows[#rows+1]={text="历史时长等待切回自动接口后补传",enabled=false}
+    end
+    rows[#rows+1]={text="使用说明",callback=function()
+        self:info("智能切换：联网阅读由 Web 上报，断网时由 E-Ink 阅读统计记录到本地，联网后由 E-Ink 在结束阅读后补传历史时间。\n\n仅 E-Ink：全部时间由 E-Ink 负责。原有通道：兼容旧版设置。\n\n切换同步方式后请重新开书。Web 精确阅读进度始终独立同步。结果不确定的时间不会自动重发。")
+    end}
+    rows[#rows+1]={text="详细诊断日志",icon_key="diagnostics",checked_func=function() return (self.store:preferences().sync or {}).time_diagnostics==true end,
+        keep_menu_open=true,callback=function()
+            local p=self.store:preferences(); p.sync.time_diagnostics=not p.sync.time_diagnostics
+            self:_save_ui_preferences(p,"readtime_diagnostics")
+        end}
+    rows[#rows+1]={text="导出运行日志",icon_key="file-manager",callback=function() self:export_runtime_log() end}
+    return rows
+end
+
+function Plugin:reading_time_mode_menu()
+    local mode=self.sync:reading_time_mode()
+    local labels={smart="智能切换（推荐） · 联网 Web，断网 E-Ink",
+        eink="仅 E-Ink · 全程本地采集和 E-Ink 上传",
+        legacy="原有通道设置 · 兼容旧版"}
+    local rows={}
+    for _,value in ipairs({"smart","eink","legacy"}) do
+        local selected=value
+        rows[#rows+1]={text=labels[value],checked_func=function()
+            return self.sync:reading_time_mode()==selected end,
+            callback=function() self:set_reading_time_mode(selected) end}
+    end
+    return rows
+end
+
+function Plugin:set_reading_time_mode(mode)
+    if mode~="smart" and mode~="eink" and mode~="legacy" then return false end
+    local previous=self.sync:reading_time_mode()
+    if previous==mode then return true end
+    local prefs=self.store:preferences()
+    prefs.sync=prefs.sync or {}
+    prefs.sync.time_route_mode=mode
+    prefs.sync.time_eink_only=mode=="eink" -- backward-compatible Worker gate
+    if self.store:save_preferences(prefs)==false then
+        self:info("无法保存阅读时长同步方式，设置未修改")
+        return false
+    end
+    if self.store.flush then pcall(self.store.flush,self.store,"reading_time_mode") end
+    if self.sync then
+        -- Never flush an outgoing Web time tail into another clock owner.
+        self.sync:stop_reading_time_only("reading_time_mode_changed")
+        if self:_active_reader_ui() then
+            self.sync.reading_time_backend="eink_restart_required"
+            self.sync.last_stage="请重新打开当前书籍开始新的时间会话"
+        else
+            self.sync.reading_time_backend=nil
+        end
+        self.sync:wake_offline_reading_time()
+    end
+    self:status_toast("阅读时间",({smart="智能切换",eink="仅 E-Ink",legacy="原有通道设置"})[mode],3)
+    if self:_active_reader_ui() then
+        self:info("同步方式已修改。请关闭并重新打开当前书籍后生效，避免两个通道重复计算同一段时间。")
+    end
+    return true
+end
+
+-- Preserve the old entry point for integration callbacks from older menus.
+function Plugin:toggle_eink_only_readtime()
+    return self:set_reading_time_mode(self.sync:reading_time_mode()=="eink" and "legacy" or "eink")
+end
+
 function Plugin:toggle_time_sync(confirmed)
     local current=self.store:preferences()
     if current.sync.time_enabled==true and confirmed~=true then
@@ -25309,11 +25633,16 @@ function Plugin:toggle_time_sync(confirmed)
     local p=self.store:preferences(); p.sync.time_enabled=not p.sync.time_enabled
     self:_save_ui_preferences(p,"time_sync_toggle")
     if p.sync.time_enabled then
+        if self.sync:reading_time_mode()=="eink" and self:_active_reader_ui()
+            and self.sync.reading_time_backend~="eink" then
+            self.sync.reading_time_backend="eink_restart_required"
+        end
         self.sync:start("enabled")
+        self.sync:wake_offline_reading_time()
         if self:_original_weread_plugin_present() then
-            self:info("阅读时间同步已开启。阅读期间仅记录时长，在结束阅读后后台上报。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。若两边都开启阅读时间同步，可能重复上报；建议只保留一边。")
+            self:info("阅读时长同步已开启，E-Ink 离线记录需要开启 KOReader 阅读统计。\n\n检测到原作者 WeRead 插件目录（weread.koplugin）。若两边都开启阅读时间同步，可能重复上报；建议只保留一边。")
         else
-            self:status_toast("自动上传阅读时间","已开启 · 60 秒",3)
+            self:status_toast("阅读时长同步","已开启",3)
         end
     else
         self.sync:stop("disabled")
@@ -27272,8 +27601,6 @@ function Plugin:show_sync_status(detail)
     end
     local issue=self:_sync_user_issue(s,current_session)
     local time_text=self:_reading_time_status_label()
-    if s.time_enabled and s.record and s.state=="paused" and not issue then time_text="已暂停" end
-    if s.time_enabled and s.record and s.state=="uploading" and not issue then time_text="正在同步" end
 
     if HomeView.is_shown() and not self:_active_reader_ui() then
         local pending=self:_home_sync_summary(true)
@@ -27287,6 +27614,7 @@ function Plugin:show_sync_status(detail)
                 self:progress_sync_label())
         local rows={
             {text="手动同步",sub_item_table_func=function() return self:sync_now_menu() end},
+            {text="阅读时长",post_text=time_text,sub_item_table_func=function() return self:reading_time_menu() end},
         }
         local total_failed=tonumber(pending.failed_total or 0) or 0
         if total_failed>0 then
@@ -27346,8 +27674,8 @@ function Plugin:show_sync_status(detail)
     if detail then
         lines[#lines+1]=""
         lines[#lines+1]="详细信息"
-        lines[#lines+1]="常规阅读时间上报周期：约 60 秒"
-        lines[#lines+1]="历史失败/休眠时长：不补传"
+        lines[#lines+1]="阅读时长先保存到本机，联网后自动同步"
+        lines[#lines+1]="离线片段等待 E-Ink 补传；休眠期间不计时"
         lines[#lines+1]="后台服务版本："..tostring(s.service_version or "—")
         if s.last_elapsed then lines[#lines+1]="上次提交时长："..tostring(s.last_elapsed).." 秒" end
         if s.last_stage then lines[#lines+1]="当前阶段："..U.first_line(s.last_stage,160) end
@@ -27433,7 +27761,7 @@ function Plugin:on_auth_required(channel,err)
     local notify=tostring(channel or "")~="read_report"
     local marked=self:_mark_auth_problem(channel,err,notify)
     if marked and not notify then
-        self:status_toast("阅读时间上传","登录验证暂时失败，本次时间不补传；下载不受影响",5)
+        self:status_toast("阅读时长同步","登录验证暂时失败，时长已保留，请恢复登录后重试",5)
     end
     return marked
 end
@@ -28435,6 +28763,7 @@ function Plugin:api_transport_menu()
         local prefs=self.store:preferences()
         prefs.api_transport=mode
         self.store:save_preferences(prefs)
+        self.sync:wake_offline_reading_time()
         self:toast("接口通道设置将在下次操作时生效")
     end
     return {
@@ -31344,10 +31673,12 @@ end
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
 function Plugin:onNetworkConnected()
+    self:_schedule_smart_readtime_route(true,"network_connected")
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
     local generation=self._network_recovery_generation
     UIManager:scheduleIn(.8,function()
         if generation~=tonumber(self._network_recovery_generation) then return end
+        self.sync:wake_offline_reading_time()
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self:_sync_home_pending({silent=true,source="network_restored"})
             if tostring(self._home_active_section or "shelf")=="shelf" then self:_home_refresh_remote(false,false) end
@@ -31384,6 +31715,8 @@ function Plugin:onNetworkConnected()
 end
 
 function Plugin:onNetworkDisconnected()
+    self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
+    self:_schedule_smart_readtime_route(false,"network_disconnected")
     logger.info("[MiuRead][Network] disconnected; safe sync remains durable")
     return false
 end
@@ -31507,9 +31840,9 @@ function Plugin:_reading_end_sync(reason,options,callback)
         transfer_priority_started=self:_critical_transfer_begin("reading_end")~=false
     end
 
-    -- One durable control write hands the final time segment to the long-lived
-    -- service. The service owns the clock and computes `now-last_report_at`.
-    -- Home/close never waits for the writer to finish or exit.
+    -- Seal KOReader statistics into the durable outbox. Any old service still
+    -- being retired keeps its existing writer barrier; new captures never use
+    -- that service's wall clock. Home/close does not wait for outbox uploads.
     local time_handoff=self.sync:stop_fast("reading_end:"..reason,nil)
     self.sync.reading_end_finalized=true
 
@@ -31550,7 +31883,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
         return true
     end
     local task_states={
-        time=time_handoff and "后台处理" or "无需补传",
+        time=time_handoff and "后台处理" or self:reading_time_status_label(),
         progress=need_progress and "正在保存最终位置" or "仅手动",
         annotations=need_annotations and "后台同步" or "无变化",
     }

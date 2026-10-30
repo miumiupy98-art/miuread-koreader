@@ -21,7 +21,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 32
+local READ_REPORT_SERVICE_VERSION = 33
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -3122,6 +3122,11 @@ end
 
 function Sync:upload(elapsed, callback, options)
     options = options or {}
+    if self:web_readtime_disabled() and ((tonumber(elapsed) or 0)>0
+        or options.time_only==true or options.report_mode=="reading_time_compat") then
+        if callback then callback(false,"仅 E-Ink 模式禁止 Web 阅读时长上传") end
+        return false
+    end
     local record = type(options.record_override)=="table" and U.copy(options.record_override) or self:record()
     if not record then if callback then callback(false, "未识别到 MiuRead 生成的当前书籍") end; return false end
     if self.progress_hold and not options.progress_only and options.reading_time_retry~=true then
@@ -3212,6 +3217,7 @@ function Sync:upload(elapsed, callback, options)
             core_map_hash = core_hash,
             progress_ratio = report_ratio,
             elapsed_seconds = elapsed or 0,
+            web_time_disabled = self:web_readtime_disabled(),
             cookies = auth.cookies or {},
             api_key = auth.api_key or "",
             wr_ticket = auth.wr_ticket or "",
@@ -3594,10 +3600,18 @@ function Sync:retry_safe_reading_time(book_id,record_override,position_override,
     return send_next()
 end
 
-function Sync:begin_progress_write(reason, callback)
+function Sync:begin_progress_write(reason, callback,reading_time_granted)
     callback=type(callback)=="function" and callback or function() end
+    self:offline_time_controller()
+    if self.offline_time and reading_time_granted~=true then
+        return self.offline_time:yield_to_progress(self,function(ok)
+            if ok then self:begin_progress_write(reason,callback,true)
+            else callback(false,{state="offline_time_writer_busy"}) end
+        end)
+    end
     reason=tostring(reason or "progress_write")
     if self.progress_write_fence==true then
+        if self.offline_time then self.offline_time:release_progress(self) end
         callback(false,{state="progress_fence_busy"})
         return false
     end
@@ -3648,6 +3662,7 @@ function Sync:begin_progress_write(reason, callback)
             waiting=false
             if notice_task then UIManager:unschedule(notice_task); notice_task=nil end
             if not ok then
+                if self.offline_time then self.offline_time:release_progress(self) end
                 self.progress_write_fence=false
                 self.progress_write_fence_seq=0
                 self:_write_daemon_control(true,true,{progress_fence=false})
@@ -3685,6 +3700,7 @@ function Sync:begin_progress_write(reason, callback)
 end
 
 function Sync:end_progress_write(reason)
+    if self.offline_time then self.offline_time:release_progress(self) end
     local had_fence=self.progress_write_fence==true
     if had_fence then
         self.progress_write_fence=false
@@ -3779,6 +3795,10 @@ function Sync:_notify_failure()
 end
 
 function Sync:test_upload(callback)
+    if self:web_readtime_disabled() then
+        if callback then callback(false,"仅 E-Ink 模式禁止 Web 30 秒测试；请使用阅读时长菜单中的立即同步") end
+        return false
+    end
     local record=self:record()
     if not record then if callback then callback(false,"未识别到 MiuRead 生成的当前书籍") end; return false end
     if not self:_read_report_allowed(record) then
@@ -3808,6 +3828,7 @@ function Sync:test_upload(callback)
             book_id=book_id,book_title=record.book.title,book=legacy_book,
             core_map_hash=core_hash,progress_ratio=nil,elapsed_seconds=30,time_only=true,
             report_mode="reading_time_compat",
+            web_time_disabled=self:web_readtime_disabled(),
             cookies=auth.cookies or {},api_key=auth.api_key or "",
             wr_ticket=auth.wr_ticket or "",wr_wrpa=auth.wr_wrpa or "",
             allow_renewal=false,force_context=false,
@@ -4252,6 +4273,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
             core_map_hash = tostring(d.core_map_hash or existing.core_map_hash or ""),
             record_generation = tonumber(d.record_generation or existing.record_generation or 0) or 0,
             time_only = time_only,
+            web_time_disabled = self:web_readtime_disabled(),
             progress_ratio = position and report_ratio_from_position(position) or tonumber(existing.progress_ratio) or 0,
             local_chapter_uid = position and position.chapter_uid or existing.local_chapter_uid,
             local_chapter_idx = position and position.chapter_index or existing.local_chapter_idx,
@@ -4282,6 +4304,13 @@ function Sync:_write_daemon_control(active, immediate, extra)
             if key ~= "_precise_position" and key ~= "_position_override" and key ~= "_time_only" then
                 control[key] = value
             end
+        end
+        if self:web_readtime_disabled() then
+            control.web_time_disabled=true
+            control.active=false
+            control.flush_seq=nil
+            control.flush_auto=nil
+            control.flush_elapsed=nil
         end
         if control.active and not time_only and (not position or tostring(control.local_chapter_uid or "")=="") then
             control.active=false
@@ -4969,6 +4998,11 @@ function Sync:_ensure_reading_time_ids(new_session,new_segment)
 end
 
 function Sync:_start_daemon(reason)
+    if self:web_readtime_disabled() then
+        self.state="paused"
+        self.last_stage="仅 E-Ink 模式已禁止 Web 时间服务"
+        return false,"仅 E-Ink 模式禁止 Web 阅读时间服务"
+    end
     local record = self:record()
     if not record then
         self.state = "stopped"
@@ -4978,6 +5012,13 @@ function Sync:_start_daemon(reason)
         self.state = "stopped"
         self.last_stage = "当前文件未启用阅读时间同步"
         return false, "当前文件未启用阅读时间同步"
+    end
+    -- A session has exactly one clock owner. Keep the upstream Web service
+    -- unchanged; only Native sessions use the historical statistics outbox.
+    if self.reading_time_backend=="eink" then
+        local controller=self:offline_time_controller()
+        if self.suspended or not controller:enabled() then return false end
+        return controller:start(self,record)
     end
     local book_id = tostring(record.book.book_id or "")
     local core_hash=self:_core_map_hash(record)
@@ -5300,7 +5341,10 @@ function Sync:_stop_daemon_fast(reason, flush_elapsed)
     -- An explicit zero is a no-flush close (used by duplicate/second close
     -- events), which prevents the same final tail from being submitted twice.
     local explicit_elapsed=tonumber(flush_elapsed)
-    local request_flush=daemon.book_id and (explicit_elapsed==nil or explicit_elapsed>0)
+    local request_flush=daemon.book_id and daemon.active==true
+        and not self:web_readtime_disabled()
+        and self.reading_time_backend~="eink_restart_required"
+        and (explicit_elapsed==nil or explicit_elapsed>0)
     if request_flush then
         local existing = read_json_file(daemon.paths.control) or {}
         extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
@@ -5316,6 +5360,7 @@ function Sync:_stop_daemon_fast(reason, flush_elapsed)
     end
 
     daemon.active = false
+    if explicit_elapsed==0 then daemon.final_flush_pending=false end
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
     return barrier_seq
@@ -5335,7 +5380,10 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
         extra.writer_barrier_reason=tostring(reason or "stop")
     end
     local explicit_elapsed=tonumber(flush_elapsed)
-    local request_flush=daemon.book_id and (explicit_elapsed==nil or explicit_elapsed>0)
+    local request_flush=daemon.book_id and daemon.active==true
+        and not self:web_readtime_disabled()
+        and self.reading_time_backend~="eink_restart_required"
+        and (explicit_elapsed==nil or explicit_elapsed>0)
     if request_flush then
         local existing = read_json_file(daemon.paths.control) or {}
         extra.flush_seq = (tonumber(existing.flush_seq or 0) or 0) + 1
@@ -5350,12 +5398,129 @@ function Sync:_stop_daemon(reason, persist, flush_elapsed)
     end
 
     daemon.active = false
+    if explicit_elapsed==0 then daemon.final_flush_pending=false end
     self:_write_daemon_control(false, true, extra)
     self.next_due = 0
 
     UIManager:scheduleIn(2, function() self:_import_daemon_status(true) end)
     UIManager:scheduleIn(6, function() self:_import_daemon_status(true) end)
     return barrier_seq
+end
+
+-- Reading time has an independent opt-in route. The precise position API
+-- stays on Web, with rt=0, regardless of this flag.
+function Sync:reading_time_mode()
+    local prefs=self.store:preferences().sync or {}
+    if prefs.time_eink_only==true or prefs.time_route_mode=="eink" then return "eink" end
+    if prefs.time_route_mode=="smart" then return "smart" end
+    return "legacy"
+end
+
+function Sync:web_readtime_disabled()
+    local mode=self:reading_time_mode()
+    return mode=="eink" or (mode=="smart" and self.reading_time_backend=="eink")
+end
+
+-- Smart mode moves ownership of *new* seconds only. Existing Web requests
+-- are never transferred to the E-Ink ledger or replayed after interruption.
+function Sync:switch_smart_time_backend(online,reason)
+    if self:reading_time_mode()~="smart" or (self.store:preferences().sync or {}).time_enabled~=true
+        or self.suspended or self.quiescing
+        or self.reading_end_finalized or not self.current
+        or not (self.host and self.host.ui and self.host.ui.document) then return false end
+    local target=online and "web" or "eink"
+    if target=="web" and self._smart_handoff then
+        -- Reconnect happened before the old Web writer acknowledged stop.
+        -- Defer re-start until that same barrier completes; starting a new
+        -- Web clock now could overlap the in-flight old request.
+        self._smart_handoff.reconnect_requested=true
+        return true
+    end
+    if self.reading_time_backend==target then return true end
+    if self.reading_time_backend~="web" and self.reading_time_backend~="eink" then return false end
+    local previous=self.reading_time_backend
+    if previous=="web" then
+        -- Stop Web without a closing tail. The service acknowledges the
+        -- writer barrier *after* its last dispatched request has returned.
+        -- No E-Ink clock can start for this interval before that receipt.
+        if self._smart_handoff then return true end
+        local active_worker=self.daemon and (self.daemon.active or self.daemon.final_flush_pending)
+        local seq=self:_stop_daemon("smart_offline:"..tostring(reason),true,0)
+        local handoff={target="eink",record=self.current,reason=reason}
+        self._smart_handoff=handoff
+        local function after_stop(ack)
+            if self._smart_handoff~=handoff then return end
+            self._smart_handoff=nil
+            if not ack then
+                self.last_stage="Web 计时服务尚未确认停止，离线接管待确认"
+                logger.warn("[MiuRead][ReadTimeRoute] Web stop not acknowledged; refusing clock overlap")
+                if self.host and self.host.on_readtime_route_change then
+                    self.host:on_readtime_route_change("unavailable",previous,self.last_stage)
+                end
+                return
+            end
+            if self.current~=handoff.record or self:reading_time_mode()~="smart" then return end
+            if handoff.reconnect_requested or (self.host and type(self.host.is_online)=="function" and self.host:is_online()) then
+                -- The old request has finished. Now a fresh Web clock can be
+                -- started without accidentally double-submitting its tail.
+                self:start("smart_online_restored_during_handoff")
+                return
+            end
+            self.reading_time_backend="eink"
+            local controller=self:offline_time_controller()
+            if controller.task then UIManager:unschedule(controller.task);controller.task=nil end
+            local ok,err=self:start("smart_network_offline")
+            if not ok then
+                self.last_stage=err or "E-Ink 本地记录不可用"
+                if self.host and self.host.on_readtime_route_change then
+                    self.host:on_readtime_route_change("unavailable",previous,self.last_stage)
+                end
+                return
+            end
+            logger.info("[MiuRead][ReadTimeRoute] smart switch", "from=",previous,
+                "to=eink", "reason=",tostring(reason))
+            if self.host and self.host.on_readtime_route_change then
+                self.host:on_readtime_route_change("eink",previous,reason)
+            end
+        end
+        if active_worker and seq then self:wait_writer_barrier(seq,after_stop,12)
+        else after_stop(true) end
+        return true
+    else
+        -- Persist the final Native interval BEFORE starting a new Web clock.
+        local controller=self:offline_time_controller()
+        if controller.active and not controller:collect(true) then
+            self.last_stage="E-Ink 时间结算失败，暂不切换 Web"
+            return false,self.last_stage
+        end
+        controller:stop(self,"smart_network_online",false)
+        self.reading_time_backend="web"
+        local ok,err=self:start("smart_network_online")
+        if not ok then
+            -- Roll back to Native rather than leave subsequent seconds ownerless.
+            self.reading_time_backend="eink"
+            controller:start(self,self.current)
+            self.last_stage=err or "Web 时间服务启动失败"
+            return false,err
+        end
+    end
+    logger.info("[MiuRead][ReadTimeRoute] smart switch",
+        "from=",previous,"to=",target,"reason=",tostring(reason))
+    if self.host.on_readtime_route_change then self.host:on_readtime_route_change(target,previous,reason) end
+    return true
+end
+
+function Sync:offline_time_controller()
+    if not self.offline_time then
+        self.offline_time=require("miuread.readtime_controller").new(self.store)
+    end
+    return self.offline_time
+end
+
+function Sync:wake_offline_reading_time()
+    if (self.store:preferences().sync or {}).time_enabled~=true then return end
+    local controller=self:offline_time_controller()
+    if controller then controller:wake(self.host) end
 end
 
 function Sync:start(reason)
@@ -5388,6 +5553,7 @@ function Sync:start(reason)
     local enabled = prefs.time_enabled == true
     self.time_enabled = enabled
     if not enabled then
+        if self.offline_time then self.offline_time:stop(self,"disabled",false) end
         self.progress_hold = false
         self.state = "stopped"
         self.last_stage = "阅读时间同步已关闭"
@@ -5408,6 +5574,50 @@ function Sync:start(reason)
             "book=",tostring(record.book and record.book.book_id or ""))
         return false,"当前文件未启用阅读时间同步"
     end
+    if self.reading_time_backend=="eink_restart_required" then
+        self.state="paused"
+        self.last_stage="时间通道已切换，请重新打开当前书籍"
+        return false,self.last_stage
+    end
+    local mode=self:reading_time_mode()
+    if mode=="smart" and not self.reading_time_backend then
+        local online=self.host and type(self.host.is_online)=="function" and self.host:is_online()
+        self.reading_time_backend=online and "web" or "eink"
+    end
+    if mode=="smart" and self.reading_time_backend=="web"
+        and self.host and type(self.host.is_online)=="function" and not self.host:is_online() then
+        return self:switch_smart_time_backend(false,"start_network_offline")
+    end
+    if mode=="eink" then
+        -- A Web-clock session from before the switch is never migrated to
+        -- Native midway through a book; that could count the same seconds twice.
+        if self.reading_time_backend=="web" then
+            self.state="paused"
+            self.last_stage="请重新打开书籍后开始仅 E-Ink 计时"
+            return false,self.last_stage
+        end
+        self.reading_time_backend="eink"
+    elseif not self.reading_time_backend then
+        self.reading_time_backend=require("miuread.api_transport").new(self.store).selected
+    end
+    if self.reading_time_backend=="eink" then
+        -- Each segment has one clock owner; smart mode may change it only
+        -- after closing the preceding owner's interval. Auth/settings
+        -- changes cannot count an existing Native interval again through Web.
+        if self.suspended then return false,"设备已休眠" end
+        if self.daemon and self.daemon.active then self:_stop_daemon("statistics_time_mode",true,0) end
+        local ok,err=self:offline_time_controller():start(self,record)
+        self.state=ok and "waiting" or "paused"
+        self.last_stage=ok and "本地记录阅读时长，联网后补传" or err
+        self.last_error=nil
+        if ok and mode=="smart" and self._smart_initial_notice_session~=self.reading_time_session_id then
+            self._smart_initial_notice_session=self.reading_time_session_id
+            if self.host and self.host.on_readtime_route_change then
+                self.host:on_readtime_route_change("eink",nil,"reader_open_offline")
+            end
+        end
+        return ok,err
+    end
     if enabled and self:periodic_progress_enabled() and not self:is_verified(record.book.book_id) then
         self.progress_hold = true
         self.state = "verification_required"
@@ -5421,14 +5631,37 @@ function Sync:start(reason)
     self.last_stage = enabled and "准备后台阅读时间工作器" or "阅读时间同步已关闭"
     logger.info("[MiuRead][ReadReport] start requested", "reason=", tostring(reason),
         "enabled=", tostring(enabled), "mode=long_lived_worker")
-    if enabled and not self.suspended then return self:_start_daemon(reason) end
+    if enabled and not self.suspended then
+        local ok,err=self:_start_daemon(reason)
+        if ok and mode=="smart" and self._smart_initial_notice_session~=self.reading_time_session_id then
+            self._smart_initial_notice_session=self.reading_time_session_id
+            if self.host and self.host.on_readtime_route_change then
+                self.host:on_readtime_route_change("web",nil,"reader_open_online")
+            end
+        end
+        return ok,err
+    end
     return enabled
 end
 
+-- A menu mode change must never cancel the independent precision-progress
+-- async worker. Stop only the time owners, without flushing the Web tail.
+function Sync:stop_reading_time_only(reason)
+    self._smart_handoff=nil
+    if self.offline_time then self.offline_time:stop(self,reason,false) end
+    local barrier_seq=self:_stop_daemon(reason or "reading_time_mode_changed",true,0)
+    self.time_enabled=(self.store:preferences().sync or {}).time_enabled==true
+    logger.info("[MiuRead][ReadTimeRoute] time-only stop", "reason=",tostring(reason),
+        "writer_barrier=",tostring(barrier_seq or "-"))
+    return barrier_seq
+end
+
 function Sync:stop(reason, flush_elapsed)
+    if self.offline_time then self.offline_time:stop(self,reason,false) end
     self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
     local barrier_seq=self:_stop_daemon(reason, true, flush_elapsed)
     self.async:cancel(reason)
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy = false
     self.progress_hold = false
     self.state = "stopped"
@@ -5438,9 +5671,11 @@ function Sync:stop(reason, flush_elapsed)
 end
 
 function Sync:stop_fast(reason, flush_elapsed)
+    if self.offline_time then self.offline_time:stop(self,reason,false) end
     self.time_enabled = (self.store:preferences().sync or {}).time_enabled==true
     local barrier_seq=self:_stop_daemon_fast(reason, flush_elapsed)
     self.async:cancel(reason)
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy = false
     self.progress_hold = false
     self.state = "stopped"
@@ -5485,6 +5720,7 @@ function Sync:preempt_reading_time_for_progress(reason, callback, flush_settled)
     self.progress_write_fence=false
     self.progress_write_fence_seq=0
     if self.async then self.async:cancel(reason) end
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy=false
     self.progress_hold=false
     self.state="stopped"
@@ -5640,6 +5876,14 @@ function Sync:on_reader_ready()
         return true
     end
     local ready_record=self:record()
+    local native_active=self.offline_time and self.offline_time.active
+    if self.reading_time_backend=="eink" and native_active and native_active.sync==self and ready_record
+        and native_active.book_id==tostring(ready_record.book.book_id or "")
+        and tostring(native_active.record.path or "")==tostring(ready_record.path or "") then
+        self.current=ready_record
+        self.suspended=false
+        return
+    end
     local ready_job=self.daemon and read_json_file(self.daemon.paths.job) or {}
     if self.daemon and self.daemon.active and ready_record
         and tostring(self.daemon.book_id or "")==tostring(ready_record.book.book_id or "")
@@ -5665,6 +5909,7 @@ function Sync:on_reader_ready()
     self.last_activity = 0
     self.last_page = nil
     self.session_started_at = os.time()
+    self.reading_time_backend=nil
     self:_ensure_reading_time_ids(true,true)
     self.resume_after_finalizer=false
     self.first_success_notified = false
@@ -5718,6 +5963,8 @@ function Sync:_defer_session_flush(delay)
 end
 
 function Sync:on_suspend(options)
+    self:offline_time_controller()
+    if self.offline_time then self.offline_time:stop(self,"suspend",true) end
     options=type(options)=="table" and options or {}
     local generation=tonumber(options.generation or 0) or 0
     if generation>0 and generation==tonumber(self.suspend_generation or 0) then return true end
@@ -5768,6 +6015,7 @@ function Sync:on_suspend(options)
 end
 
 function Sync:on_resume(_slept)
+    self:wake_offline_reading_time()
     self.quiescing=false
     self:_import_daemon_status(true)
     self.suspended = false
@@ -5782,6 +6030,13 @@ function Sync:on_resume(_slept)
         return true
     end
     self.resume_after_finalizer=false
+    if self:reading_time_mode()=="smart" and self.current then
+        local online=self.host and type(self.host.is_online)=="function" and self.host:is_online()
+        local target=online and "web" or "eink"
+        if self.reading_time_backend~=target then
+            if self:switch_smart_time_backend(online,"resume") then return end
+        end
+    end
     self:start("resume")
 end
 
@@ -5796,12 +6051,15 @@ function Sync:resume_after_reading_end()
 end
 
 function Sync:quiesce_for_exit(reason)
+    self:offline_time_controller()
+    if self.offline_time then self.offline_time:stop(self,"exit",true) end
     reason=tostring(reason or "koreader_exit")
     self.quiescing=true
     self:cancel_writer_barrier_waits(reason)
     self:_cancel_record_retry()
     if self.identity_async then self.identity_async:cancel(reason) end
     if self.async then self.async:cancel(reason) end
+    if self.offline_time then self.offline_time:release_progress(self) end
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
     if self.session_flush_task then UIManager:unschedule(self.session_flush_task); self.session_flush_task=nil end
     if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
@@ -5877,11 +6135,14 @@ function Sync:on_close(options)
 end
 
 function Sync:invalidate_login_session(reason)
+    self:offline_time_controller()
+    if self.offline_time then self.offline_time:stop(self,"auth_transition",true) end
     reason=tostring(reason or "auth_transition")
     self.auth_transitioning=true
     if self.control_write_task then UIManager:unschedule(self.control_write_task); self.control_write_task=nil end
     if self.daemon_poll then UIManager:unschedule(self.daemon_poll); self.daemon_poll=nil end
     if self.async then self.async:cancel(reason) end
+    if self.offline_time then self.offline_time:release_progress(self) end
     self.busy=false
     self.progress_hold=false
     self.daemon_context=nil
@@ -5949,6 +6210,7 @@ end
 
 function Sync:on_auth_restored()
     self.auth_transitioning=false
+    self:wake_offline_reading_time()
     self.last_error=nil
     self.consecutive_failures=0
     self.failure_notified=false
@@ -5976,6 +6238,7 @@ end
 
 function Sync:status()
     self:_import_daemon_status(false)
+    local offline=self.offline_time and self.offline_time:summary() or nil
     local r = self:record()
     local session = r and self.store:session(r.book.book_id) or {}
     local local_position = self:local_position()
@@ -5991,8 +6254,10 @@ function Sync:status()
         verified_remote_percent=self.verified_remote_percent,
         state=self.state, state_label=self:status_label(),
         progress_hold=self.progress_hold,time_enabled=self.store:preferences().sync.time_enabled,
-        session_uploads=self.session_uploads,last_upload=self.last_upload or (session and session.last_upload) or 0,
-        last_attempt=self.last_attempt or (session and session.last_attempt) or 0,
+        session_uploads=self.session_uploads,last_upload=math.max(tonumber(self.last_upload) or 0,
+            tonumber(session and session.last_upload) or 0,tonumber(offline and offline.last_success_at) or 0),
+        last_attempt=math.max(tonumber(self.last_attempt) or 0,tonumber(session and session.last_attempt) or 0,
+            tonumber(offline and offline.control and offline.control.last_attempt_at) or 0),
         last_error=(self.last_error~=nil and self.last_error or (session and session.last_error)),
         last_error_kind=self.last_error_kind or (session and session.last_error_kind),
         last_path=self.last_path or (session and session.last_path),
@@ -6012,7 +6277,9 @@ function Sync:status()
         service_version=self.daemon and self.daemon.service_version or READ_REPORT_SERVICE_VERSION,
         final_flush_pending=self.daemon and self.daemon.final_flush_pending==true or false,
         last_elapsed=session and session.last_elapsed,
-        pending_report_elapsed=0,
+        pending_report_elapsed=offline and offline.pending or 0,
+        offline_time_unknown=offline and offline.unknown or 0,
+        offline_time_error=offline and offline.error,
         last_report_reason=session and session.last_report_reason,
     }
 end
