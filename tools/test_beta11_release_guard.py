@@ -23,6 +23,6 @@ class ReleaseGuardTest(unittest.TestCase):
         self.assertIn('  push:',s)
         self.assertIn('  workflow_dispatch:',s)
         self.assertIn('python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"',s)
-        self.assertIn('python3 tools/check_beta_release_identity.py --version "$VERSION"',s)
+        self.assertIn('python3 tools/ensure_beta_tag_changelog.py',s)
         self.assertNotIn('git push --force',s)
 if __name__=='__main__':unittest.main()

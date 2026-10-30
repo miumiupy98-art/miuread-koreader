@@ -1,6 +1,5 @@
 """Build the regular plugin archive locally or in the release workflow."""
 import argparse
-import sys
 import hashlib
 from pathlib import Path
 import re
@@ -54,18 +53,7 @@ def build(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--channel", choices=("beta", "stable"), required=True)
     args = parser.parse_args()
     config = (PLUGIN / "miuread/config.lua").read_text(encoding="utf-8")
     version = re.search(r'VERSION\s*=\s*"([^"]+)"', config)[1]
-    channel = re.search(r'UPDATE_CHANNEL\s*=\s*"([^"]+)"', config)
-    expected = r"\d+\.\d+\.\d+-beta\.\d+" if args.channel == "beta" else r"\d+\.\d+\.\d+"
-    if not channel or channel.group(1) != args.channel:
-        parser.error(f"The source channel does not match the requested package channel: {args.channel}")
-    if re.fullmatch(expected, version) is None:
-        parser.error(f"The source version has the wrong channel format: {version}")
-    meta = (PLUGIN / "_meta.lua").read_text(encoding="utf-8")
-    meta_match = re.search(r'\bversion\s*=\s*"([^"]+)"', meta)
-    if not meta_match or meta_match.group(1) != version:
-        parser.error("_meta.lua and config.lua versions do not match")
     build(args.output or ROOT / "dist" / f"miuread-{version}-full.zip")

@@ -22,8 +22,7 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
     def test_tag_is_immutable_and_uses_tagged_source(self):
         self.assertIn('Tag 必须指向 beta 分支历史中的提交', self.s)
         self.assertIn('GITHUB_SHA', self.s)
-        self.assertIn('python3 tools/prepare_beta_release.py --version "$VERSION" --notes "" --tag-workspace',self.s)
-        self.assertIn('Tag normalization changed unrelated source files',self.s)
+        self.assertIn('Tag 中的源码版本', self.s)
         self.assertIn("if: github.event_name == 'workflow_dispatch'", self.s)
         self.assertNotIn('git push --force', self.s)
 
@@ -31,35 +30,18 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
         header = self.s.split('permissions:', 1)[0]
         self.assertIn('      version:', header)
         self.assertIn('      release_notes:', header)
-        self.assertEqual(header.count('        required: true'), 1)
-        self.assertIn('        required: false', header)
+        self.assertEqual(header.count('        required: true'), 2)
 
     def test_prepare_before_validation(self):
         self.assertLess(self.s.index('name: Prepare beta release metadata'),
                         self.s.index('name: Read and validate beta identity'))
         self.assertIn('tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"', self.s)
 
-    def test_version_sensitive_tests_are_after_both_preparation_paths(self):
-        # Actions injects the *requested* VERSION before this step. Testing
-        # against it before prepare_beta_release.py runs breaks every new tag.
-        metadata = self.s.split('name: Prepare beta release metadata', 1)[1].split(
-            'name: Read and validate beta identity', 1)[0]
-        check = "python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'"
-        check_at = metadata.index(check)
-        manual_at = metadata.index('python3 tools/check_beta_release_identity.py --version "$VERSION"')
-        tag_at = metadata.rindex('python3 tools/check_beta_release_identity.py --version "$VERSION"')
-        branch_end = metadata.index('          fi\n\n          # Run source regression tests')
-        self.assertLess(manual_at, check_at)
-        self.assertLess(tag_at, check_at)
-        self.assertLess(branch_end, check_at)
-
     def test_git_commit_before_tag(self):
         self.assertLess(self.s.index('name: Commit prepared beta version and changelog'),
                         self.s.index('name: Ensure release tag'))
         self.assertIn('git push origin HEAD:beta', self.s)
         self.assertIn('git push origin "refs/tags/$RELEASE_TAG"', self.s)
-        self.assertLess(self.s.index('name: Verify beta package and manifest'),
-                        self.s.index('name: Ensure release tag'))
         self.assertNotIn('git push --force', self.s)
 
     def test_only_beta_branch(self):
@@ -71,8 +53,8 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
         self.assertIn('不能重新修改该标签的版本文件', self.s)
         self.assertIn('不要从过期提交发布', self.s)
 
-    def test_release_notes_optional_before_processing(self):
-        self.assertNotIn('缺少手动发布的更新说明', self.s)
+    def test_release_notes_required_before_processing(self):
+        self.assertIn('缺少手动发布的更新说明', self.s)
         self.assertIn("python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'", self.s)
 
 

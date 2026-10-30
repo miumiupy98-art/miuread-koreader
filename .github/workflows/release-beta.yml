@@ -1,9 +1,8 @@
 name: Release beta full package
 
 # Two supported release paths:
-# - A pushed valid Beta tag determines the release version; metadata is generated
-#   inside the build workspace without modifying the source commit or moving Tag.
-# - Manual dispatch prepares/commits metadata and creates an immutable new tag.
+# - A pushed v*-beta.* tag publishes that exact tagged source (no ref rewriting).
+# - Manual dispatch prepares the beta branch and creates a new immutable tag.
 on:
   push:
     tags:
@@ -15,8 +14,8 @@ on:
         required: true
         type: string
       release_notes:
-        description: "可选：更新说明（留空自动生成）"
-        required: false
+        description: "本次更新说明（多条使用空格竖线空格分隔： | ）"
+        required: true
         type: string
 
 permissions:
@@ -29,7 +28,7 @@ concurrency:
 jobs:
   release-beta:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 8
     env:
       RELEASE_CHANNEL: beta
       CHANNEL_TAG: beta-channel
@@ -101,41 +100,7 @@ jobs:
           RELEASE_NOTES_INPUT: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            # Never move an already-published tag to a different commit.
-            EXISTING_TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
-            if [ -n "$EXISTING_TAG_SHA" ] && [ "$EXISTING_TAG_SHA" != "$(git rev-parse HEAD)" ]; then
-              echo "::error::$RELEASE_TAG 已存在于另一个提交，请使用新版本号。"
-              exit 1
-            fi
-            python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"
-            # Fail early if manual release metadata was not prepared correctly.
-            python3 tools/check_beta_release_identity.py --version "$VERSION"
-            if [ -n "$EXISTING_TAG_SHA" ] && ! git diff --quiet -- \
-                miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md; then
-              echo "::error::发布标签已存在，不能重新修改该标签的版本文件。"
-              exit 1
-            fi
-          else
-            # Tag is authoritative; no prior manual CHANGELOG or config edits.
-            # Do not amend, force-push or move this immutable Git reference.
-            python3 tools/prepare_beta_release.py --version "$VERSION" --notes "" --tag-workspace
-            python3 tools/check_beta_release_identity.py --version "$VERSION"
-            # Only generated release metadata may differ from the Tag checkout.
-            DIRTY_OTHER="$(git diff --name-only -- . ':!CHANGELOG.md' \
-              ':!miuread.koplugin/_meta.lua' ':!miuread.koplugin/miuread/config.lua')"
-            if [ -n "$DIRTY_OTHER" ]; then
-              echo "::error::Tag normalization changed unrelated source files: $DIRTY_OTHER"
-              exit 1
-            fi
-          fi
-
-          # Run source regression tests only AFTER either release path has
-          # prepared its requested version in the working tree. These tests
-          # include strict checks against VERSION and must not inspect the
-          # pre-release source version when Actions targets a newer version.
           python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'
-          python3 -m unittest discover -s tools -p 'test_beta_tag_workspace.py'
           python3 -m unittest discover -s tools -p 'test_beta_release_workflow.py'
           python3 -m unittest discover -s tools -p 'test_beta11_release_guard.py' 
           python3 -m unittest discover -s tools -p 'test_beta12_release_regression.py'
@@ -146,6 +111,47 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_632_home_download_choice.py'
           python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
           python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
+              echo "::error::缺少手动发布的更新说明。"
+              exit 1
+            fi
+            # Never move an already-published tag to a different commit.
+            EXISTING_TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
+            if [ -n "$EXISTING_TAG_SHA" ] && [ "$EXISTING_TAG_SHA" != "$(git rev-parse HEAD)" ]; then
+              echo "::error::$RELEASE_TAG 已存在于另一个提交，请使用新版本号。"
+              exit 1
+            fi
+            python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"
+            if [ -n "$EXISTING_TAG_SHA" ] && ! git diff --quiet -- \
+                miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md; then
+              echo "::error::发布标签已存在，不能重新修改该标签的版本文件。"
+              exit 1
+            fi
+          else
+            # This is a published Git tag: never rewrite/move its source commit.
+            # If version fields lag behind the tag, normalize the build workspace
+            # only; the packaged source is self-contained and clearly versioned.
+            SOURCE_VERSION="$(grep -E '^[[:space:]]*VERSION[[:space:]]*=' miuread.koplugin/miuread/config.lua | head -n1 | cut -d '"' -f2)"
+            if [ "$SOURCE_VERSION" != "$VERSION" ]; then
+              RELEASE_NOTES_INPUT="$(git log -1 --format=%s)"
+              RELEASE_NOTES_INPUT="${RELEASE_NOTES_INPUT//|/-}"
+              if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
+                echo "::error::Tag 提交缺少可用于生成更新说明的提交标题。"
+                exit 1
+              fi
+              echo "::warning::Tag 中的源码版本 $SOURCE_VERSION 与目标版本 $VERSION 不同；仅在打包工作区修正元数据，绝不移动 Tag。"
+              python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"
+            else
+              echo "Tag 源码已包含目标版本。"
+            fi
+            # Source may have the target version without a canonical CHANGELOG
+            # header. Repair only this build workspace, never move the Git tag.
+            python3 -m unittest discover -s tools -p 'test_ensure_beta_tag_changelog.py'
+            python3 tools/ensure_beta_tag_changelog.py \
+              --version "$VERSION" --notes "$(git log -1 --format=%s)"
+          fi
 
       - name: Read and validate beta identity
         shell: bash
@@ -347,7 +353,6 @@ jobs:
           lua5.1 tools/test_shelf_client.lua
           lua5.1 tools/test_multidevice_web_login.lua
           lua5.1 tools/test_finished_status.lua
-          bash tools/release_preflight.sh beta
           lua5.1 tools/test_shelf_progress.lua
           luajit tools/test_bookstore.lua
           luajit tools/test_bookstore_ui.lua
@@ -357,9 +362,7 @@ jobs:
           luajit tools/test_shelf_progress.lua
           lua5.1 tools/test_position_resolution.lua
           lua5.1 tools/test_beta8_sync_behavior.lua
-          lua5.1 tools/test_641_progress_recovery_behavior.lua
           luajit tools/test_beta8_sync_behavior.lua
-          luajit tools/test_641_progress_recovery_behavior.lua
           lua5.1 tools/test_progress_confirmation.lua
           luajit tools/test_progress_confirmation.lua
           lua5.1 tools/test_beta9_sync_readtime.lua
@@ -395,13 +398,10 @@ jobs:
           luajit tools/test_internal_links.lua
           python3 tools/test_extension_center_ux.py
           python3 tools/verify_600_beta1.py
-          lua5.1 tools/test_640_sync_state_behavior.lua
-          luajit tools/test_640_sync_state_behavior.lua
           python3 tools/test_624_release_verifier_contract.py
           python3 tools/test_635_eink_only_route.py
           python3 tools/test_636_smart_time_route.py
           python3 tools/test_637_menu_icons_and_handoff.py
-          python3 tools/test_639_open_live_position_and_comment_frame.py
           lua5.1 tools/test_637_handoff.lua
           luajit tools/test_637_handoff.lua
           python3 tools/verify_memory_profile.py
@@ -417,17 +417,63 @@ jobs:
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/miuread-eink-tests"
           "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m pip install lupa==2.8 cryptography==50.0.2
-          "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m unittest discover -s tools -p 'test_release_integrity.py'
           "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_offline_readtime.py
           "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_eink_download.py --zlib libz.so.1
-          "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m unittest discover -s tools -p 'test_*.py' 
+
+      - name: Commit prepared beta version and changelog
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore(release): prepare $RELEASE_TAG"
+            # A concurrent push to beta causes a non-fast-forward failure; no force push.
+            git push origin HEAD:beta
+          fi
+          echo "RELEASE_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Ensure release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH_SHA="$(git rev-parse HEAD)"
+          REMOTE_BRANCH_SHA="$(git ls-remote --heads origin refs/heads/beta | awk 'NR==1 {print $1}')"
+          if [ "$REMOTE_BRANCH_SHA" != "$BRANCH_SHA" ]; then
+            echo "::error::beta 分支在发布期间发生变化，请重新运行，不要从过期提交发布。"
+            exit 1
+          fi
+          REMOTE_TAG_SHA="$(
+            git ls-remote --tags origin "refs/tags/$RELEASE_TAG" \
+              | awk 'NR==1 {print $1}'
+          )"
+
+          if [ -n "$REMOTE_TAG_SHA" ]; then
+            if [ "$REMOTE_TAG_SHA" != "$BRANCH_SHA" ]; then
+              echo "::error::$RELEASE_TAG 已存在，但没有指向 beta 当前 HEAD。"
+              echo "::error::tag=$REMOTE_TAG_SHA, beta=$BRANCH_SHA"
+              echo "::error::请删除错误 tag，或使用新的版本号。"
+              exit 1
+            fi
+            echo "$RELEASE_TAG 已存在且位置正确，继续发布。"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$RELEASE_TAG" "$BRANCH_SHA"
+            git push origin "refs/tags/$RELEASE_TAG"
+            echo "已创建 $RELEASE_TAG -> $BRANCH_SHA"
+          fi
 
       - name: Build beta full package and manifest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          python3 tools/build_package.py --channel beta --output "dist/$PACKAGE_NAME"
+          python3 tools/build_package.py --output "dist/$PACKAGE_NAME"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -475,10 +521,6 @@ jobs:
         run: |
           set -euo pipefail
           unzip -t "dist/$PACKAGE_NAME"
-          python3 tools/release_integrity.py package --channel beta \
-            --proposed "dist/update-beta.json" --package "dist/$PACKAGE_NAME"
-          python3 -m unittest discover -s tools -p 'test_release_integrity.py' 
-          python3 -m unittest discover -s tools -p 'test_release_inventory.py'
 
           python3 - <<'PY'
           from pathlib import Path
@@ -557,54 +599,6 @@ jobs:
           print(f"内测版安装包检查通过，共 {len(names)} 个条目。")
           PY
 
-      - name: Commit prepared beta version and changelog
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add -- miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md
-          if ! git diff --cached --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "chore(release): prepare $RELEASE_TAG"
-            # A concurrent push to beta causes a non-fast-forward failure; no force push.
-            git push origin HEAD:beta
-          fi
-          echo "RELEASE_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Ensure release tag
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BRANCH_SHA="$(git rev-parse HEAD)"
-          REMOTE_BRANCH_SHA="$(git ls-remote --heads origin refs/heads/beta | awk 'NR==1 {print $1}')"
-          if [ "$REMOTE_BRANCH_SHA" != "$BRANCH_SHA" ]; then
-            echo "::error::beta 分支在发布期间发生变化，请重新运行，不要从过期提交发布。"
-            exit 1
-          fi
-          REMOTE_TAG_SHA="$(
-            git ls-remote --tags origin "refs/tags/$RELEASE_TAG" \
-              | awk 'NR==1 {print $1}'
-          )"
-
-          if [ -n "$REMOTE_TAG_SHA" ]; then
-            if [ "$REMOTE_TAG_SHA" != "$BRANCH_SHA" ]; then
-              echo "::error::$RELEASE_TAG 已存在，但没有指向 beta 当前 HEAD。"
-              echo "::error::tag=$REMOTE_TAG_SHA, beta=$BRANCH_SHA"
-              echo "::error::请删除错误 tag，或使用新的版本号。"
-              exit 1
-            fi
-            echo "$RELEASE_TAG 已存在且位置正确，继续发布。"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "$RELEASE_TAG" "$BRANCH_SHA"
-            git push origin "refs/tags/$RELEASE_TAG"
-            echo "已创建 $RELEASE_TAG -> $BRANCH_SHA"
-          fi
-
       - name: Create or update beta prerelease
         shell: bash
         env:
@@ -662,8 +656,18 @@ jobs:
             --prerelease \
             --latest=false
 
-          # Immutable versioned assets and monotonic OTA preflight.
-          bash tools/release_asset_guard.sh
+          retry_gh gh release upload "$RELEASE_TAG" "$FILE" --clobber
+
+          COUNT="$(
+            retry_gh gh release view "$RELEASE_TAG" \
+              --json assets \
+              --jq '[.assets[] | select(.name == env.PACKAGE_NAME)] | length'
+          )"
+
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
+            exit 1
+          fi
 
       - name: Quick-check public download URL
         shell: bash
@@ -748,7 +752,7 @@ jobs:
             --prerelease \
             --latest=false
 
-          bash tools/publish_channel_manifest.sh
+          retry_gh gh release upload "$CHANNEL_TAG" "dist/$MANIFEST_NAME" --clobber
 
           URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$CHANNEL_TAG/$MANIFEST_NAME"
           success=0

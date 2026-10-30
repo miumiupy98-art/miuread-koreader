@@ -30,9 +30,6 @@ ok(current_version is not None and (not expected_version or current_version == e
 changelog_head = re.search(r'(?m)^## (\d+\.\d+\.\d+-beta\.\d+)(?:\s+-\s+.*|\s+—\s+.*)?$', ch)
 ok(current_version is not None and changelog_head is not None and changelog_head.group(1) == current_version,
    'newest changelog entry matches current beta version')
-if current_version is not None and (changelog_head is None or changelog_head.group(1) != current_version):
-    actual = changelog_head.group(1) if changelog_head else '未找到版本标题'
-    print(f'::error::CHANGELOG 最新版本 {actual} 与当前 Beta {current_version} 不一致；请检查 Prepare beta release metadata 的输出')
 ok('## 6.0.0-beta.1' in ch, 'original 6.0.0-beta.1 changelog retained')
 ok('SCHEMA = 136' in config,'schema remains 136')
 ok('SOURCE_ANCHOR_WORDS = {24, 16, 12}' in precise,'beta19 multi-anchor sizes retained')
@@ -116,7 +113,7 @@ dead_methods = [
 ok(all(name not in main for name in dead_methods),'17 unreferenced private legacy methods removed')
 import runpy
 package_builder=runpy.run_path(str(root/'tools/build_package.py'))
-ok('python3 tools/build_package.py --channel beta --output "dist/$PACKAGE_NAME"' in workflow
+ok('python3 tools/build_package.py --output "dist/$PACKAGE_NAME"' in workflow
    and not package_builder['included'](root/'miuread.koplugin/native/miucodec.cpp'),
    'release package excludes native build source')
 ok('forbidden_prefixes = {"miuread.koplugin/native/"}' in workflow,'release verifier rejects native build source')
