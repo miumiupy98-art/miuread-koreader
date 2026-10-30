@@ -13,8 +13,8 @@ class EinkOnlyRoute(unittest.TestCase):
         store=read('miuread.koplugin/miuread/store.lua')
         self.assertIn('time_eink_only=false',store)
         config=read('miuread.koplugin/miuread/config.lua')
-        self.assertIn('VERSION = "6.3.0-beta.7"',config)
-        self.assertIn('version = "6.3.0-beta.7"',read('miuread.koplugin/_meta.lua'))
+        self.assertIn('VERSION = "6.3.2-beta.2"',config)
+        self.assertIn('version = "6.3.2-beta.2"',read('miuread.koplugin/_meta.lua'))
     def test_web_is_forbidden_at_scheduling_and_control(self):
         sync=read('miuread.koplugin/miuread/sync.lua')
         self.assertIn('function Sync:web_readtime_disabled()',sync)
