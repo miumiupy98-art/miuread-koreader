@@ -2,6 +2,7 @@
 from pathlib import Path
 import re
 import unittest
+from release_version_contract import assert_beta_identity
 BASE=Path(__file__).resolve().parents[1]
 def read(path):return (BASE/path).read_text(encoding='utf-8')
 class CompactCommentProgress(unittest.TestCase):
@@ -58,13 +59,13 @@ class CompactCommentProgress(unittest.TestCase):
     def test_release_version_and_gate(self):
         # The compact UI was introduced in beta.1 and must survive later
         # 6.3 releases; never hard-code the current release to beta.1.
-        meta=read('miuread.koplugin/_meta.lua')
-        conf=read('miuread.koplugin/miuread/config.lua')
-        m=re.search(r'version\s*=\s*"(6\.3\.2-beta\.(\d+))"',meta)
-        self.assertIsNotNone(m)
-        self.assertGreaterEqual(int(m.group(2)),1)
-        self.assertIn('VERSION = "'+m.group(1)+'"',conf)
-        self.assertIn('## '+m.group(1),read('CHANGELOG.md'))
+        # The feature must remain present through later 6.3.x/6.4.x
+        # releases, not just the version in which its test was introduced.
+        version = assert_beta_identity(self)
+        major, minor, patch, beta = map(int, re.fullmatch(
+            r"(\d+)\.(\d+)\.(\d+)-beta\.(\d+)", version).groups())
+        self.assertGreaterEqual((major, minor, patch, beta), (6, 3, 0, 1))
+        self.assertIn('## ' + version, read('CHANGELOG.md'))
         wf=read('.github/workflows/release-beta.yml')
         self.assertIn('test_630_comment_compact_progress.py',wf)
         self.assertIn('workflow_dispatch:',wf)

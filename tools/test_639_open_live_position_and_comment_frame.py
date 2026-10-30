@@ -40,13 +40,28 @@ class LiveOpenPosition(unittest.TestCase):
     def test_reader_toolbar_does_not_call_pending_writes_failures(self):
         main=read("miuread.koplugin/main.lua")
         status=main.split('function Plugin:_progress_status_label()',1)[1].split('function Plugin:show_sync_background_status()',1)[0]
-        self.assertIn('if pending or state=="waiting_network"',status)
-        self.assertIn('return "待同步确认"',status)
-        self.assertIn('state=="upload_failed"',status)
+        self.assertIn('return self:_effective_progress_status(',status)
+        rules=main.split('function Plugin:_effective_progress_status(',1)[1].split('function Plugin:_sync_user_issue(',1)[0]
+        self.assertIn('state=="upload_failed"',rules)
+        self.assertIn('return "待云端确认"',rules)
+        self.assertIn('return "章内位置待确认"',rules)
+        self.assertIn('return "已同步"',rules)
         summary=main.split('function Plugin:_reader_sync_summary()',1)[1].split('function Plugin:_reader_battery_label()',1)[0]
         self.assertIn('self:_progress_status_label()',summary)
         self.assertIn('return "同步待处理",false',summary)
         self.assertNotIn('or label:find("暂不处理",1,true) then return "同步失败"',summary)
+
+    def test_sync_overview_aggregates_progress_time_and_annotations(self):
+        main=read("miuread.koplugin/main.lua")
+        region=main.split('function Plugin:_show_reader_sync_panel(',1)[1].split(
+            'function Plugin:_show_reader_current_book_panel(',1)[0]
+        self.assertIn('local progress_state=self:_progress_status_label()',region)
+        self.assertIn('local time_state=self:reading_time_status_label()',region)
+        self.assertIn('value=aggregate',region)
+        self.assertIn('progress_state=="章内位置待确认"',region)
+        self.assertIn('progress_state=="待云端确认"',region)
+        self.assertIn('"阅读时间记录中"',region)
+        self.assertIn('value=annotation_state',region)
 
     def test_comment_progress_has_one_outer_outline_and_nonmodal_touch(self):
         ui=read("miuread.koplugin/miuread/comment_progress.lua")

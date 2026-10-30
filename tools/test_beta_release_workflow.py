@@ -38,6 +38,20 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
                         self.s.index('name: Read and validate beta identity'))
         self.assertIn('tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"', self.s)
 
+    def test_version_sensitive_tests_are_after_both_preparation_paths(self):
+        # Actions injects the *requested* VERSION before this step. Testing
+        # against it before prepare_beta_release.py runs breaks every new tag.
+        metadata = self.s.split('name: Prepare beta release metadata', 1)[1].split(
+            'name: Read and validate beta identity', 1)[0]
+        check = "python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'"
+        check_at = metadata.index(check)
+        manual_at = metadata.index('python3 tools/check_beta_release_identity.py --version "$VERSION"')
+        tag_at = metadata.index('python3 tools/ensure_beta_tag_changelog.py')
+        branch_end = metadata.index('          fi\n\n          # Run source regression tests')
+        self.assertLess(manual_at, check_at)
+        self.assertLess(tag_at, check_at)
+        self.assertLess(branch_end, check_at)
+
     def test_git_commit_before_tag(self):
         self.assertLess(self.s.index('name: Commit prepared beta version and changelog'),
                         self.s.index('name: Ensure release tag'))

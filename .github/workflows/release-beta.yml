@@ -100,18 +100,6 @@ jobs:
           RELEASE_NOTES_INPUT: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'
-          python3 -m unittest discover -s tools -p 'test_beta_release_workflow.py'
-          python3 -m unittest discover -s tools -p 'test_beta11_release_guard.py' 
-          python3 -m unittest discover -s tools -p 'test_beta12_release_regression.py'
-          python3 -m unittest discover -s tools -p 'test_620_readtime_contract.py'
-          python3 -m unittest discover -s tools -p 'test_623_session_snapshot_and_comment_ui.py'
-          python3 -m unittest discover -s tools -p 'test_625_comment_menu_and_sync_notice.py'
-          python3 -m unittest discover -s tools -p 'test_630_comment_compact_progress.py'
-          python3 -m unittest discover -s tools -p 'test_632_home_download_choice.py'
-          python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
-          python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
-
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             # Never move an already-published tag to a different commit.
             EXISTING_TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
@@ -150,6 +138,22 @@ jobs:
             python3 tools/ensure_beta_tag_changelog.py \
               --version "$VERSION" --notes "$(git log -1 --format=%s)"
           fi
+
+          # Run source regression tests only AFTER either release path has
+          # prepared its requested version in the working tree. These tests
+          # include strict checks against VERSION and must not inspect the
+          # pre-release source version when Actions targets a newer version.
+          python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'
+          python3 -m unittest discover -s tools -p 'test_beta_release_workflow.py'
+          python3 -m unittest discover -s tools -p 'test_beta11_release_guard.py' 
+          python3 -m unittest discover -s tools -p 'test_beta12_release_regression.py'
+          python3 -m unittest discover -s tools -p 'test_620_readtime_contract.py'
+          python3 -m unittest discover -s tools -p 'test_623_session_snapshot_and_comment_ui.py'
+          python3 -m unittest discover -s tools -p 'test_625_comment_menu_and_sync_notice.py'
+          python3 -m unittest discover -s tools -p 'test_630_comment_compact_progress.py'
+          python3 -m unittest discover -s tools -p 'test_632_home_download_choice.py'
+          python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
+          python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
 
       - name: Read and validate beta identity
         shell: bash
@@ -396,6 +400,8 @@ jobs:
           luajit tools/test_internal_links.lua
           python3 tools/test_extension_center_ux.py
           python3 tools/verify_600_beta1.py
+          lua5.1 tools/test_640_sync_state_behavior.lua
+          luajit tools/test_640_sync_state_behavior.lua
           python3 tools/test_624_release_verifier_contract.py
           python3 tools/test_635_eink_only_route.py
           python3 tools/test_636_smart_time_route.py
