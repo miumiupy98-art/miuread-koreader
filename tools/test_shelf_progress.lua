@@ -347,34 +347,33 @@ recovery:_schedule_home_progress_recovery(2.4); tick()
 assert(#timers==0,'offline recovery kept scheduling network work')
 offline=false; env.os=nil
 
--- beta.17: catalog recovery saves the exact Kindle position and uploads it
--- without waiting for cloud freshness. The web readback is performed after
--- submitting in the actual progress transaction, not as a blocking preflight.
+-- Recovery must not treat an old coordinate as permission to POST.
+-- The protected replay contract is separately exercised end-to-end by
+-- test_641_progress_recovery_behavior.lua. Keep shelf/catalog behavior here.
 load_method('_recover_pending_progress_coordinate')
+load_method('_pending_remote_preflight_decision')
+load_method('_pending_progress_auto_safe')
 load_method('_submit_saved_pending_progress')
 load_method('_progress_snapshot_current')
 _G.__MIUREAD_POSITION_RESOLUTION=require('miuread.position_resolution')
 local replay_session
-local submitted,submission_options,replay_error,replay_result,verified
+local submitted,replay_error,replay_result,verified
 local replay=setmetatable({sync={}}, {__index=Plugin})
 function replay:_persisted_sessions() return {a=replay_session} end
 replay.store={save_session=function(_,_,update) for k,v in pairs(update) do replay_session[k]=v end end,
-    session=function() return replay_session end}
+    session=function() return replay_session end,
+    auth=function() return {account={vid='test'},login_session_id='login'} end}
 function replay:logged_in() return true end
 function replay:_network_radio_hint() return not offline end
 function replay:_stored_progress_record() return {book={book_id='a'}} end
 function replay:_progress_snapshot_replayable(position) return position.native_offset==true and position.offset_basis=='wr_data_co' end
 function replay:_prepare_progress_snapshot(_,position) return copy(position) end
 function replay.sync:recover_partial_coordinate(_,_,done)
-    done({chapter_uid='8',offset=200,progress=20,updated_at=200,
-        native_offset=true,offset_basis='wr_data_co'})
+    done({chapter_uid='8',offset=200,canonical_offset=200,progress=20,updated_at=200,
+        safe=true,native_offset=true,offset_basis='wr_data_co'})
     return true
 end
-function replay.sync:remote() error('fresh cloud read must not gate Kindle upload') end
-function replay:_remote_matches(remote,position)
-    return remote and not remote.conflict and remote.chapter_uid==position.chapter_uid
-        and remote.offset==position.offset
-end
+function replay.sync:remote() error('unsafe/legacy pending must not reach cloud preflight') end
 function replay:_save_pending_progress(_,position,reason,state)
     replay_session.pending_progress=copy(position)
     replay_session.progress_sync_state=state
@@ -384,45 +383,44 @@ function replay:_save_progress_state(_,state) replay_session.progress_sync_state
 function replay:_clear_progress_resolution() end
 function replay:_clear_progress_write_fence() end
 function replay:_clear_pending_progress() replay_session.pending_progress=false end
+function replay:_remote_matches(remote,position)
+    return remote and not remote.conflict and remote.chapter_uid==position.chapter_uid
+        and (remote.offset or remote.chapter_offset)==(position.offset or position.chapter_offset)
+end
 function replay.sync:set_cloud_anchor() end
 function replay.sync:mark_verified() verified=true end
 function replay:_commit_progress_verified() self:_clear_pending_progress() end
 function replay:_submit_progress_snapshot(_,position,options,done)
-    submitted=copy(position); submission_options=options
-    done(true,{chapter_uid=position.chapter_uid,offset=position.offset})
-    return true
+    submitted=copy(position)
+    error('unverified catalog recovery dispatched a progress POST')
 end
-local replay_position={chapter_uid='8',offset=200,progress=20,captured_at=200,updated_at=200,
+local replay_position={chapter_uid='8',offset=200,canonical_offset=200,progress=20,captured_at=200,updated_at=200,
     progress_sequence=2,progress_epoch=1,native_offset=true,offset_basis='wr_data_co'}
 local function start_recovery()
     replay_session={progress_epoch=1,progress_latest_sequence=2,progress_verified_sequence=1,
         verified_chapter_uid='8',verified_chapter_offset=100,local_read_event_at=200,
-        pending_progress_coordinate=copy(replay_position)}
-    submitted=nil; submission_options=nil; verified=false
+        progress_submission_phase='unsent',pending_progress_coordinate=copy(replay_position)}
+    submitted=nil; verified=false
     replay_error=nil; replay_result=nil
     assert(replay:_recover_pending_progress_coordinate({book_id='a'},function(ok,err,position,remote)
         replay_error=err; replay_result={ok=ok,position=position,remote=remote}
     end))
 end
 start_recovery()
-assert(submitted and submitted.chapter_uid=='8' and submitted.offset==200,
-    'recovered Kindle coordinate was not submitted')
-assert(submission_options.force_write and submission_options.pending_already_saved,
-    'Kindle-authoritative replay lost forced write or its pending journal')
-assert(replay_result.ok and replay_result.position.progress_sequence==2
-    and replay_result.remote.offset==200,'catalog recovery changed the callback contract')
+assert(submitted==nil and replay_result.ok==false,
+    'old recovered coordinate incorrectly sent to cloud')
 assert(replay_session.pending_progress and replay_session.pending_progress.progress_sequence==2,
-    'unverified progress was discarded before cloud readback')
--- A new Kindle event superseding an older pending position must block the old
--- snapshot, even when the old position was once considered authoritative.
-local previous=copy(replay_session.pending_progress)
+    'unsafe pending position was discarded instead of retained')
+assert(replay_error=='legacy_pending_requires_review',
+    'legacy coordinate without a genuine reading event was silently approved')
+-- A superseded older pending position must not upload even if it was precise.
 replay_session.progress_latest_sequence=3
 submitted=nil;replay_error=nil
 assert(replay:_submit_saved_pending_progress({book_id='a'},function(ok,err)
     replay_error=err
 end)==false and submitted==nil and replay_error=='superseded',
     'stale snapshot overwrote a newer Kindle event')
--- Offline catalog recovery must retain its journal and refrain from sending.
+-- Offline catalog recovery retains its journal and skips any network request.
 offline=true;start_recovery()
 assert(not submitted and replay_result.ok and replay_error=='recovered_waiting_network'
     and replay_session.pending_progress,'offline catalog recovery lost pending upload')

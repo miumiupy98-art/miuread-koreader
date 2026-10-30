@@ -1,3 +1,6 @@
+## 6.3.2-beta.3 - Beta Update
+
+- 修复评论获取菜单合并后发布回归测试仍引用旧入口的问题，保持评论下载、阅读时间及锁屏功能不变
 ## 6.3.2 - 2026-10-30
 
 - feat(readtime): preserve complete offline reading-time upload implementation

@@ -21,11 +21,17 @@ class Beta17Contracts(unittest.TestCase):
     def test_kindle_authority_and_recovery(self):
         main=src('main.lua')
         recovery=main.split('function Plugin:_submit_saved_pending_progress(',1)[1].split('function Plugin:_submit_all_saved_pending_progress(',1)[0]
-        self.assertNotIn('self.sync:remote(book_id',recovery)
-        self.assertIn('force_write=true',recovery)
+        self.assertIn('self.sync:remote(book_id',recovery)
+        self.assertNotIn('force_write=true',recovery)
+        self.assertIn('_pending_progress_auto_safe',recovery)
+        self.assertIn('_pending_remote_preflight_decision',recovery)
         self.assertIn('self:_progress_snapshot_current(book_id,position)',recovery)
         self.assertIn('self:_submit_progress_snapshot(book_id,position',recovery)
-        self.assertIn('kindle_coordinate_authoritative',main)
+        # A valid Kindle coordinate no longer always wins on automatic open:
+        # verified newer cloud read-events may be adopted after live mapping.
+        self.assertNotIn('reason="kindle_coordinate_authoritative"',main)
+        self.assertIn('self.sync:resolve_local_progress(function(local_position,local_err,meta)',main)
+        self.assertIn('self:on_remote_progress(id,localp,remote,automatic==true,local_position)',main)
         self.assertIn('upload_state=="remote_newer_pending"',main)
         self.assertIn('self:_verify_progress_submission(',main)
         worker=src('miuread/legacy/read_report_worker.lua')
@@ -57,7 +63,7 @@ class Beta17Contracts(unittest.TestCase):
         self.assertIn('ignored malformed/extra entries',parser)
         self.assertIn('status.status=="cached" or status.status=="empty"',main)
         self.assertIn('function Plugin:_comment_fetch_mode_menu(',main)
-        self.assertIn('self:_fetch_current_chapter_comments(false,back_callback)',main)
+        self.assertIn('self:_fetch_current_chapter_comments(true,back_callback)',main)
         self.assertIn('self:_fetch_current_chapter_comments(true,back_callback)',main)
 
     def test_other_ux_regressions(self):

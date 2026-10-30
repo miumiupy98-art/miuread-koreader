@@ -72,8 +72,9 @@ function Compact:_build()
     local sw,sh=Screen:getWidth(),Screen:getHeight()
     local outer_w=math.min(math.floor(sw*.88),Screen:scaleBySize(500))
     outer_w=math.max(math.min(sw-12,outer_w),math.min(300,sw-12))
-    local pad=Screen:scaleBySize(6)
-    local content_w=outer_w-2*pad
+    local pad=Screen:scaleBySize(8)
+    local frame_border=math.max(1,Screen:scaleBySize(1))
+    local content_w=outer_w-2*(pad+frame_border)
     local line_h=Screen:scaleBySize(22)
     local button_h=Screen:scaleBySize(30) -- retain generous touch area
     local bar_h=math.max(2,math.min(4,Screen:scaleBySize(3)))
@@ -128,10 +129,13 @@ function Compact:_build()
         VerticalSpan:new{width=gap},
         buttons,
     }
+    -- One thin outline around the complete progress surface, not separate
+    -- boxes around the buttons or a fullscreen overlay over the reader.
     self.frame=FrameContainer:new{
         background=Blitbuffer.COLOR_WHITE,
-        bordersize=0,
-        radius=Screen:scaleBySize(3),padding=pad,margin=0,lines,
+        color=Blitbuffer.COLOR_BLACK,
+        bordersize=frame_border,
+        radius=Screen:scaleBySize(6),padding=pad,margin=0,lines,
     }
     local size=self.frame:getSize()
     local x=math.floor((sw-size.w)/2)

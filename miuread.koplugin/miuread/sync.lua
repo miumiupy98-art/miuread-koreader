@@ -2631,6 +2631,7 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent, posi
         verified_catalog_hash=catalog_hash~="" and catalog_hash or nil,
         report_core_map_hash=core_hash~="" and core_hash or nil,
         progress_local_percent=verified_local, pending=false,
+        progress_verified_read_event_seq=tonumber(session_before.local_position_event_seq or 0) or 0,
         position_state=position_state,
     })
     self.store:update_cached_progress(book_id, verified_local)
@@ -2664,11 +2665,9 @@ function Sync:_save_local_snapshot(book_id,position)
         if previous and same_position(previous,snapshot) then
             event_updated=tonumber(previous.updated_at or session.local_read_event_at or 0) or 0
         else
-            -- Reading-event time is independent from exact source mapping.
-            -- Page movement updates last_activity even if chapter/co mapping later fails.
-            local activity=tonumber(self.last_activity or 0) or 0
-            local durable_event=tonumber(session.local_read_event_at or 0) or 0
-            event_updated=math.max(activity,durable_event)
+            -- last_activity also changes on Sync:start(), so it cannot prove
+            -- a user moved the page; use the separately recorded page event.
+            event_updated=tonumber(session.local_read_event_at or 0) or 0
         end
     end
     -- A first technical snapshot created merely because the book opened is not
@@ -5928,7 +5927,7 @@ function Sync:on_reader_ready()
     self:_resolve_reader_record(self.record_generation, 1)
 end
 
-function Sync:on_page(page)
+function Sync:on_page(page, genuine_user_event)
     -- beta.5: local freshness belongs to progress reconciliation, not to the
     -- optional reading-time feature. Always track real page movement for a
     -- recognised WeRead session, even when time reporting is disabled.
@@ -5943,6 +5942,20 @@ function Sync:on_page(page)
     if page ~= self.last_page then
         self.last_page = page
         self.last_activity = os.time()
+        -- A programmatic cloud jump can emit PageUpdate. It must NOT be
+        -- counted as a human reading event merely because the page changed.
+        if genuine_user_event==true and type(self.current.book)=="table" then
+            local book_id=tostring(self.current.book.book_id or self.current.book.bookId or "")
+            if book_id~="" then
+                local session=self.store:session(book_id) or {}
+                local next_seq=(tonumber(session.local_position_event_seq or 0) or 0)+1
+                self.store:save_session(book_id,{
+                    local_position_event_seq=next_seq,
+                    local_read_event_at=os.time(),
+                },false)
+                logger.info("[MiuRead][PositionEvent] user page movement", "book=",book_id,"seq=",next_seq)
+            end
+        end
         if self.time_enabled==true then self:_write_daemon_control(true, false) end
     end
 end
@@ -5987,7 +6000,7 @@ function Sync:on_suspend(options)
             and math.max(0,math.floor(tonumber(saved.pending_report_seconds) or 0)) or 0
         local patch={
             last_read_at=now,last_read_path=r.path,
-            local_read_event_at=math.max(tonumber(saved.local_read_event_at or 0) or 0,tonumber(self.last_activity or 0) or 0),
+            local_read_event_at=tonumber(saved.local_read_event_at or 0) or 0,
             -- Never invent suspend-time debt. Preserve only seconds previously
             -- proven unsent by the background reporter; suspended wall-clock
             -- time itself is still excluded from reading time.
@@ -6104,7 +6117,7 @@ function Sync:on_close(options)
                     saved_at=now, reason="close",
                 },
                 last_read_at=now,last_read_path=r.path,
-                local_read_event_at=math.max(tonumber(session.local_read_event_at or 0) or 0,tonumber(self.last_activity or 0) or 0),
+                local_read_event_at=tonumber(session.local_read_event_at or 0) or 0,
                 progress_local_percent=position and position.progress or nil,
                 last_close_path=path,last_close_at=now,
             }, false)

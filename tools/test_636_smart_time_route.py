@@ -1,3 +1,4 @@
+from release_version_contract import assert_beta_identity
 """v6.3.0-beta.6 automated source contracts for Web/E-Ink smart time handoff."""
 from pathlib import Path
 import unittest
@@ -10,8 +11,7 @@ class SmartTimeRoute(unittest.TestCase):
         sync=read("miuread.koplugin/miuread/sync.lua")
         self.assertIn('prefs.time_eink_only==true or prefs.time_route_mode=="eink"',sync)
         self.assertIn('prefs.time_route_mode=="smart"',sync)
-        self.assertIn('VERSION = "6.3.2-beta.2"',read("miuread.koplugin/miuread/config.lua"))
-        self.assertIn('version = "6.3.2-beta.2"',read("miuread.koplugin/_meta.lua"))
+        assert_beta_identity(self)
     def test_switch_does_not_replay_web_time(self):
         sync=read("miuread.koplugin/miuread/sync.lua")
         handoff=sync.split('function Sync:switch_smart_time_backend(',1)[1].split('function Sync:',1)[0]
@@ -35,7 +35,7 @@ class SmartTimeRoute(unittest.TestCase):
         self.assertIn('if self.active then self:schedule(60)',ctrl)
         self.assertIn('UI:scheduleIn(delay or 60,task)',ctrl)
         send=ctrl.split('function M:send()',1)[1].split('function M:summary()',1)[0]
-        self.assertIn('if self.active or (live_sync and live_sync.current)',send)
+        self.assertIn('if self.active or live_reader(live_sync) or live_reader(self.sync)',send)
         self.assertIn('local eink_allowed=mode=="eink" or mode=="smart"',send)
         self.assertIn('if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink"',send)
         self.assertIn('value.state=="confirmed"',send)
