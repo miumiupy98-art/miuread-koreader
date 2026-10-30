@@ -24,8 +24,10 @@ def version_key(version):
 
 
 def parse_notes(notes):
-    if not isinstance(notes, str) or not notes.strip():
-        raise ValueError("更新说明不能为空")
+    if not isinstance(notes, str):
+        raise ValueError("更新说明必须是字符串")
+    if not notes.strip():
+        notes = "版本更新与维护"
     if len(notes) > 4000:
         raise ValueError("更新说明超过 4000 个字符")
     # GitHub workflow_dispatch uses a text input. Separate multiple points

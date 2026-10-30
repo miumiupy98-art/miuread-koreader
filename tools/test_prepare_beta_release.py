@@ -107,11 +107,10 @@ class PrepareBetaReleaseTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "无效的 Beta"):
             prepare(self.root, "not-a-version", "无效")
 
-    def test_rejects_empty_notes_without_writing(self):
-        before = self.config.read_bytes()
-        with self.assertRaisesRegex(ValueError, "不能为空"):
-            prepare(self.root, "6.0.1-beta.2", "  ")
-        self.assertEqual(before, self.config.read_bytes())
+    def test_optional_notes_generate_default_entry(self):
+        self.assertTrue(prepare(self.root, "6.0.1-beta.2", "  "))
+        self.assertIn("- 版本更新与维护", self.changelog.read_text())
+        self.assertFalse(prepare(self.root, "6.0.1-beta.2", ""))
 
     def test_rejects_mismatched_versions(self):
         self.meta.write_text('return {\n    version = "6.0.0-beta.2",\n}\n', encoding="utf-8")

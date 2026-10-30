@@ -30,7 +30,8 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
         header = self.s.split('permissions:', 1)[0]
         self.assertIn('      version:', header)
         self.assertIn('      release_notes:', header)
-        self.assertEqual(header.count('        required: true'), 2)
+        self.assertEqual(header.count('        required: true'), 1)
+        self.assertIn('        required: false', header)
 
     def test_prepare_before_validation(self):
         self.assertLess(self.s.index('name: Prepare beta release metadata'),
@@ -53,8 +54,8 @@ class BetaReleaseWorkflowContract(unittest.TestCase):
         self.assertIn('不能重新修改该标签的版本文件', self.s)
         self.assertIn('不要从过期提交发布', self.s)
 
-    def test_release_notes_required_before_processing(self):
-        self.assertIn('缺少手动发布的更新说明', self.s)
+    def test_release_notes_optional_before_processing(self):
+        self.assertNotIn('缺少手动发布的更新说明', self.s)
         self.assertIn("python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'", self.s)
 
 

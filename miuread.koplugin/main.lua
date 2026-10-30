@@ -15240,18 +15240,23 @@ function Plugin:_reader_wifi_summary()
 end
 
 function Plugin:_reader_sync_summary()
-    local label=tostring(self:progress_sync_label() or "")
+    -- The toolbar reports the actual CURRENT book transaction, not merely
+    -- that uploads are configured for Reader close. Pending writes are not
+    -- failures; a Web readback is not proof that the Reader has landed there.
+    local label=tostring(self:_progress_status_label() or "")
     if label:find("失败",1,true) or label:find("需要修复",1,true) or label:find("冲突",1,true) then
         return label=="需要修复" and "同步需修复" or "同步失败",true
     end
-    if label:find("正在",1,true) or label:find("上传中",1,true) or label:find("确认",1,true) then
+    if label:find("正在",1,true) or label:find("上传中",1,true) then
         return "同步中",false
     end
     if label:find("关闭",1,true) then return "同步关闭",false end
     if label:find("未登录",1,true) then return "同步未登录",true end
-    if label:find("等待",1,true) or label:find("暂不处理",1,true) then return "同步失败",true end
     if label=="已同步" or label=="已上传并确认" or label=="已采用云端位置" or label=="使用本机位置" then
         return "同步完成",false
+    end
+    if label:find("等待",1,true) or label:find("待",1,true) or label:find("结束阅读",1,true) then
+        return "同步待处理",false
     end
     return "同步已开启",false
 end
@@ -23476,14 +23481,21 @@ function Plugin:_progress_status_label()
     local id=tostring(r.book.book_id or "")
     local session=id~="" and (self.store:session(id) or {}) or {}
     local state=tostring(session.progress_sync_state or "")
-    if state=="local_uploaded" or state=="aligned" or state=="remote_selected" then return "已同步" end
-    if state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="finalizing" then return "同步中" end
-    if type(session.pending_progress)=="table" or type(session.pending_progress_coordinate)=="table" then return "同步失败" end
+    local pending=type(session.pending_progress)=="table"
+        or type(session.pending_progress_coordinate)=="table"
     if not self:logged_in() or session.sync_repair_required==true then return "同步失败" end
-    if state=="waiting_network" or state=="upload_unconfirmed" or state=="remote_jump_unconfirmed"
-        or state=="remote_unavailable" or state=="deferred" or state=="verification_required"
-        or state=="upload_failed" or state=="mapping_failed" or state=="different" or state=="source_conflict"
-        or state=="submitted" or state=="settling" then return "同步失败" end
+    if state=="upload_failed" or state=="mapping_failed" or state=="remote_jump_unconfirmed"
+        or state=="source_conflict" or state=="verification_required" then return "同步失败" end
+    if state=="uploading" or state=="retrying" or state=="verifying_upload" or state=="finalizing"
+        or state=="checking" or state=="mapping_preparing" or state=="position_locating"
+        or state=="different" then return "正在确认" end
+    -- The previous UI labelled every durable, still-pending reading-end
+    -- snapshot as a failure even while its Web readback was in flight.
+    if pending or state=="waiting_network" or state=="upload_unconfirmed"
+        or state=="deferred" or state=="submitted" or state=="settling"
+        or state=="remote_unavailable" then return "待同步确认" end
+    if state=="local_uploaded" or state=="aligned" or state=="remote_selected" then return "已同步" end
+    if state=="local_selected" then return "结束阅读后上传" end
     return "等待结束同步"
 end
 
@@ -26310,53 +26322,12 @@ function Plugin:ensure_read_report_progress(reason,automatic)
         end
     end
 
-    -- beta.5 fast path: when a durable exact local snapshot already exists,
-    -- compare it with one raw cloud metadata fetch before doing any source map
-    -- or XPointer work. Heavy local mapping is now a fallback, not the default
-    -- cost of opening every book.
-    local frozen_local=type(frozen_context and frozen_context.open_local_position)=="table"
-        and U.copy(frozen_context.open_local_position) or nil
-    local frozen_uid=tostring(frozen_local and (frozen_local.chapter_uid or frozen_local.chapterUid) or "")
-    local frozen_co=tonumber(frozen_local and (frozen_local.canonical_offset or frozen_local.chapter_offset or frozen_local.offset))
-    if automatic==true and frozen_uid~="" and frozen_co~=nil then
-        local localp=math.floor((tonumber(frozen_local.progress) or chapter_percent)+.5)
-        -- beta.9: a previous Web observation is useful for initial rendering,
-        -- but can never prove that the cloud is STILL aligned on a new open.
-        -- Always make a fresh asynchronous Web read for this opening session.
-        -- _progress_check_running already coalesces duplicate requests.
-        self:_save_progress_state(id,"checking","正在后台确认云端位置",localp,nil)
-        local remote_started,remote_start_error=self.sync:remote(id,function(remote,remote_err)
-            self._progress_check_running=false
-            if not remote then
-                self:_save_progress_state(id,"remote_unavailable","暂时无法读取云端位置",localp,nil)
-                self.sync:end_progress_sync("云端位置暂时不可用；本机写入保持保护")
-                self:_set_progress_write_fence(id,"remote_unavailable")
-                self:_open_sync_close("remote unavailable",true)
-                self:_finish_auto_position_check(id,"remote unavailable")
-                logger.warn("[MiuRead][Sync] lightweight remote position unavailable",tostring(remote_err or "unknown"))
-                return
-            end
-            if remote.conflict then
-                self:_save_progress_state(id,"source_conflict","云端两个来源的位置不一致",localp,nil)
-                self:on_remote_source_conflict(id,localp,remote,true,frozen_local)
-                return
-            end
-            self:_save_progress_state(id,"different","已取得云端位置，正在判断最新阅读事件",localp,tonumber(remote.percent))
-            self:on_remote_progress(id,localp,remote,true,frozen_local)
-        end,{raw_coordinate=true,update_cloud_anchor=false})
-        if remote_started==false then
-            self._progress_check_running=false
-            self:_set_progress_write_fence(id,"remote_fetch_unavailable")
-            self:_save_progress_state(id,"remote_unavailable","云端位置后台任务暂时不可用",localp,nil)
-            self.sync:end_progress_sync("无法启动云端位置检查")
-            self:_open_sync_close("remote fetch unavailable",true)
-            self:_finish_auto_position_check(id,"remote fetch unavailable")
-            logger.warn("[MiuRead][Sync] lightweight remote fetch not started",tostring(remote_start_error or "unknown"))
-            return false
-        end
-        return true
-    end
-
+    -- A persisted local/cloud snapshot is NOT proof that ReaderUI is currently
+    -- showing the same chapter/co (e.g. KOReader resumed at an older XPointer).
+    -- Resolve the live document location before comparing with the fresh Web
+    -- tuple. The same worker-backed path is used by manual sync, so automatic
+    -- open cannot report "aligned" without checking the page being displayed.
+    -- This costs a mapping pass but remains nonblocking and never uploads on open.
     local started,resolve_error=self.sync:resolve_local_progress(function(local_position,local_err,meta)
         if not local_position then local_failed(local_err,meta); return end
         local localp=math.floor((tonumber(local_position.progress) or 0)+.5)
@@ -26416,8 +26387,10 @@ function Plugin:ensure_read_report_progress(reason,automatic)
                 self:_save_position_resolution(id,"aligned","exact_position_equal",local_position,remote)
                 self:_save_progress_state(id,"aligned","章节和章节内位置一致",localp,remotep)
                 self.sync:end_progress_sync("位置已确认")
-                if automatic then self:_open_sync_close("positions aligned",false) end
-                if not automatic then
+                if automatic then
+                    self:_open_sync_close("positions aligned",false)
+                    self:_finish_auto_position_check(id,"live position aligned")
+                else
                     self:_sync_notice("read_ok")
                 end
                 return
@@ -27494,17 +27467,11 @@ function Plugin:on_remote_progress(id,localp,remote,automatic,local_position)
     }
     local winner=tostring(result.winner or "conflict")
     local reason=tostring(result.reason or "unknown")
-    -- beta.17 policy: a real Kindle coordinate is authoritative on automatic open.
-    -- Explicit 'use cloud' actions still call the separate manual adoption path.
-    local local_uid=tostring(type(local_position)=="table" and (local_position.chapter_uid or local_position.chapterUid) or "")
-    local local_offset=type(local_position)=="table" and tonumber(local_position.canonical_offset
-        or local_position.chapter_offset or local_position.offset) or nil
-    if automatic and local_uid~="" and local_offset~=nil then
-        if winner=="remote" or winner=="conflict" then
-            winner="local"
-            reason="kindle_coordinate_authoritative"
-        end
-    end
+    -- Do not force the local result merely because Kindle exposes a valid
+    -- coordinate. Both coordinates now represent actual Reader and Web states;
+    -- M.decide already protects newer local reading events and durable unsent
+    -- sequences. When Web is provably newer, automatic open must be permitted
+    -- to land it (with the same exact chapter/co verification as manual sync).
     local remote_uid=tostring(remote and (remote.chapter_uid or remote.chapterUid) or "")
     local remote_co=tonumber(remote and (remote.canonical_offset or remote.offset or remote.chapter_offset))
 

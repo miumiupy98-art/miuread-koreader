@@ -1,3 +1,4 @@
+from release_version_contract import assert_beta_identity
 from pathlib import Path
 import unittest
 ROOT=Path(__file__).resolve().parents[1]
@@ -23,6 +24,6 @@ class NextRelease(unittest.TestCase):
         self.assertIn('self.on_cancel',ui)
     def test_beta_identity(self):
         config=source("miuread.koplugin/miuread/config.lua")
-        self.assertIn('VERSION = "6.3.2-beta.3"',config)
+        assert_beta_identity(self)
         self.assertIn('UPDATE_CHANNEL = "beta"',config)
 if __name__=="__main__": unittest.main()

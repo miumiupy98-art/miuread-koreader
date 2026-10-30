@@ -14,8 +14,8 @@ on:
         required: true
         type: string
       release_notes:
-        description: "本次更新说明（多条使用空格竖线空格分隔： | ）"
-        required: true
+        description: "可选：更新说明（留空自动生成）"
+        required: false
         type: string
 
 permissions:
@@ -113,10 +113,6 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
-              echo "::error::缺少手动发布的更新说明。"
-              exit 1
-            fi
             # Never move an already-published tag to a different commit.
             EXISTING_TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
             if [ -n "$EXISTING_TAG_SHA" ] && [ "$EXISTING_TAG_SHA" != "$(git rev-parse HEAD)" ]; then
@@ -404,6 +400,7 @@ jobs:
           python3 tools/test_635_eink_only_route.py
           python3 tools/test_636_smart_time_route.py
           python3 tools/test_637_menu_icons_and_handoff.py
+          python3 tools/test_639_open_live_position_and_comment_frame.py
           lua5.1 tools/test_637_handoff.lua
           luajit tools/test_637_handoff.lua
           python3 tools/verify_memory_profile.py

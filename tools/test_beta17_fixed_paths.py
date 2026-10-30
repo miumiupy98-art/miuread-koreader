@@ -25,7 +25,11 @@ class Beta17Contracts(unittest.TestCase):
         self.assertIn('force_write=true',recovery)
         self.assertIn('self:_progress_snapshot_current(book_id,position)',recovery)
         self.assertIn('self:_submit_progress_snapshot(book_id,position',recovery)
-        self.assertIn('kindle_coordinate_authoritative',main)
+        # A valid Kindle coordinate no longer always wins on automatic open:
+        # verified newer cloud read-events may be adopted after live mapping.
+        self.assertNotIn('reason="kindle_coordinate_authoritative"',main)
+        self.assertIn('self.sync:resolve_local_progress(function(local_position,local_err,meta)',main)
+        self.assertIn('self:on_remote_progress(id,localp,remote,automatic==true,local_position)',main)
         self.assertIn('upload_state=="remote_newer_pending"',main)
         self.assertIn('self:_verify_progress_submission(',main)
         worker=src('miuread/legacy/read_report_worker.lua')
