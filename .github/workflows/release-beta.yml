@@ -364,7 +364,9 @@ jobs:
           luajit tools/test_shelf_progress.lua
           lua5.1 tools/test_position_resolution.lua
           lua5.1 tools/test_beta8_sync_behavior.lua
+          lua5.1 tools/test_641_progress_recovery_behavior.lua
           luajit tools/test_beta8_sync_behavior.lua
+          luajit tools/test_641_progress_recovery_behavior.lua
           lua5.1 tools/test_progress_confirmation.lua
           luajit tools/test_progress_confirmation.lua
           lua5.1 tools/test_beta9_sync_readtime.lua

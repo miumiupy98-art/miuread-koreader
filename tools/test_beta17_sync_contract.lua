@@ -21,17 +21,18 @@ assert(config:match('VERSION%s*=%s*"%d+%.%d+%.%d+%-beta%.%d+"'),"beta release me
 -- positions until an actual new reading event proves local freshness.
 -- Old beta.17's unconditional cloud-fence bypass is no longer a safe contract.
 local replay=fragment(main,"function Plugin:_submit_saved_pending_progress","function Plugin:_submit_all_saved_pending_progress")
-assert(replay:find("force_write=true",1,true),"local submission not authoritative")
+assert(not replay:find("force_write=true",1,true),"automatic pending replay must not force-write")
+assert(replay:find("_pending_progress_auto_safe",1,true),"automatic replay must prove original position provenance")
 assert(replay:find("_progress_snapshot_current(book_id,position)",1,true),"stale local snapshot not rejected")
-assert(not replay:find("self.sync:remote(book_id",1,true),"remote freshness still blocks Kindle")
+assert(replay:find("self.sync:remote(book_id",1,true),"automatic pending replay lacks fresh remote preflight")
 -- Historical authority mode was a blanket bypass: explicitly reject it.
 assert(not main:find('reason="kindle_coordinate_authoritative"',1,true),
     "obsolete unconditional cloud-fence bypass reintroduced")
 local fence=fragment(main,"function Plugin:_progress_write_fence","function Plugin:_save_position_resolution")
 assert(fence:find('reason=="remote_exact_unresolved"',1,true),
     "unverified remote-exact position not protected")
-assert(fence:find('local fresh_event=current_event>previous_event and current_event>=blocked_at',1,true),
-    "new local reading event not required before remote-fence release")
+assert(fence:find('local fresh_event=event_seq>blocked_seq and event_seq>0 and same_epoch',1,true),
+    "durable reading-event sequence not required before remote-fence release")
 assert(fence:find('position.safe==true',1,true),
     "unsafe local position could bypass remote fence")
 assert(fence:find('return true,reason',1,true),

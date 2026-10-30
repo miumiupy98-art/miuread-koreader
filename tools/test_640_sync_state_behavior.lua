@@ -18,20 +18,21 @@ end
 load_method("_progress_write_fence","_save_position_resolution")
 load_method("_effective_progress_status","_sync_user_issue")
 load_method("_home_sync_status_label_from_summary","_home_sync_status_label")
-local session={local_read_event_at=100}
+local session={local_position_event_seq=0,progress_epoch=1}
 local obj={store={session=function() return session end,preferences=function() return {} end},
-    _progress_write_fences={a={reason="remote_exact_unresolved",blocked_at=110,local_event_at=100}}}
+    _progress_write_fences={a={reason="remote_exact_unresolved",blocked_event_seq=0,progress_epoch=1}}}
 local exact={safe=true,chapter_uid="12",canonical_offset=6100}
 local blocked=Plugin._progress_write_fence(obj,"a",exact)
 assert(blocked==true,"precise coordinates cannot bypass a remote-exact fence")
 assert(Plugin._progress_write_fence(obj,"a")==true,"pre-mapping fence must block too")
-session.local_read_event_at=111
+session.local_position_event_seq=1
+exact.local_position_event_seq=1
 assert(Plugin._progress_write_fence(obj,"a",exact)==false,"new real reading event may authorize exact write")
-local chapter_start={safe=true,chapter_uid="12",canonical_offset=0}
+local chapter_start={safe=true,chapter_uid="12",canonical_offset=0,local_position_event_seq=1}
 assert(Plugin._progress_write_fence(obj,"a",chapter_start)==false,"co=0 is a valid exact chapter-start coordinate")
 assert(Plugin._progress_write_fence(obj,"a") == true,"no coordinate cannot bypass fence")
 for _,reason in ipairs({"remote_newer:later", "conflict:ambiguous_clock_conflict", "remote_exact_coordinate_missing"}) do
-    obj._progress_write_fences.a={reason=reason,blocked_at=120,local_event_at=111}
+    obj._progress_write_fences.a={reason=reason,blocked_event_seq=1,progress_epoch=1}
     assert(Plugin._progress_write_fence(obj,"a",exact)==true,reason)
 end
 obj._progress_write_fences.a=nil

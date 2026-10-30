@@ -1,5 +1,17 @@
 -- Behavioral beta.8 regressions: run from repository root with lua5.1 or luajit.
 package.path="./miuread.koplugin/?.lua;./miuread.koplugin/?/init.lua;"..package.path
+-- Keep the original Lua 5.1 contract runnable on Lua 5.3 test hosts too.
+if not loadstring then loadstring=load end
+if not setfenv then
+    function setfenv(fn,env)
+        for i=1,32 do
+            local name=debug.getupvalue(fn,i)
+            if name=="_ENV" then debug.setupvalue(fn,i,env); return fn end
+            if name==nil then break end
+        end
+        return fn
+    end
+end
 local PR=require('miuread.position_resolution')
 local function read(p) local f=assert(io.open(p,'rb'));local s=f:read('*a');f:close();return s end
 local main=read('miuread.koplugin/main.lua')
@@ -30,15 +42,19 @@ compile_method(main,'function Plugin:_progress_write_fence(book_id,position)',
  '\nfunction Plugin:_save_position_resolution',{
  Plugin=Plugin
 })
-local fence_state={local_read_event_at=100}
+local fence_state={local_position_event_seq=0,progress_epoch=1}
 local host=setmetatable({store={session=function() return fence_state end},
- _progress_write_fences={a={reason='remote_exact_unresolved'},b={reason='account:changed'},
- c={reason='remote_newer:clock',local_event_at=100,blocked_at=100}}},{__index=Plugin})
-assert(host:_progress_write_fence('a')==false,'obsolete jump fence blocks uploading')
-assert(host:_progress_write_fence('b')==true,'account fence was bypassed')
-assert(host:_progress_write_fence('c',{})==true,'old local event overwrote newer cloud')
-fence_state.local_read_event_at=105
-assert(host:_progress_write_fence('c',{})==false,'a real new event remained fenced')
+ _progress_write_fences={a={reason='remote_exact_unresolved',blocked_event_seq=0,progress_epoch=1},
+ b={reason='account:changed',blocked_event_seq=0,progress_epoch=1},
+ c={reason='remote_newer:clock',blocked_event_seq=0,progress_epoch=1}}},{__index=Plugin})
+local exact={safe=true,chapter_uid='12',canonical_offset=3,local_position_event_seq=0}
+assert(host:_progress_write_fence('a',exact)==true,'unverified remote must remain protected')
+assert(host:_progress_write_fence('b',exact)==true,'account fence bypassed')
+assert(host:_progress_write_fence('c',exact)==true,'older event overwrote remote')
+fence_state.local_position_event_seq=1
+exact.local_position_event_seq=1
+assert(host:_progress_write_fence('c',exact)==false,'new exact user event remained fenced')
+assert(host:_progress_write_fence('a')==true,'coordinate-free write bypassed fence')
 
 -- A verified anchor beats a server ack timestamp (not a reading event).
 local anchor={chapter_uid='41',chapter_offset=368}
@@ -146,8 +162,8 @@ assert(not ok and err=='text_anchor_search_no_match','nil no-hit misclassified a
 assert(not main:find('deferred_until_reading_end',1,true),'redundant low-level upload veto reintroduced')
 assert(not main:find('UIManager:scheduleIn(.08,function() if self.ui and self.ui.document then self:upload_local_progress(false) end end)',1,true),
  'book-open network write reintroduced')
-assert(main:find('kindle_pending_send_authoritative',1,true),
- 'Kindle pending position still depends on a fresh cloud-read decision')
+assert(not main:find('kindle_pending_send_authoritative',1,true),
+ 'automatic pending replay still bypasses cloud authority')
 assert(main:find('pending_already_saved=true',1,true) and main:find('_progress_snapshot_current(book_id,position)',1,true),
  'authoritative saved upload lost its pending snapshot or generation check')
 print('beta8 sync/time/anchor behavior: PASS')

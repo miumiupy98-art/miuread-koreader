@@ -21,8 +21,10 @@ class Beta17Contracts(unittest.TestCase):
     def test_kindle_authority_and_recovery(self):
         main=src('main.lua')
         recovery=main.split('function Plugin:_submit_saved_pending_progress(',1)[1].split('function Plugin:_submit_all_saved_pending_progress(',1)[0]
-        self.assertNotIn('self.sync:remote(book_id',recovery)
-        self.assertIn('force_write=true',recovery)
+        self.assertIn('self.sync:remote(book_id',recovery)
+        self.assertNotIn('force_write=true',recovery)
+        self.assertIn('_pending_progress_auto_safe',recovery)
+        self.assertIn('_pending_remote_preflight_decision',recovery)
         self.assertIn('self:_progress_snapshot_current(book_id,position)',recovery)
         self.assertIn('self:_submit_progress_snapshot(book_id,position',recovery)
         # A valid Kindle coordinate no longer always wins on automatic open:

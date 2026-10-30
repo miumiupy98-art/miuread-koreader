@@ -24205,7 +24205,13 @@ function Plugin:_progress_sync_issue_items()
                 local can_send=can_replay
                     and (upload_state=="pending_send" or upload_state=="remote_newer_pending" or legacy_unsent
                     or (old_conflict and (upload_state=="" or upload_state=="false")))
+                if can_send then
+                    local approved=self:_pending_progress_auto_safe(session,pending_progress)
+                    if not approved then can_send=false end
+                end
                 local can_verify=can_replay and not can_send
+                    and upload_state~="pending_send" and upload_state~="remote_newer_pending"
+                    and not legacy_unsent
                 local explicit_mismatch=pending_reason=="chapter_offset_mismatch" or pending_reason=="chapter_mismatch"
                     or pending_reason=="position_mismatch" or pending_reason=="remote_position_mismatch"
                 local can_resubmit=not authority_conflict and replayable==true and (session.progress_resubmit_allowed==true
@@ -24548,6 +24554,53 @@ function Plugin:_recover_all_pending_progress_coordinates(items,on_done)
     return true
 end
 
+function Plugin:_pending_remote_preflight_decision(session,position,remote)
+    session=type(session)=="table" and session or {}
+    position=type(position)=="table" and position or {}
+    if type(remote)~="table" or remote.conflict then return "wait","cloud_not_verified" end
+    local remote_uid=tostring(remote.chapter_uid or remote.chapterUid or "")
+    local remote_co=tonumber(remote.canonical_offset or remote.chapter_offset or remote.offset)
+    local local_uid=tostring(position.chapter_uid or "")
+    local local_co=tonumber(position.canonical_offset or position.chapter_offset or position.offset)
+    if remote_uid=="" or remote_co==nil or local_uid=="" or local_co==nil then
+        return "wait","cloud_exact_coordinate_missing"
+    end
+    local function same(uid,co) return uid~="" and uid==remote_uid and co~=nil and co==remote_co end
+    if same(local_uid,local_co) then return "verified","already_on_cloud" end
+    local anchor_uid=tostring(session.verified_chapter_uid or "")
+    local anchor_co=tonumber(session.verified_chapter_offset)
+    if not same(anchor_uid,anchor_co) then return "wait","cloud_moved_or_anchor_missing" end
+    local observed=tonumber(position.local_position_event_seq or 0) or 0
+    local verified=tonumber(session.progress_verified_read_event_seq or -1) or -1
+    if verified<0 or observed<=verified then return "wait","no_new_read_after_verified_anchor" end
+    return "send","remote_unchanged_since_verified_anchor"
+end
+
+function Plugin:_pending_progress_auto_safe(session,position)
+    session=type(session)=="table" and session or {}
+    position=type(position)=="table" and position or {}
+    local phase=tostring(session.progress_submission_phase or "")
+    if phase~="unsent" then return false,"request_may_have_dispatched" end
+    local event_seq=tonumber(position.local_position_event_seq or 0) or 0
+    if event_seq<=0 then return false,"legacy_pending_requires_review" end
+    if position.safe~=true or tostring(position.chapter_uid or "")==""
+        or tonumber(position.canonical_offset or position.chapter_offset or position.offset)==nil then
+        return false,"pending_not_precise"
+    end
+    local guard=type(session.progress_write_guard)=="table" and session.progress_write_guard or nil
+    if guard then
+        local newer=event_seq>(tonumber(guard.blocked_event_seq or 0) or 0)
+        local same_epoch=(tonumber(guard.progress_epoch or 1) or 1)==(tonumber(session.progress_epoch or 1) or 1)
+        if not newer or not same_epoch then return false,"remote_guard_unresolved" end
+    end
+    local reason=tostring(position.pending_reason or "")
+    if reason:find("^write_fenced:") and not guard then
+        -- Old records predate durable guard metadata; never auto-upgrade them.
+        return false,"legacy_guard_missing"
+    end
+    return true,"approved_unsent_exact"
+end
+
 function Plugin:_submit_saved_pending_progress(item,callback)
     callback=type(callback)=="function" and callback or function() end
     item=type(item)=="table" and item or {}
@@ -24577,24 +24630,75 @@ function Plugin:_submit_saved_pending_progress(item,callback)
         callback(false,"superseded")
         return false
     end
-    -- beta.17: the user explicitly selected Kindle-authoritative uploads.
-    -- An UNSENT precise local coordinate does not need a preliminary remote
-    -- freshness vote. The full upload still verifies its eventual cloud readback.
-    self:_clear_progress_write_fence(book_id,"kindle_pending_send_authoritative")
-    self:_save_progress_state(book_id,"uploading","正在上传 Kindle 本机保存的精确位置",
+    -- Automated replay is not a manual choice and must not gain force_write.
+    -- A durable remote fence cannot be erased by returning Home or relaunching.
+    local safe_to_send,why=self:_pending_progress_auto_safe(session,position)
+    if not safe_to_send then
+        callback(false,why or "pending_requires_cloud_review")
+        return false
+    end
+    -- Each unsent replay must first read fresh cloud coordinates. Neither a
+    -- cached CloudAnchor nor an old background retry implies remote freshness.
+    local auth_before=self.store:auth() or {}
+    local vid_before=tostring(type(auth_before.account)=="table" and auth_before.account.vid or "")
+    local login_before=tostring(auth_before.login_session_id or "")
+    local completed=false
+    local function finish(ok,reason,remote)
+        if completed then return end
+        completed=true
+        callback(ok,reason,remote)
+    end
+    self:_save_progress_state(book_id,"verifying_upload","正在重新确认云端位置，暂不上传",
         localp,nil,position.progress_sequence)
-    local started=self:_submit_progress_snapshot(book_id,position,{
-        detached=true,reason="kindle_pending_send",pending_reason="upload_queued",
-        pending_already_saved=true,record_override=record_snapshot,record_snapshot=record_snapshot,
-        uploading_message="正在上传 Kindle 本机进度",
-        verifying_message="阅读进度已提交，等待微信确认",
-        unconfirmed_message="阅读进度已提交，仍等待微信确认",
-        failed_message="Kindle 精确位置已保存，稍后继续上传",
-        verify_delays={3,10,24},force_write=true,
-    },function(ok,verified_remote,err)
-        callback(ok,err,verified_remote)
-    end)
-    if not started then callback(false,"progress_worker_busy") end
+    local started,remote_error=self.sync:remote(book_id,function(remote,err)
+        if completed then return end
+        local auth_now=self.store:auth() or {}
+        local vid_now=tostring(type(auth_now.account)=="table" and auth_now.account.vid or "")
+        if vid_now~=vid_before or tostring(auth_now.login_session_id or "")~=login_before then
+            finish(false,"account_changed",remote); return
+        end
+        if self._active_reader_ui and self:_active_reader_ui() then
+            finish(false,"reader_active",remote); return
+        end
+        if not self:_progress_snapshot_current(book_id,position) then
+            finish(false,"superseded",remote); return
+        end
+        local decision,why=self:_pending_remote_preflight_decision(session,position,remote)
+        if decision=="verified" then
+            -- An earlier submission may already have reached WeRead; VERIFY
+            -- only and never issue a second POST.
+            local running=self:_verify_progress_submission(book_id,position,{
+                detached=true,reason="saved_pending_already_on_cloud",verify_delays={1,6,18},
+                record_snapshot=record_snapshot,
+            },function(verified,verified_remote,verify_error)
+                finish(verified,verify_error or "remote_already_matches",verified_remote)
+            end)
+            if running==false then finish(false,"progress_verify_busy") end
+            return
+        end
+        if decision~="send" then
+            self:_save_progress_state(book_id,"verification_required",
+                "云端位置未证明可安全覆盖；本机记录已保留",localp,nil,position.progress_sequence)
+            finish(false,why or err or "remote_preflight_blocked",remote)
+            return
+        end
+        self:_save_progress_state(book_id,"uploading","正在上传已确认安全的本机位置",
+            localp,nil,position.progress_sequence)
+        local upload_started=self:_submit_progress_snapshot(book_id,position,{
+            detached=true,reason="kindle_pending_send",pending_reason="upload_queued",
+            pending_already_saved=true,record_override=record_snapshot,record_snapshot=record_snapshot,
+            uploading_message="正在上传 Kindle 本机进度",
+            verifying_message="阅读进度已提交，等待微信确认",
+            unconfirmed_message="阅读进度已提交，仍等待微信确认",
+            failed_message="Kindle 精确位置已保存，稍后继续上传",
+            verify_delays={3,10,24},
+        },function(ok,verified_remote,upload_err)
+            finish(ok,upload_err,verified_remote)
+        end)
+        if upload_started==false then finish(false,"progress_worker_busy") end
+    end,{force=true,raw_coordinate=true,web_only=true,verify_only=true,
+        detached=true,record_snapshot=record_snapshot,update_cloud_anchor=false})
+    if started==false then finish(false,remote_error or "remote_preflight_busy") end
     return started~=false
 end
 
@@ -26185,17 +26289,21 @@ end
 function Plugin:_set_progress_write_fence(book_id,reason)
     book_id=tostring(book_id or "")
     if book_id=="" then return false end
-    -- beta.6: write protection is reconciliation-scoped, never a durable book lock.
-    -- A failed cloud jump may block one immediate write, but it must not poison
-    -- future reading sessions or survive a restart.
     self._progress_write_fences=type(self._progress_write_fences)=="table" and self._progress_write_fences or {}
     local session=self.store:session(book_id) or {}
-    self._progress_write_fences[book_id]={
+    local fence={
         reason=tostring(reason or "reconciliation_unresolved"),
         blocked_at=os.time(),
-        local_event_at=tonumber(session.local_read_event_at or 0) or 0,
+        blocked_event_seq=tonumber(session.local_position_event_seq or 0) or 0,
+        progress_epoch=tonumber(session.progress_epoch or 1) or 1,
     }
-    logger.info("[MiuRead][ProgressFence] blocked","book=",book_id,"reason=",tostring(reason or "unknown"),"scope=session")
+    self._progress_write_fences[book_id]=fence
+    -- Only actual cloud/account uncertainty is a durable write veto.
+    -- A crashed "remote_fetch_pending" check must not lock a book forever.
+    if fence.reason~="remote_fetch_pending" then
+        self.store:save_session(book_id,{progress_write_guard=fence})
+    end
+    logger.info("[MiuRead][ProgressFence] blocked","book=",book_id,"reason=",fence.reason,"scope=durable")
     return true
 end
 
@@ -26204,33 +26312,34 @@ function Plugin:_clear_progress_write_fence(book_id,reason)
     if book_id=="" then return false end
     self._progress_write_fences=type(self._progress_write_fences)=="table" and self._progress_write_fences or {}
     self._progress_write_fences[book_id]=nil
-    logger.info("[MiuRead][ProgressFence] released","book=",book_id,"reason=",tostring(reason or "resolved"),"scope=session")
+    self.store:save_session(book_id,{progress_write_guard=false})
+    logger.info("[MiuRead][ProgressFence] released","book=",book_id,"reason=",tostring(reason or "resolved"),"scope=durable")
     return true
 end
 
 function Plugin:_progress_write_fence(book_id,position)
     book_id=tostring(book_id or "")
     self._progress_write_fences=type(self._progress_write_fences)=="table" and self._progress_write_fences or {}
+    local session=self.store:session(book_id) or {}
     local fence=self._progress_write_fences[book_id]
+    if type(fence)~="table" then fence=session.progress_write_guard end
     if type(fence)~="table" then return false,"" end
     local reason=tostring(fence.reason or "")
+    -- Precision is not freshness. Only an independently recorded user page
+    -- event, associated with THIS saved coordinate, may release a remote fence.
     local protects_remote=reason:find("^remote_newer:")~=nil
         or reason:find("^conflict:")~=nil
         or reason=="remote_exact_unresolved" or reason=="remote_exact_coordinate_missing"
         or reason=="unknown_freshness_conflict" or reason=="ambiguous_clock_conflict"
     if protects_remote then
-        -- Safe coordinates describe precision, NOT freshness. A failed remote
-        -- landing must never turn into an upload merely because Reader close
-        -- re-captured its old (and still precise) local page.
-        local session=self.store:session(book_id) or {}
-        local current_event=tonumber(session.local_read_event_at or 0) or 0
-        local previous_event=tonumber(fence.local_event_at or 0) or 0
-        local blocked_at=tonumber(fence.blocked_at or 0) or 0
-        local fresh_event=current_event>previous_event and current_event>=blocked_at
+        local event_seq=tonumber(position and position.local_position_event_seq or 0) or 0
+        local blocked_seq=tonumber(fence.blocked_event_seq or 0) or 0
+        local same_epoch=(tonumber(session.progress_epoch or 1) or 1)==(tonumber(fence.progress_epoch or 1) or 1)
+        local fresh_event=event_seq>blocked_seq and event_seq>0 and same_epoch
         if fresh_event and type(position)=="table" and position.safe==true
             and tostring(position.chapter_uid or "")~=""
             and tonumber(position.canonical_offset or position.chapter_offset or position.offset)~=nil then
-            return false,"new_read_event_after_remote_observation"
+            return false,"new_user_position_event_after_remote_observation"
         end
         return true,reason
     end
@@ -26310,6 +26419,7 @@ function Plugin:_restore_position_rollback(reason,keep_for_user_undo)
     local row=self._position_rollback
     if type(row)~="table" then return false end
     self._position_resolution_applying=true
+    self._progress_programmatic_page_guard_until=monotonic_wall_time()+1.0
     local ok=false
     if type(row.xpointer)=="string" and row.xpointer~="" then ok=self.sync:jump_xpointer(row.xpointer)==true end
     if not ok and tonumber(row.progress)~=nil then ok=self.sync:jump(tonumber(row.progress))==true end
@@ -26695,6 +26805,8 @@ function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
         return false
     end
     snapshot.pending_reason=tostring(reason or "unconfirmed")
+    snapshot.local_position_event_seq=tonumber(position.local_position_event_seq)
+        or tonumber(session.local_position_event_seq or 0) or 0
     local pre_send={
         upload_queued=true,manual_upload_queued=true,background_upload_queued=true,
         manual_resubmit_queued=true,retry_upload_queued=true,progress_worker_busy=true,
@@ -26975,7 +27087,14 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
         return false
     end
     local seq=tonumber(snapshot.progress_sequence or 0) or 0
+    if options.pending_already_saved~=true and tonumber(snapshot.local_position_event_seq)==nil then
+        local event_session=self.store:session(book_id) or {}
+        snapshot.local_position_event_seq=tonumber(event_session.local_position_event_seq or 0) or 0
+    end
     local blocked,block_reason=self:_progress_write_fence(book_id,snapshot)
+    if not blocked and block_reason=="new_user_position_event_after_remote_observation" then
+        self:_clear_progress_write_fence(book_id,"new_user_position_event_after_remote_observation")
+    end
     if blocked and options.force_write~=true and options.verify_first~=true then
         -- The exact local snapshot has NOT been submitted. Persist it explicitly
         -- as UNSENT; recovery must re-check cloud freshness before a later send.
@@ -26989,7 +27108,8 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
         logger.warn("[MiuRead][ProgressFence] local write blocked","book=",book_id,"reason=",tostring(block_reason),"parked=unsent")
         -- Consume this one-shot session fence after the unsafe write has been
         -- parked. Future recovery starts from a fresh remote observation.
-        self:_clear_progress_write_fence(book_id,"blocked_write_parked_unsent")
+        self._progress_write_fences=self._progress_write_fences or {}
+        self._progress_write_fences[book_id]=nil
         callback(false,nil,"progress_write_fenced",snapshot,{fenced=true,reason=block_reason,unsent=true})
         return false
     end
@@ -27637,8 +27757,10 @@ function Plugin:on_remote_progress(id,localp,remote,automatic,local_position)
             resolved_remote=type(resolved_remote)=="table" and resolved_remote or remote
             self:_remember_position_rollback(id,local_position)
             self._position_resolution_applying=true
+            self._progress_programmatic_page_guard_until=monotonic_wall_time()+1.0
             return self:_use_remote_position(id,localp,resolved_remote,{automatic=automatic,local_position=local_position,reason=reason,callback=function(ok,actual_position,failure_meta)
                 self._position_resolution_applying=false
+                self._progress_programmatic_page_guard_until=monotonic_wall_time()+0.6
                 if ok then
                     self:_clear_progress_write_fence(id,"remote_position_verified")
                     local pending_session=self.store:session(id) or {}
@@ -31948,7 +32070,9 @@ function Plugin:onPageUpdate(page)
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
     if weread then
-        self.sync:on_page(page)
+        self.sync:on_page(page, self._position_resolution_applying~=true
+            and self._auto_position_check_active~=true
+            and monotonic_wall_time()>(tonumber(self._progress_programmatic_page_guard_until) or 0))
         self:_schedule_thought_prewarm()
         -- No network or full-document search on the page-turn hot path.
         self:_schedule_comment_overlay_refresh(false)
