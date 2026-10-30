@@ -71,9 +71,18 @@ test("automatic opening always reads live Web even with matching 28-second cache
  session=function()return {position_state={remote_position=cached}} end}
  local sync={record=function()return {book={book_id="853116",title="Mock"}} end,
  begin_progress_sync=function()end,local_ratio=function()return 0.74 end,
+ -- Live reader-position resolution is a prerequisite of fresh cloud fetch.
+ -- The production method is defined in Sync; this isolated test must mock it
+ -- rather than relying on the old implementation that read only the cache.
+ resolve_local_progress=function(_,done,options)
+  assert(options.precise==true and options.prepare_catalog==true)
+  done(copy(localp),nil,{})
+  return true
+ end,
  remote=function(_,id,done,options)
   remote_calls=remote_calls+1
-  assert(options.raw_coordinate and not options.update_cloud_anchor)
+  -- Live coordinates were resolved above; the read must stay read-only.
+  assert(options==nil or options.update_cloud_anchor~=true)
   done({chapter_uid="44",offset=671,percent=20})
   return true
  end}
@@ -84,6 +93,10 @@ test("automatic opening always reads live Web even with matching 28-second cache
  function host:_position_resolution_context()return {open_local_position=copy(localp)} end
  function host:_set_progress_write_fence()end
  function host:_save_progress_state()end
+ function host:_remote_matches(remote,position)
+  assert(remote.chapter_uid=="44" and position.chapter_uid=="59")
+  return false
+ end
  function host:on_remote_progress(id,percent,remote)
   assert(id=="853116" and remote.chapter_uid=="44");applied=remote
  end

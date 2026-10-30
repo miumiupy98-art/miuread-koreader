@@ -9,6 +9,7 @@ fi
 python3 -m unittest discover -s tools -p 'test_release_integrity.py'
 python3 -m unittest discover -s tools -p 'test_release_workflows.py'
 python3 -m unittest discover -s tools -p 'test_release_inventory.py'
+python3 -m unittest discover -s tools -p 'test_release_lua_suite_sync.py'
 python3 -m unittest discover -s tools -p 'test_beta_tag_workspace.py'
 for engine in lua5.1 luajit; do
   "$engine" tools/test_shelf_progress.lua

@@ -657,7 +657,9 @@ class OfflineReadtimeTests(unittest.TestCase):
             fake_now=1080;assert(controller:send() and calls==1)
         ''')
         other = runtime(self.root)
-        self.assertEqual(other.eval("queue:summary('a').control.next_send"), 1140)
+        # Once the book is closed, there is no active 60-second reading interval.
+        # The confirmed retry persists its normal 10-second idle cooldown.
+        self.assertEqual(other.eval("queue:summary('a').control.next_send"), 1090)
 
     def test_position_pause_can_be_checked_and_resumed_without_replay(self):
         self.controller_fixture()

@@ -38,6 +38,13 @@ jobs:
           set -euo pipefail
           find miuread.koplugin -name '*.lua' -type f -print0 | xargs -0 -n1 luac5.1 -p
           bash tools/release_preflight.sh "$RELEASE_CHANNEL"
+      - name: Full Beta Lua release suite
+        if: env.RELEASE_CHANNEL == 'beta'
+        env:
+          LUA_PATH: "./miuread.koplugin/?.lua;./miuread.koplugin/?/init.lua;;"
+        run: |
+          set -euo pipefail
+          bash tools/run_beta_release_lua_suite.sh
       - name: Offline E-Ink and translation fixtures
         run: |
           set -euo pipefail
