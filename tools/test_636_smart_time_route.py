@@ -10,8 +10,8 @@ class SmartTimeRoute(unittest.TestCase):
         sync=read("miuread.koplugin/miuread/sync.lua")
         self.assertIn('prefs.time_eink_only==true or prefs.time_route_mode=="eink"',sync)
         self.assertIn('prefs.time_route_mode=="smart"',sync)
-        self.assertIn('VERSION = "6.5.0-beta.8"',read("miuread.koplugin/miuread/config.lua"))
-        self.assertIn('version = "6.5.0-beta.8"',read("miuread.koplugin/_meta.lua"))
+        self.assertIn('VERSION = "6.5.0-beta.11"',read("miuread.koplugin/miuread/config.lua"))
+        self.assertIn('version = "6.5.0-beta.11"',read("miuread.koplugin/_meta.lua"))
     def test_switch_does_not_replay_web_time(self):
         sync=read("miuread.koplugin/miuread/sync.lua")
         handoff=sync.split('function Sync:switch_smart_time_backend(',1)[1].split('function Sync:',1)[0]
@@ -35,7 +35,7 @@ class SmartTimeRoute(unittest.TestCase):
         self.assertIn('if self.active then self:schedule(60)',ctrl)
         self.assertIn('UI:scheduleIn(delay or 60,task)',ctrl)
         send=ctrl.split('function M:send()',1)[1].split('function M:summary()',1)[0]
-        self.assertIn('if mode=="smart" and ((live_sync and live_sync.current)',send)
+        self.assertIn('if self.active or live_reader(live_sync) or live_reader(self.sync) then return false end',send)
         self.assertIn('local eink_allowed=mode=="eink" or mode=="smart"',send)
         self.assertIn('if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink"',send)
         self.assertIn('value.state=="confirmed"',send)

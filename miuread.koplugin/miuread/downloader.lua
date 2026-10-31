@@ -2575,12 +2575,6 @@ function Downloader:_book_once(input, opt, progress)
         }
     end
 
-    respect_reader_priority("package")
-    progress("package", #chapters, math.max(1,accessible_expected), book.title, {
-        message=preview and (preview_mode=="info" and "正在生成试读信息版"
-            or (preview_mode=="partial" and ("正在生成部分试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章")
-            or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
-    })
     opt.expected_chapter_count = accessible_expected
     -- beta.18: `expected` is the number of chapters selected for this local
     -- EPUB, not the size of the whole WeRead catalog. Keep these two counts
@@ -2598,26 +2592,48 @@ function Downloader:_book_once(input, opt, progress)
     opt.guard_chapter_uid = guard_uid
     opt.checkpointed = true
 
-    -- Coordinate source completeness is part of the generated-book identity.
-    -- This does not block EPUB creation: a missing source is recorded so later
-    -- sync can recover just that chapter instead of pretending the whole book
-    -- has a reliable local progress basis.
-    local source_expected,source_cached=0,0
-    for _,cached_entry in pairs(type(cache.manifest.chapters)=="table" and cache.manifest.chapters or {}) do
-        if type(cached_entry)=="table" and cached_entry.content_done==true
-            and cached_entry.structural~=true and tostring(cached_entry.uid or "")~="" then
-            source_expected=source_expected+1
-            if cached_entry.source_cache_done==true then source_cached=source_cached+1 end
+    -- 6.5.0-beta.10: the EPUB MUST NOT be installed or advertised as complete
+    -- before every actual readable chapter has a verified Web coordinate source.
+    -- Work remains inside this existing download transaction (not post-install).
+    local Gate=require("miuread.download_source_gate")
+    local gate_ok,ready,gate_error,partial=pcall(Gate.prepare,{
+        reader=self.reader,book=book,chapters=chapters,cache=cache,format=format,
+        progress=progress,checkpoint=respect_reader_priority,
+        save_checkpoint=function() cache_save(cache) end,
+    })
+    if not gate_ok then
+        local original=tostring(ready or "unknown")
+        if Http.is_rate_limit_error(original) or Http.is_auth_error(original)
+            or Http.is_network_error(original) then
+            error("正文已下载，Web 定位网络请求尚未成功 [MiuReadWebCoordinatePending] "..original,0)
         end
+        error(original,0)
     end
-    opt.progress_source_chapter_count=source_expected
-    opt.progress_source_cached_count=source_cached
-    opt.progress_source_complete=source_expected>0 and source_cached==source_expected
-    opt.progress_source_book_version=tonumber(book.version) or 0
-    logger.info("[MiuRead][ProgressSource] download source summary",
-        "book=",tostring(book.bookId),"cached=",tostring(source_cached),
-        "expected=",tostring(source_expected),"complete=",tostring(opt.progress_source_complete==true),
-        "version=",tostring(opt.progress_source_book_version))
+    if not ready or ready.complete~=true or ready.verified~=ready.expected then
+        opt.progress_source_complete=false
+        opt.progress_source_chapter_count=tonumber(partial and partial.expected) or 0
+        opt.progress_source_cached_count=tonumber(partial and partial.verified) or 0
+        logger.warn("[MiuRead][WebCoordinateGate] install blocked",
+            "book=",tostring(book.bookId),"reason=",tostring(gate_error),
+            "verified=",tostring(opt.progress_source_cached_count),
+            "expected=",tostring(opt.progress_source_chapter_count))
+        error("正文已下载，但 Web 定位仍未全部验证；原书已保留，重新下载可从断点继续。 [MiuReadWebCoordinatePending] "
+            ..tostring(gate_error),0)
+    end
+    opt.progress_source_chapter_count=ready.expected
+    opt.progress_source_cached_count=ready.verified
+    opt.progress_source_complete=true
+    opt.progress_source_book_version=ready.version
+    logger.info("[MiuRead][WebCoordinateGate] all sources ready before installation",
+        "book=",tostring(book.bookId),"verified=",tostring(ready.verified),
+        "expected=",tostring(ready.expected),"version=",tostring(ready.version))
+
+    respect_reader_priority("package")
+    progress("package", #chapters, math.max(1,accessible_expected), book.title, {
+        message=preview and (preview_mode=="info" and "正在生成试读信息版"
+            or (preview_mode=="partial" and ("正在生成部分试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章")
+            or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
+    })
 
     local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session, progress)
     record.annotation_summary = annotation_summary

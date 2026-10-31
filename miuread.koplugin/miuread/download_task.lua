@@ -1127,13 +1127,13 @@ function DownloadTask:stage()
 end
 
 local HEAVY_STAGES={
-    content=true,underlines=true,thoughts=true,footnotes=true,images=true,package=true,
+    content=true,underlines=true,thoughts=true,footnotes=true,images=true,coordinate=true,package=true,
     annotation_batch=true,annotation_apply=true,transform=true,
 }
 local STALL_RECOVERABLE_STAGES={
     prepare=true,catalog=true,resume=true,content=true,images=true,
     underlines=true,thoughts=true,footnotes=true,annotation_batch=true,
-    annotation_apply=true,transform=true,package=true,
+    annotation_apply=true,transform=true,coordinate=true,package=true,
 }
 
 local function stall_recovery_seconds(backgrounded,stage)
@@ -1315,6 +1315,8 @@ function DownloadTask:_finish(job, forced_error)
                 result = {ok = false, error = "无法保存下载结果，请检查设备剩余空间和存储权限。已完成的章节断点仍会保留。"}
             elseif diagnostic:find("child_fatal",1,true) then
                 result = {ok = false, error = "下载进程发生内部异常，诊断信息已保留。已完成的章节断点不会丢失。"}
+            elseif stage == "coordinate" then
+                result = {ok = false, error = "Web 定位补全任务被中断；已下载正文与断点保留，重新运行只补缺失的章节。"}
             elseif stage == "package" then
                 result = {ok = false, error = "EPUB 生成进程被中断；原有完整书未被覆盖，已下载章节仍保存在断点缓存。请再次下载继续。"}
             elseif stage == "done" then
@@ -2502,6 +2504,12 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     if stage == "package" then
                         local package_fraction=math.max(0,math.min(1,tonumber(detail.package_fraction) or 0))
                         percent = 0.96 + 0.03 * package_fraction
+                    elseif stage == "coordinate" then
+                        -- Body download is not the end of the task. Never display
+                        -- 100% before every chapter Web source is verified and
+                        -- the EPUB has actually been installed.
+                        percent = 0.94 + 0.02 * math.max(0,math.min(1,
+                            (tonumber(current) or 0)/math.max(1,tonumber(total) or 1)))
                     elseif total and total > 0 then
                         local base = (math.max(1, current) - 1) / total
                         local step = 0

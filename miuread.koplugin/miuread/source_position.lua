@@ -323,6 +323,58 @@ function M.cacheChapter(reader, book_id, uid, version, coord_html)
     return true, path
 end
 
+-- Download completion gate: inspect only the exact book-version source. A
+-- different-version cache is not proof for a newly built EPUB.
+function M.readExactChapter(reader, book_id, uid, version)
+    for _, path in ipairs(cache_paths(reader, book_id, uid, version)) do
+        local body=read_cached(path)
+        if body then return body end
+    end
+    return nil, "source_cache_missing"
+end
+
+-- Validate an E-Ink/local chapter against the authoritative Web coordinate
+-- source. This deliberately uses the same normalized rune mapping that the
+-- reading-progress resolver uses. Do not guess from percentages or native co.
+-- Three distributed, unique ordered anchors avoid falsely approving a source
+-- that shares only the title or a boilerplate paragraph.
+function M.validateDownloadChapter(local_html, web_html)
+    if type(local_html)~="string" or local_html=="" then return nil,"local_source_missing" end
+    if type(web_html)~="string" or web_html=="" then return nil,"web_source_missing" end
+    if #web_html>MAX_SOURCE_BYTES then return nil,"web_source_too_large" end
+    local local_ok,local_map=pcall(PosMap.build,local_html)
+    local web_ok,web_map=pcall(PosMap.build,web_html)
+    if not local_ok or not web_ok or type(local_map)~="table" or type(web_map)~="table" then
+        return nil,"source_map_build_failed"
+    end
+    local local_norm=local_map.norm_map or {}
+    local n=#local_norm
+    if n<12 then return nil,"source_text_too_short_or_image_only" end
+    local web_norm=tostring(web_map.norm_text or "")
+    local count=n>=90 and 3 or (n>=46 and 2 or 1)
+    local width=math.min(32,math.max(12,math.floor(n/(count*2))))
+    local positions=count==3 and {.19,.50,.81} or (count==2 and {.30,.70} or {.50})
+    local prev_hit,verified=0,0
+    for _,fraction in ipairs(positions) do
+        local start=math.max(1,math.min(n-width+1,math.floor(n*fraction-width/2)))
+        local chars={}
+        for j=start,start+width-1 do
+            chars[#chars+1]=local_map.text_runes[local_norm[j]]
+        end
+        local sample=table.concat(chars)
+        local found=web_norm:find(sample,1,true)
+        if not found then return nil,"source_anchor_missing:"..tostring(verified+1) end
+        if web_norm:find(sample,found+#sample,true) then
+            return nil,"source_anchor_ambiguous:"..tostring(verified+1)
+        end
+        if found<=prev_hit then return nil,"source_anchor_order_mismatch" end
+        prev_hit=found
+        verified=verified+1
+    end
+    return {ready=true, anchors=verified, local_characters=n,
+        web_characters=#(web_map.norm_map or {})}
+end
+
 -- B3: only inspect existing authoritative coordinate sources. Never request
 -- remote content merely to render cached public comments. Existing sources
 -- may have a version suffix; pick the latest *existing* valid file.

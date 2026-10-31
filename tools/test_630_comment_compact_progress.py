@@ -17,10 +17,10 @@ class CompactCommentProgress(unittest.TestCase):
         self.assertNotIn('self.comment_opaque',u)
         self.assertNotIn('Screen:getHeight() * 0.60',u)
         self.assertIn('self.progress=ProgressWidget:new{',u)
-        self.assertIn('math.floor(fraction*100+.5)',u)
+        self.assertIn('self.progress:setPercentage(fraction)',u)
         self.assertIn('if signature==self._last_signature then return end',u)
         self.assertNotIn('state.chapter',u)
-        self.assertNotIn('state.comments',u)
+        self.assertIn('state.comments',u)
         self.assertNotIn('state.failed',u)
     def test_each_action_uses_real_icon_and_real_task_callback(self):
         u=read('miuread.koplugin/miuread/comment_progress.lua')

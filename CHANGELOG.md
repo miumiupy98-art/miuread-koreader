@@ -1,3 +1,36 @@
+## 6.5.0-beta.12 - 2026-11-01
+
+- 为已安装的旧版 EPUB 新增后台 Web 章节定位来源补全；逐章匹配，不修改原书或阅读进度。
+- 支持已安装书籍的补全任务暂停、重新验证、取消，以及离线重试和账号隔离。
+- 恢复 KOReader 原生锁屏独立选项、主页快捷栏长按层级菜单。
+- 统一评论获取/更新入口；指定范围可选择刷新已有评论。
+- 内测发布流程恢复到 v6.5.0-beta.5 原版，手动发布仅需版本号。
+
+## 6.5.0-beta.11
+
+- Automatic background continuation after failed Web coordinate validation during new-book download; persistent checkpoint retry with exponential backoff.
+- Prevent retry while reading, offline, asleep or when user download tasks are queued.
+- Only verified coordinates permit final EPUB installation. Preserve beta.9 reading time fixes and beta.10 progress behavior.
+- Deterministic Web/local content mismatches receive bounded retry and remain visible for manual attention.
+
+## 6.5.0-beta.10 - Verified Web position before EPUB installation
+
+- Continue directly from the user-provided 6.5.0-beta.9 source. Keep the reading-time worker ownership, close/suspend handoff and progress upload/readback implementations.
+- New downloads now prepare an authoritative Web source for every actual readable chapter after E-Ink/Web content fetching and BEFORE generating/installing a final EPUB. A downloaded chapter alone cannot finish the task.
+- Verify sampled, unique, ordered local-vs-Web text anchors for each chapter. Reject missing/mismatched/ambiguous sources rather than invent co. Persist each verified source and checkpoint for resume; reuse cached chapters without re-downloading the book.
+- Download progress shows a separate Web-coordinate phase (94–96%); 100% remains reserved for completed EPUB installation. Failure retains the existing EPUB and download checkpoints.
+- Restore late-version standalone comment progress UI; restore stopped-reader historical E-Ink time outbox guard and Web-specific credential revisions. Do not replace beta.9 worker ownership, ProgressFence, progress POST, or pending replay.
+- Caveat: all-chapter verification can fail conservatively on non-text/image-only or structurally divergent chapters; online Web access and Kindle end-to-end verification remain required.
+
+## 6.5.0-beta.9 - Reading-time ownership and compact channel status
+
+- Based directly on the user-provided experimental 6.5.0-beta.8 source rebuild (its reading-time router is inherited from 6.3.0-beta.7). No later 6.5 beta.3 auto-rebind behavior is introduced.
+- Reading-time UI displays only Web, Eink, 未启用 or a neutral dash when no active clock has taken ownership. Historical upload success is never used to choose the live channel; diagnostics/outbox still report errors and pending time.
+- Suspend/close progress-finalizer preemption retains its original daemon owner across deferred callbacks. If another reader segment has replaced it, the old finalizer refuses to stop/cancel the new clock and leaves progress pending for safe recovery.
+- Delayed daemon health recovery refuses to remove files owned by a replacement service; delayed restarts are limited to the same reading session.
+- Preserve the original smart Web/E-Ink writer barrier, SQLite ledger, authentication isolation, Web time reporting protocol, and beta.8 exact Web coordinate protections.
+- Source tests only; Kindle runtime, actual cloud time credit, and offline-to-online switching need device verification before publishing.
+
 ## 6.5.0-beta.8 - Experimental source rebuild from 6.3.0-beta.7
 
 - Rebased on the 6.3.0-beta.7 upload/readback implementation. Did not migrate the 6.5 beta.4–7 progress fences or replay policy.
@@ -17,6 +50,13 @@
 - 设置模式变更仅停止阅读时间服务，不再取消阅读进度相关异步任务。
 
 # Changelog
+
+## 6.5.0-beta.12 - 2026-11-01
+
+- 旧版 EPUB 的 Web 定位来源按需后台补齐并验证，不重建书籍。
+- 恢复 KOReader 原生锁屏设置和主页快捷栏长按统一菜单。
+- 评论下载与更新合并入口，范围内刷新已有缓存可选。
+- Beta 发布工作流恢复 6.5.0-beta.5 原版。
 
 ## 6.3.0-beta.6 - Beta Update
 

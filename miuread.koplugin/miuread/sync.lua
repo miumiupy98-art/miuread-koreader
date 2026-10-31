@@ -4111,6 +4111,8 @@ function Sync:_restart_unhealthy_daemon(reason)
     local max_restarts=math.max(1,tonumber(Config.READ_REPORT_MAX_HEALTH_RESTARTS) or 2)
     local was_active=daemon.active==true
     local old_pid=tonumber(daemon.pid)
+    local old_session=self.reading_time_session_id
+    local old_segment=self.reading_time_segment_id
     local paths=daemon.paths
     logger.warn("[MiuRead][ReadReport] unhealthy service detected",
         "pid=",tostring(old_pid or "-"),"reason=",tostring(reason or "unknown"),
@@ -4130,6 +4132,21 @@ function Sync:_restart_unhealthy_daemon(reason)
     end
     self.daemon_health_restart_pending=true
     UIManager:scheduleIn(math.max(.5,tonumber(Config.READ_REPORT_HEALTH_RESTART_DELAY_SECONDS) or 1.2),function()
+        -- A reader reopen/resume may have created a replacement worker while
+        -- this delayed cleanup was pending. Never delete that worker's files.
+        if self.daemon~=nil
+            or self.reading_time_session_id~=old_session
+            or self.reading_time_segment_id~=old_segment then
+            self.daemon_health_restart_pending=false
+            logger.info("[MiuRead][ReadReport] stale health recovery skipped", "reason=new_owner_or_segment")
+            return
+        end
+        local owner=paths and read_json_file(paths.owner) or nil
+        if owner and tonumber(owner.pid)~=old_pid and process_alive(owner.pid) then
+            self.daemon_health_restart_pending=false
+            logger.warn("[MiuRead][ReadReport] stale health cleanup refused", "reason=new_pid")
+            return
+        end
         if old_pid and process_alive(old_pid) then signal_process(old_pid,9) end
         if paths then
             os.remove(paths.job); os.remove(paths.control); os.remove(paths.status); os.remove(paths.context)
@@ -4555,7 +4572,7 @@ function Sync:_load_daemon_context()
     if tonumber(envelope.generation or -1)~=tonumber(daemon.generation or 0)
         or tostring(envelope.controller_token or "")~=tostring(self.controller_token or "")
         or tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
-        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
         or tostring(envelope.account_vid or "")~=tostring(account.vid or "")
         or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "")
         or tostring(envelope.core_map_hash or "")~=tostring(daemon.core_map_hash or "") then
@@ -4606,7 +4623,7 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         return false,current_revision
     end
     local updated=self.store:auth()
-    local new_revision=math.max(0,tonumber(updated.auth_revision or 0) or 0)
+    local new_revision=math.max(0,tonumber(updated.web_auth_revision or updated.auth_revision or 0) or 0)
     if new_revision==current_revision then
         logger.info("[MiuRead][ReadReport] background credential update already current",
             "revision=",tostring(new_revision),"fields=",table.concat(fields,","))
@@ -4631,7 +4648,7 @@ function Sync:_import_daemon_status(force)
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local current_session=tostring(auth.login_session_id or "")
-    local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    local current_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
     local current_vid=tostring(account.vid or "")
     local status_session=tostring(status.login_session_id or "")
     local status_revision=math.max(0,tonumber(status.auth_revision or 0) or 0)
@@ -5010,14 +5027,26 @@ function Sync:_schedule_daemon_poll(delay)
             if was_active and self.store:preferences().sync.time_enabled and not self.suspended and self:record() then
                 self.daemon_restart_count=(tonumber(self.daemon_restart_count) or 0)+1
                 if self.daemon_restart_count<=1 then
-                    UIManager:scheduleIn(10, function() self:start("service_restart") end)
+                    local old_record=self.current
+                    local old_session=self.reading_time_session_id
+                    UIManager:scheduleIn(10,function()
+                        if self.daemon==nil and not self.suspended and self.current==old_record
+                            and self.reading_time_session_id==old_session then
+                            self:start("service_restart")
+                        end
+                    end)
                 else
                     self.last_error="阅读时间后台服务连续异常退出"
                     self.last_stage="本次阅读会话已停止自动重启"
                     logger.warn("[MiuRead][ReadReport] automatic restart suppressed")
                 end
             elseif was_active then
-                UIManager:scheduleIn(10, function() self:_ensure_daemon() end)
+                local old_record=self.current
+                UIManager:scheduleIn(10,function()
+                    if self.daemon==nil and self.current==old_record and not self.suspended then
+                        self:_ensure_daemon()
+                    end
+                end)
             end
             return
         end
@@ -5100,7 +5129,7 @@ function Sync:_start_daemon(reason)
     local auth = self.store:auth()
     local current_account=type(auth.account)=="table" and auth.account or {}
     local login_session_id=tostring(auth.login_session_id or "")
-    local auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    local auth_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
     local account_vid=tostring(current_account.vid or "")
     if login_session_id=="" or account_vid=="" then
         self.state="stopped"
@@ -5742,10 +5771,25 @@ end
 -- neither drop those seconds nor send them twice. On timeout the drop policy
 -- above applies unchanged.
 local FINAL_FLUSH_GRACE_POLLS = 24 -- 24 x 0.25 s
-function Sync:preempt_reading_time_for_progress(reason, callback, flush_settled)
+function Sync:preempt_reading_time_for_progress(reason, callback, flush_settled, ownership)
     callback=type(callback)=="function" and callback or function() end
     reason=tostring(reason or "progress_priority")
-    local daemon=self.daemon
+    -- Capture ownership at the beginning. An async wait must NEVER reselect
+    -- self.daemon: resume may have installed a new clock in the meantime.
+    ownership=ownership or {
+        daemon=self.daemon,
+        session=self.reading_time_session_id,
+        segment=self.reading_time_segment_id,
+    }
+    local daemon=ownership.daemon
+    if self.daemon~=daemon
+        or self.reading_time_session_id~=ownership.session
+        or self.reading_time_segment_id~=ownership.segment then
+        logger.warn("[MiuRead][ReadReport] stale finalizer refused",
+            "reason=writer_owner_changed", "requested=",reason)
+        callback(false,{state="writer_owner_changed"})
+        return false
+    end
     if flush_settled~=true and daemon and daemon.final_flush_pending==true then
         local polls=0
         local function wait()
@@ -5755,7 +5799,7 @@ function Sync:preempt_reading_time_for_progress(reason, callback, flush_settled)
                 logger.info("[MiuRead][ReadReport] final flush before progress priority",
                     "result=",(self.daemon==daemon and daemon.final_flush_pending==true) and "timeout" or "settled",
                     "waited_ms=",tostring((polls-1)*250),"reason=",reason)
-                return self:preempt_reading_time_for_progress(reason,callback,true)
+                return self:preempt_reading_time_for_progress(reason,callback,true,ownership)
             end
             UIManager:scheduleIn(.25,wait)
         end
@@ -5793,12 +5837,23 @@ function Sync:preempt_reading_time_for_progress(reason, callback, flush_settled)
     local polls=0
     local hard_killed=false
     local function finish(ok,state)
-        if self.daemon==daemon then self.daemon=nil end
-        if paths then pcall(self._cleanup_daemon_files,self,daemon) end
+        local still_owner=self.daemon==daemon
+            and self.reading_time_session_id==ownership.session
+            and self.reading_time_segment_id==ownership.segment
+        if still_owner then
+            self.daemon=nil
+            if paths then pcall(self._cleanup_daemon_files,self,daemon) end
+        end
         callback(ok,{state=state,pid=pid})
     end
     local function poll()
         polls=polls+1
+        if self.daemon~=daemon
+            or self.reading_time_session_id~=ownership.session
+            or self.reading_time_segment_id~=ownership.segment then
+            callback(false,{state="writer_owner_changed",pid=pid})
+            return
+        end
         if not pid or subprocess_done(pid) or not process_alive(pid) then
             finish(true,hard_killed and "time_writer_killed" or "time_writer_preempted")
             return
@@ -6068,7 +6123,6 @@ function Sync:on_resume(_slept)
     self.last_upload = 0
     self.daemon_health_restart_count = 0
     self.session_started_at = os.time()
-    self:_ensure_reading_time_ids(false,true)
     self.reading_end_finalized=false
     if self.host and (self.host._reading_end_sync_active==true or self.host._reading_end_finalizer_active==true) then
         self.resume_after_finalizer=true
@@ -6076,6 +6130,10 @@ function Sync:on_resume(_slept)
         return true
     end
     self.resume_after_finalizer=false
+    -- Only change the segment after the old suspend-finalizer has finished.
+    -- Otherwise the finalizer's ownership token becomes stale before it can
+    -- retire the *old* writer, leaving that process behind on a fast wake.
+    self:_ensure_reading_time_ids(false,true)
     if self:reading_time_mode()=="smart" and self.current then
         local online=self.host and type(self.host.is_online)=="function" and self.host:is_online()
         local target=online and "web" or "eink"
@@ -6089,8 +6147,15 @@ end
 function Sync:resume_after_reading_end()
     if self.resume_after_finalizer~=true then return false end
     if self.suspended or not (self.host and self.host.ui and self.host.ui.document) then return false end
+    -- Foreground handoff can finish before the background finalizer. Do not
+    -- reactivate Web until the old reader's critical writer has retired.
+    if self.host._reading_end_finalizer_active==true then
+        logger.info("[MiuRead][ReadReport] resume still deferred", "reason=finalizer_pending")
+        return false
+    end
     self.resume_after_finalizer=false
     self.reading_end_finalized=false
+    self:_ensure_reading_time_ids(false,true)
     self:start("resume")
     logger.info("[MiuRead][ReadReport] resumed after interrupted finalizer")
     return true

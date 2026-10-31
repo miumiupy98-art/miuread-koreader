@@ -1143,6 +1143,20 @@ function Plugin:init()
         if startup_download_state.status=="completed" then self.store:clear_download_state() end
         local recovered=self:_recover_download_state()
         if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
+        UIManager:scheduleIn(3.0,function()
+            local prior=self.store:download_state()
+            if prior.status=="failed" and prior.error_kind=="coordinate_pending"
+                and type(prior.book)=="table" and type(prior.options)=="table" then
+                local Retry=require("miuread.download_coordinate_retry")
+                local auth=self.store:auth() or {}
+                if not Retry.has(self.store,Retry.key(prior.book,prior.options)) then
+                    Retry.record(self.store,prior.book,prior.options,
+                        (auth.account or {}).vid,auth.login_session_id,prior.error,os.time())
+                end
+            end
+            self:_schedule_coordinate_retry("startup")
+            self:_legacy_coordinate_schedule(15,"startup")
+        end)
     end
     -- Extension install staging is independent from book-download checkpoints.
     -- Clean only stale extension-center artifacts after startup is responsive;
@@ -2213,14 +2227,9 @@ function Plugin:show_account_status()
     local function seconds_label(value)
         return tostring(math.max(0,math.floor(tonumber(value) or 0))).." 秒"
     end
-    local active_backend=self.sync and self.sync.reading_time_backend or nil
-    local label
-    if prefs.time_enabled~=true then label="已关闭"
-    elseif self.sync:reading_time_mode()=="eink" then label="仅 E-Ink"
-    elseif self.sync:reading_time_mode()=="smart" then label="智能 · "..(active_backend=="eink" and "本地记录" or active_backend=="web" and "Web" or "待开书")
-    elseif active_backend=="eink" then label="E-Ink"
-    elseif active_backend=="web" then label="Web"
-    else label="自动选择（下次开书）" end
+    -- Same read-only channel label as the reader; pending/error details are
+    -- still listed separately below for diagnostics.
+    local label=self:_reading_time_status_label()
     local online_label=health.state=="ok" and "全部正常"
         or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
     local rows={
@@ -10203,6 +10212,36 @@ function Plugin:_home_hold_book(book,anchor)
     -- Less clutter on downloaded books; keep advanced actions available.
     local more_actions={self:_home_variant_download_action(target,true,notes_context)}
     if available then
+        local state=require("miuread.legacy_coordinate_backfill").summary(self.store,id)
+        local detail="旧书补定位，不修改 EPUB 或阅读进度"
+        if state.needs_attention>0 then detail="部分章节需要处理 · 可手动重试"
+        elseif state.pending>0 then detail="后台补全中 · 点击可重新检查"
+        elseif state.total>0 and state.complete==state.total then detail="已补齐 · 点击可重新验证" end
+        more_actions[#more_actions+1]={icon="location",label="Web 定位补全",
+            detail=detail,callback=function()
+                local Legacy=require("miuread.legacy_coordinate_backfill")
+                local st=Legacy.summary(self.store,id)
+                local menu={{text="开始 / 重新验证",callback=function()
+                    self:_legacy_coordinate_request(id,record and record.file)
+                end}}
+                if st.pending>0 then
+                    menu[#menu+1]={text="暂停后台补全",callback=function()
+                        Legacy.set_status(self.store,id,"paused")
+                        self:_legacy_coordinate_pause("user paused")
+                        self:toast("该书 Web 定位补全已暂停",2)
+                    end}
+                end
+                if st.total>0 then
+                    menu[#menu+1]={text="取消该书补全任务",callback=function()
+                        Legacy.set_status(self.store,id,"cancel")
+                        self:_legacy_coordinate_pause("user cancelled")
+                        self:toast("已取消后台任务，书籍文件没有改变",2)
+                    end}
+                end
+                return self:_show_standalone_menu("Web 定位补全",menu,{anchor=anchor})
+            end}
+    end
+    if available then
         more_actions[#more_actions+1]={icon="▤",label=chapter_label,detail=chapter_detail,callback=chapter_callback}
         more_actions[#more_actions+1]=self:_home_variant_download_action(target,false,clean_context)
     end
@@ -10224,6 +10263,17 @@ function Plugin:_home_hold_book(book,anchor)
         actions=actions,wide_last=(#actions%2==1),
     }
     return true
+end
+
+function Plugin:_home_sync_management_menu(anchor)
+    return self:_show_standalone_menu("同步管理",{
+        {text="立即同步",post_text="执行符合条件的同步任务",
+            callback=function() self:_sync_home_pending({source="home_quick"}) end},
+        {text="同步状态",post_text="阅读进度、阅读时间与批注",
+            callback=function() self:show_sync_status(false) end},
+        {text="同步设置",post_text="同步策略与自动同步",
+            sub_item_table_func=function() return self:sync_settings_menu() end},
+    },{anchor=anchor})
 end
 
 function Plugin:_home_action_entries()
@@ -10251,13 +10301,23 @@ function Plugin:_home_action_entries()
 
     local function hold_for(key,label)
         return function(anchor)
-            local actions=self:_home_action_function_actions(key,anchor)
-            for _,entry in ipairs(self:_home_action_edit_actions(key,anchor)) do actions[#actions+1]=entry end
-            ActionSheet.show{
-                cache_key="home_action_functions_"..tostring(key),anchor=anchor,preferred_direction="below",width_ratio=.72,
-                title=tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),subtitle="操作与快捷栏编辑",
-                actions=actions,wide_last=(#actions%2==1),
-            }
+            local entries={}
+            if key=="sync" then
+                entries[#entries+1]={text="立即同步",post_text="执行符合条件的同步任务",
+                    callback=function() self:_sync_home_pending({source="home_quick"}) end}
+            end
+            for _,action in ipairs(self:_home_action_function_actions(key,anchor)) do
+                local fn=action.callback
+                entries[#entries+1]={text=tostring(action.label or "操作"),post_text=tostring(action.detail or ""),
+                    enabled=action.enabled~=false,callback=fn}
+            end
+            for _,action in ipairs(self:_home_action_edit_actions(key,anchor)) do
+                entries[#entries+1]={text=tostring(action.label or "编辑快捷项"),
+                    post_text=tostring(action.detail or ""),enabled=action.enabled~=false,
+                    callback=action.callback}
+            end
+            return self:_show_standalone_menu(tostring(label or HOME_ACTION_LABELS[key] or "快捷项"),
+                entries,{anchor=anchor})
         end
     end
 
@@ -10266,8 +10326,8 @@ function Plugin:_home_action_entries()
         search={icon="⌕",icon_key="search",label="搜索",callback=function() self:search_dialog("搜索微信读书") end},
         bookstore={icon="library",icon_key="library",label="书城",callback=function() self:show_bookstore() end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function() self:show_downloads() end},
-        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function()
-            return self:show_sync_status(false)
+        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
+            return self:_home_sync_management_menu(anchor)
         end},
         miuread_settings={icon="⚙",icon_key="settings",label="设置",callback=function() self:_show_home_settings_center() end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
@@ -10319,6 +10379,7 @@ function Plugin:_home_stop_background(reason,options)
     end
     self._home_resume_generation=(tonumber(self._home_resume_generation) or 0)+1
     self:_home_unschedule_task("_home_resume_background_task")
+    self:_legacy_coordinate_pause("home stopped")
     self:_home_unschedule_task("_home_manual_metadata_retry_task")
     self:_home_unschedule_task("_home_stats_refresh_task")
     self:_home_unschedule_task("_home_stats_apply_task")
@@ -14872,6 +14933,7 @@ function Plugin:_start_comment_range(book,rows,first,last,force)
         self:info("评论章节范围无效，请重新选择。")
         return false
     end
+    self:_cancel_next_comment_preload("manual priority")
     if self._comment_range_task then
         self:_show_comment_range_progress(self._comment_range_task)
         self:toast("已有评论获取任务，请先完成或取消",2)
@@ -14948,6 +15010,7 @@ function Plugin:_choose_comment_range(force,back_callback)
             end
         end
         local last=math.min(#rows,first+9)
+        local refresh_existing=force==true
         local show_editor
         local function choose_boundary(which)
             local start=which=="last" and first or 1
@@ -14977,10 +15040,12 @@ function Plugin:_choose_comment_range(force,back_callback)
                         callback=function() choose_boundary("first") end},
                     {label="结束章节",value="第 "..tostring(last).." 章",arrow=true,
                         callback=function() choose_boundary("last") end},
+                    {label="同时更新已有评论",value=refresh_existing and "已开启" or "已关闭",arrow=true,
+                        callback=function() refresh_existing=not refresh_existing;show_editor() end},
                     {label="开始获取",value=tostring(last-first+1).." 章",arrow=true,
                         callback=function()
                             local function start_task()
-                                self:_start_comment_range(book,rows,first,last,force==true)
+                                self:_start_comment_range(book,rows,first,last,refresh_existing==true)
                             end
                             if last-first+1>30 then
                                 UIManager:show(ConfirmBox:new{
@@ -14996,27 +15061,122 @@ function Plugin:_choose_comment_range(force,back_callback)
     end,{context=context,status_text="正在后台读取评论目录…"})
 end
 
+-- Low-priority, opt-in next-chapter comment cache warming. No reader-thread network.
+function Plugin:_cancel_next_comment_preload(reason)
+    if self._next_comment_preload_task then
+        UIManager:unschedule(self._next_comment_preload_task)
+        self._next_comment_preload_task=nil
+    end
+    local running=self._next_comment_preload
+    self._next_comment_preload=nil
+    if running and running.async then running.async:cancel(reason or "cancelled") end
+end
+
+function Plugin:_schedule_next_comment_preload(delay,attempt)
+    if (self.store:preferences().sync or {}).comment_auto_preload~=true then return false end
+    if self._next_comment_preload_task then UIManager:unschedule(self._next_comment_preload_task) end
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    attempt=math.max(0,tonumber(attempt) or 0)
+    local task
+    task=function()
+        if self._next_comment_preload_task~=task then return end
+        self._next_comment_preload_task=nil
+        if tonumber(HOME_SESSION.reader_session_generation or 0)~=session
+            or not self:_reader_session_is_weread() then return end
+        if self._comment_range_task or self._next_comment_preload
+            or not self:_reader_background_idle() then
+            -- Bounded retry: no persistent timer, no work while sleeping.
+            if attempt<2 and self._miuread_suspended~=true and HOME_SESSION.suspended~=true then
+                self:_schedule_next_comment_preload(2+2*attempt,attempt+1)
+            end
+            return
+        end
+        if not self:is_online() then return end -- re-armed by onNetworkConnected
+        local ctx=self:_chapter_navigation_context(false)
+        if not (ctx and ctx.state=="NEXT" and ctx.catalog_complete==true) then return end
+        local book_id,uid=tostring(ctx.book_id or ""),tostring(ctx.next_uid or "")
+        if book_id=="" or uid=="" then return end
+        local status=self.comment_sync:status(book_id,uid)
+        if status.has_cache and (status.status=="cached" or status.status=="empty") then return end
+        local async=Async:new(self.store,{disable_fallback=true,poll_interval=.35})
+        if not async:available() then return end
+        local runtime={async=async,book_id=book_id,uid=uid,session=session}
+        self._next_comment_preload=runtime
+        local auth=U.copy(self.store:auth())
+        local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+        local api_mode=require("miuread.api_transport").preference(self.store)
+        local started,err=async:run("comment_next_preload",function()
+            local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
+            child_store.cache_books_dir=data_dir.."/books"
+            function child_store:book_cache_path(id)
+                return self.cache_books_dir.."/"..U.id_name(tostring(id or ""))
+            end
+            function child_store:book_dir(id)
+                local path=self:book_cache_path(id);U.mkdir(path);return path
+            end
+            local child_http=Http:new(child_store)
+            local child_reader=Reader:new(child_http,child_store)
+            local child_api=Api:new(child_http,child_store,child_reader):scope()
+            local result,fetch_error=require("miuread.comment_sync"):new(child_api,child_store):fetch(book_id,uid,{force=false})
+            local changed_auth,changed=child_store:snapshot()
+            return {ok=result~=nil,result=result,error=fetch_error,auth=changed_auth,auth_changed=changed}
+        end,function(reply)
+            if self._next_comment_preload~=runtime then return end
+            self._next_comment_preload=nil
+            local value=reply and reply.value or nil
+            if reply and reply.ok==true and type(value)=="table" and value.auth_changed==true then
+                self:_apply_interactive_auth({auth=value.auth,changed=true})
+            end
+            if not (reply and reply.ok==true and value and value.ok==true) then
+                logger.warn("[MiuRead][Comments] next preload failed",tostring(value and value.error or reply and reply.error))
+            end
+        end,180)
+        if not started then
+            self._next_comment_preload=nil
+            logger.warn("[MiuRead][Comments] next preload unavailable",tostring(err))
+        end
+    end
+    self._next_comment_preload_task=task
+    UIManager:scheduleIn(math.max(.5,tonumber(delay) or 3),task)
+    return true
+end
+
 function Plugin:_comment_fetch_mode_menu(back_callback)
-    local function select_range(force)
-        return self:_choose_comment_range(force,back_callback)
+    local function current()
+        local scope=self:_current_thought_favorite_scope()
+        if self._comment_range_task then
+            return self:_show_comment_range_progress(self._comment_range_task)
+        end
+        local status=scope.book_id~="" and scope.chapter_uid~=""
+            and self.comment_sync:status(scope.book_id,scope.chapter_uid) or {}
+        -- Completed cache: a deliberate click refreshes. Partial or error
+        -- resumes without clearing existing local comments.
+        local complete=status.has_cache==true and (status.status=="cached" or status.status=="empty")
+        return self:_fetch_current_chapter_comments(complete,back_callback)
     end
     local rows={
-        {label="当前章节",arrow=true,
-            callback=function() self:_fetch_current_chapter_comments(false,back_callback) end},
-        {label="指定章节范围",arrow=true,callback=function() select_range(false) end},
-        {label="更新当前章节",arrow=true,
-            callback=function() self:_fetch_current_chapter_comments(true,back_callback) end},
-        {label="更新指定范围",arrow=true,callback=function() select_range(true) end},
+        {label="当前章节",value="获取 / 更新",arrow=true,callback=current},
+        {label="指定章节范围",value="可选择更新已有评论",arrow=true,
+            callback=function() self:_choose_comment_range(false,back_callback) end},
+        {label="自动预载下一章评论",value=((self.store:preferences().sync or {}).comment_auto_preload==true) and "已开启" or "已关闭",
+            arrow=true,callback=function()
+                local prefs=self.store:preferences();prefs.sync=prefs.sync or {}
+                prefs.sync.comment_auto_preload=not (prefs.sync.comment_auto_preload==true)
+                self:_save_ui_preferences(prefs,"comment_auto_preload")
+                if not prefs.sync.comment_auto_preload then self:_cancel_next_comment_preload("setting disabled")
+                else self:_schedule_next_comment_preload(2) end
+                self:_comment_fetch_mode_menu(back_callback)
+            end},
     }
     if self._comment_range_task then
-        table.insert(rows,1,{icon="progress",label="评论获取任务",
+        table.insert(rows,1,{icon="progress",label="查看评论任务",
             value=self._comment_range_task.paused and "已暂停" or "后台进行",
             arrow=true,callback=function()
                 if self._comment_range_task then self:_show_comment_range_progress(self._comment_range_task) end
             end})
     end
     return ReaderSettingsDialog.show{
-        opaque_fullscreen=true,title="获取公开评论",
+        opaque_fullscreen=true,title="获取 / 更新评论",
         on_back=back_callback or function() self:_show_reader_comment_center() end,
         sections={{title="",rows=rows}}
     }
@@ -20029,6 +20189,189 @@ function Plugin:_on_download_progress(runtime,state)
         end
     end
 end
+-- beta.11: the durable coordinate-retry queue is separate from the normal
+-- one-slot user download queue and NEVER runs inside ReaderUI or while asleep.
+-- beta.12: independent, low-priority source-only backfill for old installed EPUBs.
+-- Never calls Sync, ReadReport, pending upload, position events or Web progress POST.
+function Plugin:_legacy_coordinate_pause(reason)
+    if self._legacy_coordinate_timer then
+        UIManager:unschedule(self._legacy_coordinate_timer)
+        self._legacy_coordinate_timer=nil
+    end
+    local worker=self._legacy_coordinate_runtime
+    self._legacy_coordinate_runtime=nil
+    if worker and worker.async then worker.async:cancel(reason or "paused") end
+end
+
+function Plugin:_legacy_coordinate_schedule(seconds,reason)
+    if self._legacy_coordinate_timer or self._legacy_coordinate_runtime
+        or HOME_EXITING or UIManager._exit_code~=nil then return false end
+    local task
+    task=function()
+        if self._legacy_coordinate_timer~=task then return end
+        self._legacy_coordinate_timer=nil
+        self:_legacy_coordinate_pump(reason)
+    end
+    self._legacy_coordinate_timer=task
+    UIManager:scheduleIn(math.max(4,tonumber(seconds) or 25),task)
+    return true
+end
+
+function Plugin:_legacy_coordinate_request(book_id,path)
+    local Legacy=require("miuread.legacy_coordinate_backfill")
+    local book=self.store:book(book_id)
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    if vid=="" or session=="" then self:info("请先登录微信读书再补齐 Web 定位。") return false end
+    local rows=Legacy.discover(self.store,book_id,path)
+    if #rows==0 then self:info("没有找到符合条件的觅阅 EPUB，或章节无法安全识别。") return false end
+    local count=0
+    for _,job in ipairs(rows) do
+        local ok=Legacy.enqueue(self.store,job,vid,session,true)
+        if ok then count=count+1 end
+    end
+    self:toast("Web 定位补全已加入后台任务："..tostring(count).." 本地版本",2)
+    self:_legacy_coordinate_pause("manual request")
+    self:_legacy_coordinate_schedule(4,"manual")
+    return true
+end
+
+function Plugin:_legacy_coordinate_pump(reason)
+    local Legacy=require("miuread.legacy_coordinate_backfill")
+    if not (self.store and self:logged_in()) then return false end
+    if not HomeView.is_shown() or self:_active_reader_ui() or HOME_EXITING
+        or self._miuread_suspended==true or HOME_SESSION.suspended==true
+        or PowerState.state()~="NORMAL" or self:_home_background_blocked()
+        or self:_home_ui_busy() or self._download_runtime
+        or (self.download_task and self.download_task:busy())
+        or self._comment_range_task or self._next_comment_preload
+        or #(self.store:download_queue() or {})>0 then
+        self:_legacy_coordinate_schedule(80,"busy")
+        return false
+    end
+    if self:_network_radio_hint()==false then
+        self:_legacy_coordinate_schedule(100,"offline")
+        return false
+    end
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    if vid=="" or session=="" then return false end
+    local job=Legacy.select(self.store,os.time(),vid,session)
+    if not job then
+        local candidates=Legacy.discover(self.store)
+        Legacy.seed(self.store,candidates,vid,session)
+        job=Legacy.select(self.store,os.time(),vid,session)
+    end
+    if not job then
+        local wait=Legacy.next_delay(self.store,os.time(),vid,session)
+        if wait then self:_legacy_coordinate_schedule(math.min(180,math.max(6,wait)),"pending cooldown") end
+        return false
+    end
+    local async=Async:new(self.store,{disable_fallback=true,poll_interval=.4})
+    if not async:available() then
+        self:_legacy_coordinate_schedule(100,"worker unavailable")
+        return false
+    end
+    local runtime={async=async,key=job.key,book=job.book_id}
+    self._legacy_coordinate_runtime=runtime
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local api_mode=require("miuread.api_transport").preference(self.store)
+    local saved_auth=U.copy(auth)
+    local started,err=async:run("legacy_coordinate_chapter",function()
+        local child_store=interactive_child_store(saved_auth,data_dir,temp_dir,api_mode)
+        child_store.cache_books_dir=data_dir.."/books"
+        function child_store:book_cache_path(id)
+            return self.cache_books_dir.."/"..U.id_name(tostring(id or ""))
+        end
+        function child_store:book_dir(id)
+            local path=self:book_cache_path(id)
+            U.mkdir(path)
+            return path
+        end
+        local child_http=Http:new(child_store)
+        local child_reader=Reader:new(child_http,child_store)
+        local child_legacy=require("miuread.legacy_coordinate_backfill")
+        return child_legacy.perform(job,child_reader)
+    end,function(reply)
+        if self._legacy_coordinate_runtime~=runtime then return end
+        self._legacy_coordinate_runtime=nil
+        -- Check identity again before accepting a worker result. Account
+        -- changes never reuse position-source proof from another session.
+        local current=self.store:auth() or {}
+        if tostring(((current.account or {}).vid) or "")==vid
+            and tostring(current.login_session_id or "")==session then
+            local value=reply and reply.value
+            local outcome=reply and reply.ok and type(value)=="table" and value or
+                {ok=false,reason=tostring(reply and reply.error or "worker_failed")}
+            Legacy.commit(self.store,job,outcome,os.time())
+        end
+        self:_legacy_coordinate_schedule(16,"chapter finished")
+    end,65)
+    if not started then
+        self._legacy_coordinate_runtime=nil
+        logger.warn("[MiuRead][LegacyCoordinate] worker refused",tostring(err))
+        self:_legacy_coordinate_schedule(100,"start failed")
+    end
+    return started==true
+end
+
+function Plugin:_schedule_coordinate_retry(reason)
+    if self._coordinate_retry_task or HOME_EXITING or UIManager._exit_code~=nil then return false end
+    if not self.store then return false end
+    local Retry=require("miuread.download_coordinate_retry")
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    local next_wait=Retry.next_delay(self.store,os.time(),vid,session)
+    if not next_wait then return false end
+    -- One timer per Plugin, no rapid spin while offline or sleeping.
+    local delay=math.max(2,math.min(120,next_wait))
+    local task
+    task=function()
+        if self._coordinate_retry_task~=task then return end
+        self._coordinate_retry_task=nil
+        self:_coordinate_retry_pump("scheduled")
+    end
+    self._coordinate_retry_task=task
+    UIManager:scheduleIn(delay,task)
+    logger.info("[MiuRead][CoordinateRetry] scheduled", "reason=",tostring(reason or ""),"seconds=",tostring(delay))
+    return true
+end
+function Plugin:_coordinate_retry_pump(reason)
+    local Retry=require("miuread.download_coordinate_retry")
+    if not self.store or HOME_EXITING or UIManager._exit_code~=nil then return false end
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    local job=Retry.select(self.store,os.time(),vid,session)
+    if not job then return self:_schedule_coordinate_retry("no_due:"..tostring(reason)) end
+    if not self:logged_in() or self:_network_radio_hint()==false
+        or self._miuread_suspended==true or HOME_SESSION.suspended==true
+        or PowerState.state()~="NORMAL" or self:_active_reader_ui()
+        or (self.download_task and self.download_task:busy()) or self._download_runtime
+        or #(self.store:download_queue() or {})>0
+        or self.cache_cleanup_task and self.cache_cleanup_task:busy() then
+        Retry.defer(self.store,job.key,os.time(),90)
+        self:_schedule_coordinate_retry("resource_or_reader_busy")
+        return false
+    end
+    local accepted=self:download(job.book,U.copy(job.options),false,nil,true,true)
+    local runtime=self._download_runtime
+    if runtime and tostring((runtime.book or {}).bookId or "")==tostring((job.book or {}).bookId or "")
+        and self.download_task and self.download_task:busy() then
+        -- A crashed subprocess may disappear before completion is reported;
+        -- a persisted cooldown permits recovery on subsequent plugin startup.
+        Retry.defer(self.store,job.key,os.time(),600)
+        logger.info("[MiuRead][CoordinateRetry] resumed checkpoint",
+            "book=",tostring(job.book.bookId),"attempt=",tostring(job.attempt or 0))
+        return true
+    end
+    Retry.defer(self.store,job.key,os.time(),90)
+    self:_schedule_coordinate_retry("start_not_accepted")
+    return accepted==true
+end
 function Plugin:_finish_download_runtime(runtime,result)
     if self._download_runtime~=runtime then return end
     local b=runtime.book or {}
@@ -20055,6 +20398,10 @@ function Plugin:_finish_download_runtime(runtime,result)
         if opt.chapter_continuous_open==true then self:_clear_chapter_advance_wait("next chapter download failed") end
         logger.warn("[MiuRead][Download] failed",tostring(err))
         if tostring(err)=="下载已取消" then
+            if opt._coordinate_auto_retry==true then
+                local Retry=require("miuread.download_coordinate_retry")
+                Retry.remove(self.store,Retry.key(b,opt))
+            end
             self.store:clear_download_state()
             self:_update_open_shelf_download_status(b.bookId,"生成已取消")
             self:_notify_home_data_changed("content")
@@ -20068,6 +20415,13 @@ function Plugin:_finish_download_runtime(runtime,result)
         local content_pending=tostring(err):find("[MiuReadAnnotationPending]",1,true)~=nil
         local image_missing=tostring(err):find("[MiuReadImageMissing]",1,true)~=nil
             or tostring(err):find("[MiuReadImageExternal]",1,true)~=nil
+        local coordinate_pending=tostring(err):find("[MiuReadWebCoordinatePending]",1,true)~=nil
+        if opt._coordinate_auto_retry==true and not coordinate_pending then
+            local Retry=require("miuread.download_coordinate_retry")
+            Retry.remove(self.store,Retry.key(b,opt))
+            logger.warn("[MiuRead][CoordinateRetry] auto retry stopped on unrelated failure",
+                "book=",tostring(b.bookId))
+        end
         local validation_failed=tostring(err):find("EPUB 完整性验证失败",1,true)~=nil
         local wait_seconds=tonumber(result and result.wait_seconds) or tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
@@ -20077,15 +20431,37 @@ function Plugin:_finish_download_runtime(runtime,result)
             current=runtime.last_state and runtime.last_state.current,total=runtime.last_state and runtime.last_state.total,
             percent=runtime.last_state and runtime.last_state.percent,seen=false,
             auth_required=auth_required or nil,
-            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit"
-                or (network_failed and "network" or (image_missing and "image_missing"
-                or (content_pending and "content_pending" or (validation_failed and "validation" or nil))))),
+            error_kind=coordinate_pending and "coordinate_pending" or (auth_required and "authentication"
+                or (rate_limited and "rate_limit" or (network_failed and "network"
+                or (image_missing and "image_missing" or (content_pending and "content_pending"
+                or (validation_failed and "validation" or nil)))))),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
+        local coordinate_retry_status=nil
+        if coordinate_pending then
+            local auth=self.store:auth() or {}
+            local Retry=require("miuread.download_coordinate_retry")
+            local row,queue_err=Retry.record(self.store,b,opt,
+                (auth.account or {}).vid,auth.login_session_id,err,os.time())
+            coordinate_retry_status=row and row.status or "manual_required"
+            if row and row.status=="pending" then
+                logger.info("[MiuRead][CoordinateRetry] retained for automatic retry",
+                    "book=",tostring(b.bookId),"attempt=",tostring(row.attempt),
+                    "next_at=",tostring(row.next_at))
+                self:_schedule_coordinate_retry("coordinate_incomplete")
+            elseif row then
+                logger.warn("[MiuRead][CoordinateRetry] source mismatch requires attention",
+                    "book=",tostring(b.bookId),"attempt=",tostring(row.attempt))
+            else
+                logger.warn("[MiuRead][CoordinateRetry] cannot persist automatic retry",
+                    "book=",tostring(b.bookId),"error=",tostring(queue_err))
+            end
+        end
         self:_update_open_shelf_download_status(b.bookId,
             auth_required and "等待登录恢复" or (rate_limited and "请求受限 · 稍后继续"
                 or (network_failed and "等待网络 · 可继续"
-                or (image_missing and "正文图片待修复 · 断点已保留" or "生成未完成"))))
+                or (image_missing and "正文图片待修复 · 断点已保留" or (coordinate_pending and (coordinate_retry_status=="pending" and "Web 定位待补全 · 将自动续补"
+                    or "Web 定位待补全 · 需要手动处理") or "生成未完成")))))
         self:_notify_home_data_changed("content")
         local first
         if auth_required then
@@ -20097,6 +20473,10 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
         elseif image_missing then
             first="书籍正文图片仍有缺失。已完成章节和下载断点均已保留，可在“修复书籍”中只补缺失内容；原文件没有被覆盖。"
+        elseif coordinate_pending then
+            first=coordinate_retry_status=="pending"
+                and "正文已下载，Web 定位尚未全部验证。原书和断点已保留；插件运行且设备联网空闲时将自动续补。"
+                or "正文已下载，但 Web 定位连续验证失败或无法登记自动任务。原书与断点已保留，需手动重试或检查章节版本。"
         elseif content_pending then
             first="生成未完成，原文件和下载进度已保留。请稍后使用“生成／更新书籍”重试。"
         elseif validation_failed then
@@ -20111,21 +20491,30 @@ function Plugin:_finish_download_runtime(runtime,result)
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
                 or (image_missing and "已完成内容和断点已保留，可用修复书籍继续"
+                or (coordinate_pending and (coordinate_retry_status=="pending" and "Web 定位待补全，将按条件自动续补"
+                    or "Web 定位无法自动补全，需要手动处理")
                 or (content_pending and "生成未完成，原文件和进度已保留"
-                or (tostring(b.title or "未命名").."下载未完成，进度已保留")))))
+                or (tostring(b.title or "未命名").."下载未完成，进度已保留"))))))
             local translation_notice=opt.generate_translation_uid and require("miuread.translation_generation").friendly_error(err)
             if translation_notice then toast_title="外文翻译"; toast_text=translation_notice end
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
-        -- Any failed book pauses the single waiting task. The user decides whether
-        -- to retry the current book or skip it, avoiding repeated requests after an
-        -- account, network, validation or content problem.
-        if #self.store:download_queue()>0 then
+        -- Only coordinate-pending failures have durable, low-priority auto
+        -- recovery. Let newer user-queued jobs proceed ahead of them.
+        if coordinate_pending then
+            if #self.store:download_queue()>0 then
+                UIManager:scheduleIn(.8,function() self:_start_next_queued_download() end)
+            end
+        elseif #self.store:download_queue()>0 then
             self:status_toast("下载队列","等待任务已暂停，请先处理当前失败任务",5)
         end
         return
     end
     self:_mark_auth_channel_ok("download")
+    do
+        local Retry=require("miuread.download_coordinate_retry")
+        Retry.remove(self.store,Retry.key(b,opt))
+    end
     local rec=self:_merge_download_result(result,b,opt)
     if opt.annotations==true then
         if rec.annotation_pending==true then
@@ -20225,6 +20614,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         self:_show_download_complete(rec,opt,b)
     end
     self:_start_next_queued_download()
+    self:_schedule_coordinate_retry("download_finished")
 end
 function Plugin:_recover_download_state()
     local state=self.store:download_state()
@@ -21069,7 +21459,8 @@ function Plugin:_start_next_queued_download()
         return false
     end
     local state=self.store:download_state()
-    if state.status=="active" or state.status=="prefetch" or state.status=="failed" or state.status=="interrupted" then
+    if state.status=="active" or state.status=="prefetch" or state.status=="interrupted"
+        or (state.status=="failed" and state.error_kind~="coordinate_pending") then
         return false
     end
     if not self:logged_in() or self:_network_radio_hint()==false then return false end
@@ -21298,6 +21689,13 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
             self:info("无法启动下载任务：\n"..tostring(err))
         end
         return false
+    end
+    -- A manual download supersedes the same old automatic retry ONLY after
+    -- a real worker is accepted; canceled/offline/low-memory attempts do not
+    -- silently discard durable pending coordinate work.
+    if not is_prefetch and opt._coordinate_auto_retry~=true then
+        local Retry=require("miuread.download_coordinate_retry")
+        Retry.remove(self.store,Retry.key(b,opt))
     end
     -- Only an accepted fork clears retry backoff. A failed admission keeps
     -- its prior attempts so intermittent pressure cannot create a hot loop.
@@ -21636,6 +22034,7 @@ function Plugin:_schedule_chapter_navigation_context(session,delay)
         end
         self._chapter_navigation_task=nil
         self:_chapter_navigation_context(true)
+        self:_schedule_next_comment_preload(3)
         self:_schedule_reader_toolbar_state_refresh(nil,.05)
     end
     self._chapter_navigation_task=task
@@ -23346,17 +23745,18 @@ function Plugin:_sync_user_issue(status, session)
     return nil
 end
 
+-- Compact UI reads the *actual active clock owner*.  A successful upload from
+-- another book/session is not evidence that the current clock is Web or E-Ink.
+-- This function has no side effects: display must never start/stop a reporter.
 function Plugin:_reading_time_status_label()
-    local prefs=self.store:preferences().sync or {}
-    if prefs.time_enabled~=true then return "已关闭" end
-    local r=self.sync and self.sync:record() or nil
-    if not (r and r.book) then return "等待阅读" end
-    local id=tostring(r.book.book_id or r.book.bookId or "")
-    local session=id~="" and (self.store:session(id) or {}) or {}
-    if tostring(session.report_state or "")=="ok" or (tonumber(self.sync and self.sync.last_upload or 0) or 0)>0 then
-        return "已同步"
-    end
-    return "尽力同步"
+    if (self.store:preferences().sync or {}).time_enabled~=true then return "未启用" end
+    local sync=self.sync
+    if not sync or not sync.current or sync.suspended or sync.reading_end_finalized then return "—" end
+    local backend=sync.reading_time_backend
+    if backend=="web" and sync.daemon and sync.daemon.active==true then return "Web" end
+    if backend=="eink" and sync.offline_time and sync.offline_time.active
+        and sync.offline_time.active.sync==sync then return "Eink" end
+    return "—"
 end
 
 function Plugin:_sync_current_book_label()
@@ -25503,32 +25903,12 @@ local function reading_time_duration(seconds)
     seconds=math.max(0,tonumber(seconds) or 0)
     return seconds<60 and (tostring(seconds).." 秒") or (string.format("%.1f",seconds/60).." 分钟")
 end
+-- The detailed pending/unknown/error evidence stays in diagnostics and the
+-- E-Ink outbox; the primary status displays only which clock owns new seconds.
 function Plugin:reading_time_status_label()
-    if (self.store:preferences().sync or {}).time_enabled~=true then return "已关闭" end
-    local mode=self.sync:reading_time_mode()
-    if self.sync.reading_time_backend=="eink_restart_required" then
-        return "通道设置已变化 · 请重新开书"
-    end
-    local backend=mode=="eink" and "eink" or self.sync.reading_time_backend
-        or (mode=="smart" and (self:is_online() and "web" or "eink"))
-        or require("miuread.api_transport").new(self.store).selected
-    if backend=="web" then
-        if mode=="smart" then return self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 等待上传服务" end
-        return self:_reading_time_status_label()
-    end
-    local controller=self.sync:offline_time_controller()
-    local summary=controller and controller:summary() or {}
-    if summary.error then return summary.error=="ledger_full" and "本地记录已满" or "本地记录异常" end
-    if summary.blocked then return "已暂停 · 请核对云端位置" end
-    if (summary.unknown or 0)>0 then return "有待确认记录" end
-    if (summary.in_flight or 0)>0 then return "正在同步" end
-    if (summary.control or {}).reason=="authentication" then return "需要授权" end
-    if (summary.pending or 0)>0 then
-        return "待同步 "..reading_time_duration(summary.pending)
-    end
-    if summary.capture_error=="statistics_unavailable" then return "请开启 KOReader 阅读统计" end
-    return summary.last_success_at and "已同步" or "已开启 · 自动记录与同步"
+    return self:_reading_time_status_label()
 end
+
 function Plugin:reading_time_unknown_menu(offset)
     local controller=self.sync:offline_time_controller()
     local groups=controller and controller:unknown()
@@ -25571,10 +25951,7 @@ function Plugin:reading_time_menu()
         end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
         {text="同步方式",icon_key="swap",post_text=({smart="智能切换",eink="仅 E-Ink",legacy="原有通道设置"})[self.sync:reading_time_mode()],
             sub_item_table_func=function() return self:reading_time_mode_menu() end},
-        {text="当前时间通道",icon_key="wifi",post_text=self.sync.reading_time_backend=="eink" and "E-Ink · 本地记录"
-            or self.sync.reading_time_backend=="web" and (self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 待启动")
-            or self.sync.reading_time_backend=="eink_restart_required" and "请重新开书"
-            or "等待开启书籍",enabled=false},
+        {text="当前时间通道",icon_key="wifi",post_text=self:_reading_time_status_label(),enabled=false},
         {text="E-Ink 客户端授权",icon_key="shield-check",post_text=self:_eink_auth_status_text(summary),
             sub_item_table_func=function() return self:eink_authorization_menu() end},
         {text="离线待上传",icon_key="upload",post_text=reading_time_duration(summary.pending),enabled=false},
@@ -28324,10 +28701,13 @@ function Plugin:home_lockscreen_provider_menu()
     local ink=self:_inkstain_status()
     local dash=self:_dashwallpaper_status()
     return {
+        {text="KOReader 原生锁屏",post_text="由 KOReader 管理锁屏样式",radio=true,
+            checked_func=function() local h=self:_home_preferences(); return self:_home_lockscreen_provider(h)=="native" and h.lockscreen_recent==false end,
+            callback=function() self:_home_use_koreader_lockscreen() end},
         {
             text="书籍封面",post_text=self:_home_native_lockscreen_style(home)=="frame" and "画框" or (self:_home_native_lockscreen_style(home)=="fit" and "完整" or "铺满"),
-            radio=true,checked_func=function() return self:_home_lockscreen_provider()=="native" end,
-            callback=function() self:_request_lockscreen_provider("native") end,
+            radio=true,checked_func=function() local h=self:_home_preferences(); return self:_home_lockscreen_provider(h)=="native" and h.lockscreen_recent~=false end,
+            callback=function() self:_activate_native_lockscreen(self:_home_native_lockscreen_style()) end,
         },
         {
             text="墨痕壁纸",post_text=ink.loaded and "已就绪" or (ink.installed and "已安装 · 需重启加载" or "未安装 · 可直接安装"),
@@ -28347,6 +28727,18 @@ function Plugin:home_lockscreen_style_menu()
     return self:home_lockscreen_provider_menu()
 end
 
+function Plugin:_home_use_koreader_lockscreen()
+    local home=self:_home_preferences()
+    if self:_home_lockscreen_provider(home)~="native" then
+        if not self:_request_lockscreen_provider("native") then return false end
+        home=self:_home_preferences()
+    end
+    if home.lockscreen_recent~=false then self:_toggle_home_lockscreen() end
+    self:toast("已使用 KOReader 原生锁屏，请在 KOReader 设置中选择锁屏样式",3)
+    UIManager:scheduleIn(.12,function() self:_show_native_koreader_menu() end)
+    return true
+end
+
 function Plugin:home_lockscreen_settings_menu()
     local home=self:_home_preferences()
     local provider=self:_home_lockscreen_provider(home)
@@ -28354,6 +28746,9 @@ function Plugin:home_lockscreen_settings_menu()
         {text="锁屏来源",post_text=self:_home_lockscreen_style_label(home),sub_item_table_func=function() return self:home_lockscreen_provider_menu() end},
     }
     if provider=="native" then
+        rows[#rows+1]={text="KOReader 原生锁屏",post_text=home.lockscreen_recent==false and "使用中" or "使用 KOReader 自带设置",
+            radio=true,checked_func=function() return self:_home_preferences().lockscreen_recent==false end,
+            callback=function() self:_home_use_koreader_lockscreen() end}
         rows[#rows+1]={text="主页锁屏显示最近阅读封面",checked_func=function() return self:_home_preferences().lockscreen_recent~=false end,keep_menu_open=true,callback=function() self:_toggle_home_lockscreen() end}
         rows[#rows+1]={text="书籍封面样式",post_text=({frame="画框",fit="完整",fill="铺满"})[self:_home_native_lockscreen_style(home)] or "画框",enabled_func=function() return self:_home_preferences().lockscreen_recent~=false end,sub_item_table_func=function() return self:home_native_lockscreen_style_menu() end}
     elseif provider=="inkstain" then
@@ -31741,6 +32136,7 @@ function Plugin:onNetworkConnected()
             self:_sync_home_pending({silent=true,source="network_restored"})
             if tostring(self._home_active_section or "shelf")=="shelf" then self:_home_refresh_remote(false,false) end
         elseif self.ui and self.ui.document and self:_reader_session_is_weread() then
+            self:_schedule_next_comment_preload(3)
             local prefs=self.store:preferences().sync or {}
             if prefs.auto_latest_position~=false and not self._progress_check_running then
                 logger.info("[MiuRead][ResumeSync] waiting_network","source=network_restored")
@@ -31768,11 +32164,14 @@ function Plugin:onNetworkConnected()
             end
         end
         self:_schedule_hibernated_download_resume("network restored")
+        self:_legacy_coordinate_schedule(18,"network restored")
     end)
     return false
 end
 
 function Plugin:onNetworkDisconnected()
+    self:_legacy_coordinate_pause("network disconnected")
+    self:_cancel_next_comment_preload("network disconnected")
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
     self:_schedule_smart_readtime_route(false,"network_disconnected")
     logger.info("[MiuRead][Network] disconnected; safe sync remains durable")
@@ -31949,6 +32348,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
     -- being retired keeps its existing writer barrier; new captures never use
     -- that service's wall clock. Home/close does not wait for outbox uploads.
     local time_handoff=self.sync:stop_fast("reading_end:"..reason,nil)
+    -- Retain the time writer which belonged to this closing/suspending reader.
+    -- A late precision-progress callback must never select a fresh wake clock.
+    local time_writer_ownership={
+        daemon=self.sync.daemon,
+        session=self.sync.reading_time_session_id,
+        segment=self.sync.reading_time_segment_id,
+    }
     self.sync.reading_end_finalized=true
 
     self._reading_end_sync_active=true
@@ -32141,7 +32547,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                         mark_critical_done(false,"time_writer_preempt_failed")
                         if HomeView.is_shown() and not self:_active_reader_ui() then self:_schedule_home_progress_recovery(.6) end
                     end
-                end)
+                end,false,time_writer_ownership)
             else
                 start_background_progress()
             end
@@ -32938,6 +33344,7 @@ function Plugin:onNotCharging()
 end
 
 function Plugin:onSuspend()
+    self:_legacy_coordinate_pause("device suspend")
     if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end
     -- 书摘局域网传输只属于前台交互。任何 Suspend 边沿都先关闭它，
     -- 不申请下载/同步的后台保活，也不会在 Resume 后自动恢复。
@@ -33397,6 +33804,8 @@ function Plugin:onResume()
         logger.info("[MiuRead][Power] resume stable",
             "state=",normal.state,"generation=",tostring(normal.generation))
         self:_pump_finished_status(true)
+        self:_schedule_coordinate_retry("device_resumed")
+        self:_legacy_coordinate_schedule(18,"resume")
         -- UI timers may have stopped during physical suspend. Re-evaluate a
         -- durable memory-wait queue now that the device is fully resumed.
         local waiting=self.store:download_queue()[1]
@@ -33698,6 +34107,7 @@ function Plugin:_schedule_post_reader_work(reason,delay,phase)
 end
 
 function Plugin:onCloseDocument()
+    self:_cancel_next_comment_preload("document close")
     self:_cancel_comment_range_task("document close",true)
     self:_teardown_comment_overlay()
     if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end

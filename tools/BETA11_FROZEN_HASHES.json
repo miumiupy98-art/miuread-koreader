@@ -1,0 +1,14 @@
+{
+  "_submit_saved_pending_progress": "31fbc0806c94011f2b3343b3b3c459a24235277fa6906af2eb377c5f37b48645",
+  "_save_pending_progress": "7c8de5098a75e6724e01737853a40f4e7ce27f652eab544be1ebe74fd60b86e4",
+  "_submit_progress_snapshot": "f11334e82f077bd087b6040d2988e8d1153644af94e18c1a095f9a099a14a993",
+  "_verify_progress_submission": "3af4fdfc160785c0bc4f0ea9e60c8d3d7d2be6041003444c366d3abcee14c5f9",
+  "_commit_progress_verified": "73c2c8004d960f553bfc66113f8346fc85f7bf13984b01fa4d522b818df57b0b",
+  "on_remote_progress": "5d301fa38440aae07eab6ad3d8441b7cbe4bd823cfa9d69bbd00e2d709794949",
+  "_reading_end_sync": "c1a41245995573c2a3bcecfc83d8a80c212d15eecaf0401926f40e2aa96e452a",
+  "miuread.koplugin/miuread/sync.lua": "d7d5cae7abbf69f09e28b4efe85d0caa3641883b068a029ce63794483d876323",
+  "miuread.koplugin/miuread/readtime_controller.lua": "4d92caf01181f5dc90f81202d17fbb4b5dd8988bcc1201c93024a79304e6909c",
+  "miuread.koplugin/miuread/read_report_service.lua": "09c74a7f0ea3c8f730a3b9f049479a15cf36adddbaca667be1a02958ebee461f",
+  "miuread.koplugin/miuread/download_source_gate.lua": "d01ed6b104badaf75c6d771d7fc30b960416d1d68bab007cfab78b2d098ed114",
+  "miuread.koplugin/miuread/download_coordinate_retry.lua": "2f7601ef8d691c3fb13f4563034a21425a9d11454c4978108d7c11c9f01fecc6"
+}

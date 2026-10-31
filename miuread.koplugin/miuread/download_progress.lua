@@ -303,6 +303,7 @@ function DownloadProgress:set_state(state)
         thoughts = "获取想法",
         footnotes = "处理脚注",
         images = "处理图片",
+        coordinate = "补全并验证 Web 定位",
         package = "验证并生成 EPUB",
         rate_limit = "等待请求恢复",
         restart = "从断点自动恢复",
