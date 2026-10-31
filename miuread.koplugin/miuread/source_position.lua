@@ -274,6 +274,17 @@ end
 -- B3: only inspect existing authoritative coordinate sources. Never request
 -- remote content merely to render cached public comments. Existing sources
 -- may have a version suffix; pick the latest *existing* valid file.
+-- Exact-version lookup for download backfill. An old version's XHTML is
+-- not authoritative merely because it shares a chapter UID.
+function M.cachedChapterExists(store, book_id, uid, version)
+    if not store or tostring(uid or "")=="" then return false end
+    local reader={store=store}
+    for _,path in ipairs(cache_paths(reader,book_id,uid,version)) do
+        if read_cached(path) then return true end
+    end
+    return false
+end
+
 function M.readCachedChapter(store, book_id, uid)
     if not store or not store.book_dir then return nil end
     local root=store:book_dir(book_id) .. "/progress-source-position"

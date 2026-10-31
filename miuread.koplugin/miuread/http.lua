@@ -1062,7 +1062,7 @@ function Http:request(opt)
     local shared_remaining,shared_state=self:_shared_rate_limit(rate_limit_scope)
     if shared_remaining>0 then
         local code=shared_state and shared_state.code or "rate_limit"
-        if opt.rate_limit_fail_fast==true then
+        if opt.rate_limit_fail_fast==true or self.rate_limit_fail_fast_default==true then
             error("请求频率暂时受限 [MiuReadRateLimit] [MiuReadLocalCooldown] error_code="..tostring(code)
                 .." wait_seconds="..tostring(shared_remaining).."：已暂停请求，请稍后重试。")
         end

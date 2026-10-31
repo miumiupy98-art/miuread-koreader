@@ -20154,6 +20154,163 @@ function Plugin:_on_download_progress(runtime,state)
         end
     end
 end
+-- 6.5.0-beta.4: download source backfill is a separate, resumable, low-priority
+-- job. It never blocks EPUB completion or modifies a KOReader reading file.
+function Plugin:_queue_source_backfill(record)
+    if type(record)~="table" or record.progress_source_complete==true then return false end
+    local id=tostring(record.book_id or record.bookId or "")
+    if id=="" then return false end
+    local auth=self.store:auth() or {}
+    local old=self.store:session(id) or {}
+    local Backfill=require("miuread.progress_source_backfill")
+    local queue,err=Backfill.queue(self.store,record,old.progress_source_backfill,auth.login_session_id)
+    if not queue then
+        logger.info("[MiuRead][SourceBackfill] not queued","book=",id,"reason=",tostring(err))
+        return false
+    end
+    self.store:save_session(id,{progress_source_backfill=queue})
+    logger.info("[MiuRead][SourceBackfill] queued","book=",id,"missing=",tostring(#queue.jobs),
+        "version=",tostring(queue.version))
+    if #queue.jobs>0 then self:_schedule_source_backfill(14) end
+    return #queue.jobs>0
+end
+
+function Plugin:_schedule_source_backfill(delay)
+    if self._source_backfill_timer then UIManager:unschedule(self._source_backfill_timer) end
+    local task
+    task=function()
+        if self._source_backfill_timer~=task then return end
+        self._source_backfill_timer=nil
+        self:_pump_source_backfill()
+    end
+    self._source_backfill_timer=task
+    UIManager:scheduleIn(math.max(3,tonumber(delay) or 15),task)
+end
+
+function Plugin:_pump_source_backfill()
+    if not HomeView.is_shown() or self:_active_reader_ui()
+        or not self:logged_in() or self:_network_radio_hint()==false
+        or self._miuread_suspended==true or HOME_SESSION.suspended==true
+        or self._download_runtime or (self.download_task and self.download_task.busy and self.download_task:busy()) then
+        return false
+    end
+    if self.interactive_network_async and self.interactive_network_async:busy() then
+        self:_schedule_source_backfill(24)
+        return false
+    end
+    local Backfill=require("miuread.progress_source_backfill")
+    local now=os.time()
+    local auth=self.store:auth() or {}
+    local login=tostring(auth.login_session_id or "")
+    if login=="" then return false end
+    local chosen_id,chosen_queue,chosen_index,chosen_job,earliest
+    for book_id,session in pairs(self:_persisted_sessions() or {}) do
+        local queue=type(session)=="table" and session.progress_source_backfill or nil
+        if type(queue)=="table" and tostring(queue.login_session_id or "")==login then
+            local index,job,due=Backfill.next_job(queue,now)
+            if job and not chosen_job then
+                chosen_id,chosen_queue,chosen_index,chosen_job=tostring(book_id),queue,index,job
+            elseif due then earliest=math.min(earliest or due,due) end
+        end
+    end
+    if not chosen_job then
+        if earliest then self:_schedule_source_backfill(math.max(15,earliest-now)) end
+        return false
+    end
+    local book=self.store:book(chosen_id) or {}
+    local book_root=self.store:book_dir(chosen_id)
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local api_mode=require("miuread.api_transport").preference(self.store)
+    local auth_snapshot=U.copy(auth)
+    local uid=tostring(chosen_job.uid)
+    local book_id=chosen_id
+    local version=tonumber(chosen_queue.version) or 0
+    -- A worker interrupted after writing its sidecar may lose the IPC reply.
+    -- Detect that already-present coordinate and retire the task locally.
+    if require("miuread.source_position").cachedChapterExists(self.store,book_id,uid,version) then
+        local copy=U.copy(chosen_queue)
+        Backfill.finish(copy,chosen_index,true,nil,now)
+        self.store:save_session(book_id,{progress_source_backfill=copy})
+        self:_schedule_source_backfill(12)
+        return true
+    end
+    local generation=tostring(chosen_queue.core_map_hash or "")
+    local chapter={uid=uid,chapterUid=uid,chapterIdx=tonumber(chosen_job.index) or 0,
+        index=tonumber(chosen_job.index) or 0,title=tostring(chosen_job.title or "")}
+    local book_arg={bookId=book_id,book_id=book_id,title=book.title,author=book.author,version=version}
+    local started,err=self:_run_interactive_network("source_backfill:"..book_id,"Web 坐标准备",function()
+        local HttpChild=require("miuread.http")
+        local ReaderChild=require("miuread.reader")
+        local SourcePosition=require("miuread.source_position")
+        local child_store=interactive_child_store(auth_snapshot,data_dir,temp_dir,api_mode)
+        function child_store:book_dir() return book_root end
+        local http=HttpChild:new(child_store)
+        -- A source preparation task must never sleep inside the HTTP worker
+        -- for a multi-minute shared 429 cooldown and then time out.
+        local remaining=http:_shared_rate_limit("global")
+        if tonumber(remaining) and remaining>0 then
+            return {success=false,error="rate_limit_cooldown",wait_seconds=remaining}
+        end
+        http.rate_limit_retries=0
+        http.rate_limit_fail_fast_default=true
+        local reader=ReaderChild:new(http,child_store)
+        local ok,body,_,_,state=pcall(reader.web_chapter,reader,book_arg,chapter,"epub",
+            {images=false,fresh_context=true})
+        if not ok then
+            local error_text=tostring(body or "")
+            local detail=HttpChild.rate_limit_details(error_text)
+            return {success=false,error=error_text,
+                wait_seconds=detail and detail.wait_seconds or nil}
+        end
+        local coord=type(state)=="table" and tostring(state.coord_html or "") or ""
+        if type(state)=="table" and state.coordinate_source_authoritative==false then
+            return {success=false,error="web_source_not_authoritative"}
+        end
+        if type(state)=="table" and state.structural==true then
+            return {success=false,error="web_structure_placeholder"}
+        end
+        if coord=="" then return {success=false,error="web_coordinate_missing"} end
+        if coord:find('data-miuread-structure="1"',1,true) then
+            return {success=false,error="web_structure_placeholder"}
+        end
+        local saved,save_error=SourcePosition.cacheChapter(reader,book_id,uid,version,coord)
+        local child_auth,auth_changed=child_store:snapshot()
+        return {success=saved==true,error=saved and nil or tostring(save_error or "cache_write_failed"),
+            auth=auth_changed and child_auth or nil,auth_changed=auth_changed}
+    end,function(result)
+        local value=type(result)=="table" and result.value or nil
+        if not (result and result.ok==true and type(value)=="table") then
+            value={success=false,error=result and result.error or "worker_failed"}
+        end
+        if value.auth_changed==true then
+            self:_apply_interactive_auth({auth=value.auth,changed=true})
+        end
+        local fresh=self.store:session(book_id) or {}
+        local queue=type(fresh.progress_source_backfill)=="table" and U.copy(fresh.progress_source_backfill) or nil
+        local current_auth=self.store:auth() or {}
+        if queue and tostring(queue.login_session_id or "")==tostring(current_auth.login_session_id or "")
+            and tonumber(queue.version)==version and tostring(queue.core_map_hash or "")==generation then
+            local match_index
+            for i,entry in ipairs(queue.jobs or {}) do
+                if tostring(entry.uid or "")==uid then match_index=i;break end
+            end
+            if match_index then
+                Backfill.finish(queue,match_index,value.success==true,value.error,os.time(),value.wait_seconds)
+                self.store:save_session(book_id,{progress_source_backfill=queue})
+                logger.info("[MiuRead][SourceBackfill] chapter", "book=",book_id,"chapter=",uid,
+                    "ok=",tostring(value.success==true),"remaining=",tostring(#queue.jobs),
+                    "reason=",U.first_line(tostring(value.error or "-"),100))
+            end
+        end
+        self:_schedule_source_backfill(16)
+    end,{silent=true,timeout=32})
+    if not started then
+        logger.info("[MiuRead][SourceBackfill] deferred","reason=",tostring(err))
+        self:_schedule_source_backfill(35)
+    end
+    return started==true
+end
+
 function Plugin:_finish_download_runtime(runtime,result)
     if self._download_runtime~=runtime then return end
     local b=runtime.book or {}
@@ -20252,6 +20409,7 @@ function Plugin:_finish_download_runtime(runtime,result)
     end
     self:_mark_auth_channel_ok("download")
     local rec=self:_merge_download_result(result,b,opt)
+    if opt.prefetch~=true then self:_queue_source_backfill(rec) end
     if opt.annotations==true then
         if rec.annotation_pending==true then
             local kind=tostring(rec.annotation_error_kind or ((rec.annotation_summary or {}).error_kind) or "incomplete")
@@ -24952,7 +25110,10 @@ function Plugin:_schedule_home_progress_recovery(delay)
             if item.can_verify and (tonumber(item.last_verify_at or 0)<=0
                 or now-tonumber(item.last_verify_at or 0)>=120) then replayable=replayable+1 end
         end
-        if anchors<=0 and coordinates<=0 and unsent<=0 and replayable<=0 then return end
+        if anchors<=0 and coordinates<=0 and unsent<=0 and replayable<=0 then
+            self:_pump_source_backfill()
+            return
+        end
         self._home_progress_recovery_at=now
         logger.info("[MiuRead][ProgressRetry] home recovery scheduled",
             "anchors=",tostring(anchors),"coordinates=",tostring(coordinates),
@@ -26275,8 +26436,8 @@ function Plugin:_position_resolution_context(book_id)
     local prior=type(state.local_position)=="table" and state.local_position
         or (type(session.local_position_snapshot)=="table" and session.local_position_snapshot or {})
     local context={
-        local_seq=tonumber(session.progress_latest_sequence or 0) or 0,
-        verified_seq=tonumber(session.progress_verified_sequence or 0) or 0,
+        local_seq=tonumber(session.local_position_event_seq or 0) or 0,
+        verified_seq=tonumber(session.progress_verified_read_event_seq or 0) or 0,
         -- Freshness is the last real local position event only. Upload/readback
         -- timestamps and resolver decision times are technical events and must
         -- never make the local copy look newer merely because the book opened.
@@ -26297,11 +26458,26 @@ function Plugin:_set_progress_write_fence(book_id,reason)
     if book_id=="" then return false end
     self._progress_write_fences=type(self._progress_write_fences)=="table" and self._progress_write_fences or {}
     local session=self.store:session(book_id) or {}
+    local current=self._progress_write_fences[book_id]
+    if type(current)~="table" then current=session.progress_write_guard end
+    local epoch=tonumber(session.progress_epoch or 1) or 1
+    local reason_text=tostring(reason or "reconciliation_unresolved")
+    local remote=type(session.remote_wire_anchor)=="table" and session.remote_wire_anchor or {}
+    local remote_key=table.concat({tostring(remote.chapter_uid or ""),
+        tostring(remote.chapter_offset or ""),
+        tostring(remote.server_updated or remote.updated_at or "")},"|")
+    -- Repeated checks of the SAME unresolved cloud condition must not move
+    -- the fence past a real human page turn that already occurred.
+    local original_seq=(type(current)=="table" and current.reason==reason_text
+        and tonumber(current.progress_epoch)==epoch
+        and tostring(current.remote_fingerprint or "")==remote_key)
+        and tonumber(current.blocked_event_seq) or nil
     local fence={
-        reason=tostring(reason or "reconciliation_unresolved"),
+        reason=reason_text,
         blocked_at=os.time(),
-        blocked_event_seq=tonumber(session.local_position_event_seq or 0) or 0,
-        progress_epoch=tonumber(session.progress_epoch or 1) or 1,
+        blocked_event_seq=original_seq or (tonumber(session.local_position_event_seq or 0) or 0),
+        progress_epoch=epoch,
+        remote_fingerprint=remote_key,
     }
     self._progress_write_fences[book_id]=fence
     -- Only actual cloud/account uncertainty is a durable write veto.
@@ -27301,15 +27477,11 @@ function Plugin:upload_local_progress(manual,callback)
     end
     local id=tostring(r.book.book_id)
     local session=self.store:session(id) or {}
-    if manual~=true then
-        local blocked,block_reason=self:_progress_write_fence(id)
-        if blocked then
-            logger.info("[MiuRead][ProgressFence] automatic upload skipped before mapping",
-                "book=",id,"reason=",tostring(block_reason))
-            if callback then callback(false,"progress_write_fenced") end
-            return false
-        end
-    end
+    -- Do not evaluate the durable fence without a coordinate/event snapshot:
+    -- that pre-check has no event sequence and would reject every legitimate
+    -- new user page turn after a failed remote landing. The guarded write
+    -- remains inside _submit_progress_snapshot, AFTER exact mapping.
+    -- Resolving a local position does not itself perform any cloud write.
     if session.sync_repair_required==true
         and (tostring(session.sync_repair_kind or "")=="context" or tostring(session.sync_repair_kind or "")=="position") then
         if manual then self:_show_sync_repair_prompt(session.sync_repair_error,"context",id) end
@@ -27485,7 +27657,7 @@ function Plugin:_use_remote_position(id,localp,remote,options)
                         or (kind=="soft" and "已定位到云端章节，坐标验证待完成" or "云端位置已跳转，但精确位置验证失败"))
                     if not automatic then
                         if reliable then
-                            self:_sync_notice("uploaded")
+                            self:status_toast("云端位置待验证", "已根据文本定位，但字符坐标尚未通过回读验证", 5)
                         else
                             self:info(kind=="soft" and "已定位到云端章节，但章节内位置仍无法可靠确认。"
                                 or ("已跳到云端位置附近，但暂时无法完成同页级坐标确认。\n\n"..U.first_line(tostring(position_error or "精确位置不可用"),160)))
@@ -27838,6 +28010,26 @@ function Plugin:on_remote_progress(id,localp,remote,automatic,local_position)
         if basis:find("unresolved",1,true) or tonumber(remote and remote.canonical_progress)==nil then
             local started=self.sync:resolve_remote_progress(remote,function(resolved,resolve_error)
                 if not resolved then
+                    -- A cloud-only chapter UID is not a local EPUB chapter.
+                    -- Never substitute a guessed local ordinal or report a
+                    -- percent jump as exact. Keep it pending until a human
+                    -- produces a new trusted local position.
+                    if tostring(resolve_error or "")=="remote_chapter_not_in_catalog" then
+                        self:_set_progress_write_fence(id,"remote_exact_unresolved")
+                        self:_save_position_resolution(id,"remote","remote_chapter_not_in_catalog",local_position,remote)
+                        self:_save_progress_state(id,"remote_chapter_unavailable",
+                            "云端章节不在本地目录；保留当前位置，新的实际阅读事件会重新裁决",localp,remotep)
+                        self.sync:end_progress_sync("云端章节无法映射到本地 EPUB")
+                        if automatic then
+                            self:_open_sync_close("remote chapter missing",false)
+                            self:_finish_auto_position_check(id,"remote chapter missing")
+                        else
+                            self:info("云端章节不在本地目录中，暂时无法精确定位。当前位置未被覆盖。")
+                        end
+                        logger.warn("[MiuRead][PositionResolve] remote chapter unavailable",
+                            "book=",id,"remote_uid=",tostring(remote and remote.chapter_uid or ""))
+                        return
+                    end
                     -- beta.6: native source mapping is an optimization, not an
                     -- authority gate. Fall back to the server percent only as an
                     -- approximate navigation seed, then require exact chapter/co
@@ -27920,6 +28112,25 @@ function Plugin:show_sync_status(detail)
         rows[#rows+1]={text="阅读进度",post_text=progress_status,
             enabled=(tonumber(pending.progress or 0) or 0)>0,
             callback=(tonumber(pending.progress or 0) or 0)>0 and function() self:show_progress_sync_issues() end or nil}
+        local coordinate_waiting,coordinate_blocked=0,0
+        for _,session in pairs(self:_persisted_sessions() or {}) do
+            local source=type(session)=="table" and session.progress_source_backfill or nil
+            for _,job in ipairs(type(source)=="table" and source.jobs or {}) do
+                if job.blocked==true then coordinate_blocked=coordinate_blocked+1
+                else coordinate_waiting=coordinate_waiting+1 end
+            end
+        end
+        if coordinate_waiting>0 or coordinate_blocked>0 then
+            local text=coordinate_waiting>0 and ("待补齐 "..tostring(coordinate_waiting).." 章")
+                or ("不可用 "..tostring(coordinate_blocked).." 章")
+            rows[#rows+1]={text="Web 精确坐标准备",post_text=text,enabled=true,
+                callback=function()
+                    self:_schedule_source_backfill(3)
+                    self:info("下载的 EPUB 已可阅读。缺少的 Web 章节坐标会在联网且空闲时补齐。"
+                        ..(coordinate_blocked>0 and ("\n\n另有 "..tostring(coordinate_blocked).." 章无法自动补齐，已停止请求。") or "")
+                        .."\n\n坐标准备完成后仍会验证实际阅读位置，不会用猜测坐标上传。")
+                end}
+        end
         local h_count=tonumber(pending.highlight or 0) or 0
         local t_count=tonumber(pending.thought or 0) or 0
         local b_count=tonumber(pending.bookmark or 0) or 0

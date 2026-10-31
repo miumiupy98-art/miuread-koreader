@@ -1553,6 +1553,12 @@ function Sync:_source_position_async(callback, options)
     launch_network=function()
         if self.async:busy() then return false,"source_worker_busy" end
         return self.async:run("progress_source_position_network", function()
+            -- Do not spend the 40-second resolver budget sleeping through a
+            -- known 429 cooldown. Keep the anchor for later offline recovery.
+            if reader and reader.http then
+                reader.http.rate_limit_fail_fast_default=true
+                reader.http.rate_limit_retries=0
+            end
             local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=false,force_refresh=true,force_refresh_uid=tostring(anchor.chapter_uid or "")})
             return {position=value,error=source_error}
         end,function(result) on_phase_result("network",result) end,
@@ -6032,11 +6038,16 @@ function Sync:on_page(page, genuine_user_event)
             local book_id=tostring(self.current.book.book_id or self.current.book.bookId or "")
             if book_id~="" then
                 local session=self.store:session(book_id) or {}
-                local next_seq=(tonumber(session.local_position_event_seq or 0) or 0)+1
+                -- Progress transactions are not reading events. Reconcile all
+                -- durable event baselines so an old snapshot or a second plugin
+                -- instance cannot reset the human page-movement sequence.
+                local Event=require("miuread.position_event")
+                local next_seq=Event.next_sequence(session)
                 self.store:save_session(book_id,{
                     local_position_event_seq=next_seq,
                     local_read_event_at=os.time(),
                 },false)
+                if type(self._defer_session_flush)=="function" then self:_defer_session_flush(1.0) end
                 logger.info("[MiuRead][PositionEvent] user page movement", "book=",book_id,"seq=",next_seq)
             end
         end

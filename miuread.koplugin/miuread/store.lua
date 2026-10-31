@@ -2504,6 +2504,12 @@ function Store:save_session(id,patch,flush_now)
                 "sequence=",task_seq,"abandoned=",abandoned)
         end
     end
+    -- A background coordinate queue is a REPLACEMENT, not a deep-merge patch.
+    -- Merging its indexed jobs would resurrect completed chapters and replay
+    -- Web requests after a successful cache fill.
+    if incoming.progress_source_backfill~=nil then
+        current.progress_source_backfill=nil
+    end
     a[k]=U.merge(current,incoming)
     local _,removed=compact_session_row(a[k],keep_chapters)
     if removed>0 then
