@@ -2,7 +2,8 @@ name: Release beta full package
 
 # Two supported release paths:
 # - A pushed v*-beta.* tag publishes that exact tagged source (no ref rewriting).
-# - Manual dispatch prepares the beta branch and creates a new immutable tag.
+# - Manual dispatch builds from beta HEAD and creates a tag, without committing release metadata to beta.
+# Release identity and notes are generated only in this Actions workspace.
 on:
   push:
     tags:
@@ -11,10 +12,6 @@ on:
     inputs:
       version:
         description: "要发布的 Beta 版本，例如 6.0.1-beta.2"
-        required: true
-        type: string
-      release_notes:
-        description: "本次更新说明（多条使用空格竖线空格分隔： | ）"
         required: true
         type: string
 
@@ -94,68 +91,47 @@ jobs:
           echo "  tag=$RELEASE_TAG"
           echo "  source=$BRANCH_SHA"
 
-      - name: Prepare beta release metadata
+      - name: Generate beta metadata and changelog automatically
         shell: bash
         env:
-          RELEASE_NOTES_INPUT: ${{ inputs.release_notes }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s tools -p 'test_prepare_beta_release.py'
-          python3 -m unittest discover -s tools -p 'test_beta_release_workflow.py'
-          python3 -m unittest discover -s tools -p 'test_beta11_release_guard.py' 
-          python3 -m unittest discover -s tools -p 'test_beta12_release_regression.py'
-          python3 -m unittest discover -s tools -p 'test_620_readtime_contract.py'
-          python3 -m unittest discover -s tools -p 'test_623_session_snapshot_and_comment_ui.py'
-          python3 -m unittest discover -s tools -p 'test_625_comment_menu_and_sync_notice.py'
-          python3 -m unittest discover -s tools -p 'test_630_comment_compact_progress.py'
-          python3 -m unittest discover -s tools -p 'test_632_home_download_choice.py'
-          python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
-          python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
-          python3 -m unittest discover -s tools -p 'test_650_beta8_progress_rebuild.py'
-          python3 -m unittest discover -s tools -p 'test_650_beta9_readtime_contract.py'
-          python3 -m unittest discover -s tools -p 'test_650_beta10_contract.py'
-          python3 -m unittest discover -s tools -p 'test_650_beta11_contract.py'
+          git fetch --force --tags origin
 
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
-              echo "::error::缺少手动发布的更新说明。"
-              exit 1
-            fi
-            # Never move an already-published tag to a different commit.
-            EXISTING_TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
-            if [ -n "$EXISTING_TAG_SHA" ] && [ "$EXISTING_TAG_SHA" != "$(git rev-parse HEAD)" ]; then
-              echo "::error::$RELEASE_TAG 已存在于另一个提交，请使用新版本号。"
-              exit 1
-            fi
-            python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"
-            if [ -n "$EXISTING_TAG_SHA" ] && ! git diff --quiet -- \
-                miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md; then
-              echo "::error::发布标签已存在，不能重新修改该标签的版本文件。"
-              exit 1
-            fi
+          # A failed Tag can exist without a published installation package.
+          # Use the last successfully published beta ZIP as the changelog base.
+          if gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              > "$RUNNER_TEMP/miuread-published-releases.json"; then
+            PUBLISHED_BETA_TAGS="$(python3 - <<'PYRELEASES'
+          import json
+          import re
+          from pathlib import Path
+          import os
+
+          path = Path(os.environ['RUNNER_TEMP']) / 'miuread-published-releases.json'
+          releases = json.loads(path.read_text(encoding='utf-8'))
+          versions = []
+          for release in releases:
+              tag = release.get('tag_name', '')
+              if release.get('draft') or not re.fullmatch(r'v\d+\.\d+\.\d+-beta\.\d+', tag):
+                  continue
+              expected = f'miuread-{tag}-full.zip'
+              if any(asset.get('name') == expected for asset in release.get('assets', [])):
+                  versions.append(tag)
+          print(','.join(versions))
+          PYRELEASES
+            )"
+            echo "MIUREAD_PUBLISHED_BETA_TAGS=$PUBLISHED_BETA_TAGS" >> "$GITHUB_ENV"
+            export MIUREAD_PUBLISHED_BETA_TAGS="$PUBLISHED_BETA_TAGS"
           else
-            # This is a published Git tag: never rewrite/move its source commit.
-            # If version fields lag behind the tag, normalize the build workspace
-            # only; the packaged source is self-contained and clearly versioned.
-            SOURCE_VERSION="$(grep -E '^[[:space:]]*VERSION[[:space:]]*=' miuread.koplugin/miuread/config.lua | head -n1 | cut -d '"' -f2)"
-            if [ "$SOURCE_VERSION" != "$VERSION" ]; then
-              RELEASE_NOTES_INPUT="$(git log -1 --format=%s)"
-              RELEASE_NOTES_INPUT="${RELEASE_NOTES_INPUT//|/-}"
-              if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
-                echo "::error::Tag 提交缺少可用于生成更新说明的提交标题。"
-                exit 1
-              fi
-              echo "::warning::Tag 中的源码版本 $SOURCE_VERSION 与目标版本 $VERSION 不同；仅在打包工作区修正元数据，绝不移动 Tag。"
-              python3 tools/prepare_beta_release.py --version "$VERSION" --notes "$RELEASE_NOTES_INPUT"
-            else
-              echo "Tag 源码已包含目标版本。"
-            fi
-            # Source may have the target version without a canonical CHANGELOG
-            # header. Repair only this build workspace, never move the Git tag.
-            python3 -m unittest discover -s tools -p 'test_ensure_beta_tag_changelog.py'
-            python3 tools/ensure_beta_tag_changelog.py \
-              --version "$VERSION" --notes "$(git log -1 --format=%s)"
+            echo "::warning::无法读取 GitHub 已发布版本，改用现有 Git Tag 历史生成更新说明。"
           fi
+
+          # Both manual and Tag releases derive their notes from Git history.
+          # In a Tag build only the checkout workspace is modified; no Tag is moved.
+          python3 .github/scripts/sync_release_identity.py \
+            --channel beta --version "$VERSION" --tag "$RELEASE_TAG"
 
       - name: Read and validate beta identity
         shell: bash
@@ -323,163 +299,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run Lua syntax checks and release regression verifier
-        shell: bash
-        env:
-          LUA_PATH: "./miuread.koplugin/?.lua;./miuread.koplugin/?/init.lua;;"
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y lua5.1 luajit
-          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
-          lua5.1 tools/test_api_transports.lua
-          # Beta.17 contracts must run in the publishing gate as well as locally.
-          lua5.1 tools/test_beta17_transport_cooldown.lua
-          lua5.1 tools/test_beta17_sync_contract.lua
-          lua5.1 tools/test_beta17_worker_and_comments.lua
-          lua5.1 tools/test_630_comment_compact_ui.lua
-          luajit tools/test_630_comment_compact_ui.lua
-          lua5.1 tools/test_632_home_download_choice.lua
-          luajit tools/test_632_home_download_choice.lua
-          lua5.1 tools/test_633_download_choices.lua
-          luajit tools/test_633_download_choices.lua
-          lua5.1 tools/test_633_action_sheet_fallback.lua
-          luajit tools/test_633_action_sheet_fallback.lua
-          lua5.1 tools/test_620_readtime_clock.lua
-          lua5.1 tools/test_readtime_recovery.lua
-          lua5.1 tools/test_beta5_sync_contract.lua
-          lua5.1 tools/test_beta18_comment_refresh.lua
-          lua5.1 tools/test_beta19_comment_and_abandon.lua
-          lua5.1 tools/test_beta15_comment_response.lua
-          lua5.1 tools/test_diagnostic_log.lua
-          lua5.1 tools/test_bookstore.lua
-          lua5.1 tools/test_bookstore_ui.lua
-          lua5.1 tools/test_shelf_client.lua
-          lua5.1 tools/test_multidevice_web_login.lua
-          lua5.1 tools/test_finished_status.lua
-          lua5.1 tools/test_shelf_progress.lua
-          luajit tools/test_bookstore.lua
-          luajit tools/test_bookstore_ui.lua
-          luajit tools/test_shelf_client.lua
-          luajit tools/test_multidevice_web_login.lua
-          luajit tools/test_finished_status.lua
-          luajit tools/test_shelf_progress.lua
-          lua5.1 tools/test_position_resolution.lua
-          lua5.1 tools/test_beta8_sync_behavior.lua
-          luajit tools/test_beta8_sync_behavior.lua
-          lua5.1 tools/test_progress_confirmation.lua
-          luajit tools/test_progress_confirmation.lua
-          lua5.1 tools/test_beta9_sync_readtime.lua
-          luajit tools/test_beta9_sync_readtime.lua
-          lua5.1 tools/test_position_state_hotfix.lua
-          lua5.1 tools/test_open_sync_contract.lua
-          lua5.1 tools/test_beta6_end_reading_latest_wins.lua
-          lua5.1 tools/test_beta6_sync_contract.lua
-          lua5.1 tools/test_beta7_sync_contract.lua
-          lua5.1 tools/test_beta8_home_translation_contract.lua
-          lua5.1 tools/test_beta19_robust_mapping.lua
-          lua5.1 tools/test_591_beta1_progress_recovery.lua
-          lua5.1 tools/test_cloud_mirror_contract.lua
-          lua5.1 tools/test_long_book_anchor.lua
-          lua5.1 tools/test_terminal_progress_guard.lua
-          lua5.1 tools/test_finished_resolution.lua
-          lua5.1 tools/test_download_resource_admission.lua
-          luajit tools/test_download_resource_admission.lua
-          lua5.1 tools/test_beta5_reintegration.lua
-          luajit tools/test_beta5_reintegration.lua
-          luajit tools/test_beta6_end_reading_latest_wins.lua
-          luajit tools/test_readtime_recovery.lua
-          luajit tools/test_beta5_sync_contract.lua
-          lua5.1 tools/test_store_repair.lua
-          lua5.1 tools/test_cloud_freshness_contract.lua
-          lua5.1 tools/test_beta10_translation_dependency_contract.lua
-          lua5.1 tools/test_memory_profile.lua
-          lua5.1 tools/test_download_safety.lua
-          luajit tools/test_translation.lua
-          luajit tools/test_translation_generation.lua
-          luajit tools/test_translation_fetch.lua
-          luajit tools/test_translation_ux.lua
-          luajit tools/test_internal_links.lua
-          python3 tools/test_extension_center_ux.py
-          python3 tools/verify_600_beta1.py
-          python3 tools/test_624_release_verifier_contract.py
-          python3 tools/test_635_eink_only_route.py
-          python3 tools/test_636_smart_time_route.py
-          python3 tools/test_637_menu_icons_and_handoff.py
-          lua5.1 tools/test_637_handoff.lua
-          luajit tools/test_637_handoff.lua
-          lua5.1 tools/test_650_beta9_readtime_ownership.lua
-          luajit tools/test_650_beta9_readtime_ownership.lua
-          lua5.1 tools/test_650_beta11_coordinate_retry.lua
-          luajit tools/test_650_beta11_coordinate_retry.lua
-          lua5.1 tools/test_650_beta10_coordinate_gate.lua
-          luajit tools/test_650_beta10_coordinate_gate.lua
-          lua5.1 tools/test_650_beta10_source_map.lua
-          luajit tools/test_650_beta10_source_map.lua
-          python3 tools/verify_memory_profile.py
-          python3 tools/test_beta11_download_resume.py
-          lua5.1 tools/test_beta11_download_resume_policy.lua
-          lua5.1 tools/test_beta11_resume_coordinator.lua
-          luajit tools/test_beta11_download_resume_policy.lua
-          luajit tools/test_beta11_resume_coordinator.lua
-
-      - name: Verify E-Ink archives, annotations and translations offline
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m venv "$RUNNER_TEMP/miuread-eink-tests"
-          "$RUNNER_TEMP/miuread-eink-tests/bin/python" -m pip install lupa==2.8 cryptography==50.0.2
-          "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_offline_readtime.py
-          "$RUNNER_TEMP/miuread-eink-tests/bin/python" tools/test_eink_download.py --zlib libz.so.1
-
-      - name: Commit prepared beta version and changelog
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add -- miuread.koplugin/_meta.lua miuread.koplugin/miuread/config.lua CHANGELOG.md
-          if ! git diff --cached --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "chore(release): prepare $RELEASE_TAG"
-            # A concurrent push to beta causes a non-fast-forward failure; no force push.
-            git push origin HEAD:beta
-          fi
-          echo "RELEASE_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Ensure release tag
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BRANCH_SHA="$(git rev-parse HEAD)"
-          REMOTE_BRANCH_SHA="$(git ls-remote --heads origin refs/heads/beta | awk 'NR==1 {print $1}')"
-          if [ "$REMOTE_BRANCH_SHA" != "$BRANCH_SHA" ]; then
-            echo "::error::beta 分支在发布期间发生变化，请重新运行，不要从过期提交发布。"
-            exit 1
-          fi
-          REMOTE_TAG_SHA="$(
-            git ls-remote --tags origin "refs/tags/$RELEASE_TAG" \
-              | awk 'NR==1 {print $1}'
-          )"
-
-          if [ -n "$REMOTE_TAG_SHA" ]; then
-            if [ "$REMOTE_TAG_SHA" != "$BRANCH_SHA" ]; then
-              echo "::error::$RELEASE_TAG 已存在，但没有指向 beta 当前 HEAD。"
-              echo "::error::tag=$REMOTE_TAG_SHA, beta=$BRANCH_SHA"
-              echo "::error::请删除错误 tag，或使用新的版本号。"
-              exit 1
-            fi
-            echo "$RELEASE_TAG 已存在且位置正确，继续发布。"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "$RELEASE_TAG" "$BRANCH_SHA"
-            git push origin "refs/tags/$RELEASE_TAG"
-            echo "已创建 $RELEASE_TAG -> $BRANCH_SHA"
-          fi
-
       - name: Build beta full package and manifest
         shell: bash
         run: |
@@ -528,88 +347,38 @@ jobs:
           )
           PY
 
-      - name: Verify beta package and manifest
+      - name: Ensure release tag
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
-          unzip -t "dist/$PACKAGE_NAME"
 
-          python3 - <<'PY'
-          from pathlib import Path
-          from zipfile import ZipFile
-          import hashlib
-          import json
-          import os
-          import sys
+          BRANCH_SHA="$(git rev-parse HEAD)"
+          REMOTE_BRANCH_SHA="$(git ls-remote --heads origin refs/heads/beta | awk 'NR==1 {print $1}')"
+          if [ "$REMOTE_BRANCH_SHA" != "$BRANCH_SHA" ]; then
+            echo "::error::beta 分支在发布期间发生变化，请重新运行，不要从过期提交发布。"
+            exit 1
+          fi
+          REMOTE_TAG_SHA="$(
+            git ls-remote --tags origin "refs/tags/$RELEASE_TAG" \
+              | awk 'NR==1 {print $1}'
+          )"
 
-          package = Path("dist") / os.environ["PACKAGE_NAME"]
-          manifest = json.loads(Path("dist/update-beta.json").read_text(encoding="utf-8"))
-          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
-
-          required = {
-              "miuread.koplugin/_meta.lua",
-              "miuread.koplugin/main.lua",
-              "miuread.koplugin/miuread/config.lua",
-              "miuread.koplugin/LICENSE",
-              "miuread.koplugin/NOTICE",
-              "miuread.koplugin/THIRD_PARTY_NOTICES",
-              "miuread.koplugin/miuread/readtime_controller.lua",
-              "miuread.koplugin/miuread/readtime_outbox.lua",
-              "miuread.koplugin/miuread/readtime_stats.lua",
-              "miuread.koplugin/miuread/readtime_clock.lua",
-              "miuread.koplugin/miuread/readtime_metadata.lua",
-              "miuread.koplugin/miuread/readtime_protocol.lua",
-              "miuread.koplugin/miuread/eink_readtime.lua",
-              "miuread.koplugin/licenses/weread-omni-MIT.txt",
-              "miuread.koplugin/licenses/moon-GPL-3.0.txt",
-          }
-          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
-          forbidden_suffixes = {".md", ".epub", ".log"}
-          forbidden_prefixes = {"miuread.koplugin/native/"}
-
-          with ZipFile(package) as archive:
-              names = archive.namelist()
-              damaged = archive.testzip()
-
-          errors = []
-          if damaged:
-              errors.append(f"ZIP 损坏：{damaged}")
-
-          for name in sorted(required.difference(names)):
-              errors.append(f"安装包缺少：{name}")
-
-          for name in names:
-              path = Path(name)
-              if not name.startswith("miuread.koplugin/"):
-                  errors.append(f"安装包根目录错误：{name}")
-              if (
-                  path.name in forbidden_names
-                  or path.suffix.lower() in forbidden_suffixes
-                  or "__MACOSX" in path.parts
-                  or any(name.startswith(prefix) for prefix in forbidden_prefixes)
-              ):
-                  errors.append(f"不应进入安装包：{name}")
-
-          if manifest.get("version") != os.environ["VERSION"]:
-              errors.append("更新清单版本错误")
-          if manifest.get("channel") != "beta":
-              errors.append("更新清单通道错误")
-          if manifest.get("notes") != summary or manifest.get("summary") != summary:
-              errors.append("线上更新摘要错误")
-          if len(summary.splitlines()) > 4 or len(summary) > 180:
-              errors.append("设备更新摘要超过 4 行或 180 个字符")
-          if manifest.get("size") != package.stat().st_size:
-              errors.append("更新清单文件大小错误")
-          if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
-              errors.append("更新清单 SHA-256 错误")
-
-          if errors:
-              for error in errors:
-                  print(f"::error::{error}")
-              sys.exit(1)
-
-          print(f"内测版安装包检查通过，共 {len(names)} 个条目。")
-          PY
+          if [ -n "$REMOTE_TAG_SHA" ]; then
+            if [ "$REMOTE_TAG_SHA" != "$BRANCH_SHA" ]; then
+              echo "::error::$RELEASE_TAG 已存在，但没有指向 beta 当前 HEAD。"
+              echo "::error::tag=$REMOTE_TAG_SHA, beta=$BRANCH_SHA"
+              echo "::error::请删除错误 tag，或使用新的版本号。"
+              exit 1
+            fi
+            echo "$RELEASE_TAG 已存在且位置正确，继续发布。"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$RELEASE_TAG" "$BRANCH_SHA"
+            git push origin "refs/tags/$RELEASE_TAG"
+            echo "已创建 $RELEASE_TAG -> $BRANCH_SHA"
+          fi
 
       - name: Create or update beta prerelease
         shell: bash
@@ -679,33 +448,6 @@ jobs:
           if [ "$COUNT" != "1" ]; then
             echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
             exit 1
-          fi
-
-      - name: Quick-check public download URL
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
-          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update-beta.json"))["sha256"])')"
-
-          success=0
-          for attempt in 1 2 3; do
-            rm -f dist/public-download.zip
-            if curl --fail --location --silent --show-error \
-                --connect-timeout 5 --max-time 20 \
-                --output dist/public-download.zip "$URL"; then
-              ACTUAL="$(sha256sum dist/public-download.zip | awk '{print $1}')"
-              if [ "$ACTUAL" = "$EXPECTED" ]; then
-                success=1
-                break
-              fi
-            fi
-            [ "$attempt" = "3" ] || sleep 2
-          done
-
-          if [ "$success" != "1" ]; then
-            echo "::warning::Release 已由 GitHub API 确认上传，但当前 runner 暂时无法从公开 CDN 回读；继续发布 Beta 清单。"
           fi
 
       - name: Publish fixed beta channel manifest

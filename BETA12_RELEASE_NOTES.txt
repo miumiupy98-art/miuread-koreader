@@ -1,2 +1,2 @@
-Version: 6.1.0-beta.12
-修复 Lua 5.1/LuaJIT 发布回归测试的模块搜索路径 | 已准备版本允许在发布前更新 CHANGELOG 说明 | 统一发布测试配置并保留 Beta 手动与 Tag 两种入口 | 正式版改为测试通过后创建不可变 Tag，不再强制移动已有 Tag | 保留现有阅读同步、阅读时间和下载业务逻辑，Schema 136 不变
+Version: 6.5.0-beta.12
+旧版 EPUB Web 定位后台补全；原生 KOReader 锁屏；主页快捷菜单；评论获取与更新合并；Beta 发布流程恢复 beta.5。

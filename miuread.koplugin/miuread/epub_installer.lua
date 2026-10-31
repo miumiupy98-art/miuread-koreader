@@ -260,6 +260,24 @@ function Installer.inspect(path)
     return meta,entries
 end
 
+-- Public bounded one-chapter extractor for pre-existing generated MiuRead
+-- EPUBs. No write path, no extraction of the whole archive.
+function Installer.read_chapter_text(path,index,meta,entries)
+    if not meta or not entries then
+        meta,entries=Installer.inspect(path)
+        if not meta then return nil,nil,entries end
+    end
+    index=math.floor(tonumber(index) or 0)
+    if index<1 or index>meta._chapter_count then return nil,nil,"chapter_out_of_range" end
+    local entry=entries[string.format("OEBPS/text/chapter-%04d.xhtml",index)]
+    if not entry or entry.method~=0 or entry.uncompressed>2*1024*1024 then
+        return nil,nil,"chapter_too_large_or_compressed"
+    end
+    local html,err=read_entry(path,entry)
+    if not html then return nil,nil,err end
+    return html,(meta.chapters or {})[index] or {}
+end
+
 -- Read generated chapter text one chapter at a time. Translation display
 -- inspection must not extract images, rewrite the archive or retain a whole
 -- book in memory. Older MiuRead EPUBs use the same stored ZIP entry format.

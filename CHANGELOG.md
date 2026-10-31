@@ -1,3 +1,11 @@
+## 6.5.0-beta.12 - 2026-11-01
+
+- 为已安装的旧版 EPUB 新增后台 Web 章节定位来源补全；逐章匹配，不修改原书或阅读进度。
+- 支持已安装书籍的补全任务暂停、重新验证、取消，以及离线重试和账号隔离。
+- 恢复 KOReader 原生锁屏独立选项、主页快捷栏长按层级菜单。
+- 统一评论获取/更新入口；指定范围可选择刷新已有评论。
+- 内测发布流程恢复到 v6.5.0-beta.5 原版，手动发布仅需版本号。
+
 ## 6.5.0-beta.11
 
 - Automatic background continuation after failed Web coordinate validation during new-book download; persistent checkpoint retry with exponential backoff.
@@ -42,6 +50,13 @@
 - 设置模式变更仅停止阅读时间服务，不再取消阅读进度相关异步任务。
 
 # Changelog
+
+## 6.5.0-beta.12 - 2026-11-01
+
+- 旧版 EPUB 的 Web 定位来源按需后台补齐并验证，不重建书籍。
+- 恢复 KOReader 原生锁屏设置和主页快捷栏长按统一菜单。
+- 评论下载与更新合并入口，范围内刷新已有缓存可选。
+- Beta 发布工作流恢复 6.5.0-beta.5 原版。
 
 ## 6.3.0-beta.6 - Beta Update
 
