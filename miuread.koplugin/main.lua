@@ -1143,6 +1143,19 @@ function Plugin:init()
         if startup_download_state.status=="completed" then self.store:clear_download_state() end
         local recovered=self:_recover_download_state()
         if not recovered then UIManager:scheduleIn(1.0,function() self:_start_next_queued_download() end) end
+        UIManager:scheduleIn(3.0,function()
+            local prior=self.store:download_state()
+            if prior.status=="failed" and prior.error_kind=="coordinate_pending"
+                and type(prior.book)=="table" and type(prior.options)=="table" then
+                local Retry=require("miuread.download_coordinate_retry")
+                local auth=self.store:auth() or {}
+                if not Retry.has(self.store,Retry.key(prior.book,prior.options)) then
+                    Retry.record(self.store,prior.book,prior.options,
+                        (auth.account or {}).vid,auth.login_session_id,prior.error,os.time())
+                end
+            end
+            self:_schedule_coordinate_retry("startup")
+        end)
     end
     -- Extension install staging is independent from book-download checkpoints.
     -- Clean only stale extension-center artifacts after startup is responsive;
@@ -20126,6 +20139,63 @@ function Plugin:_on_download_progress(runtime,state)
         end
     end
 end
+-- beta.11: the durable coordinate-retry queue is separate from the normal
+-- one-slot user download queue and NEVER runs inside ReaderUI or while asleep.
+function Plugin:_schedule_coordinate_retry(reason)
+    if self._coordinate_retry_task or HOME_EXITING or UIManager._exit_code~=nil then return false end
+    if not self.store then return false end
+    local Retry=require("miuread.download_coordinate_retry")
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    local next_wait=Retry.next_delay(self.store,os.time(),vid,session)
+    if not next_wait then return false end
+    -- One timer per Plugin, no rapid spin while offline or sleeping.
+    local delay=math.max(2,math.min(120,next_wait))
+    local task
+    task=function()
+        if self._coordinate_retry_task~=task then return end
+        self._coordinate_retry_task=nil
+        self:_coordinate_retry_pump("scheduled")
+    end
+    self._coordinate_retry_task=task
+    UIManager:scheduleIn(delay,task)
+    logger.info("[MiuRead][CoordinateRetry] scheduled", "reason=",tostring(reason or ""),"seconds=",tostring(delay))
+    return true
+end
+function Plugin:_coordinate_retry_pump(reason)
+    local Retry=require("miuread.download_coordinate_retry")
+    if not self.store or HOME_EXITING or UIManager._exit_code~=nil then return false end
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    local job=Retry.select(self.store,os.time(),vid,session)
+    if not job then return self:_schedule_coordinate_retry("no_due:"..tostring(reason)) end
+    if not self:logged_in() or self:_network_radio_hint()==false
+        or self._miuread_suspended==true or HOME_SESSION.suspended==true
+        or PowerState.state()~="NORMAL" or self:_active_reader_ui()
+        or (self.download_task and self.download_task:busy()) or self._download_runtime
+        or #(self.store:download_queue() or {})>0
+        or self.cache_cleanup_task and self.cache_cleanup_task:busy() then
+        Retry.defer(self.store,job.key,os.time(),90)
+        self:_schedule_coordinate_retry("resource_or_reader_busy")
+        return false
+    end
+    local accepted=self:download(job.book,U.copy(job.options),false,nil,true,true)
+    local runtime=self._download_runtime
+    if runtime and tostring((runtime.book or {}).bookId or "")==tostring((job.book or {}).bookId or "")
+        and self.download_task and self.download_task:busy() then
+        -- A crashed subprocess may disappear before completion is reported;
+        -- a persisted cooldown permits recovery on subsequent plugin startup.
+        Retry.defer(self.store,job.key,os.time(),600)
+        logger.info("[MiuRead][CoordinateRetry] resumed checkpoint",
+            "book=",tostring(job.book.bookId),"attempt=",tostring(job.attempt or 0))
+        return true
+    end
+    Retry.defer(self.store,job.key,os.time(),90)
+    self:_schedule_coordinate_retry("start_not_accepted")
+    return accepted==true
+end
 function Plugin:_finish_download_runtime(runtime,result)
     if self._download_runtime~=runtime then return end
     local b=runtime.book or {}
@@ -20152,6 +20222,10 @@ function Plugin:_finish_download_runtime(runtime,result)
         if opt.chapter_continuous_open==true then self:_clear_chapter_advance_wait("next chapter download failed") end
         logger.warn("[MiuRead][Download] failed",tostring(err))
         if tostring(err)=="下载已取消" then
+            if opt._coordinate_auto_retry==true then
+                local Retry=require("miuread.download_coordinate_retry")
+                Retry.remove(self.store,Retry.key(b,opt))
+            end
             self.store:clear_download_state()
             self:_update_open_shelf_download_status(b.bookId,"生成已取消")
             self:_notify_home_data_changed("content")
@@ -20166,6 +20240,12 @@ function Plugin:_finish_download_runtime(runtime,result)
         local image_missing=tostring(err):find("[MiuReadImageMissing]",1,true)~=nil
             or tostring(err):find("[MiuReadImageExternal]",1,true)~=nil
         local coordinate_pending=tostring(err):find("[MiuReadWebCoordinatePending]",1,true)~=nil
+        if opt._coordinate_auto_retry==true and not coordinate_pending then
+            local Retry=require("miuread.download_coordinate_retry")
+            Retry.remove(self.store,Retry.key(b,opt))
+            logger.warn("[MiuRead][CoordinateRetry] auto retry stopped on unrelated failure",
+                "book=",tostring(b.bookId))
+        end
         local validation_failed=tostring(err):find("EPUB 完整性验证失败",1,true)~=nil
         local wait_seconds=tonumber(result and result.wait_seconds) or tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
@@ -20175,15 +20255,37 @@ function Plugin:_finish_download_runtime(runtime,result)
             current=runtime.last_state and runtime.last_state.current,total=runtime.last_state and runtime.last_state.total,
             percent=runtime.last_state and runtime.last_state.percent,seen=false,
             auth_required=auth_required or nil,
-            error_kind=auth_required and "authentication" or (rate_limited and "rate_limit"
-                or (network_failed and "network" or (image_missing and "image_missing"
-                or (coordinate_pending and "coordinate_pending" or (content_pending and "content_pending" or (validation_failed and "validation" or nil)))))),
+            error_kind=coordinate_pending and "coordinate_pending" or (auth_required and "authentication"
+                or (rate_limited and "rate_limit" or (network_failed and "network"
+                or (image_missing and "image_missing" or (content_pending and "content_pending"
+                or (validation_failed and "validation" or nil)))))),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
+        local coordinate_retry_status=nil
+        if coordinate_pending then
+            local auth=self.store:auth() or {}
+            local Retry=require("miuread.download_coordinate_retry")
+            local row,queue_err=Retry.record(self.store,b,opt,
+                (auth.account or {}).vid,auth.login_session_id,err,os.time())
+            coordinate_retry_status=row and row.status or "manual_required"
+            if row and row.status=="pending" then
+                logger.info("[MiuRead][CoordinateRetry] retained for automatic retry",
+                    "book=",tostring(b.bookId),"attempt=",tostring(row.attempt),
+                    "next_at=",tostring(row.next_at))
+                self:_schedule_coordinate_retry("coordinate_incomplete")
+            elseif row then
+                logger.warn("[MiuRead][CoordinateRetry] source mismatch requires attention",
+                    "book=",tostring(b.bookId),"attempt=",tostring(row.attempt))
+            else
+                logger.warn("[MiuRead][CoordinateRetry] cannot persist automatic retry",
+                    "book=",tostring(b.bookId),"error=",tostring(queue_err))
+            end
+        end
         self:_update_open_shelf_download_status(b.bookId,
             auth_required and "等待登录恢复" or (rate_limited and "请求受限 · 稍后继续"
                 or (network_failed and "等待网络 · 可继续"
-                or (image_missing and "正文图片待修复 · 断点已保留" or (coordinate_pending and "Web 定位待补全 · 断点已保留" or "生成未完成")))))
+                or (image_missing and "正文图片待修复 · 断点已保留" or (coordinate_pending and (coordinate_retry_status=="pending" and "Web 定位待补全 · 将自动续补"
+                    or "Web 定位待补全 · 需要手动处理") or "生成未完成")))))
         self:_notify_home_data_changed("content")
         local first
         if auth_required then
@@ -20196,7 +20298,9 @@ function Plugin:_finish_download_runtime(runtime,result)
         elseif image_missing then
             first="书籍正文图片仍有缺失。已完成章节和下载断点均已保留，可在“修复书籍”中只补缺失内容；原文件没有被覆盖。"
         elseif coordinate_pending then
-            first="书籍正文已下载，但尚有章节的 Web 定位未能验证；原书和下载断点已保留。请检查登录及网络，重新选择生成／更新书籍继续补全。"
+            first=coordinate_retry_status=="pending"
+                and "正文已下载，Web 定位尚未全部验证。原书和断点已保留；插件运行且设备联网空闲时将自动续补。"
+                or "正文已下载，但 Web 定位连续验证失败或无法登记自动任务。原书与断点已保留，需手动重试或检查章节版本。"
         elseif content_pending then
             first="生成未完成，原文件和下载进度已保留。请稍后使用“生成／更新书籍”重试。"
         elseif validation_failed then
@@ -20211,22 +20315,30 @@ function Plugin:_finish_download_runtime(runtime,result)
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
                 or (image_missing and "已完成内容和断点已保留，可用修复书籍继续"
-                or (coordinate_pending and "Web 定位待补全，原书与下载断点已保留"
+                or (coordinate_pending and (coordinate_retry_status=="pending" and "Web 定位待补全，将按条件自动续补"
+                    or "Web 定位无法自动补全，需要手动处理")
                 or (content_pending and "生成未完成，原文件和进度已保留"
                 or (tostring(b.title or "未命名").."下载未完成，进度已保留"))))))
             local translation_notice=opt.generate_translation_uid and require("miuread.translation_generation").friendly_error(err)
             if translation_notice then toast_title="外文翻译"; toast_text=translation_notice end
             self:status_toast(toast_title,toast_text,5)
         else self:info(first) end
-        -- Any failed book pauses the single waiting task. The user decides whether
-        -- to retry the current book or skip it, avoiding repeated requests after an
-        -- account, network, validation or content problem.
-        if #self.store:download_queue()>0 then
+        -- Only coordinate-pending failures have durable, low-priority auto
+        -- recovery. Let newer user-queued jobs proceed ahead of them.
+        if coordinate_pending then
+            if #self.store:download_queue()>0 then
+                UIManager:scheduleIn(.8,function() self:_start_next_queued_download() end)
+            end
+        elseif #self.store:download_queue()>0 then
             self:status_toast("下载队列","等待任务已暂停，请先处理当前失败任务",5)
         end
         return
     end
     self:_mark_auth_channel_ok("download")
+    do
+        local Retry=require("miuread.download_coordinate_retry")
+        Retry.remove(self.store,Retry.key(b,opt))
+    end
     local rec=self:_merge_download_result(result,b,opt)
     if opt.annotations==true then
         if rec.annotation_pending==true then
@@ -20326,6 +20438,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         self:_show_download_complete(rec,opt,b)
     end
     self:_start_next_queued_download()
+    self:_schedule_coordinate_retry("download_finished")
 end
 function Plugin:_recover_download_state()
     local state=self.store:download_state()
@@ -21170,7 +21283,8 @@ function Plugin:_start_next_queued_download()
         return false
     end
     local state=self.store:download_state()
-    if state.status=="active" or state.status=="prefetch" or state.status=="failed" or state.status=="interrupted" then
+    if state.status=="active" or state.status=="prefetch" or state.status=="interrupted"
+        or (state.status=="failed" and state.error_kind~="coordinate_pending") then
         return false
     end
     if not self:logged_in() or self:_network_radio_hint()==false then return false end
@@ -21399,6 +21513,13 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
             self:info("无法启动下载任务：\n"..tostring(err))
         end
         return false
+    end
+    -- A manual download supersedes the same old automatic retry ONLY after
+    -- a real worker is accepted; canceled/offline/low-memory attempts do not
+    -- silently discard durable pending coordinate work.
+    if not is_prefetch and opt._coordinate_auto_retry~=true then
+        local Retry=require("miuread.download_coordinate_retry")
+        Retry.remove(self.store,Retry.key(b,opt))
     end
     -- Only an accepted fork clears retry backoff. A failed admission keeps
     -- its prior attempts so intermittent pressure cannot create a hot loop.
@@ -33486,6 +33607,7 @@ function Plugin:onResume()
         logger.info("[MiuRead][Power] resume stable",
             "state=",normal.state,"generation=",tostring(normal.generation))
         self:_pump_finished_status(true)
+        self:_schedule_coordinate_retry("device_resumed")
         -- UI timers may have stopped during physical suspend. Re-evaluate a
         -- durable memory-wait queue now that the device is fully resumed.
         local waiting=self.store:download_queue()[1]

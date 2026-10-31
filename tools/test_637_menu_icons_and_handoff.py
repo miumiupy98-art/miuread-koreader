@@ -5,8 +5,8 @@ ROOT=Path(__file__).resolve().parents[1]
 def read(path):return (ROOT/path).read_text(encoding='utf-8')
 class MenuAndHandoff(unittest.TestCase):
     def test_version_and_mode_migration(self):
-        self.assertIn('VERSION = "6.5.0-beta.10"',read('miuread.koplugin/miuread/config.lua'))
-        self.assertIn('version = "6.5.0-beta.10"',read('miuread.koplugin/_meta.lua'))
+        self.assertIn('VERSION = "6.5.0-beta.11"',read('miuread.koplugin/miuread/config.lua'))
+        self.assertIn('version = "6.5.0-beta.11"',read('miuread.koplugin/_meta.lua'))
         self.assertIn('time_eink_only=false,time_route_mode="legacy"',read('miuread.koplugin/miuread/store.lua'))
     def test_time_settings_entry_and_toggle_are_distinct(self):
         main=read('miuread.koplugin/main.lua')

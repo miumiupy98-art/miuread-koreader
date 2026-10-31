@@ -15,8 +15,8 @@ class Beta10Contract(unittest.TestCase):
             self.assertEqual(hashlib.sha256(block.encode()).hexdigest(),expected,name)
     def test_download_gate_before_epub_install(self):
         source=read('miuread.koplugin/miuread/downloader.lua')
-        self.assertIn('Gate.prepare({',source)
-        self.assertLess(source.index('Gate.prepare({'),source.index('local record = self:_save(book, chapters',source.index('Gate.prepare({')))
+        self.assertTrue('Gate.prepare({' in source or 'pcall(Gate.prepare,{' in source)
+        self.assertLess(source.index('pcall(Gate.prepare,{' if 'pcall(Gate.prepare,{' in source else 'Gate.prepare({'),source.index('local record = self:_save(book, chapters',source.index('pcall(Gate.prepare,{' if 'pcall(Gate.prepare,{' in source else 'Gate.prepare({')))
         self.assertIn('not ready or ready.complete~=true or ready.verified~=ready.expected',source)
         self.assertIn('[MiuReadWebCoordinatePending]',source)
         self.assertIn('source_verification_anchors',read('miuread.koplugin/miuread/download_source_gate.lua'))

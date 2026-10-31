@@ -15,3 +15,6 @@
 | Existing build workflows | Uploaded beta.9 | Preserved; version updated |
 
 **Not guaranteed**: Full feature parity with all historic 6.5 branches. Only identified and explicitly listed features were ported. The beta.9 base itself already omitted some earlier upgrades.
+
+## beta.11 incremental change
+- Durable Web coordinate retry (new). All beta.10 source gate, beta.9 time-worker ownership and progress code retained.

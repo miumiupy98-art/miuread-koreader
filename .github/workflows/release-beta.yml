@@ -114,6 +114,7 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_650_beta8_progress_rebuild.py'
           python3 -m unittest discover -s tools -p 'test_650_beta9_readtime_contract.py'
           python3 -m unittest discover -s tools -p 'test_650_beta10_contract.py'
+          python3 -m unittest discover -s tools -p 'test_650_beta11_contract.py'
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
@@ -409,6 +410,8 @@ jobs:
           luajit tools/test_637_handoff.lua
           lua5.1 tools/test_650_beta9_readtime_ownership.lua
           luajit tools/test_650_beta9_readtime_ownership.lua
+          lua5.1 tools/test_650_beta11_coordinate_retry.lua
+          luajit tools/test_650_beta11_coordinate_retry.lua
           lua5.1 tools/test_650_beta10_coordinate_gate.lua
           luajit tools/test_650_beta10_coordinate_gate.lua
           lua5.1 tools/test_650_beta10_source_map.lua

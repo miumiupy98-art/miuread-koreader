@@ -2596,11 +2596,19 @@ function Downloader:_book_once(input, opt, progress)
     -- before every actual readable chapter has a verified Web coordinate source.
     -- Work remains inside this existing download transaction (not post-install).
     local Gate=require("miuread.download_source_gate")
-    local ready,gate_error,partial=Gate.prepare({
+    local gate_ok,ready,gate_error,partial=pcall(Gate.prepare,{
         reader=self.reader,book=book,chapters=chapters,cache=cache,format=format,
         progress=progress,checkpoint=respect_reader_priority,
         save_checkpoint=function() cache_save(cache) end,
     })
+    if not gate_ok then
+        local original=tostring(ready or "unknown")
+        if Http.is_rate_limit_error(original) or Http.is_auth_error(original)
+            or Http.is_network_error(original) then
+            error("正文已下载，Web 定位网络请求尚未成功 [MiuReadWebCoordinatePending] "..original,0)
+        end
+        error(original,0)
+    end
     if not ready or ready.complete~=true or ready.verified~=ready.expected then
         opt.progress_source_complete=false
         opt.progress_source_chapter_count=tonumber(partial and partial.expected) or 0

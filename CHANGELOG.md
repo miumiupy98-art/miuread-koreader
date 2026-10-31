@@ -1,3 +1,10 @@
+## 6.5.0-beta.11
+
+- Automatic background continuation after failed Web coordinate validation during new-book download; persistent checkpoint retry with exponential backoff.
+- Prevent retry while reading, offline, asleep or when user download tasks are queued.
+- Only verified coordinates permit final EPUB installation. Preserve beta.9 reading time fixes and beta.10 progress behavior.
+- Deterministic Web/local content mismatches receive bounded retry and remain visible for manual attention.
+
 ## 6.5.0-beta.10 - Verified Web position before EPUB installation
 
 - Continue directly from the user-provided 6.5.0-beta.9 source. Keep the reading-time worker ownership, close/suspend handoff and progress upload/readback implementations.
