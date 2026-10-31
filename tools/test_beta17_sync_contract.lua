@@ -16,13 +16,32 @@ local sync=read("miuread.koplugin/miuread/sync.lua")
 local service=read("miuread.koplugin/miuread/read_report_service.lua")
 assert(config:match('VERSION%s*=%s*"%d+%.%d+%.%d+%-beta%.%d+"'),"beta release metadata")
 
--- The user has made Kindle the authoritative position on each safe upload.
+-- The 6.1.0-beta.17 Kindle-first policy is retired.  Keep this legacy
+-- contract file runnable, but assert the CURRENT safe Web-preflight replay
+-- behavior rather than force_write / bypassing a newer cloud position.
 local replay=fragment(main,"function Plugin:_submit_saved_pending_progress","function Plugin:_submit_all_saved_pending_progress")
-assert(replay:find("force_write=true",1,true),"local submission not authoritative")
-assert(replay:find("_progress_snapshot_current(book_id,position)",1,true),"stale local snapshot not rejected")
-assert(not replay:find("self.sync:remote(book_id",1,true),"remote freshness still blocks Kindle")
-assert(main:find("kindle_coordinate_authoritative",1,true),"cloud fence not bypassed for native Kindle")
-assert(main:find("_verify_progress_submission",1,true),"cloud readback verification missing")
+assert(replay:find("_progress_snapshot_current(book_id,position)",1,true),
+    "stale pending progress can be replayed")
+assert(replay:find("self.sync:remote(book_id,on_remote",1,true),
+    "pending replay no longer consults the remote position")
+assert(replay:find("web_only=true,verify_only=true,raw_coordinate=true,update_cloud_anchor=false",1,true),
+    "pending replay must use read-only Web coordinate preflight")
+assert(replay:find("PR.same_position(remote,position)",1,true),
+    "same exact cloud position is no longer detected")
+assert(replay:find('done(true,"already_verified",remote)',1,true),
+    "identical exact remote position must be verified without a second POST")
+assert(replay:find("PR.trusted_verified_anchor(session,session.position_state)",1,true),
+    "trusted verified anchor is not checked")
+assert(replay:find("if not anchor or not PR.same_position(remote,anchor) then",1,true),
+    "changed or untrusted cloud position may be overwritten")
+assert(replay:find('parked(anchor and "cloud_changed_since_anchor" or "verified_anchor_missing",remote)',1,true),
+    "cloud change must park, not force-send pending progress")
+assert(not replay:find("force_write=true",1,true),
+    "retired Kindle-first force_write reintroduced into automatic replay")
+assert(replay:find("_submit_progress_snapshot(book_id,position",1,true),
+    "safe replay no longer submits the verified current pending position")
+assert(main:find("_verify_progress_submission",1,true),
+    "cloud readback verification missing")
 
 -- 6.2: time and progress use separate position authorities.
 local compat=fragment(worker,"if reading_time_compat then","local accepted, result")
@@ -49,4 +68,4 @@ local store=read("miuread.koplugin/miuread/store.lua")
 assert(store:find("pending_unresolved_position",1,true),"pending position persistence removed")
 assert(main:find('text="以云端为准"',1,true),"manual remote resolution lost")
 assert(main:find('text="以本机为准"',1,true),"manual Kindle resolution lost")
-print("beta17 Kindle-authoritative progress / time separation contracts: PASS")
+print("current safe Web-preflight replay / historical time separation contracts: PASS")

@@ -61,8 +61,10 @@ class Beta17Contracts(unittest.TestCase):
         self.assertIn('ignored malformed/extra entries',parser)
         self.assertIn('status.status=="cached" or status.status=="empty"',main)
         self.assertIn('function Plugin:_comment_fetch_mode_menu(',main)
-        self.assertIn('self:_fetch_current_chapter_comments(false,back_callback)',main)
-        self.assertIn('self:_fetch_current_chapter_comments(true,back_callback)',main)
+        # beta.12 merged download/update into one entry; the current menu
+        # passes a mode flag instead of separate force=false/true branches.
+        self.assertIn('function Plugin:_fetch_current_chapter_comments(force,return_to_comments)',main)
+        self.assertIn('return self:_fetch_current_chapter_comments(complete,back_callback)',main)
 
     def test_other_ux_regressions(self):
         self.assertIn('label:find("插件状态",1,true)',src('miuread/extension_center.lua'))
