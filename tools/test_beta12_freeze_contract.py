@@ -4,7 +4,13 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 FROZEN=json.loads((ROOT/'tools/BETA11_FROZEN_HASHES.json').read_text())
 MAIN=(ROOT/'miuread.koplugin/main.lua').read_text()
+# beta.14 explicitly changes the download-only Web source gate; do not
+# misclassify that intentional change as a reading-progress/time regression.
+CHANGED_DOWNLOAD_ONLY={'miuread.koplugin/miuread/download_source_gate.lua'}
 for name,digest in FROZEN.items():
+    if name in CHANGED_DOWNLOAD_ONLY:
+        assert (ROOT/name).is_file(), name
+        continue
     if name.startswith('miuread.koplugin/'):
         blob=(ROOT/name).read_bytes()
     else:

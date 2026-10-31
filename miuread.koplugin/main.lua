@@ -20956,6 +20956,22 @@ function Plugin:_merge_download_result(result,book,opt)
         directory=opt.prefetch_hidden==true and self.store:epub_root() or rec.directory,updated_at=os.time(),catalog=catalog,access=nil,
         content_type=book.content_type,
     })
+    if rec.post_install_web_status=="complete" or rec.post_install_web_status=="needs_attention" then
+        local auth=self.store:auth() or {}
+        local snapshot=type(result.auth_snapshot)=="table" and result.auth_snapshot or {}
+        local vid=tostring(((auth.account or {}).vid) or "")
+        local session_id=tostring(auth.login_session_id or "")
+        -- Source-verification UI records must stay with the download's
+        -- original account. A logout/login during the worker run may not
+        -- attach old Web source data to the new account's task list.
+        if vid~="" and session_id~="" and tostring(snapshot.vid or "")==vid
+            and tostring(snapshot.login_session_id or "")==session_id then
+            require("miuread.legacy_coordinate_backfill").import_post_install(
+                self.store,rec,vid,session_id)
+        else
+            logger.warn("[MiuRead][PostInstallWeb] result task import skipped: account changed")
+        end
+    end
     if type(self.store.clear_book_access)=="function" then self.store:clear_book_access(book.bookId) end
     self.access:unlock_book(book.bookId)
 
@@ -20973,7 +20989,18 @@ function Plugin:_show_download_complete(rec,opt,book)
         {{text="立即阅读",callback=function() UIManager:close(dialog); self:open_file(rec.file) end}},
     }
     buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
-    dialog=ButtonDialog:new{title=self:_download_summary(rec,opt),title_align="center",buttons=buttons}
+    local summary=self:_download_summary(rec,opt)
+    if rec.post_install_web_status=="complete" then
+        summary=summary.."\nWeb 原文已缓存："..tostring(rec.post_install_web_cached or rec.post_install_web_verified or 0)
+            .."/"..tostring(rec.post_install_web_total or 0).." 章"
+            .."\nEPUB 正文对应已验证："..tostring(rec.post_install_web_verified or 0)
+            .." 章；精确 co 仍以阅读时检验为准"
+    elseif rec.post_install_web_status=="needs_attention" then
+        summary=summary.."\nEPUB 已安装，可阅读。Web 原文部分未缓存（"
+            ..tostring(rec.post_install_web_cached or rec.post_install_web_verified or 0).."/"
+            ..tostring(rec.post_install_web_total or 0).." 章），请到下载管理查看。"
+    end
+    dialog=ButtonDialog:new{title=summary,title_align="center",buttons=buttons}
     UIManager:show(dialog)
 end
 function Plugin:show_download_status()
@@ -23448,6 +23475,71 @@ function Plugin:show_download_cleanup_dialog()
     UIManager:show(dialog)
 end
 
+-- beta.14: view persisted legacy Web-coordinate jobs without waking network
+-- workers, entering reading mode or touching progress/readtime state.
+function Plugin:show_web_coordinate_jobs(back_callback)
+    local Legacy=require("miuread.legacy_coordinate_backfill")
+    local auth=self.store:auth() or {}
+    local vid=tostring(((auth.account or {}).vid) or "")
+    local session=tostring(auth.login_session_id or "")
+    local jobs=Legacy.progress_rows(self.store,vid~="" and vid or nil,
+        session~="" and session or nil)
+    local status_labels={pending="等待 / 补全中",paused="已暂停",complete="已完成",
+        needs_attention="需要处理",cancelled="已取消"}
+    local items={}
+    items[#items+1]={text="刷新进度",callback=function()
+        self:show_web_coordinate_jobs(back_callback)
+    end}
+    for _,job in ipairs(jobs) do
+        local title=tostring(job.title or job.book_id or "未知书籍")
+        local status=status_labels[job.status] or tostring(job.status)
+        local progress=job.total>0 and (tostring(job.cached).." 已缓存 / "..
+            tostring(math.max(job.verified,job.total-job.skipped)).." 预计正文") or "尚未扫描章节"
+        local sub=status.." · "..progress
+        items[#items+1]={text=title,post_text=sub,callback=function()
+            local info={"状态："..status,
+                "Web 原文已缓存："..tostring(job.cached),
+                "EPUB 正文对应已验证："..tostring(job.verified),
+                "尚不能证明正文对应："..tostring(job.unmapped or 0),
+                "当前 EPUB 章节总数："..tostring(job.total),
+                "已跳过结构章节："..tostring(job.skipped),
+                "下一章节序号："..tostring(job.next_index)}
+            if job.chapter_uid and job.chapter_uid~="" then
+                info[#info+1]="上次章节 UID："..tostring(job.chapter_uid)
+            end
+            if job.mapping_error and job.mapping_error~="" then
+                info[#info+1]="最近一次正文不匹配："..tostring(job.mapping_error)
+            end
+            if job.error and job.error~="" then info[#info+1]="获取失败原因："..tostring(job.error) end
+            local actions={
+                {text="查看详细进度",callback=function() self:info(table.concat(info,"\n")) end},
+                {text="重新获取 / 继续",callback=function()
+                    self:_legacy_coordinate_request(job.book_id,job.file)
+                end},
+            }
+            if job.status=="pending" then
+                actions[#actions+1]={text="暂停该书任务",callback=function()
+                    Legacy.set_status(self.store,job.book_id,"paused")
+                    self:_legacy_coordinate_pause("progress panel pause")
+                    self:toast("已暂停 Web 定位补全",2)
+                end}
+            end
+            if job.status~="complete" and job.status~="cancelled" then
+                actions[#actions+1]={text="取消该书任务",callback=function()
+                    Legacy.set_status(self.store,job.book_id,"cancel")
+                    self:_legacy_coordinate_pause("progress panel cancel")
+                    self:toast("已取消该书后台补全；EPUB 未修改",2)
+                end}
+            end
+            return self:_show_standalone_menu("Web 定位 · "..title,actions)
+        end}
+    end
+    if #jobs==0 then items[#items+1]={text="暂无旧书 Web 定位任务",enabled=false} end
+    items[#items+1]={text="提示：来源已缓存不代表当前阅读坐标可上传",enabled=false}
+    return self:_show_miuread_menu("Web 定位补全",items,
+        {on_back=back_callback or function() self:show_downloads() end,page_size=7})
+end
+
 function Plugin:show_downloads(back_callback)
     self:_reconcile_download_state("open_downloads")
     if type(back_callback)=="function" then
@@ -23508,6 +23600,9 @@ function Plugin:show_downloads(back_callback)
         if self:_has_download_status() then items[#items+1]={text=self:_download_status_label(),callback=function() self:show_download_status() end} end
         local queue=self.store:download_queue()
         items[#items+1]={text="等待下载",post_text=tostring(#queue).." 项",callback=function() self:show_waiting_downloads() end}
+        local legacy_summary=require("miuread.legacy_coordinate_backfill").summary(self.store)
+        items[#items+1]={text="Web 定位补全",post_text=tostring(legacy_summary.pending).." 项待处理",
+            callback=function() self:show_web_coordinate_jobs(function() self:show_downloads(back_callback) end) end}
         items[#items+1]={text="下载设置",sub_item_table_func=function() return self:download_settings_menu() end}
     end
 

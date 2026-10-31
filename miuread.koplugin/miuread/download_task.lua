@@ -1316,7 +1316,7 @@ function DownloadTask:_finish(job, forced_error)
             elseif diagnostic:find("child_fatal",1,true) then
                 result = {ok = false, error = "下载进程发生内部异常，诊断信息已保留。已完成的章节断点不会丢失。"}
             elseif stage == "coordinate" then
-                result = {ok = false, error = "Web 定位补全任务被中断；已下载正文与断点保留，重新运行只补缺失的章节。"}
+                result = {ok = false, error = "EPUB 如已安装则不会被撤销；Web 定位阶段被中断，可从保存的章节继续。"}
             elseif stage == "package" then
                 result = {ok = false, error = "EPUB 生成进程被中断；原有完整书未被覆盖，已下载章节仍保存在断点缓存。请再次下载继续。"}
             elseif stage == "done" then
@@ -2503,12 +2503,11 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                     local percent
                     if stage == "package" then
                         local package_fraction=math.max(0,math.min(1,tonumber(detail.package_fraction) or 0))
-                        percent = 0.96 + 0.03 * package_fraction
+                        percent = 0.85 + 0.09 * package_fraction
                     elseif stage == "coordinate" then
-                        -- Body download is not the end of the task. Never display
-                        -- 100% before every chapter Web source is verified and
-                        -- the EPUB has actually been installed.
-                        percent = 0.94 + 0.02 * math.max(0,math.min(1,
+                        -- beta.15: EPUB already installed; the same task is
+                        -- continuing its independently fallible Web pass.
+                        percent = 0.94 + 0.05 * math.max(0,math.min(1,
                             (tonumber(current) or 0)/math.max(1,tonumber(total) or 1)))
                     elseif total and total > 0 then
                         local base = (math.max(1, current) - 1) / total
@@ -2519,7 +2518,7 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                         elseif stage == "thoughts" then step = 0.55
                         elseif stage == "footnotes" then step = 0.75
                         elseif stage == "images" then step = 0.88 end
-                        percent = math.min(0.94, base * 0.94 + step / total)
+                        percent = math.min(0.85, base * 0.85 + step / total)
                     end
                     if stage == "package" then
                         detail.message = detail.message or "正在低内存生成并验证 EPUB"
@@ -2576,6 +2575,9 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                 local recovery_ok,recovery_error=write_json(recovery_path,payload,"recovery")
                 emit{stage = "done", current = 1, total = 1, percent = 1,
                     chapter = clean_book.title or "",
+                    message = value and value.record and
+                        (value.record.post_install_web_status=="complete" and "EPUB 已安装，Web 原文缓存完成"
+                        or "EPUB 已安装；Web 定位尚未全部通过，可继续处理") or nil,
                     recovery_result = {ok=true,value=payload.value},
                     recovery_saved = recovery_ok==true, recovery_error = recovery_ok and nil or tostring(recovery_error)}
             else
