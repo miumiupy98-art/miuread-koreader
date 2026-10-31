@@ -104,7 +104,14 @@ local function fetch_google(http, book)
     end
     local url = "https://www.googleapis.com/books/v1/volumes?q=" .. url_encode(query)
         .. "&maxResults=5&printType=books"
-    local data = http:get_json(url, {auth = false, retries = 1, timeout = {8, 15}, pacing = false})
+    -- Independent third-party budget. A Google 429 must never poison WeRead's
+    -- global cooldown or its progress upload/readback path. Fail fast on the
+    -- provider's own cooldown rather than occupying the shared HTTP worker.
+    local data = http:get_json(url, {
+        auth = false, retries = 1, timeout = {8, 15}, pacing = false,
+        rate_limit_scope = "metadata-google", rate_limit_retries = 0,
+        rate_limit_fail_fast = true,
+    })
     local best, best_score
     for _, item in ipairs(type(data) == "table" and data.items or {}) do
         local info = type(item) == "table" and item.volumeInfo or nil
@@ -153,6 +160,8 @@ local function fetch_openlibrary(http, book)
     if not isbn then return nil end
     local edition = http:get_json("https://openlibrary.org/isbn/" .. url_encode(isbn) .. ".json", {
         auth = false, retries = 1, timeout = {8, 15}, pacing = false,
+        rate_limit_scope = "metadata-openlibrary", rate_limit_retries = 0,
+        rate_limit_fail_fast = true,
     })
     local patch = openlibrary_patch(edition)
     local work_key = type(edition) == "table" and type(edition.works) == "table"
@@ -160,6 +169,8 @@ local function fetch_openlibrary(http, book)
     if work_key and (not patch or not patch.description or not patch.category) then
         local work = http:get_json("https://openlibrary.org" .. tostring(work_key) .. ".json", {
             auth = false, retries = 1, timeout = {8, 15}, pacing = false,
+            rate_limit_scope = "metadata-openlibrary", rate_limit_retries = 0,
+            rate_limit_fail_fast = true,
         })
         patch = merge_patch(patch, openlibrary_patch(work))
     end

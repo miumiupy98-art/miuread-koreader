@@ -1,3 +1,10 @@
+## 6.5.0-beta.17 - 2026-11-01
+
+- 将 Google Books、Open Library 的图书元数据 HTTP 429 冷却分别隔离到 `metadata-google`、`metadata-openlibrary` 作用域，避免写入微信读书沿用的 `global` 限流文件。
+- 图书元数据请求遇到自身 429 立即停止并尝试另一来源（可用时），不在元数据任务中持续等待 300 秒；原有网络补全开关保持可用。
+- 只修改 `network_metadata.lua` 和版本标识，保留 beta.16 的 EPUB 下载/即时 Web 补全、阅读进度/时间 Worker、云端保护及 beta.5 发布工作流。
+- 已存在的旧版 `weread-rate-limit.json` 仍须自行到期；不会绕过真实的微信读书 429。
+
 ## 6.5.0-beta.16 - 2026-11-01
 
 - 恢复 Web 原文获取与 EPUB 文本严格匹配的独立判断：EPUB 安装后同一任务立即逐章获取 Web 原文，正文过短、重复或不一致不会阻止可信 Web 原文缓存。
