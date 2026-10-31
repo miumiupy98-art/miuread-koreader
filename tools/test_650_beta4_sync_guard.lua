@@ -23,5 +23,6 @@ assert(Event.next_sequence({local_position_event_seq=1,progress_write_guard={blo
     "reading event regressed behind durable fence")
 assert(Event.next_sequence({local_position_event_seq=2,position_state={local_position={local_position_event_seq=8}}})==9,
     "reading event regressed behind saved position")
-assert(sync:find('self:_defer_session_flush(1.0)',1,true),"human reading event needs deferred durability")
+assert(sync:find("record_user_position_event(book_id)",1,true),"real page event must persist across instances")
+assert(store:find("function Store:record_user_position_event(id)",1,true),"durable event method missing")
 print("PASS beta4: exact-snapshot fence, genuine-event sequence, job replacement")

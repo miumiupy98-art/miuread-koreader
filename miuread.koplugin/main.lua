@@ -26827,22 +26827,25 @@ function Plugin:_remote_matches(remote,target,web_post_verification)
         or target_position.chapter_offset or target_position.offset)
     local chapter_words=target_position and tonumber(target_position.chapter_word_count) or 0
     local target_basis=target_position and tostring(target_position.offset_basis or target_position.position_basis or "") or ""
-    -- Native Web Reader co is a raw-XHTML UTF-16 coordinate. The service may
-    -- normalize by a few code units around tag/text boundaries, so keep a tiny
-    -- native tolerance while never accepting the large false mismatches that
-    -- beta.5 created by clamping co to chapter wordCount.
-    -- beta.25: chapter_uid + co are authoritative whenever both sides expose
-    -- them. Percent is navigation/fallback metadata only and may never override
-    -- a real coordinate mismatch. Keep only a tiny technical tolerance for
-    -- Web Reader boundary normalization.
-    local co_tolerance=(target_basis=="wr_data_co" or (target_position and target_position.native_offset==true))
-        and 16 or 12
+    -- Web Reader's raw-XHTML UTF-16 co may shift near text/tag boundaries.
+    -- The beta.5 product decision is a pragmatic 100-unit tolerance for
+    -- trusted same-chapter Web coordinates, NOT a claim of identical pages.
+    -- Non-Web/unverified coordinates retain the prior 12-unit tolerance.
+    local target_web=(target_basis=="wr_data_co" or (target_position and target_position.native_offset==true))
 
     local function match(candidate)
         if not candidate then return false,nil,nil end
         local percent=tonumber(candidate.percent)
         local candidate_uid=tostring(candidate.chapter_uid or candidate.chapterUid or "")
         local candidate_co=tonumber(candidate.canonical_offset or candidate.offset or candidate.chapter_offset)
+        local candidate_basis=tostring(candidate.position_basis or candidate.offset_basis or "")
+        local candidate_web=tostring(candidate.source or "")=="web_cookie"
+            or candidate_basis=="wr_data_co"
+        local co_tolerance=(target_web and candidate_web) and 100 or 12
+        -- A zero from an unresolved Web readback is not a proven chapter start.
+        if candidate_co==0 and candidate_basis:find("unresolved",1,true) then
+            return false,percent,candidate.source,{reason="remote_coordinate_unresolved",basis=candidate_basis}
+        end
         if target_uid~="" and target_co~=nil and (candidate_uid=="" or candidate_co==nil) then
             return false,percent,candidate.source,{reason="remote_coordinate_missing",basis=target_basis}
         end
@@ -26888,6 +26891,11 @@ function Plugin:_prepare_progress_snapshot(book_id,position,persist_sequence)
     local snapshot=U.copy(position)
     snapshot=self:_normalize_exact_progress_snapshot(snapshot)
     snapshot.captured_at=tonumber(snapshot.captured_at) or os.time()
+    -- The event ID must belong to THIS position snapshot; do not copy the
+    -- current session's event into an old pending verification/replay.
+    if snapshot.local_position_event_seq~=nil then
+        snapshot.local_position_event_seq=tonumber(snapshot.local_position_event_seq)
+    end
     local current_epoch=math.max(1,tonumber(session.progress_epoch or 1) or 1)
     snapshot.progress_epoch=tonumber(snapshot.progress_epoch or position.progress_epoch) or current_epoch
     position.progress_epoch=snapshot.progress_epoch
@@ -26987,8 +26995,16 @@ function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
         return false
     end
     snapshot.pending_reason=tostring(reason or "unconfirmed")
+    -- Only a newly captured reader position may inherit the current book's
+    -- genuine-event counter. An older unsent/submitted retry must keep its
+    -- own event identity; borrowing a later counter could bypass a cloud fence.
     snapshot.local_position_event_seq=tonumber(position.local_position_event_seq)
-        or tonumber(session.local_position_event_seq or 0) or 0
+        or tonumber(snapshot.local_position_event_seq)
+        or (tostring(reason or "")=="final_position_captured"
+            and tonumber(session.local_position_event_seq or 0) or nil)
+    if snapshot.local_position_event_seq~=nil then
+        position.local_position_event_seq=snapshot.local_position_event_seq
+    end
     local pre_send={
         upload_queued=true,manual_upload_queued=true,background_upload_queued=true,
         manual_resubmit_queued=true,retry_upload_queued=true,progress_worker_busy=true,
@@ -27023,7 +27039,7 @@ function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
         "co=",tostring(snapshot.canonical_offset or snapshot.chapter_offset or snapshot.offset or "-"),
         "reason=",snapshot.pending_reason)
     self:_invalidate_home_sync_status()
-    return true
+    return true,snapshot
 end
 
 function Plugin:_clear_pending_progress(book_id,position_or_sequence)
@@ -27203,7 +27219,13 @@ function Plugin:_verify_progress_submission(book_id,submitted_position,options,c
             self.sync:remote(book_id,function(remote,remote_err)
                 local matched,actual,source,meta=self:_remote_matches(remote,submitted_position,true)
                 meta=type(meta)=="table" and meta or {}
-                local remote_updated=tonumber(remote and remote.updated_at or 0) or 0
+                local web_observation=remote and (remote.web or remote) or nil
+                local remote_updated=tonumber(web_observation and (web_observation.updated_at
+                    or web_observation.updated) or 0) or 0
+                if matched and (remote_updated<=0 or remote_updated+2<submitted_at) then
+                    matched=false
+                    meta.reason=remote_updated<=0 and "remote_timestamp_missing" or "stale_remote"
+                end
                 local target_co=tonumber(submitted_position.canonical_offset or submitted_position.chapter_offset or submitted_position.offset)
                 local remote_co=tonumber(remote and remote.offset)
                 if not matched and remote_updated>0 and remote_updated+2<submitted_at then
@@ -27269,9 +27291,24 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
         return false
     end
     local seq=tonumber(snapshot.progress_sequence or 0) or 0
-    if options.pending_already_saved~=true and tonumber(snapshot.local_position_event_seq)==nil then
-        local event_session=self.store:session(book_id) or {}
-        snapshot.local_position_event_seq=tonumber(event_session.local_position_event_seq or 0) or 0
+    if tonumber(snapshot.local_position_event_seq)==nil then
+        -- When finalization has already saved the immutable pending record,
+        -- restore exactly its event ID, not a later reader's event. This also
+        -- repairs pre-beta.5 snapshots saved by the older implementation.
+        local saved_session=(self:_persisted_sessions()[book_id]) or self.store:session(book_id) or {}
+        local saved=type(saved_session.pending_progress)=="table" and saved_session.pending_progress or nil
+        local same_saved=saved and tonumber(saved.progress_sequence)==tonumber(snapshot.progress_sequence)
+            and tonumber(saved.progress_epoch or 1)==tonumber(snapshot.progress_epoch or 1)
+            and tostring(saved.chapter_uid or "")==tostring(snapshot.chapter_uid or "")
+            and tonumber(saved.canonical_offset or saved.chapter_offset or saved.offset)
+                ==tonumber(snapshot.canonical_offset or snapshot.chapter_offset or snapshot.offset)
+        if same_saved then
+            snapshot.local_position_event_seq=tonumber(saved.local_position_event_seq)
+        elseif options.pending_already_saved~=true and options.reading_end~=true then
+            -- Ordinary foreground uploads are captured from the current book.
+            local event_session=self.store:session(book_id) or {}
+            snapshot.local_position_event_seq=tonumber(event_session.local_position_event_seq or 0) or 0
+        end
     end
     local blocked,block_reason=self:_progress_write_fence(book_id,snapshot)
     if not blocked and block_reason=="new_user_position_event_after_remote_observation" then
@@ -32505,10 +32542,20 @@ function Plugin:_reading_end_sync(reason,options,callback)
     -- still be stored and uploaded instead of being discarded.
     self._reading_end_background_verify_active=true
     local function handle_final_position(position,gate_already_released,source_reason)
+        -- The reader and Home may have different Store instances. Freeze the
+        -- real event watermark alongside the final local coordinate BEFORE
+        -- saving pending and passing the position to the upload fence.
+        local live_event=self.store:session(book_id) or {}
+        local durable_event=(self:_persisted_sessions()[book_id]) or {}
+        position.local_position_event_seq=math.max(
+            tonumber(position.local_position_event_seq or 0) or 0,
+            tonumber(live_event.local_position_event_seq or 0) or 0,
+            tonumber(durable_event.local_position_event_seq or 0) or 0)
         local snapshot=self:_prepare_progress_snapshot(book_id,position,false) or position
         self:_remember_passive_exact_position(book_id,snapshot,xpointer_snapshot,source_reason or "reading_end")
         self.store:save_session(book_id,{pending_unresolved_position=false},false)
-        self:_save_pending_progress(book_id,snapshot,"final_position_captured","finalizing")
+        local saved_pending,pending_snapshot=self:_save_pending_progress(book_id,snapshot,"final_position_captured","finalizing")
+        if saved_pending and type(pending_snapshot)=="table" then snapshot=pending_snapshot end
         task_states.progress=authenticated and "✓ 已保存 · 后台上传" or "✓ 已保存 · 等待网络"
         logger.info("[MiuRead][ReadingEnd] final position captured",
             "reason=",reason,"book=",book_id,"seq=",tostring(snapshot.progress_sequence or "-"),

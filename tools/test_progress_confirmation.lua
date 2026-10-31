@@ -25,7 +25,7 @@ end
 local function fixture()
     local f={now=0,timers={},sessions={},posts=0,reads=0,callbacks=0,
         auth={account={vid="account-a"},login_session_id="login-a"},
-        cloud={chapter_uid="27",offset=336,percent=0,source="web_cookie"}}
+        cloud={chapter_uid="27",offset=336,percent=0,source="web_cookie",updated_at=os.time()}}
     local ui={}
     function ui:scheduleIn(delay,fn) f.timers[#f.timers+1]={at=f.now+delay,fn=fn} end
     function f:tick()
@@ -72,7 +72,7 @@ local function fixture()
         ui:scheduleIn(.2,function()
             if not f.no_commit then
                 f.cloud={chapter_uid=position.chapter_uid,offset=position.canonical_offset,
-                    percent=position.progress,source="web_cookie"}
+                    percent=position.progress,source="web_cookie",updated_at=os.time()}
             end
             if f.unknown_response then done(false,"transport_unknown",position,{request_dispatched=true})
             else done(true,{succ=1},position,{accepted=true,request_dispatched=true}) end
@@ -167,6 +167,72 @@ test("real mismatch stays pending without replay",function()
     local f=fixture();f.no_commit=true;f:submit();f:tick()
     assert(f.ok==false and f.posts==1 and f.reads==1)
     assert(f.sessions.book.progress_upload_state=="submitted" and type(f.sessions.book.pending_progress)=="table")
+end)
+test("native Web offset 76 is an equivalent confirmed position",function()
+    local f=fixture();f.cloud.offset=724 -- submitted=800, delta=76
+    f.no_commit=true;f:submit(target(800));f:tick()
+    assert(f.ok==true and f.posts==1 and f.reads==1,tostring(f.why))
+end)
+test("native Web offset 101 must remain unconfirmed",function()
+    local f=fixture();f.cloud.offset=699 -- submitted=800, delta=101
+    f.no_commit=true;f:submit(target(800));f:tick()
+    assert(f.ok==false and f.posts==1 and f.reads==1)
+end)
+test("different chapter must never pass tolerance",function()
+    local f=fixture();f.cloud.chapter_uid="28";f.cloud.offset=800
+    f.no_commit=true;f:submit(target(800));f:tick()
+    assert(f.ok==false and f.posts==1)
+end)
+test("unresolved zero offset is not an accepted chapter start",function()
+    local f=fixture();f.cloud.offset=0;f.cloud.position_basis="wr_data_co_unresolved"
+    f.no_commit=true;f:submit(target(30));f:tick()
+    assert(f.ok==false)
+end)
+test("stale server timestamp cannot confirm otherwise matching co",function()
+    local f=fixture();f.cloud.offset=800;f.cloud.updated_at=os.time()-600
+    f.no_commit=true;f:submit(target(800));f:tick()
+    assert(f.ok==false and f.posts==1)
+end)
+test("pending-saved final position uses the same real page event for fence",function()
+    local f=fixture()
+    f.store:save_session("book",{local_position_event_seq=30,
+        progress_write_guard={reason="remote_exact_unresolved",blocked_event_seq=29,progress_epoch=1}})
+    local position=target(800)
+    f.host:_save_pending_progress("book",position,"final_position_captured","finalizing")
+    assert(position.local_position_event_seq==30,"save_pending did not propagate event to final snapshot")
+    f:submit(position,{pending_already_saved=true,verify_delays={.2}})
+    f:tick()
+    assert(f.posts==1 and f.ok==true,tostring(f.why))
+end)
+test("trusted resolved chapter-start zero can be confirmed",function()
+    local f=fixture();f.cloud.offset=0;f.cloud.position_basis="wr_data_co"
+    f.no_commit=true;f:submit(target(0));f:tick()
+    assert(f.ok==true and f.posts==1 and f.reads==1,tostring(f.why))
+end)
+test("non-Web coordinates do not inherit the 100-unit allowance",function()
+    local f=fixture()
+    local bad={source="eink",chapter_uid="27",offset=724,percent=2,position_basis="eink"}
+    local ok=f.host:_remote_matches(bad,target(800),false)
+    assert(ok==false,"100-unit tolerance incorrectly applied to native EInk coordinate")
+end)
+test("old pending retry cannot borrow a later reading event",function()
+    local f=fixture()
+    f.store:save_session("book",{local_position_event_seq=30,
+        progress_write_guard={reason="remote_exact_unresolved",blocked_event_seq=29,progress_epoch=1}})
+    local older=target(800);older.local_position_event_seq=nil
+    f.host:_save_pending_progress("book",older,"retry_upload_queued","deferred")
+    -- It can retain its old event ID only if one was attached to its original
+    -- snapshot; never grant it event=30 solely from the current session.
+    assert(older.local_position_event_seq==nil,"replay borrowed a newer event")
+end)
+test("no fresh reading event must still respect a remote fence",function()
+    local f=fixture()
+    f.store:save_session("book",{local_position_event_seq=29,
+        progress_write_guard={reason="remote_exact_unresolved",blocked_event_seq=29,progress_epoch=1}})
+    local position=target(800);position.local_position_event_seq=29
+    f:submit(position,{verify_delays={.2}})
+    f:tick()
+    assert(f.posts==0 and f.ok==false,"remote fence incorrectly bypassed")
 end)
 for _,message in ipairs(failed) do io.stderr:write("FAIL: ",message,"\n") end
 assert(#failed==0,tostring(#failed).." progress confirmation regression(s) failed")

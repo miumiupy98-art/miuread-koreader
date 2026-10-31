@@ -6037,18 +6037,24 @@ function Sync:on_page(page, genuine_user_event)
         if genuine_user_event==true and type(self.current.book)=="table" then
             local book_id=tostring(self.current.book.book_id or self.current.book.bookId or "")
             if book_id~="" then
-                local session=self.store:session(book_id) or {}
-                -- Progress transactions are not reading events. Reconcile all
-                -- durable event baselines so an old snapshot or a second plugin
-                -- instance cannot reset the human page-movement sequence.
-                local Event=require("miuread.position_event")
-                local next_seq=Event.next_sequence(session)
-                self.store:save_session(book_id,{
-                    local_position_event_seq=next_seq,
-                    local_read_event_at=os.time(),
-                },false)
-                if type(self._defer_session_flush)=="function" then self:_defer_session_flush(1.0) end
-                logger.info("[MiuRead][PositionEvent] user page movement", "book=",book_id,"seq=",next_seq)
+                local next_seq,event_error
+                if type(self.store.record_user_position_event)=="function" then
+                    next_seq,event_error=self.store:record_user_position_event(book_id)
+                else
+                    -- Test/store adapters without the new durable method.
+                    local Event=require("miuread.position_event")
+                    next_seq=Event.next_sequence(self.store:session(book_id) or {})
+                    local _,saved,err=self.store:save_session(book_id,{
+                        local_position_event_seq=next_seq,local_read_event_at=os.time(),
+                    },true)
+                    if saved==false then next_seq=nil;event_error=err end
+                end
+                if next_seq then
+                    logger.info("[MiuRead][PositionEvent] user page movement", "book=",book_id,"seq=",next_seq)
+                else
+                    logger.warn("[MiuRead][PositionEvent] durable save failed", "book=",book_id,
+                        "reason=",tostring(event_error or "unknown"))
+                end
             end
         end
         if self.time_enabled==true then self:_write_daemon_control(true, false) end

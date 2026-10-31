@@ -2504,6 +2504,19 @@ function Store:save_session(id,patch,flush_now)
                 "sequence=",task_seq,"abandoned=",abandoned)
         end
     end
+    -- Never let a detached caller overwrite a newer genuine page event.
+    if incoming.local_position_event_seq~=nil then
+        local incoming_event=tonumber(incoming.local_position_event_seq or 0) or 0
+        local current_event=tonumber(current.local_position_event_seq or 0) or 0
+        if incoming_event<current_event then
+            incoming.local_position_event_seq=current_event
+            if incoming.local_read_event_at~=nil then
+                incoming.local_read_event_at=math.max(
+                    tonumber(incoming.local_read_event_at or 0) or 0,
+                    tonumber(current.local_read_event_at or 0) or 0)
+            end
+        end
+    end
     -- A background coordinate queue is a REPLACEMENT, not a deep-merge patch.
     -- Merging its indexed jobs would resurrect completed chapters and replay
     -- Web requests after a successful cache fill.
@@ -2524,6 +2537,26 @@ function Store:save_session(id,patch,flush_now)
     end
     return a[k],true
 end
+-- Genuine page events use the on-disk watermark, not only this Store's
+-- potentially stale session. Persist immediately so the independent Home and
+-- Reader instances cannot restart the event counter at 1 or reuse an ID.
+function Store:record_user_position_event(id)
+    local key=tostring(id or "")
+    if key=="" then return nil,"book_missing" end
+    local live=self:session(key) or {}
+    local disk_data=not self.isolated and self:_read_settings_file() or nil
+    local persisted=type(disk_data)=="table" and type(disk_data.sessions)=="table"
+        and disk_data.sessions[key] or {}
+    local Event=require("miuread.position_event")
+    local next_seq=math.max(Event.next_sequence(live),Event.next_sequence(persisted))
+    local _,saved,err=self:save_session(key,{
+        local_position_event_seq=next_seq,
+        local_read_event_at=os.time(),
+    },true)
+    if saved~=true then return nil,err or "event_persist_failed" end
+    return next_seq
+end
+
 function Store:invalidate_book_sync_context(id,reason,core_map_hash)
     local sessions=self:get("sessions",{})
     local key=tostring(id or "")
@@ -2751,6 +2784,7 @@ local PROGRESS_SESSION_FIELDS={
     "progress_resolution_choice","progress_resolution_fingerprint","progress_resolution_at",
     "local_display_progress","local_display_progress_at","local_display_xpointer","local_display_progress_source",
     "last_verified_exact_position","pending_unresolved_position","local_read_event_at",
+    "local_position_event_seq","progress_verified_read_event_seq","progress_write_guard",
 }
 
 -- Fields that belong to the synchronization control plane. When the on-disk
@@ -2815,6 +2849,18 @@ local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
         if type(disk_row)=="table" then
             local memory_row=type(memory_sessions[id])=="table" and memory_sessions[id] or nil
             if memory_row then
+                -- Real page-movement event IDs are independent from progress
+                -- transaction IDs: a stale Home instance must never roll back
+                -- the reader's latest event just because its progress job has
+                -- a larger sequence or timestamp.
+                local disk_event=tonumber(disk_row.local_position_event_seq or 0) or 0
+                local memory_event=tonumber(memory_row.local_position_event_seq or 0) or 0
+                if disk_event>memory_event then
+                    memory_row.local_position_event_seq=disk_event
+                    memory_row.local_read_event_at=math.max(
+                        tonumber(memory_row.local_read_event_at or 0) or 0,
+                        tonumber(disk_row.local_read_event_at or 0) or 0)
+                end
                 local disk_epoch=math.max(1,tonumber(disk_row.progress_epoch or 1) or 1)
                 local memory_epoch=math.max(1,tonumber(memory_row.progress_epoch or 1) or 1)
                 local disk_seq=progress_session_sequence(disk_row)
@@ -2841,8 +2887,17 @@ local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
                         memory_row[field]=U.copy(disk_row[field])
                     end
                 end
+                -- Both branches above can copy an older local event along with
+                -- an otherwise newer progress transaction. Restore the max.
+                if disk_event>0 or memory_event>0 then
+                    memory_row.local_position_event_seq=math.max(disk_event,memory_event)
+                    memory_row.local_read_event_at=math.max(
+                        tonumber(memory_row.local_read_event_at or 0) or 0,
+                        tonumber(disk_row.local_read_event_at or 0) or 0)
+                end
             elseif progress_session_sequence(disk_row)>0
-                or (tonumber(disk_row.progress_epoch or 1) or 1)>1 then
+                or (tonumber(disk_row.progress_epoch or 1) or 1)>1
+                or (tonumber(disk_row.local_position_event_seq or 0) or 0)>0 then
                 memory_sessions[id]=U.copy(disk_row)
             end
         end
