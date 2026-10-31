@@ -4,6 +4,7 @@
 local U=require("miuread.util")
 local Installer=require("miuread.epub_installer")
 local Source=require("miuread.source_position")
+local Provenance=require("miuread.web_source_provenance")
 local M={}
 local KEY="legacy_web_coordinate_jobs_v1"
 local MAX_JOBS=256
@@ -32,7 +33,7 @@ local function files_for_book(store,book)
         if type(v)~="table" then return end
         local path=tostring(v.file or "")
         if path:lower():match("%.epub$") and U.file_exists(path) and v.pending_install~=true then
-            local ready=v.progress_source_complete==true
+            local ready=v.progress_source_complete==true or v.post_install_web_status=="complete"
             if ready then
                 local chapters=type(v.chapter_map)=="table" and v.chapter_map or {}
                 local version=tonumber(v.progress_source_book_version or book.version or 0) or 0
@@ -96,8 +97,16 @@ function M.enqueue(store,job,vid,session,manual)
         and existing.size==job.size and existing.mtime==job.mtime
         and existing.version==job.version then
         if manual then
-            existing.status="pending";existing.next_at=0;existing.failures=0
-            existing.next_index=1;existing.error=nil
+            existing.status="pending";existing.next_at=0;existing.failures=0;existing.error=nil
+            -- For a newly downloaded beta.16 book, manual retry starts only
+            -- at chapters that actually failed Web acquisition; cached sources
+            -- must not be re-requested just to clear a failure state.
+            if type(existing.retry_indices)=="table" and #existing.retry_indices>0 then
+                existing.next_index=existing.retry_indices[1]
+            else
+                existing.next_index=1;existing.verified=0;existing.cached=0
+                existing.unmapped=0;existing.skipped=0
+            end
             return put(store,rows)==true
         end
         return existing.status=="pending" or existing.status=="complete"
@@ -114,7 +123,7 @@ function M.enqueue(store,job,vid,session,manual)
     local entry={key=job.key,book_id=job.book_id,file=job.file,variant=job.variant,
         title=job.title,version=job.version,size=job.size,mtime=job.mtime,
         vid=tostring(vid),session=tostring(session),status="pending",
-        next_at=0,next_index=1,verified=0,total=0,failures=0}
+        next_at=0,next_index=1,verified=0,skipped=0,total=0,failures=0}
     rows[#rows+1]=entry
     return put(store,rows)==true
 end
@@ -138,7 +147,7 @@ function M.seed(store,candidates,vid,session)
                 local row={key=key,book_id=job.book_id,file=job.file,variant=job.variant,
                     title=job.title,version=job.version,size=job.size,mtime=job.mtime,
                     vid=tostring(vid),session=tostring(session),status="pending",
-                    next_at=0,next_index=1,verified=0,total=0,failures=0}
+                    next_at=0,next_index=1,verified=0,skipped=0,total=0,failures=0}
                 if old_index then rows[old_index]=row else
                     rows[#rows+1]=row;by_key[key]=#rows end
                 added=added+1;changed=true
@@ -191,6 +200,79 @@ function M.next_delay(store,now,vid,session)
         end
     end
     return earliest
+end
+
+-- Read-only snapshot for the download manager; never starts work, probes the
+-- network, reads EPUB bytes, or changes scheduling while a panel is visible.
+function M.progress_rows(store,vid,session)
+    local result={}
+    for _,row in ipairs(get(store)) do
+        if (not vid or row.vid==tostring(vid)) and (not session or row.session==tostring(session)) then
+            local total=math.max(0,tonumber(row.total) or 0)
+            local verified=math.max(0,tonumber(row.verified) or 0)
+            local skipped=math.max(0,tonumber(row.skipped) or 0)
+            result[#result+1]={book_id=row.book_id,title=row.title,file=row.file,
+                status=row.status or "pending",verified=verified,
+                cached=math.max(0,tonumber(row.cached) or verified),
+                unmapped=math.max(0,tonumber(row.unmapped) or 0),
+                mapping_error=row.mapping_error,total=total,
+                skipped=skipped,next_index=tonumber(row.next_index) or 1,
+                chapter_uid=row.last_uid,error=row.error,next_at=row.next_at,
+                completed_at=row.completed_at,updated_at=row.updated_at}
+        end
+    end
+    table.sort(result,function(a,b)
+        if a.status=="complete" and b.status~="complete" then return false end
+        if b.status=="complete" and a.status~="complete" then return true end
+        return tostring(a.title or "")<tostring(b.title or "")
+    end)
+    return result
+end
+
+-- beta.15: import a finished synchronous post-install pass solely for UI and
+-- explicit manual retry. Never auto-schedule unfinished newly generated books
+-- as a hidden background task; the initial pass ran in the download worker.
+function M.import_post_install(store,record,vid,session)
+    if type(record)~="table" or (record.post_install_web_status~="complete"
+        and record.post_install_web_status~="needs_attention") then return false end
+    if tostring(vid or "")=="" or tostring(session or "")=="" then return false end
+    local path=tostring(record.file or "")
+    if not U.file_exists(path) then return false end
+    local job={book_id=tostring(record.book_id or ""),file=path,
+        variant=tostring(record.variant or "clean")}
+    job.key=identify(job)
+    if job.book_id=="" then return false end
+    local rows=get(store)
+    local row={key=job.key,book_id=job.book_id,file=path,variant=job.variant,
+        title=record.title,version=tonumber(record.progress_source_book_version) or 0,
+        size=U.file_size(path) or 0,mtime=modified(path),vid=tostring(vid),
+        session=tostring(session),status=record.post_install_web_status,
+        next_at=0,next_index=math.max(1,tonumber(record.post_install_web_next_index) or 1),
+        verified=math.max(0,tonumber(record.post_install_web_verified) or 0),
+        cached=math.max(0,tonumber(record.post_install_web_cached or record.post_install_web_verified) or 0),
+        unmapped=math.max(0,tonumber(record.post_install_web_unmapped) or 0),
+        mapping_error=record.post_install_web_mapping_error,
+        skipped=math.max(0,tonumber(record.post_install_web_skipped) or 0),
+        total=math.max(0,tonumber(record.chapter_count) or 0),
+        failures=math.max(0,tonumber(record.post_install_web_failed) or 0),
+        error=record.post_install_web_error,updated_at=os.time()}
+    if row.status=="needs_attention" and type(record.post_install_web_failed_uids)=="table" then
+        local seen={};row.retry_indices={}
+        for _,entry in ipairs(record.post_install_web_failed_uids) do
+            local idx=tonumber(entry.index)
+            if idx and idx>=1 and idx<=row.total and not seen[idx] then
+                row.retry_indices[#row.retry_indices+1]=idx;seen[idx]=true
+            end
+        end
+        table.sort(row.retry_indices)
+    end
+    if row.status=="complete" then row.completed_at=os.time() end
+    for i,old in ipairs(rows) do
+        if old.key==job.key then rows[i]=row;return put(store,rows)==true end
+    end
+    if #rows>=MAX_JOBS then return false end
+    rows[#rows+1]=row
+    return put(store,rows)==true
 end
 
 function M.summary(store,book_id)
@@ -246,10 +328,18 @@ function M.perform(job,reader)
     if chapter.structural then
         return {ok=true,index=idx,uid=chapter.uid,skipped=true,total=meta._chapter_count}
     end
-    -- Never use a native E-Ink chapter as authoritative Web co basis.
+    -- beta.16: source acquisition and EPUB text correspondence are separate.
+    -- An exact-version cache is reusable only when its Web origin is proved
+    -- by an account-bound beta.16 sidecar. Text equality alone is not proof
+    -- that the source came from Web instead of older Native caches.
+    -- An unproved, mismatched legacy cache is refreshed exactly once through
+    -- the Web Reader, NOT repeatedly because its local XHTML is different.
     local web=Source.readExactChapter(reader,job.book_id,chapter.uid,version)
-    local mapped=web and Source.validateDownloadChapter(html,web) or nil
-    if not mapped then
+    local mapped,comparison_error
+    if web then mapped,comparison_error=Source.validateDownloadChapter(html,web) end
+    local proved=web and Provenance.is_trusted(reader,job.book_id,chapter.uid,version,web)
+    local fetched=false
+    if not web or not proved then
         local book={bookId=tostring(job.book_id),title=tostring(job.title or ""),version=version}
         local ch={uid=chapter.uid,chapterUid=chapter.uid,
             chapterIdx=chapter.index,title=chapter.title}
@@ -260,17 +350,32 @@ function M.perform(job,reader)
         end
         if not called then return {ok=false,reason="web_fetch:"..tostring(body)} end
         if type(state)~="table" or state.coordinate_source_authoritative==false
-            or state.source_channel=="eink" then
+            or state.source_channel=="eink" or state.structural==true then
             return {ok=false,reason="web_source_not_authoritative",permanent=true}
         end
-        web=tostring(state.coord_html or "")
-        if web=="" then web=tostring(body or "") end
-        mapped,err=Source.validateDownloadChapter(html,web)
-        if not mapped then return {ok=false,reason="anchor_mismatch:"..tostring(err),permanent=true} end
-        local saved,why=Source.cacheChapter(reader,job.book_id,chapter.uid,version,web)
+        local candidate=tostring(state.coord_html or "")
+        if candidate=="" then candidate=tostring(body or "") end
+        if candidate=="" then return {ok=false,reason="web_source_empty",permanent=true} end
+        -- Do not throw away a previously cached source on a failed fetch.
+        -- Only replace the exact-version file with a successful Web response.
+        local saved,why=Source.cacheChapter(reader,job.book_id,chapter.uid,version,candidate)
         if not saved then return {ok=false,reason="cache_failed:"..tostring(why)} end
+        web=candidate
+        fetched=true
+        mapped,comparison_error=Source.validateDownloadChapter(html,web)
+        local stamped,stamp_error=Provenance.mark(reader,job.book_id,chapter.uid,version,web)
+        if not stamped then
+            return {ok=false,reason="source_provenance_failed:"..tostring(stamp_error)}
+        end
     end
-    return {ok=true,index=idx,uid=chapter.uid,anchors=mapped.anchors,total=meta._chapter_count}
+    -- "cached" means only that the authoritative Web chapter source exists.
+    -- It does NOT certify all EPUB chars, a future XPointer, or a cloud co.
+    -- Do not erase the comparison error or invent an exact coordinate.
+    return {ok=true,index=idx,uid=chapter.uid,total=meta._chapter_count,
+        cached=true,fetched=fetched,mapping_verified=mapped~=nil,
+        anchors=mapped and mapped.anchors or 0,
+        mapping_error=mapped and nil or tostring(comparison_error or "source_not_proven_mapped")}
+
 end
 
 function M.commit(store,job,result,now)
@@ -282,8 +387,28 @@ function M.commit(store,job,result,now)
             result=type(result)=="table" and result or {ok=false,reason="worker_unavailable"}
             if result.ok==true then
                 row.failures=0;row.error=nil
-                row.next_index=math.max(1,tonumber(row.next_index) or 1)+1
-                if result.skipped~=true then row.verified=(tonumber(row.verified) or 0)+1 end
+                if type(row.retry_indices)=="table" and #row.retry_indices>0 then
+                    -- Remove only the now-successful retry target; if a later
+                    -- target fails it stays in this durable list for next time.
+                    if tonumber(row.retry_indices[1])==tonumber(row.next_index) then
+                        table.remove(row.retry_indices,1)
+                    end
+                    row.next_index=row.retry_indices[1] or ((tonumber(row.total) or 0)+1)
+                else
+                    row.next_index=math.max(1,tonumber(row.next_index) or 1)+1
+                end
+                if result.skipped~=true then
+                    row.cached=(tonumber(row.cached) or tonumber(row.verified) or 0)+1
+                    if result.mapping_verified==true or (result.mapping_verified==nil and result.anchors) then
+                        row.verified=(tonumber(row.verified) or 0)+1
+                    else
+                        row.unmapped=(tonumber(row.unmapped) or 0)+1
+                        row.mapping_error=tostring(result.mapping_error or "source_mapping_unverified"):sub(1,180)
+                    end
+                else
+                    row.skipped=(tonumber(row.skipped) or 0)+1
+                end
+                row.last_uid=tostring(result.uid or "")
                 row.total=math.max(tonumber(row.total) or 0,tonumber(result.total) or 0)
                 if result.complete==true or row.next_index>row.total then
                     row.status="complete";row.completed_at=now

@@ -1,4 +1,4 @@
-"""Beta.10 non-regression contracts; hashes are from user-provided beta.9 main.lua."""
+"""Historical frozen-progress contracts, with beta.15 EPUB-first download ordering."""
 from pathlib import Path
 import hashlib,re,unittest
 ROOT=Path(__file__).resolve().parents[1]
@@ -13,12 +13,19 @@ class Beta10Contract(unittest.TestCase):
             end=re.search(r'\nfunction Plugin:',source[m.end():])
             block=source[m.start():m.end()+end.start() if end else len(source)]
             self.assertEqual(hashlib.sha256(block.encode()).hexdigest(),expected,name)
-    def test_download_gate_before_epub_install(self):
+    def test_beta15_epub_first_without_blocking_web_gate(self):
         source=read('miuread.koplugin/miuread/downloader.lua')
-        self.assertTrue('Gate.prepare({' in source or 'pcall(Gate.prepare,{' in source)
-        self.assertLess(source.index('pcall(Gate.prepare,{' if 'pcall(Gate.prepare,{' in source else 'Gate.prepare({'),source.index('local record = self:_save(book, chapters',source.index('pcall(Gate.prepare,{' if 'pcall(Gate.prepare,{' in source else 'Gate.prepare({')))
-        self.assertIn('not ready or ready.complete~=true or ready.verified~=ready.expected',source)
-        self.assertIn('[MiuReadWebCoordinatePending]',source)
+        tail=source[source.index('function Downloader:_book_once'):source.index('function Downloader:book')]
+        self.assertIn('local record = self:_save(book, chapters',tail)
+        self.assertIn('Post.begin(self.store,record,book,opt)',tail)
+        self.assertIn('pcall(Post.run,self.store,record,book,self.reader,opt',tail)
+        self.assertLess(tail.index('local record = self:_save(book, chapters'),
+            tail.index('pcall(Post.run,self.store,record,book,self.reader,opt'))
+        self.assertNotIn('Gate.prepare({',tail)
+        self.assertNotIn('install blocked',tail)
+        post=read('miuread.koplugin/miuread/post_install_web.lua')
+        self.assertIn('pcall(Legacy.perform,job,reader)',post)
+        self.assertIn('identity_ok(state,store,book,opt)',post)
         self.assertIn('source_verification_anchors',read('miuread.koplugin/miuread/download_source_gate.lua'))
     def test_reader_time_and_comment_ports(self):
         main=read('miuread.koplugin/main.lua')
@@ -37,8 +44,8 @@ class Beta10Contract(unittest.TestCase):
     def test_no_premature_download_complete(self):
         task=read('miuread.koplugin/miuread/download_task.lua')
         self.assertIn('stage == "coordinate"',task)
-        self.assertIn('percent = 0.94 + 0.02',task)
-        self.assertIn('percent = 0.96 + 0.03',task)
+        self.assertIn('percent = 0.94 + 0.05',task)
+        self.assertIn('percent = 0.85 + 0.09',task)
         main=read('miuread.koplugin/main.lua')
         self.assertIn('Web 定位待补全',main)
         self.assertIn('coordinate_pending',main)

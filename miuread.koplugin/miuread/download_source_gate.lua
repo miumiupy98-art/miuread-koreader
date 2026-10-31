@@ -95,7 +95,8 @@ function Gate.prepare(args)
                     entry.source_verification_error=tostring(error_reason or "source_mismatch")
                     if type(args.save_checkpoint)=="function" then args.save_checkpoint() end
                     return nil,"web_source_validation_failed:"..uid..":"..tostring(error_reason),
-                        {expected=expected,verified=verified}
+                        {expected=expected,verified=verified,fallback_uid=uid,
+                         fallback_reason=tostring(error_reason)}
                 end
                 local saved,save_err=SourcePosition.cacheChapter(reader,book.bookId,uid,version,web_html)
                 if not saved then return nil,"web_source_cache_write_failed:"..uid..":"..tostring(save_err),

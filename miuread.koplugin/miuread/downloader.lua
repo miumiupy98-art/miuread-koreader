@@ -1544,6 +1544,25 @@ function Downloader:_book_once(input, opt, progress)
     transport.checkpoint=respect_reader_priority
     local book = normalized_book(input)
     if book.bookId == "" then error("bookId missing") end
+    -- Hibernate/restart after EPUB installation must NOT rebuild or replace
+    -- the same book again. Resume only the persisted coordinate phase when
+    -- its task id, EPUB identity, size and account still match.
+    local PostInstall=require("miuread.post_install_web")
+    local previous=PostInstall.resume(self.store,book,opt)
+    if previous then
+        logger.info("[MiuRead][PostInstallWeb] resume installed EPUB without packaging",
+            "book=",tostring(book.bookId),"task=",tostring(opt.download_run_id))
+        local ok,err=pcall(PostInstall.run,self.store,previous,book,self.reader,opt,
+            progress,respect_reader_priority)
+        if not ok then
+            local reason=tostring(err)
+            if reason:find("__MIUREAD_HIBERNATE__",1,true) or reason:find("download cancelled",1,true) then error(err,0) end
+            logger.warn("[MiuRead][PostInstallWeb] resume error, EPUB preserved",reason)
+            previous.post_install_web_status="needs_attention"
+            previous.post_install_web_error=reason:sub(1,180)
+        end
+        return previous
+    end
     -- Restore the route before the catalog request, which now also uses the
     -- common API. A resumed Web task must not probe a failed Native route.
     local prior=DownloadDatabase.load_manifest(cache_root(self.store,book,opt))
@@ -2254,6 +2273,20 @@ function Downloader:_book_once(input, opt, progress)
                 cached_source, cache_error = SourcePosition.cacheChapter(
                     self.reader, book.bookId, uid, book.version or 0, coord_body)
             end
+            -- beta.16: a chapter downloaded directly from Web already has an
+            -- authoritative source; mark that provenance now so the immediate
+            -- post-install phase does not refetch all Web-backed chapters.
+            -- Native E-Ink bodies must never receive a Web provenance mark.
+            if cached_source and type(state)=="table"
+                and state.coordinate_source_authoritative~=false
+                and state.source_channel~="eink" then
+                local proof_ok,proof_err=require("miuread.web_source_provenance").mark(
+                    self.reader,book.bookId,uid,book.version or 0,coord_body)
+                if not proof_ok then
+                    logger.warn("[MiuRead][WebProvenance] not recorded",
+                        "chapter=",uid,"reason=",tostring(proof_err))
+                end
+            end
             local source_cache_state={
                 done=cached_source==true, version=tonumber(book.version) or 0,
                 error=cached_source==true and nil or tostring(cache_error or "source_cache_write_failed"),
@@ -2592,41 +2625,14 @@ function Downloader:_book_once(input, opt, progress)
     opt.guard_chapter_uid = guard_uid
     opt.checkpointed = true
 
-    -- 6.5.0-beta.10: the EPUB MUST NOT be installed or advertised as complete
-    -- before every actual readable chapter has a verified Web coordinate source.
-    -- Work remains inside this existing download transaction (not post-install).
-    local Gate=require("miuread.download_source_gate")
-    local gate_ok,ready,gate_error,partial=pcall(Gate.prepare,{
-        reader=self.reader,book=book,chapters=chapters,cache=cache,format=format,
-        progress=progress,checkpoint=respect_reader_priority,
-        save_checkpoint=function() cache_save(cache) end,
-    })
-    if not gate_ok then
-        local original=tostring(ready or "unknown")
-        if Http.is_rate_limit_error(original) or Http.is_auth_error(original)
-            or Http.is_network_error(original) then
-            error("正文已下载，Web 定位网络请求尚未成功 [MiuReadWebCoordinatePending] "..original,0)
-        end
-        error(original,0)
-    end
-    if not ready or ready.complete~=true or ready.verified~=ready.expected then
-        opt.progress_source_complete=false
-        opt.progress_source_chapter_count=tonumber(partial and partial.expected) or 0
-        opt.progress_source_cached_count=tonumber(partial and partial.verified) or 0
-        logger.warn("[MiuRead][WebCoordinateGate] install blocked",
-            "book=",tostring(book.bookId),"reason=",tostring(gate_error),
-            "verified=",tostring(opt.progress_source_cached_count),
-            "expected=",tostring(opt.progress_source_chapter_count))
-        error("正文已下载，但 Web 定位仍未全部验证；原书已保留，重新下载可从断点继续。 [MiuReadWebCoordinatePending] "
-            ..tostring(gate_error),0)
-    end
-    opt.progress_source_chapter_count=ready.expected
-    opt.progress_source_cached_count=ready.verified
-    opt.progress_source_complete=true
-    opt.progress_source_book_version=ready.version
-    logger.info("[MiuRead][WebCoordinateGate] all sources ready before installation",
-        "book=",tostring(book.bookId),"verified=",tostring(ready.verified),
-        "expected=",tostring(ready.expected),"version=",tostring(ready.version))
+    -- beta.15: EPUB integrity is independent of Web-coordinate readiness.
+    -- The complete EPUB must be installed before the same download worker
+    -- begins the optional, non-blocking, per-chapter Web-source pass. Do not
+    -- resurrect beta.10's pre-install gate, or modify the reading upload code.
+    opt.progress_source_complete=false
+    opt.progress_source_chapter_count=0
+    opt.progress_source_cached_count=0
+    opt.progress_source_book_version=tonumber(book.version) or 0
 
     respect_reader_priority("package")
     progress("package", #chapters, math.max(1,accessible_expected), book.title, {
@@ -2635,7 +2641,37 @@ function Downloader:_book_once(input, opt, progress)
             or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
     })
 
-    local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"), self:_cover(book, true), opt, failures, session, progress)
+    local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"),
+        self:_cover(book, true), opt, failures, session, progress)
+    -- The EPUB has already been installed and safely committed by _save.
+    -- Continue Web-source fill IN THIS SAME CHILD WORKER before returning.
+    -- Web failures are per-chapter results, not EPUB-installation failures.
+    if record.pending_install~=true and opt.prefetch_hidden~=true
+        and record.access_scope=="full" and record.partial_range~=true
+        and opt.chapter_uid==nil and opt.generate_translation_uid==nil then
+        local Post=require("miuread.post_install_web")
+        local begun,why=Post.begin(self.store,record,book,opt)
+        if begun then
+            local ok,err=pcall(Post.run,self.store,record,book,self.reader,opt,
+                progress,respect_reader_priority)
+            if not ok then
+                local reason=tostring(err)
+                if reason:find("__MIUREAD_HIBERNATE__",1,true) then error(err,0) end
+                if reason:find("download cancelled",1,true) then error(err,0) end
+                logger.warn("[MiuRead][PostInstallWeb] unexpected failure, EPUB preserved",reason)
+                record.post_install_web_status="needs_attention"
+                record.post_install_web_error=reason:sub(1,180)
+            end
+        else
+            logger.warn("[MiuRead][PostInstallWeb] checkpoint unavailable, EPUB preserved",tostring(why))
+            record.post_install_web_status="needs_attention"
+            record.post_install_web_error="checkpoint:"..tostring(why)
+        end
+    else
+        record.post_install_web_status="deferred"
+        logger.info("[MiuRead][PostInstallWeb] deferred for pending/hidden install",
+            "book=",tostring(book.bookId))
+    end
     record.annotation_summary = annotation_summary
     cache.manifest.final_repair_required=nil
     if type(cache.manifest.last_image_repair)=="table" then

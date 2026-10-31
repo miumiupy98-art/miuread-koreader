@@ -15,6 +15,11 @@ function source.validateDownloadChapter(a,b)
 end
 function source.cacheChapter(reader,id,uid,ver,web) cache[id..':'..uid..':'..ver]=web;return true end
 package.preload['miuread.source_position']=function() return source end
+local proofs={}
+package.preload['miuread.web_source_provenance']=function() return {
+ is_trusted=function(r,id,uid,ver,web) return proofs[id..':'..uid..':'..ver]==web end,
+ mark=function(r,id,uid,ver,web) proofs[id..':'..uid..':'..ver]=web;return true end
+} end
 local fixture={book_id='123',progress_source_book_version=8,_chapter_count=2,
  chapters={{uid='a',title='A'},{uid='b',title='B'}}}
 local installer={}
@@ -52,6 +57,9 @@ assert(r.ok and r.uid=='b' and called==2)
 assert(legacy.commit(store,job,r,101))
 assert(not legacy.select(store,200,'user-a','session-a'))
 assert(legacy.summary(store,'123').complete==1)
+local rows=legacy.progress_rows(store,'user-a','session-a')
+assert(#rows==1 and rows[1].verified==2 and rows[1].total==2 and rows[1].status=='complete')
+assert(#legacy.progress_rows(store,'user-b','session-b')==0)
 -- Rechecking uses existing exact-version caches without a network call.
 assert(legacy.enqueue(store,candidates[1],'user-a','session-a',true))
 job=assert(legacy.select(store,200,'user-a','session-a'))

@@ -333,11 +333,13 @@ function M.readExactChapter(reader, book_id, uid, version)
     return nil, "source_cache_missing"
 end
 
--- Validate an E-Ink/local chapter against the authoritative Web coordinate
--- source. This deliberately uses the same normalized rune mapping that the
--- reading-progress resolver uses. Do not guess from percentages or native co.
--- Three distributed, unique ordered anchors avoid falsely approving a source
--- that shares only the title or a boilerplate paragraph.
+-- Download-source validation is deliberately stronger than matching a few
+-- excerpts. A short phrase may occur many times in perfectly identical text.
+-- The final source must be provably identical (after the same whitespace/star
+-- normalization used by the position mapper), or a single contiguous span of
+-- the Web source accounting for nearly all of that source. Never infer missing
+-- middle passages or extrapolate a percentage into a Web co position.
+-- The returned mode describes source-text correspondence, NOT a cloud offset.
 function M.validateDownloadChapter(local_html, web_html)
     if type(local_html)~="string" or local_html=="" then return nil,"local_source_missing" end
     if type(web_html)~="string" or web_html=="" then return nil,"web_source_missing" end
@@ -347,32 +349,33 @@ function M.validateDownloadChapter(local_html, web_html)
     if not local_ok or not web_ok or type(local_map)~="table" or type(web_map)~="table" then
         return nil,"source_map_build_failed"
     end
-    local local_norm=local_map.norm_map or {}
-    local n=#local_norm
-    if n<12 then return nil,"source_text_too_short_or_image_only" end
-    local web_norm=tostring(web_map.norm_text or "")
-    local count=n>=90 and 3 or (n>=46 and 2 or 1)
-    local width=math.min(32,math.max(12,math.floor(n/(count*2))))
-    local positions=count==3 and {.19,.50,.81} or (count==2 and {.30,.70} or {.50})
-    local prev_hit,verified=0,0
-    for _,fraction in ipairs(positions) do
-        local start=math.max(1,math.min(n-width+1,math.floor(n*fraction-width/2)))
-        local chars={}
-        for j=start,start+width-1 do
-            chars[#chars+1]=local_map.text_runes[local_norm[j]]
-        end
-        local sample=table.concat(chars)
-        local found=web_norm:find(sample,1,true)
-        if not found then return nil,"source_anchor_missing:"..tostring(verified+1) end
-        if web_norm:find(sample,found+#sample,true) then
-            return nil,"source_anchor_ambiguous:"..tostring(verified+1)
-        end
-        if found<=prev_hit then return nil,"source_anchor_order_mismatch" end
-        prev_hit=found
-        verified=verified+1
+    local n=#(local_map.norm_map or {})
+    local m=#(web_map.norm_map or {})
+    if n<12 or m<12 then return nil,"source_text_too_short_or_image_only" end
+    local local_text=tostring(local_map.norm_text or "")
+    local web_text=tostring(web_map.norm_text or "")
+    if local_text==web_text and n==m then
+        -- The entire normalized rune stream is equal, even if every word
+        -- repeats. Each position is disambiguated by its *index* in that stream.
+        return {ready=true,anchors=3,mode="full_text_equal",
+            local_characters=n,web_characters=m}
     end
-    return {ready=true, anchors=verified, local_characters=n,
-        web_characters=#(web_map.norm_map or {})}
+    -- An exact, unique whole-chapter span in a slightly larger Web wrapper
+    -- is safe. Do not mistake a short excerpt or duplicate chapter for a full
+    -- source: the local chapter must cover at least 80% of Web text, and its
+    -- span must occur only once in the authoritative Web source.
+    if n<=m and n*5>=m*4 then
+        local first=web_text:find(local_text,1,true)
+        if first and not web_text:find(local_text,first+1,true) then
+            return {ready=true,anchors=3,mode="unique_contiguous_span",
+                local_characters=n,web_characters=m}
+        end
+        if first then return nil,"source_full_text_ambiguous" end
+    end
+    -- Dispersed short matches are not proof that all intermediate co offsets
+    -- remain accurate. The download coordinator may rebuild this one chapter
+    -- from authoritative Web content; otherwise it retains its checkpoint.
+    return nil,"source_full_text_mismatch"
 end
 
 -- B3: only inspect existing authoritative coordinate sources. Never request
