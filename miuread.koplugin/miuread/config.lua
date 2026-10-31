@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "6.3.2-beta.3",
+    VERSION = "6.5.0-beta.8",
     SCHEMA = 136,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
@@ -12,7 +12,7 @@ local C = {
     UPDATE_CHANNEL_LABEL = "内测通道",
     UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     UPDATE_MANIFESTS = {
-    "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     },
     UPDATE_CHANNELS = {
         stable = {

@@ -42,7 +42,7 @@ class UIContract(unittest.TestCase):
         self.assertIn('label="查看本章评论"',main)
         self.assertIn('label="我的评论收藏"',main)
         self.assertIn('self._opening_cached_comment',main)
-        self.assertIn('label="获取/更新当前章节评论"',main)
+        self.assertIn('label="更新当前章节"',main)
 
     def test_book_and_download_menu_actions_not_removed(self):
         main=read('main.lua')

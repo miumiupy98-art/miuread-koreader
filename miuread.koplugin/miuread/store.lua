@@ -281,7 +281,7 @@ local PROGRESS_SYNC_RESET_KEYS={
     -- local_read_event_at is reconciliation metadata, not the KOReader page.
     -- Keeping it across a clean-state reset can immediately recreate an
     -- ambiguous-clock conflict against the freshly fetched server baseline.
-    "local_read_event_at","progress_write_guard","progress_verified_read_event_seq",
+    "local_read_event_at",
     "pending_progress","pending_progress_coordinate",
     "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
     "progress_upload_pending_at","progress_upload_submitted_at","progress_upload_verified_at",

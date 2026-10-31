@@ -267,18 +267,12 @@ function M:send()
     local mode=(live_sync and live_sync.reading_time_mode and live_sync:reading_time_mode())
         or (prefs.time_eink_only==true and "eink" or prefs.time_route_mode or "legacy")
     local eink_allowed=mode=="eink" or mode=="smart"
-    -- Sync.current is a cached book identity and can survive stop_fast() while
-    -- the close finalizer runs. It is not by itself proof of live reading.
-    -- Sync:stop_fast() moves state to "stopped"; the reading-end host barrier
-    -- below still blocks any dispatch until the high-priority close finishes.
-    local function live_reader(s)
-        return s and s.current and s.state~="stopped"
-    end
-    if live_sync and live_sync.reading_time_backend=="web" and live_reader(live_sync) then return false end
-    if self.sync and self.sync.reading_time_backend=="web" and live_reader(self.sync) then return false end
-    -- The active Native clock is authoritative even without Sync.current.
-    -- No E-Ink POST during reading. Persist locally and send after close.
-    if self.active or live_reader(live_sync) or live_reader(self.sync) then return false end
+    if live_sync and live_sync.reading_time_backend=="web" and live_sync.current then return false end
+    if self.sync and self.sync.reading_time_backend=="web" and self.sync.current then return false end
+    -- Home and Reader may have separate plugin hosts sharing one Native
+    -- controller. Neither host can dispatch historical time while reading.
+    if mode=="smart" and ((live_sync and live_sync.current)
+        or (self.sync and self.sync.current)) then return false end
     if host._reading_end_sync_active or host._reading_end_finalizer_active
         or (self.sync and (self.sync.busy or self.sync.progress_write_fence)) then return false end
     if type(host.is_online)~="function" or not host:is_online() then

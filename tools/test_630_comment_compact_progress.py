@@ -2,7 +2,6 @@
 from pathlib import Path
 import re
 import unittest
-from release_version_contract import assert_beta_identity
 BASE=Path(__file__).resolve().parents[1]
 def read(path):return (BASE/path).read_text(encoding='utf-8')
 class CompactCommentProgress(unittest.TestCase):
@@ -18,10 +17,10 @@ class CompactCommentProgress(unittest.TestCase):
         self.assertNotIn('self.comment_opaque',u)
         self.assertNotIn('Screen:getHeight() * 0.60',u)
         self.assertIn('self.progress=ProgressWidget:new{',u)
-        self.assertIn('local fraction=total>0',u)
+        self.assertIn('math.floor(fraction*100+.5)',u)
         self.assertIn('if signature==self._last_signature then return end',u)
         self.assertNotIn('state.chapter',u)
-        self.assertIn('state.comments',u)
+        self.assertNotIn('state.comments',u)
         self.assertNotIn('state.failed',u)
     def test_each_action_uses_real_icon_and_real_task_callback(self):
         u=read('miuread.koplugin/miuread/comment_progress.lua')
@@ -48,7 +47,7 @@ class CompactCommentProgress(unittest.TestCase):
         center=m.split('function Plugin:_show_reader_comment_center(',1)[1].split('function Plugin:_reader_font_label',1)[0]
         self.assertIn('label="评论获取任务"',menu)
         self.assertIn('label="评论获取任务"',center)
-        for item in ('获取/更新当前章节评论','获取/更新指定章节范围','自动预载下一章评论'):
+        for item in ('当前章节','指定章节范围','更新当前章节','更新指定范围'):
             self.assertIn('label="'+item+'"',menu)
         self.assertIn('runtime.async:run("comment_range_chapter"',m)
         self.assertIn('self.comment_sync:status(runtime.book_id,uid)',m)
@@ -59,13 +58,13 @@ class CompactCommentProgress(unittest.TestCase):
     def test_release_version_and_gate(self):
         # The compact UI was introduced in beta.1 and must survive later
         # 6.3 releases; never hard-code the current release to beta.1.
-        # The feature must remain present through later 6.3.x/6.4.x
-        # releases, not just the version in which its test was introduced.
-        version = assert_beta_identity(self)
-        major, minor, patch, beta = map(int, re.fullmatch(
-            r"(\d+)\.(\d+)\.(\d+)-beta\.(\d+)", version).groups())
-        self.assertGreaterEqual((major, minor, patch, beta), (6, 3, 0, 1))
-        self.assertIn('## ' + version, read('CHANGELOG.md'))
+        meta=read('miuread.koplugin/_meta.lua')
+        conf=read('miuread.koplugin/miuread/config.lua')
+        m=re.search(r'version\s*=\s*"(6\.5\.0-beta\.(\d+))"',meta)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(int(m.group(2)),1)
+        self.assertIn('VERSION = "'+m.group(1)+'"',conf)
+        self.assertIn('## '+m.group(1),read('CHANGELOG.md'))
         wf=read('.github/workflows/release-beta.yml')
         self.assertIn('test_630_comment_compact_progress.py',wf)
         self.assertIn('workflow_dispatch:',wf)

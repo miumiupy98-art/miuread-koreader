@@ -49,20 +49,3 @@ def normalize_changelog(text):
             seen_versions[version] = (start+1, value)
         chunks.append(chunk)
     return ''.join(''.join(chunk) for chunk in chunks)
-
-
-def canonicalize_changelog(text):
-    """Normalize duplicate sections and put the document heading at the top.
-
-    Never delete nonempty historic notes or reorder historic release sections.
-    """
-    normalized = normalize_changelog(text)
-    lines = normalized.splitlines(keepends=True)
-    heading_lines = [i for i, line in enumerate(lines) if line.strip().lower() == '# changelog']
-    if not heading_lines:
-        return normalized
-    # normalize_changelog has already rejected a second nonempty heading.
-    for i in reversed(heading_lines):
-        del lines[i]
-    content = ''.join(lines).lstrip('\r\n')
-    return '# Changelog\n\n' + content

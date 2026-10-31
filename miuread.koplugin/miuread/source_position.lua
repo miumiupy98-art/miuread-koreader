@@ -165,7 +165,12 @@ local function fetch_coord_html(reader, record, anchor, options)
                     "stage=cache_skip", "book=", tostring(book.book_id or book.bookId or ""),
                     "chapter=", uid, "reason=stale_structure_placeholder", "source_bytes=", tostring(#cached))
             elseif cached then
-                return cached, true, nil, {kind="exact", path=path, version=version}
+                local anchor_text=U.trim(tostring(anchor.anchor_text or ""))
+                local valid=anchor_text=="" or validate_anchor_source(cached,anchor)~=nil
+                if valid then return cached, true, nil, {kind="exact", path=path, version=version} end
+                logger.warn("[MiuRead][ProgressSourceDiagnostic]",
+                    "stage=cache_skip", "book=",tostring(book.book_id or book.bookId or ""),
+                    "chapter=",uid,"reason=anchor_mismatch")
             end
         end
 
@@ -232,6 +237,9 @@ local function fetch_coord_html(reader, record, anchor, options)
         return nil, nil, "source_network_fetch_failed:" .. detail
     end
 
+    if type(state)=="table" and state.coordinate_source_authoritative==false then
+        return nil,nil,"web_coordinate_source_not_authoritative"
+    end
     local coord_html = type(state) == "table" and tostring(state.coord_html or "") or ""
     if coord_html == "" then coord_html = tostring(downloaded or "") end
     if coord_html == "" then
@@ -255,8 +263,52 @@ local function fetch_coord_html(reader, record, anchor, options)
             "cache_write=skipped", "reason=stale_structure_placeholder")
         write_path = nil
     end
-    if write_path then pcall(U.atomic_write, write_path, coord_html, true) end
+    if U.trim(tostring(anchor.anchor_text or ""))~="" then
+        local valid_map, source_error=validate_anchor_source(coord_html,anchor)
+        if not valid_map then
+            logger.warn("[MiuRead][ProgressSourceDiagnostic]",
+                "stage=web_source_rejected", "book=", book_arg.bookId, "chapter=",uid,
+                "reason=anchor_mismatch", "detail=",tostring(source_error or "not_found"))
+            return nil, nil, "source_anchor_mismatch:"..tostring(source_error or "not_found")
+        end
+    end
+    if write_path then
+        local wrote, write_error=U.atomic_write(write_path, coord_html, true)
+        if not wrote then
+            logger.warn("[MiuRead][ProgressSourceDiagnostic]",
+                "stage=cache_write_failed", "book=", book_arg.bookId,
+                "chapter=",uid,"error=",tostring(write_error))
+        end
+    end
     return coord_html, false, nil, {kind="network_refresh", path=write_path, version=version}
+end
+
+-- 6.5.0-beta.8: prime an authoritative Web chapter source in a worker.
+-- Native E-Ink XHTML is never a Web co source. The Reader anchor is required
+-- for cache validation and avoids accepting stale same-version placeholder HTML.
+-- Called only from Sync:prepare_current_web_source (not from page-turn hot path).
+function M.ensureWebChapterSource(reader, record, anchor, options)
+    options = type(options)=="table" and options or {}
+    if type(anchor)~="table" or tostring(anchor.chapter_uid or "")=="" then
+        return nil, "chapter_uid_missing"
+    end
+    if U.trim(tostring(anchor.anchor_text or ""))=="" then
+        return nil, "anchor_text_missing"
+    end
+    local function verified(options_for_fetch)
+        local html, hit, err, meta = fetch_coord_html(reader, record, anchor, options_for_fetch)
+        if not html then return nil, err end
+        local map, why = validate_anchor_source(html, anchor)
+        if not map then return nil, "source_anchor_mismatch:"..tostring(why) end
+        return {ready=true, cache_hit=hit==true, cache_kind=meta and meta.kind or "unknown",
+            chapter_uid=tostring(anchor.chapter_uid), source_bytes=#html}
+    end
+    local value, err = verified({cache_only=true})
+    if value then return value end
+    if options.cache_only==true then return nil, err end
+    -- Bypass a mismatched exact-version cache as well as a missing one. The
+    -- existing Web-only fresh_context path fetches only this single chapter.
+    return verified({force_refresh=true,force_refresh_uid=tostring(anchor.chapter_uid)})
 end
 
 function M.cacheChapter(reader, book_id, uid, version, coord_html)

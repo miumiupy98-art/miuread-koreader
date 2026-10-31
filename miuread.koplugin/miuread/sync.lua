@@ -1382,6 +1382,52 @@ function Sync:resolve_local_progress(callback, options)
     return true
 end
 
+-- 6.5.0-beta.8: current-chapter Web source prewarm, strictly worker-only.
+-- This does not read or write progress; it only prepares a verified source
+-- for the existing native Web co mapper. A busy worker is a harmless retry.
+function Sync:prepare_current_web_source(callback)
+    callback=type(callback)=="function" and callback or function() end
+    local record=self:record()
+    local ui=self.host and self.host.ui or nil
+    if not record or not ui or not ui.document then return false,"position_context_missing" end
+    if not self.async or not self.async:available() then return false,"source_worker_unavailable" end
+    if self.async:busy() then return false,"source_worker_busy" end
+    local anchor,anchor_error=PrecisePosition.capture(ui,record,self:_precision_catalog(record))
+    if not anchor then return false,anchor_error or "source_anchor_unavailable" end
+    local uid=tostring(anchor.chapter_uid or "")
+    local book_id=tostring(record.book and (record.book.book_id or record.book.bookId) or "")
+    if uid=="" or book_id=="" then return false,"chapter_identity_missing" end
+    local generation=tonumber(self.record_generation or 0) or 0
+    local path=tostring(record.path or "")
+    local record_snapshot={book=U.copy(record.book or {}),record=U.copy(record.record or {}),
+        variant=record.variant,path=record.path}
+    local reader=self.reader
+    return self.async:run("web_source_preparation",function()
+        local prepared,why=SourcePosition.ensureWebChapterSource(reader,record_snapshot,anchor)
+        return {prepared=prepared,error=why}
+    end,function(result)
+        local current=self:record()
+        if generation~=tonumber(self.record_generation or 0) or not current
+            or tostring(current.book and current.book.book_id or "")~=book_id
+            or tostring(current.path or "")~=path then
+            callback(false,"stale_reading_session",uid)
+            return
+        end
+        local payload=result and result.ok==true and type(result.value)=="table" and result.value or nil
+        local prepared=payload and payload.prepared or nil
+        if type(prepared)=="table" and prepared.ready==true then
+            logger.info("[MiuRead][WebSourcePrewarm] ready", "book=",book_id,
+                "chapter=",uid,"cache=",tostring(prepared.cache_hit==true))
+            callback(true,nil,uid)
+        else
+            local why=tostring(payload and payload.error or (result and result.error) or "prewarm_failed")
+            logger.warn("[MiuRead][WebSourcePrewarm] unavailable", "book=",book_id,
+                "chapter=",uid,"reason=",why)
+            callback(false,why,uid)
+        end
+    end,tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
+end
+
 function Sync:_source_position_async(callback, options)
     options=type(options)=="table" and options or {}
     local detached=options.detached==true
@@ -2631,7 +2677,6 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent, posi
         verified_catalog_hash=catalog_hash~="" and catalog_hash or nil,
         report_core_map_hash=core_hash~="" and core_hash or nil,
         progress_local_percent=verified_local, pending=false,
-        progress_verified_read_event_seq=tonumber(session_before.local_position_event_seq or 0) or 0,
         position_state=position_state,
     })
     self.store:update_cached_progress(book_id, verified_local)
@@ -2665,9 +2710,11 @@ function Sync:_save_local_snapshot(book_id,position)
         if previous and same_position(previous,snapshot) then
             event_updated=tonumber(previous.updated_at or session.local_read_event_at or 0) or 0
         else
-            -- last_activity also changes on Sync:start(), so it cannot prove
-            -- a user moved the page; use the separately recorded page event.
-            event_updated=tonumber(session.local_read_event_at or 0) or 0
+            -- Reading-event time is independent from exact source mapping.
+            -- Page movement updates last_activity even if chapter/co mapping later fails.
+            local activity=tonumber(self.last_activity or 0) or 0
+            local durable_event=tonumber(session.local_read_event_at or 0) or 0
+            event_updated=math.max(activity,durable_event)
         end
     end
     -- A first technical snapshot created merely because the book opened is not
@@ -5927,7 +5974,7 @@ function Sync:on_reader_ready()
     self:_resolve_reader_record(self.record_generation, 1)
 end
 
-function Sync:on_page(page, genuine_user_event)
+function Sync:on_page(page)
     -- beta.5: local freshness belongs to progress reconciliation, not to the
     -- optional reading-time feature. Always track real page movement for a
     -- recognised WeRead session, even when time reporting is disabled.
@@ -5942,20 +5989,6 @@ function Sync:on_page(page, genuine_user_event)
     if page ~= self.last_page then
         self.last_page = page
         self.last_activity = os.time()
-        -- A programmatic cloud jump can emit PageUpdate. It must NOT be
-        -- counted as a human reading event merely because the page changed.
-        if genuine_user_event==true and type(self.current.book)=="table" then
-            local book_id=tostring(self.current.book.book_id or self.current.book.bookId or "")
-            if book_id~="" then
-                local session=self.store:session(book_id) or {}
-                local next_seq=(tonumber(session.local_position_event_seq or 0) or 0)+1
-                self.store:save_session(book_id,{
-                    local_position_event_seq=next_seq,
-                    local_read_event_at=os.time(),
-                },false)
-                logger.info("[MiuRead][PositionEvent] user page movement", "book=",book_id,"seq=",next_seq)
-            end
-        end
         if self.time_enabled==true then self:_write_daemon_control(true, false) end
     end
 end
@@ -6000,7 +6033,7 @@ function Sync:on_suspend(options)
             and math.max(0,math.floor(tonumber(saved.pending_report_seconds) or 0)) or 0
         local patch={
             last_read_at=now,last_read_path=r.path,
-            local_read_event_at=tonumber(saved.local_read_event_at or 0) or 0,
+            local_read_event_at=math.max(tonumber(saved.local_read_event_at or 0) or 0,tonumber(self.last_activity or 0) or 0),
             -- Never invent suspend-time debt. Preserve only seconds previously
             -- proven unsent by the background reporter; suspended wall-clock
             -- time itself is still excluded from reading time.
@@ -6117,7 +6150,7 @@ function Sync:on_close(options)
                     saved_at=now, reason="close",
                 },
                 last_read_at=now,last_read_path=r.path,
-                local_read_event_at=tonumber(session.local_read_event_at or 0) or 0,
+                local_read_event_at=math.max(tonumber(session.local_read_event_at or 0) or 0,tonumber(self.last_activity or 0) or 0),
                 progress_local_percent=position and position.progress or nil,
                 last_close_path=path,last_close_at=now,
             }, false)

@@ -43,7 +43,7 @@ class Beta2Contracts(unittest.TestCase):
         self.assertIn('_time_sync_first_notice_shown==true',m)
     def test_comment_range_worker_and_ui(self):
         m=read('miuread.koplugin/main.lua')
-        self.assertIn('label="获取/更新指定章节范围"',m)
+        self.assertIn('label="指定章节范围"',m)
         self.assertNotIn('label="自选范围（默认）"',m)
         self.assertIn('function Plugin:_choose_comment_range(force,back_callback)',m)
         self.assertIn('function Plugin:_comment_range_next(runtime)',m)
