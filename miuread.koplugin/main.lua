@@ -25743,6 +25743,12 @@ function Plugin:reading_time_status_label()
         or (mode=="smart" and (self:is_online() and "web" or "eink"))
         or require("miuread.api_transport").new(self.store).selected
     if backend=="web" then
+        if self.sync._web_recovery_pending==true then
+            if os.time()-(tonumber(self.sync._web_recovery_started) or 0)<45 then
+                return "Web · 正在恢复"
+            end
+            return "Web · 等待服务确认"
+        end
         if self.sync.daemon and self.sync.daemon.active then return "Web · 记录中" end
         return "Web · "..self:_reading_time_status_label()
     end

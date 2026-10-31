@@ -4508,7 +4508,8 @@ function Sync:_load_daemon_context()
     if tonumber(envelope.generation or -1)~=tonumber(daemon.generation or 0)
         or tostring(envelope.controller_token or "")~=tostring(self.controller_token or "")
         or tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
-        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=
+            math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
         or tostring(envelope.account_vid or "")~=tostring(account.vid or "")
         or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "")
         or tostring(envelope.core_map_hash or "")~=tostring(daemon.core_map_hash or "") then
@@ -4551,7 +4552,8 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         fields[#fields+1]="wr_wrpa"
     end
     if #fields==0 then return false,current_revision end
-    local saved,save_error=self.store:save_auth(candidate,{expected_revision=current_revision})
+    local global_revision=math.max(0,tonumber((current_auth or self.store:auth()).auth_revision or 0) or 0)
+    local saved,save_error=self.store:save_auth(candidate,{expected_revision=global_revision})
     if saved~=true then
         logger.warn("[MiuRead][ReadReport] stale background credential update ignored",
             "revision=",tostring(current_revision),
@@ -4559,7 +4561,7 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         return false,current_revision
     end
     local updated=self.store:auth()
-    local new_revision=math.max(0,tonumber(updated.auth_revision or 0) or 0)
+    local new_revision=math.max(0,tonumber(updated.web_auth_revision or updated.auth_revision or 0) or 0)
     if new_revision==current_revision then
         logger.info("[MiuRead][ReadReport] background credential update already current",
             "revision=",tostring(new_revision),"fields=",table.concat(fields,","))
@@ -4569,6 +4571,48 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         "from_revision=",tostring(current_revision),"to_revision=",tostring(new_revision),
         "fields=",table.concat(fields,","))
     return true,new_revision
+end
+
+-- Same-account Web credential rotations can be rebound by advancing the
+-- existing worker generation. The single worker serializes old requests and
+-- keeps the old 15/60-second clock when its session/segment tokens match.
+-- A real login/account transition is never silently repaired.
+function Sync:_rebind_web_readtime_identity(status,current_auth,current_revision)
+    local daemon=self.daemon
+    if not daemon or self.reading_time_backend~="web" or self:web_readtime_disabled()
+        or self.suspended or self.quiescing or self.reading_end_finalized
+        or self.auth_transitioning or self._smart_handoff
+        or (self.host and (self.host._reading_end_sync_active or self.host._reading_end_barrier_active))
+        or not self.current or not self.current.book then return false end
+    local auth=current_auth or self.store:auth()
+    local vid=tostring((auth.account or {}).vid or "")
+    local session=tostring(auth.login_session_id or "")
+    if vid=="" or session=="" or tostring(daemon.login_session_id or "")~=session
+        or tostring(daemon.account_vid or "")~=vid
+        or tostring(status.login_session_id or "")~=session
+        or tostring(status.account_vid or "")~=vid
+        or tostring(daemon.book_id or "")~=tostring(self.current.book.book_id or "")
+        or tostring(((auth.cookies or {}).wr_skey) or "")=="" then return false end
+    local key=session..":"..vid..":"..tostring(current_revision)
+    local now=os.time()
+    if self._web_rebind_key~=key then
+        self._web_rebind_key=key
+        self._web_rebind_count=0
+        self._web_rebind_at=0
+    end
+    if self._web_rebind_count>=2 then return false end
+    if now-(self._web_rebind_at or 0)<25 then return true end
+    self._web_rebind_at=now
+    self._web_rebind_count=self._web_rebind_count+1
+    -- If the Web clock was actually inactive, it must start a NEW segment:
+    -- otherwise the idle gap could be added to the next server report.
+    if daemon.active~=true then self:_ensure_reading_time_ids(false,true) end
+    local ok,err=self:start("web_auth_rebind")
+    if ok then self._web_recovery_pending=true;self._web_recovery_started=now end
+    logger.info("[MiuRead][ReadReport] same-account Web credential rebind",
+        "ok=",tostring(ok),"attempt=",tostring(self._web_rebind_count),
+        "revision=",tostring(current_revision),"error=",tostring(err or "-"))
+    return ok==true
 end
 
 function Sync:_import_daemon_status(force)
@@ -4584,7 +4628,7 @@ function Sync:_import_daemon_status(force)
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local current_session=tostring(auth.login_session_id or "")
-    local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    local current_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
     local current_vid=tostring(account.vid or "")
     local status_session=tostring(status.login_session_id or "")
     local status_revision=math.max(0,tonumber(status.auth_revision or 0) or 0)
@@ -4606,6 +4650,14 @@ function Sync:_import_daemon_status(force)
             daemon.stale_identity_fingerprint=fingerprint
             daemon.stale_identity_count=1
         end
+        if status_session==current_session and status_vid==current_vid
+            and current_session~="" and current_vid~="" and status_revision~=current_revision then
+            if self:_rebind_web_readtime_identity(status,auth,current_revision) then
+                daemon.stale_identity_count=0
+                daemon.stale_identity_fingerprint=nil
+                return
+            end
+        end
         if daemon.stale_identity_count==1 then
             logger.warn("[MiuRead][ReadReport] stale login identity detected",
                 "reason=",table.concat(reasons,","),"status_revision=",tostring(status_revision),
@@ -4621,6 +4673,12 @@ function Sync:_import_daemon_status(force)
         return
     end
 
+    -- Do not show "recording" before the worker has acknowledged our new
+    -- generation and Web login revision. A matching status ends recovery.
+    if self._web_recovery_pending==true
+        and tostring(status.state or "")~="service_waiting" then
+        self._web_recovery_pending=false
+    end
     local status_book_id = tostring(status.book_id or daemon.book_id or daemon.final_book_id or "")
     local expected_book_id=tostring(daemon.book_id or daemon.final_book_id or "")
     if status_book_id~="" and expected_book_id~="" and status_book_id~=expected_book_id then return end
@@ -5053,7 +5111,7 @@ function Sync:_start_daemon(reason)
     local auth = self.store:auth()
     local current_account=type(auth.account)=="table" and auth.account or {}
     local login_session_id=tostring(auth.login_session_id or "")
-    local auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    local auth_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
     local account_vid=tostring(current_account.vid or "")
     if login_session_id=="" or account_vid=="" then
         self.state="stopped"
@@ -5435,7 +5493,26 @@ function Sync:switch_smart_time_backend(online,reason)
         self._smart_handoff.reconnect_requested=true
         return true
     end
-    if self.reading_time_backend==target then return true end
+    if self.reading_time_backend==target then
+        if target~="web" then return true end
+        local daemon=self.daemon
+        if daemon and daemon.active and not daemon.identity_stale
+            and (not daemon.pid or process_alive(daemon.pid)) then return true end
+        if daemon and daemon.final_flush_pending then return false,"Web 写入正在结算" end
+        -- The selected route is not proof that its service is alive. Only
+        -- recovery while a real reader session is open is allowed. No replay.
+        local now=os.time()
+        if now-(tonumber(self._smart_web_recovery_at) or 0)<25 then
+            return false,"Web 服务恢复冷却中"
+        end
+        self._smart_web_recovery_at=now
+        self:_ensure_reading_time_ids(false,true)
+        local ok,err=self:start("smart_web_service_recovery")
+        if ok then self._web_recovery_pending=true;self._web_recovery_started=now end
+        logger.info("[MiuRead][ReadTimeRoute] web service recovery",
+            "ok=",tostring(ok),"error=",tostring(err or "-"))
+        return ok,err
+    end
     if self.reading_time_backend~="web" and self.reading_time_backend~="eink" then return false end
     local previous=self.reading_time_backend
     if previous=="web" then
@@ -5466,6 +5543,7 @@ function Sync:switch_smart_time_backend(online,reason)
                 return
             end
             self.reading_time_backend="eink"
+            self._web_recovery_pending=false
             local controller=self:offline_time_controller()
             if controller.task then UIManager:unschedule(controller.task);controller.task=nil end
             local ok,err=self:start("smart_network_offline")
@@ -5909,6 +5987,12 @@ function Sync:on_reader_ready()
     self.last_page = nil
     self.session_started_at = os.time()
     self.reading_time_backend=nil
+    self._web_rebind_key=nil
+    self._web_rebind_count=0
+    self._web_rebind_at=0
+    self._smart_web_recovery_at=0
+    self._web_recovery_pending=false
+    self._web_recovery_started=0
     self:_ensure_reading_time_ids(true,true)
     self.resume_after_finalizer=false
     self.first_success_notified = false
