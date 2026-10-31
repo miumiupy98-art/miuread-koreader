@@ -72,8 +72,9 @@ function Compact:_build()
     local sw,sh=Screen:getWidth(),Screen:getHeight()
     local outer_w=math.min(math.floor(sw*.88),Screen:scaleBySize(500))
     outer_w=math.max(math.min(sw-12,outer_w),math.min(300,sw-12))
-    local pad=Screen:scaleBySize(6)
-    local content_w=outer_w-2*pad
+    local pad=Screen:scaleBySize(8)
+    local frame_border=math.max(1,Screen:scaleBySize(1))
+    local content_w=outer_w-2*(pad+frame_border)
     local line_h=Screen:scaleBySize(22)
     local button_h=Screen:scaleBySize(30) -- retain generous touch area
     local bar_h=math.max(2,math.min(4,Screen:scaleBySize(3)))
@@ -86,8 +87,12 @@ function Compact:_build()
         max_width=title_w,truncate_with_ellipsis=true,
     }
     self.count_label=TextWidget:new{
-        text="0/0章 · 0%", face=Font:getFace("x_smallinfofont"),
+        text="0/0章", face=Font:getFace("x_smallinfofont"),
         max_width=count_w,truncate_with_ellipsis=true,
+    }
+    self.detail_label=TextWidget:new{
+        text="准备获取评论",face=Font:getFace("x_smallinfofont"),
+        max_width=content_w,truncate_with_ellipsis=true,
     }
     self.progress=ProgressWidget:new{
         width=content_w,height=bar_h,percentage=0,
@@ -120,12 +125,17 @@ function Compact:_build()
         VerticalSpan:new{width=gap},
         self.progress,
         VerticalSpan:new{width=gap},
+        self.detail_label,
+        VerticalSpan:new{width=gap},
         buttons,
     }
+    -- One thin outline around the complete progress surface, not separate
+    -- boxes around the buttons or a fullscreen overlay over the reader.
     self.frame=FrameContainer:new{
         background=Blitbuffer.COLOR_WHITE,
-        bordersize=0,
-        radius=Screen:scaleBySize(3),padding=pad,margin=0,lines,
+        color=Blitbuffer.COLOR_BLACK,
+        bordersize=frame_border,
+        radius=Screen:scaleBySize(6),padding=pad,margin=0,lines,
     }
     local size=self.frame:getSize()
     local x=math.floor((sw-size.w)/2)
@@ -174,12 +184,18 @@ function Compact:set_state(state)
     local current=number(state.current)
     local total=number(state.total)
     local fraction=total>0 and math.min(1,current/total) or 0
-    local label=tostring(current).."/"..tostring(total).."章 · "..tostring(math.floor(fraction*100+.5)).."%"
-    local signature=(paused and "paused" or "running")..":"..label
+    local single=total==1
+    local label=single and "当前章节" or (tostring(current).."/"..tostring(total).."章")
+    local detail=tostring(state.message or "")
+    if paused then detail="已暂停 · "..detail end
+    if single and current==0 and detail=="" then detail="正在获取评论" end
+    if not single then detail=detail.." · 已保存 "..tostring(number(state.comments)).." 条" end
+    local signature=(paused and "paused" or "running")..":"..label..":"..detail
     if signature==self._last_signature then return end
     self._last_signature=signature
     self.progress:setPercentage(fraction)
     self.count_label:setText(label)
+    self.detail_label:setText(detail)
     self:_redraw()
 end
 

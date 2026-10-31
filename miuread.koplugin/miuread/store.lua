@@ -1565,6 +1565,7 @@ function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
+    auth.web_auth_revision=math.max(0,tonumber(auth.web_auth_revision) or auth.auth_revision)
     auth.mp_cookie_header=nil
     auth.mp_extra_headers=nil
     auth.mp_referer=nil
@@ -1593,7 +1594,7 @@ local function same_native_shelf_credentials(a,b)
     end
     return true
 end
-local function same_auth_credentials(a,b)
+local function same_web_credentials(a,b)
     a=sanitized_auth(a); b=sanitized_auth(b)
     local aa=type(a.account)=="table" and a.account or {}
     local ba=type(b.account)=="table" and b.account or {}
@@ -1603,6 +1604,10 @@ local function same_auth_credentials(a,b)
         and tostring(a.wr_ticket or "")==tostring(b.wr_ticket or "")
         and tostring(a.wr_wrpa or "")==tostring(b.wr_wrpa or "")
         and same_login_cookies(a.cookies,b.cookies)
+end
+local function same_auth_credentials(a,b)
+    a=sanitized_auth(a);b=sanitized_auth(b)
+    return same_web_credentials(a,b)
         and same_native_shelf_credentials(a.native_shelf,b.native_shelf)
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
@@ -1617,6 +1622,8 @@ function Store:save_auth(v,opt)
         return false,"登录凭据已经更新，已忽略旧任务结果"
     end
     local credentials_changed=not same_auth_credentials(current,incoming)
+    local web_changed=not same_web_credentials(current,incoming)
+    incoming.web_auth_revision=current.web_auth_revision+(web_changed and 1 or 0)
     if credentials_changed then
         if opt.replace_login~=true and current_revision>0 and incoming_revision~=current_revision then
             return false,"登录凭据版本已经变化，已拒绝旧凭据覆盖"
@@ -1636,6 +1643,10 @@ function Store:save_auth(v,opt)
 end
 function Store:auth_revision()
     return math.max(0,tonumber(self:auth().auth_revision or 0) or 0)
+end
+function Store:web_auth_revision()
+    local auth=self:auth()
+    return math.max(0,tonumber(auth.web_auth_revision) or tonumber(auth.auth_revision) or 0)
 end
 function Store:clear_native_shelf_auth()
     local auth=self:auth()

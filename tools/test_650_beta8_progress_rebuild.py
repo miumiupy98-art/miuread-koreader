@@ -11,9 +11,9 @@ SRC="miuread.koplugin/miuread/source_position.lua"
 SYNC="miuread.koplugin/miuread/sync.lua"
 class ProgressRebuildContract(unittest.TestCase):
     def test_version(self):
-        self.assertIn('VERSION = "6.5.0-beta.8"',read('miuread.koplugin/miuread/config.lua'))
-        self.assertIn('version = "6.5.0-beta.8"',read('miuread.koplugin/_meta.lua'))
-        self.assertTrue(read('CHANGELOG.md').startswith('## 6.5.0-beta.8'))
+        self.assertIn('VERSION = "6.5.0-beta.10"',read('miuread.koplugin/miuread/config.lua'))
+        self.assertIn('version = "6.5.0-beta.10"',read('miuread.koplugin/_meta.lua'))
+        self.assertTrue(read('CHANGELOG.md').startswith('## 6.5.0-beta.10'))
     def test_web_coordinate_authority(self):
         s=read(SRC)
         self.assertIn('function M.ensureWebChapterSource(',s)

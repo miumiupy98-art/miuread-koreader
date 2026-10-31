@@ -2213,14 +2213,9 @@ function Plugin:show_account_status()
     local function seconds_label(value)
         return tostring(math.max(0,math.floor(tonumber(value) or 0))).." 秒"
     end
-    local active_backend=self.sync and self.sync.reading_time_backend or nil
-    local label
-    if prefs.time_enabled~=true then label="已关闭"
-    elseif self.sync:reading_time_mode()=="eink" then label="仅 E-Ink"
-    elseif self.sync:reading_time_mode()=="smart" then label="智能 · "..(active_backend=="eink" and "本地记录" or active_backend=="web" and "Web" or "待开书")
-    elseif active_backend=="eink" then label="E-Ink"
-    elseif active_backend=="web" then label="Web"
-    else label="自动选择（下次开书）" end
+    -- Same read-only channel label as the reader; pending/error details are
+    -- still listed separately below for diagnostics.
+    local label=self:_reading_time_status_label()
     local online_label=health.state=="ok" and "全部正常"
         or (health.state=="partial" and "部分暂时异常" or "等待实际使用验证")
     local rows={
@@ -10226,6 +10221,17 @@ function Plugin:_home_hold_book(book,anchor)
     return true
 end
 
+function Plugin:_home_sync_management_menu(anchor)
+    return self:_show_standalone_menu("同步管理",{
+        {text="立即同步",post_text="执行符合条件的同步任务",
+            callback=function() self:_sync_home_pending({source="home_quick"}) end},
+        {text="同步状态",post_text="阅读进度、阅读时间与批注",
+            callback=function() self:show_sync_status(false) end},
+        {text="同步设置",post_text="同步策略与自动同步",
+            sub_item_table_func=function() return self:sync_settings_menu() end},
+    },{anchor=anchor})
+end
+
 function Plugin:_home_action_entries()
     local home=self:_home_preferences()
     local download_state=self:_download_state()
@@ -10266,8 +10272,8 @@ function Plugin:_home_action_entries()
         search={icon="⌕",icon_key="search",label="搜索",callback=function() self:search_dialog("搜索微信读书") end},
         bookstore={icon="library",icon_key="library",label="书城",callback=function() self:show_bookstore() end},
         downloads={icon="⇩",icon_key="download",label="下载",badge=download_badge,callback=function() self:show_downloads() end},
-        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function()
-            return self:show_sync_status(false)
+        sync={icon="⇅",icon_key="sync",label="同步",badge=sync_badge,callback=function(anchor)
+            return self:_home_sync_management_menu(anchor)
         end},
         miuread_settings={icon="⚙",icon_key="settings",label="设置",callback=function() self:_show_home_settings_center() end},
         all_books={icon="▦",label="全部书籍",callback=function() self:show_home_all_books() end},
@@ -14872,6 +14878,7 @@ function Plugin:_start_comment_range(book,rows,first,last,force)
         self:info("评论章节范围无效，请重新选择。")
         return false
     end
+    self:_cancel_next_comment_preload("manual priority")
     if self._comment_range_task then
         self:_show_comment_range_progress(self._comment_range_task)
         self:toast("已有评论获取任务，请先完成或取消",2)
@@ -14996,6 +15003,86 @@ function Plugin:_choose_comment_range(force,back_callback)
     end,{context=context,status_text="正在后台读取评论目录…"})
 end
 
+-- Low-priority, opt-in next-chapter comment cache warming. No reader-thread network.
+function Plugin:_cancel_next_comment_preload(reason)
+    if self._next_comment_preload_task then
+        UIManager:unschedule(self._next_comment_preload_task)
+        self._next_comment_preload_task=nil
+    end
+    local running=self._next_comment_preload
+    self._next_comment_preload=nil
+    if running and running.async then running.async:cancel(reason or "cancelled") end
+end
+
+function Plugin:_schedule_next_comment_preload(delay,attempt)
+    if (self.store:preferences().sync or {}).comment_auto_preload~=true then return false end
+    if self._next_comment_preload_task then UIManager:unschedule(self._next_comment_preload_task) end
+    local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
+    attempt=math.max(0,tonumber(attempt) or 0)
+    local task
+    task=function()
+        if self._next_comment_preload_task~=task then return end
+        self._next_comment_preload_task=nil
+        if tonumber(HOME_SESSION.reader_session_generation or 0)~=session
+            or not self:_reader_session_is_weread() then return end
+        if self._comment_range_task or self._next_comment_preload
+            or not self:_reader_background_idle() then
+            -- Bounded retry: no persistent timer, no work while sleeping.
+            if attempt<2 and self._miuread_suspended~=true and HOME_SESSION.suspended~=true then
+                self:_schedule_next_comment_preload(2+2*attempt,attempt+1)
+            end
+            return
+        end
+        if not self:is_online() then return end -- re-armed by onNetworkConnected
+        local ctx=self:_chapter_navigation_context(false)
+        if not (ctx and ctx.state=="NEXT" and ctx.catalog_complete==true) then return end
+        local book_id,uid=tostring(ctx.book_id or ""),tostring(ctx.next_uid or "")
+        if book_id=="" or uid=="" then return end
+        local status=self.comment_sync:status(book_id,uid)
+        if status.has_cache and (status.status=="cached" or status.status=="empty") then return end
+        local async=Async:new(self.store,{disable_fallback=true,poll_interval=.35})
+        if not async:available() then return end
+        local runtime={async=async,book_id=book_id,uid=uid,session=session}
+        self._next_comment_preload=runtime
+        local auth=U.copy(self.store:auth())
+        local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+        local api_mode=require("miuread.api_transport").preference(self.store)
+        local started,err=async:run("comment_next_preload",function()
+            local child_store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
+            child_store.cache_books_dir=data_dir.."/books"
+            function child_store:book_cache_path(id)
+                return self.cache_books_dir.."/"..U.id_name(tostring(id or ""))
+            end
+            function child_store:book_dir(id)
+                local path=self:book_cache_path(id);U.mkdir(path);return path
+            end
+            local child_http=Http:new(child_store)
+            local child_reader=Reader:new(child_http,child_store)
+            local child_api=Api:new(child_http,child_store,child_reader):scope()
+            local result,fetch_error=require("miuread.comment_sync"):new(child_api,child_store):fetch(book_id,uid,{force=false})
+            local changed_auth,changed=child_store:snapshot()
+            return {ok=result~=nil,result=result,error=fetch_error,auth=changed_auth,auth_changed=changed}
+        end,function(reply)
+            if self._next_comment_preload~=runtime then return end
+            self._next_comment_preload=nil
+            local value=reply and reply.value or nil
+            if reply and reply.ok==true and type(value)=="table" and value.auth_changed==true then
+                self:_apply_interactive_auth({auth=value.auth,changed=true})
+            end
+            if not (reply and reply.ok==true and value and value.ok==true) then
+                logger.warn("[MiuRead][Comments] next preload failed",tostring(value and value.error or reply and reply.error))
+            end
+        end,180)
+        if not started then
+            self._next_comment_preload=nil
+            logger.warn("[MiuRead][Comments] next preload unavailable",tostring(err))
+        end
+    end
+    self._next_comment_preload_task=task
+    UIManager:scheduleIn(math.max(.5,tonumber(delay) or 3),task)
+    return true
+end
+
 function Plugin:_comment_fetch_mode_menu(back_callback)
     local function select_range(force)
         return self:_choose_comment_range(force,back_callback)
@@ -15007,6 +15094,16 @@ function Plugin:_comment_fetch_mode_menu(back_callback)
         {label="更新当前章节",arrow=true,
             callback=function() self:_fetch_current_chapter_comments(true,back_callback) end},
         {label="更新指定范围",arrow=true,callback=function() select_range(true) end},
+        {label="自动预载下一章评论",value=((self.store:preferences().sync or {}).comment_auto_preload==true) and "已开启" or "已关闭",
+            arrow=true,callback=function()
+                local prefs=self.store:preferences();prefs.sync=prefs.sync or {}
+                prefs.sync.comment_auto_preload=not (prefs.sync.comment_auto_preload==true)
+                self:_save_ui_preferences(prefs,"comment_auto_preload")
+                if not prefs.sync.comment_auto_preload then
+                    self:_cancel_next_comment_preload("setting disabled")
+                else self:_schedule_next_comment_preload(2) end
+                self:_comment_fetch_mode_menu(back_callback)
+            end},
     }
     if self._comment_range_task then
         table.insert(rows,1,{icon="progress",label="评论获取任务",
@@ -20068,6 +20165,7 @@ function Plugin:_finish_download_runtime(runtime,result)
         local content_pending=tostring(err):find("[MiuReadAnnotationPending]",1,true)~=nil
         local image_missing=tostring(err):find("[MiuReadImageMissing]",1,true)~=nil
             or tostring(err):find("[MiuReadImageExternal]",1,true)~=nil
+        local coordinate_pending=tostring(err):find("[MiuReadWebCoordinatePending]",1,true)~=nil
         local validation_failed=tostring(err):find("EPUB 完整性验证失败",1,true)~=nil
         local wait_seconds=tonumber(result and result.wait_seconds) or tonumber(tostring(err):match("wait_seconds=(%d+)"))
         if auth_required then self:_mark_auth_problem("download",err,true) end
@@ -20079,13 +20177,13 @@ function Plugin:_finish_download_runtime(runtime,result)
             auth_required=auth_required or nil,
             error_kind=auth_required and "authentication" or (rate_limited and "rate_limit"
                 or (network_failed and "network" or (image_missing and "image_missing"
-                or (content_pending and "content_pending" or (validation_failed and "validation" or nil))))),
+                or (coordinate_pending and "coordinate_pending" or (content_pending and "content_pending" or (validation_failed and "validation" or nil)))))),
             wait_seconds=rate_limited and wait_seconds or nil,
         },true)
         self:_update_open_shelf_download_status(b.bookId,
             auth_required and "等待登录恢复" or (rate_limited and "请求受限 · 稍后继续"
                 or (network_failed and "等待网络 · 可继续"
-                or (image_missing and "正文图片待修复 · 断点已保留" or "生成未完成"))))
+                or (image_missing and "正文图片待修复 · 断点已保留" or (coordinate_pending and "Web 定位待补全 · 断点已保留" or "生成未完成")))))
         self:_notify_home_data_changed("content")
         local first
         if auth_required then
@@ -20097,6 +20195,8 @@ function Plugin:_finish_download_runtime(runtime,result)
             first="网络连接暂时中断。已完成章节和下载断点均已保留，网络恢复后可继续下载。"
         elseif image_missing then
             first="书籍正文图片仍有缺失。已完成章节和下载断点均已保留，可在“修复书籍”中只补缺失内容；原文件没有被覆盖。"
+        elseif coordinate_pending then
+            first="书籍正文已下载，但尚有章节的 Web 定位未能验证；原书和下载断点已保留。请检查登录及网络，重新选择生成／更新书籍继续补全。"
         elseif content_pending then
             first="生成未完成，原文件和下载进度已保留。请稍后使用“生成／更新书籍”重试。"
         elseif validation_failed then
@@ -20111,8 +20211,9 @@ function Plugin:_finish_download_runtime(runtime,result)
                 or (rate_limited and "已停止继续请求，下载断点已保留"
                 or (network_failed and "下载断点已保留，网络恢复后可继续"
                 or (image_missing and "已完成内容和断点已保留，可用修复书籍继续"
+                or (coordinate_pending and "Web 定位待补全，原书与下载断点已保留"
                 or (content_pending and "生成未完成，原文件和进度已保留"
-                or (tostring(b.title or "未命名").."下载未完成，进度已保留")))))
+                or (tostring(b.title or "未命名").."下载未完成，进度已保留"))))))
             local translation_notice=opt.generate_translation_uid and require("miuread.translation_generation").friendly_error(err)
             if translation_notice then toast_title="外文翻译"; toast_text=translation_notice end
             self:status_toast(toast_title,toast_text,5)
@@ -21636,6 +21737,7 @@ function Plugin:_schedule_chapter_navigation_context(session,delay)
         end
         self._chapter_navigation_task=nil
         self:_chapter_navigation_context(true)
+        self:_schedule_next_comment_preload(3)
         self:_schedule_reader_toolbar_state_refresh(nil,.05)
     end
     self._chapter_navigation_task=task
@@ -23346,17 +23448,18 @@ function Plugin:_sync_user_issue(status, session)
     return nil
 end
 
+-- Compact UI reads the *actual active clock owner*.  A successful upload from
+-- another book/session is not evidence that the current clock is Web or E-Ink.
+-- This function has no side effects: display must never start/stop a reporter.
 function Plugin:_reading_time_status_label()
-    local prefs=self.store:preferences().sync or {}
-    if prefs.time_enabled~=true then return "已关闭" end
-    local r=self.sync and self.sync:record() or nil
-    if not (r and r.book) then return "等待阅读" end
-    local id=tostring(r.book.book_id or r.book.bookId or "")
-    local session=id~="" and (self.store:session(id) or {}) or {}
-    if tostring(session.report_state or "")=="ok" or (tonumber(self.sync and self.sync.last_upload or 0) or 0)>0 then
-        return "已同步"
-    end
-    return "尽力同步"
+    if (self.store:preferences().sync or {}).time_enabled~=true then return "未启用" end
+    local sync=self.sync
+    if not sync or not sync.current or sync.suspended or sync.reading_end_finalized then return "—" end
+    local backend=sync.reading_time_backend
+    if backend=="web" and sync.daemon and sync.daemon.active==true then return "Web" end
+    if backend=="eink" and sync.offline_time and sync.offline_time.active
+        and sync.offline_time.active.sync==sync then return "Eink" end
+    return "—"
 end
 
 function Plugin:_sync_current_book_label()
@@ -25503,32 +25606,12 @@ local function reading_time_duration(seconds)
     seconds=math.max(0,tonumber(seconds) or 0)
     return seconds<60 and (tostring(seconds).." 秒") or (string.format("%.1f",seconds/60).." 分钟")
 end
+-- The detailed pending/unknown/error evidence stays in diagnostics and the
+-- E-Ink outbox; the primary status displays only which clock owns new seconds.
 function Plugin:reading_time_status_label()
-    if (self.store:preferences().sync or {}).time_enabled~=true then return "已关闭" end
-    local mode=self.sync:reading_time_mode()
-    if self.sync.reading_time_backend=="eink_restart_required" then
-        return "通道设置已变化 · 请重新开书"
-    end
-    local backend=mode=="eink" and "eink" or self.sync.reading_time_backend
-        or (mode=="smart" and (self:is_online() and "web" or "eink"))
-        or require("miuread.api_transport").new(self.store).selected
-    if backend=="web" then
-        if mode=="smart" then return self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 等待上传服务" end
-        return self:_reading_time_status_label()
-    end
-    local controller=self.sync:offline_time_controller()
-    local summary=controller and controller:summary() or {}
-    if summary.error then return summary.error=="ledger_full" and "本地记录已满" or "本地记录异常" end
-    if summary.blocked then return "已暂停 · 请核对云端位置" end
-    if (summary.unknown or 0)>0 then return "有待确认记录" end
-    if (summary.in_flight or 0)>0 then return "正在同步" end
-    if (summary.control or {}).reason=="authentication" then return "需要授权" end
-    if (summary.pending or 0)>0 then
-        return "待同步 "..reading_time_duration(summary.pending)
-    end
-    if summary.capture_error=="statistics_unavailable" then return "请开启 KOReader 阅读统计" end
-    return summary.last_success_at and "已同步" or "已开启 · 自动记录与同步"
+    return self:_reading_time_status_label()
 end
+
 function Plugin:reading_time_unknown_menu(offset)
     local controller=self.sync:offline_time_controller()
     local groups=controller and controller:unknown()
@@ -25571,10 +25654,7 @@ function Plugin:reading_time_menu()
         end,keep_menu_open=true,callback=function() self:toggle_time_sync() end},
         {text="同步方式",icon_key="swap",post_text=({smart="智能切换",eink="仅 E-Ink",legacy="原有通道设置"})[self.sync:reading_time_mode()],
             sub_item_table_func=function() return self:reading_time_mode_menu() end},
-        {text="当前时间通道",icon_key="wifi",post_text=self.sync.reading_time_backend=="eink" and "E-Ink · 本地记录"
-            or self.sync.reading_time_backend=="web" and (self.sync.daemon and self.sync.daemon.active and "Web · 记录中" or "Web · 待启动")
-            or self.sync.reading_time_backend=="eink_restart_required" and "请重新开书"
-            or "等待开启书籍",enabled=false},
+        {text="当前时间通道",icon_key="wifi",post_text=self:_reading_time_status_label(),enabled=false},
         {text="E-Ink 客户端授权",icon_key="shield-check",post_text=self:_eink_auth_status_text(summary),
             sub_item_table_func=function() return self:eink_authorization_menu() end},
         {text="离线待上传",icon_key="upload",post_text=reading_time_duration(summary.pending),enabled=false},
@@ -31741,6 +31821,7 @@ function Plugin:onNetworkConnected()
             self:_sync_home_pending({silent=true,source="network_restored"})
             if tostring(self._home_active_section or "shelf")=="shelf" then self:_home_refresh_remote(false,false) end
         elseif self.ui and self.ui.document and self:_reader_session_is_weread() then
+            self:_schedule_next_comment_preload(3)
             local prefs=self.store:preferences().sync or {}
             if prefs.auto_latest_position~=false and not self._progress_check_running then
                 logger.info("[MiuRead][ResumeSync] waiting_network","source=network_restored")
@@ -31773,6 +31854,7 @@ function Plugin:onNetworkConnected()
 end
 
 function Plugin:onNetworkDisconnected()
+    self:_cancel_next_comment_preload("network disconnected")
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
     self:_schedule_smart_readtime_route(false,"network_disconnected")
     logger.info("[MiuRead][Network] disconnected; safe sync remains durable")
@@ -31949,6 +32031,13 @@ function Plugin:_reading_end_sync(reason,options,callback)
     -- being retired keeps its existing writer barrier; new captures never use
     -- that service's wall clock. Home/close does not wait for outbox uploads.
     local time_handoff=self.sync:stop_fast("reading_end:"..reason,nil)
+    -- Retain the time writer which belonged to this closing/suspending reader.
+    -- A late precision-progress callback must never select a fresh wake clock.
+    local time_writer_ownership={
+        daemon=self.sync.daemon,
+        session=self.sync.reading_time_session_id,
+        segment=self.sync.reading_time_segment_id,
+    }
     self.sync.reading_end_finalized=true
 
     self._reading_end_sync_active=true
@@ -32141,7 +32230,7 @@ function Plugin:_reading_end_sync(reason,options,callback)
                         mark_critical_done(false,"time_writer_preempt_failed")
                         if HomeView.is_shown() and not self:_active_reader_ui() then self:_schedule_home_progress_recovery(.6) end
                     end
-                end)
+                end,false,time_writer_ownership)
             else
                 start_background_progress()
             end
@@ -33698,6 +33787,7 @@ function Plugin:_schedule_post_reader_work(reason,delay,phase)
 end
 
 function Plugin:onCloseDocument()
+    self:_cancel_next_comment_preload("document close")
     self:_cancel_comment_range_task("document close",true)
     self:_teardown_comment_overlay()
     if self._bookstore_shelf_auth then require("miuread.bookstore").reset(self) end

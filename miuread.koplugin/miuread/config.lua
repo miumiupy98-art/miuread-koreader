@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "6.5.0-beta.8",
+    VERSION = "6.5.0-beta.10",
     SCHEMA = 136,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
@@ -302,7 +302,7 @@ local C = {
     DOWNLOAD_BACKGROUND_STALL_SECONDS = {
         prepare = 120, catalog = 120, resume = 120, content = 150, images = 180,
         underlines = 240, thoughts = 600, footnotes = 240,
-        annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
+        annotation_batch = 180, annotation_apply = 240, transform = 240, coordinate = 300, package = 300,
     },
     -- Foreground notices remain earlier than recovery. Heavy local stages still
     -- use generous bounds to avoid turning a large comment set into a false
@@ -311,7 +311,7 @@ local C = {
     DOWNLOAD_FOREGROUND_STALL_SECONDS = {
         prepare = 50, catalog = 60, resume = 50, content = 90, images = 120,
         underlines = 240, thoughts = 600, footnotes = 240,
-        annotation_batch = 180, annotation_apply = 240, transform = 240, package = 300,
+        annotation_batch = 180, annotation_apply = 240, transform = 240, coordinate = 300, package = 300,
     },
     DOWNLOAD_CANCEL_FORCE_SECONDS = 4,
     DOWNLOAD_STALL_RESTART_GRACE_SECONDS = 3,

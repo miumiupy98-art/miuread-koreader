@@ -112,6 +112,8 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_633_comment_flat_and_modal.py'
           python3 -m unittest discover -s tools -p 'test_635_eink_only_route.py'
           python3 -m unittest discover -s tools -p 'test_650_beta8_progress_rebuild.py'
+          python3 -m unittest discover -s tools -p 'test_650_beta9_readtime_contract.py'
+          python3 -m unittest discover -s tools -p 'test_650_beta10_contract.py'
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             if [ -z "${RELEASE_NOTES_INPUT//[[:space:]]/}" ]; then
@@ -405,6 +407,12 @@ jobs:
           python3 tools/test_637_menu_icons_and_handoff.py
           lua5.1 tools/test_637_handoff.lua
           luajit tools/test_637_handoff.lua
+          lua5.1 tools/test_650_beta9_readtime_ownership.lua
+          luajit tools/test_650_beta9_readtime_ownership.lua
+          lua5.1 tools/test_650_beta10_coordinate_gate.lua
+          luajit tools/test_650_beta10_coordinate_gate.lua
+          lua5.1 tools/test_650_beta10_source_map.lua
+          luajit tools/test_650_beta10_source_map.lua
           python3 tools/verify_memory_profile.py
           python3 tools/test_beta11_download_resume.py
           lua5.1 tools/test_beta11_download_resume_policy.lua

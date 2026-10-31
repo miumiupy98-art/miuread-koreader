@@ -1,3 +1,21 @@
+## 6.5.0-beta.10 - Verified Web position before EPUB installation
+
+- Continue directly from the user-provided 6.5.0-beta.9 source. Keep the reading-time worker ownership, close/suspend handoff and progress upload/readback implementations.
+- New downloads now prepare an authoritative Web source for every actual readable chapter after E-Ink/Web content fetching and BEFORE generating/installing a final EPUB. A downloaded chapter alone cannot finish the task.
+- Verify sampled, unique, ordered local-vs-Web text anchors for each chapter. Reject missing/mismatched/ambiguous sources rather than invent co. Persist each verified source and checkpoint for resume; reuse cached chapters without re-downloading the book.
+- Download progress shows a separate Web-coordinate phase (94–96%); 100% remains reserved for completed EPUB installation. Failure retains the existing EPUB and download checkpoints.
+- Restore late-version standalone comment progress UI; restore stopped-reader historical E-Ink time outbox guard and Web-specific credential revisions. Do not replace beta.9 worker ownership, ProgressFence, progress POST, or pending replay.
+- Caveat: all-chapter verification can fail conservatively on non-text/image-only or structurally divergent chapters; online Web access and Kindle end-to-end verification remain required.
+
+## 6.5.0-beta.9 - Reading-time ownership and compact channel status
+
+- Based directly on the user-provided experimental 6.5.0-beta.8 source rebuild (its reading-time router is inherited from 6.3.0-beta.7). No later 6.5 beta.3 auto-rebind behavior is introduced.
+- Reading-time UI displays only Web, Eink, 未启用 or a neutral dash when no active clock has taken ownership. Historical upload success is never used to choose the live channel; diagnostics/outbox still report errors and pending time.
+- Suspend/close progress-finalizer preemption retains its original daemon owner across deferred callbacks. If another reader segment has replaced it, the old finalizer refuses to stop/cancel the new clock and leaves progress pending for safe recovery.
+- Delayed daemon health recovery refuses to remove files owned by a replacement service; delayed restarts are limited to the same reading session.
+- Preserve the original smart Web/E-Ink writer barrier, SQLite ledger, authentication isolation, Web time reporting protocol, and beta.8 exact Web coordinate protections.
+- Source tests only; Kindle runtime, actual cloud time credit, and offline-to-online switching need device verification before publishing.
+
 ## 6.5.0-beta.8 - Experimental source rebuild from 6.3.0-beta.7
 
 - Rebased on the 6.3.0-beta.7 upload/readback implementation. Did not migrate the 6.5 beta.4–7 progress fences or replay policy.
