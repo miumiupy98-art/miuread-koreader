@@ -1,4 +1,3 @@
-from release_version_contract import assert_beta_identity
 """v6.3.0-beta.6 automated source contracts for Web/E-Ink smart time handoff."""
 from pathlib import Path
 import unittest
@@ -11,7 +10,8 @@ class SmartTimeRoute(unittest.TestCase):
         sync=read("miuread.koplugin/miuread/sync.lua")
         self.assertIn('prefs.time_eink_only==true or prefs.time_route_mode=="eink"',sync)
         self.assertIn('prefs.time_route_mode=="smart"',sync)
-        assert_beta_identity(self)
+        self.assertIn('VERSION = "6.5.0-beta.8"',read("miuread.koplugin/miuread/config.lua"))
+        self.assertIn('version = "6.5.0-beta.8"',read("miuread.koplugin/_meta.lua"))
     def test_switch_does_not_replay_web_time(self):
         sync=read("miuread.koplugin/miuread/sync.lua")
         handoff=sync.split('function Sync:switch_smart_time_backend(',1)[1].split('function Sync:',1)[0]
@@ -35,7 +35,7 @@ class SmartTimeRoute(unittest.TestCase):
         self.assertIn('if self.active then self:schedule(60)',ctrl)
         self.assertIn('UI:scheduleIn(delay or 60,task)',ctrl)
         send=ctrl.split('function M:send()',1)[1].split('function M:summary()',1)[0]
-        self.assertIn('if self.active or live_reader(live_sync) or live_reader(self.sync)',send)
+        self.assertIn('if mode=="smart" and ((live_sync and live_sync.current)',send)
         self.assertIn('local eink_allowed=mode=="eink" or mode=="smart"',send)
         self.assertIn('if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink"',send)
         self.assertIn('value.state=="confirmed"',send)
@@ -62,7 +62,7 @@ class SmartTimeRoute(unittest.TestCase):
         self.assertIn('self:_schedule_smart_readtime_route(false,"network_disconnected")',main)
         self.assertIn('UIManager:scheduleIn(4,function()',main)
         self.assertIn('self.sync:stop_reading_time_only("reading_time_mode_changed")',main)
-        self.assertIn('已切换至 E-Ink 离线计时，记录本地保存，联网后补传',main)
+        self.assertIn('网络已断开，阅读时间已转为本地记录',main)
         self.assertIn('网络已恢复，Web 阅读时间同步已启动',main)
     def test_precise_progress_kept_independent(self):
         sync=read('miuread.koplugin/miuread/sync.lua')

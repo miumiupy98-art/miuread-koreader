@@ -42,7 +42,7 @@ class SnapshotAndUiRegression(unittest.TestCase):
         self.assertNotIn('self:list(',region)
         self.assertIn('local page_size=8',region)
         self.assertGreaterEqual(region.count('opaque_fullscreen=true'),3)
-        for action in ('获取/更新指定章节范围','获取/更新当前章节评论','自动预载下一章评论'):
+        for action in ('指定章节范围','更新指定范围','当前章节','更新当前章节'):
             self.assertIn(action,region)
         self.assertIn('self.covers_fullscreen=self.opts.opaque_fullscreen==true', dialog)
         self.assertIn('LineWidget:new{background=Blitbuffer.COLOR_WHITE',dialog)

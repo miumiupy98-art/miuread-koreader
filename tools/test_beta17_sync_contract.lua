@@ -16,27 +16,12 @@ local sync=read("miuread.koplugin/miuread/sync.lua")
 local service=read("miuread.koplugin/miuread/read_report_service.lua")
 assert(config:match('VERSION%s*=%s*"%d+%.%d+%.%d+%-beta%.%d+"'),"beta release metadata")
 
--- A user-authorized or genuinely pending local upload keeps its exact Kindle
--- coordinate, but automatic open reconciliation must preserve newer remote
--- positions until an actual new reading event proves local freshness.
--- Old beta.17's unconditional cloud-fence bypass is no longer a safe contract.
+-- The user has made Kindle the authoritative position on each safe upload.
 local replay=fragment(main,"function Plugin:_submit_saved_pending_progress","function Plugin:_submit_all_saved_pending_progress")
-assert(not replay:find("force_write=true",1,true),"automatic pending replay must not force-write")
-assert(replay:find("_pending_progress_auto_safe",1,true),"automatic replay must prove original position provenance")
+assert(replay:find("force_write=true",1,true),"local submission not authoritative")
 assert(replay:find("_progress_snapshot_current(book_id,position)",1,true),"stale local snapshot not rejected")
-assert(replay:find("self.sync:remote(book_id",1,true),"automatic pending replay lacks fresh remote preflight")
--- Historical authority mode was a blanket bypass: explicitly reject it.
-assert(not main:find('reason="kindle_coordinate_authoritative"',1,true),
-    "obsolete unconditional cloud-fence bypass reintroduced")
-local fence=fragment(main,"function Plugin:_progress_write_fence","function Plugin:_save_position_resolution")
-assert(fence:find('reason=="remote_exact_unresolved"',1,true),
-    "unverified remote-exact position not protected")
-assert(fence:find('local fresh_event=event_seq>blocked_seq and event_seq>0 and same_epoch',1,true),
-    "durable reading-event sequence not required before remote-fence release")
-assert(fence:find('position.safe==true',1,true),
-    "unsafe local position could bypass remote fence")
-assert(fence:find('return true,reason',1,true),
-    "remote-exact uncertainty no longer blocks unsafe writes")
+assert(not replay:find("self.sync:remote(book_id",1,true),"remote freshness still blocks Kindle")
+assert(main:find("kindle_coordinate_authoritative",1,true),"cloud fence not bypassed for native Kindle")
 assert(main:find("_verify_progress_submission",1,true),"cloud readback verification missing")
 
 -- 6.2: time and progress use separate position authorities.
@@ -64,4 +49,4 @@ local store=read("miuread.koplugin/miuread/store.lua")
 assert(store:find("pending_unresolved_position",1,true),"pending position persistence removed")
 assert(main:find('text="以云端为准"',1,true),"manual remote resolution lost")
 assert(main:find('text="以本机为准"',1,true),"manual Kindle resolution lost")
-print("beta17 guarded Kindle progress / time separation contracts: PASS")
+print("beta17 Kindle-authoritative progress / time separation contracts: PASS")

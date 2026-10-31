@@ -1,45 +1,12 @@
-## 6.5.0-beta.5 - Beta Update
+## 6.5.0-beta.8 - Experimental source rebuild from 6.3.0-beta.7
 
-- Fix final reading-end snapshot losing its genuine page-event sequence between pending save and upload guard; leave guarded, unsent progress intact when no evidence of reading exists.
-- Persist real page-event IDs across Reader/Home instances; merge durable event watermarks independently of cloud progress transaction sequence.
-- Verify trusted Web chapter coordinates with a pragmatic ±100-unit same-chapter tolerance (not a claim of identical rendering pages). Reject unresolved zero coordinates and stale/missing post-POST timestamps.
-- Keep reading-time session coordinate behavior, EInk/Web routing, source backfill, pending verification-first recovery and existing release workflows unchanged.
-- Add beta.5 regression coverage for blocked-then-read upload, 76/101 co mismatches, cross-instance event merging, and safe verification.
-
-## 6.5.0-beta.4 - Beta Update
-
-- 修复真实翻页后被无坐标 ProgressFence 提前拦截的问题，保留精准坐标上传与云端回读验证
-- 修复阅读事件序号回退与相同云端观察重复加锁；未知章节 UID 不再猜测跳转
-- EInk/Web 混合下载后后台逐章补齐缺少的可信 Web 坐标缓存，不改写 EPUB
-- Web 坐标任务尊重 429 冷却、退避、登录隔离与可恢复队列，避免重复抓取
-- 区分云端文本定位成功和坐标精确验证成功；新增相关回归测试
-
-## 6.3.2-beta.3 - Beta Update
-
-- 修复评论获取菜单合并后发布回归测试仍引用旧入口的问题，保持评论下载、阅读时间及锁屏功能不变
-
-## 6.3.2-beta.2 - 2026-10-30
-
-- 主页同步短按与长按统一打开「同步管理」，含立即同步、同步状态、同步设置；立即同步仍使用原有安全同步函数。
-- 主页其他快捷按钮长按统一复用觅阅层级菜单组件，保留快捷栏编辑能力与原有功能回调。
-- 锁屏来源新增「KOReader 原生锁屏」，选择后关闭觅阅主页封面覆盖并进入 KOReader 原生设置菜单；不改写 KOReader 原生锁屏配置。
-- 保留 6.3.2-beta.1 的阅读时间与评论系统修改，不修改业务同步或下载协议。
-
-## 6.3.2-beta.1 - 2026-10-30
-
-- 修正 E-Ink 活跃阅读会话期间可能启动历史阅读时间上传的问题；正常关书后按已有队列机制尝试上传。
-- 阅读时间状态优先显示正在使用的 Web/E-Ink 通道和本地待上传状态；缩短切换提示。
-- 评论下载入口合并为「获取/更新当前章节评论」「获取/更新指定章节范围」，主动操作始终重新获取。
-- 评论下载进度显示处理章节数、任务阶段和实际缓存条数；保留暂停、继续、取消及后台按钮。
-- 新增默认关闭的「自动预载下一章评论」开关；仅在下一章 UID 可靠且无已有缓存时使用独立后台 Worker。
-
-## 6.3.1 - 2026-10-30
-
-- feat(readtime): preserve complete offline reading-time upload implementation
-- fix(readtime): adapt Web outbox to upstream and preserve close tails
-- fix(readtime): preserve upstream Web reporting and isolate E-Ink outbox
-- 修复弹窗空白和美化评论获取进度条
-- 实现 Web/E-Ink 智能阅读时间同步与离线补传，修复授权和同步稳定性问题，并全面优化菜单交互逻辑及黑白 SVG 图标体系
+- Rebased on the 6.3.0-beta.7 upload/readback implementation. Did not migrate the 6.5 beta.4–7 progress fences or replay policy.
+- Added low-priority on-reading Web coordinate source preparation for E-Ink EPUB chapters; retained the existing `fresh_context` Web-only fetch, cache, anchor mapping, and saved-anchor recovery. No full-book Web re-download and no automatic page-turn progress POST.
+- Validate cached and network Web source against current text anchor before treating it as authoritative. Reject stale/ambiguous content without inventing a coordinate.
+- Removed forced Kindle-first override on automatic cloud read; existing position-resolution policy now decides.
+- Guard automatic replay of UNSENT pending progress with a Web-only preflight. If remote equals pending, verify without repost; if remote equals trusted common anchor, submit; otherwise park pending without overwriting other device. Explicit manual force-local remains available.
+- Version metadata synchronized for beta.8. No data is cleared and no downloaded EPUB is rebuilt.
+- **Experimental**: device tests, server time/readtime interactions, E-Ink text divergence, and older/newer store migration still require verification.
 
 ## 6.3.0-beta.7
 
@@ -74,9 +41,6 @@
 - 迁入官方协议对照后的签名、异常标记和文件版本处理，以及休眠、校时、重启退避、限频冷却和容量保护。完整保留上游 Web 周期上报、关书尾段与默认关闭跨会话补报的规则。
 - 加入离线账本与生命周期回归、协议夹具、依赖许可和完整安装包校验；正式功能不包含临时实机自检按钮。
 - Rebase 至最新上游 beta；移除自建 Web 补传分支及临时会话标识，恢复上游原有 Worker。每次开书固定计时来源，E-Ink 不降级为 Web，已有离线记录等待 Web 收尾完成后再补传，避免同一时段重复上传。
-## 6.3.0 - 2026-10-30
-
-- 正式版本更新至 6.3.0，功能内容与当前 main 分支一致。
 
 ## 6.2.1 - 2026-10-29
 ## 6.3.0-beta.3 - Beta Update

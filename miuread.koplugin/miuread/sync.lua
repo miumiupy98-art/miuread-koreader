@@ -1382,6 +1382,52 @@ function Sync:resolve_local_progress(callback, options)
     return true
 end
 
+-- 6.5.0-beta.8: current-chapter Web source prewarm, strictly worker-only.
+-- This does not read or write progress; it only prepares a verified source
+-- for the existing native Web co mapper. A busy worker is a harmless retry.
+function Sync:prepare_current_web_source(callback)
+    callback=type(callback)=="function" and callback or function() end
+    local record=self:record()
+    local ui=self.host and self.host.ui or nil
+    if not record or not ui or not ui.document then return false,"position_context_missing" end
+    if not self.async or not self.async:available() then return false,"source_worker_unavailable" end
+    if self.async:busy() then return false,"source_worker_busy" end
+    local anchor,anchor_error=PrecisePosition.capture(ui,record,self:_precision_catalog(record))
+    if not anchor then return false,anchor_error or "source_anchor_unavailable" end
+    local uid=tostring(anchor.chapter_uid or "")
+    local book_id=tostring(record.book and (record.book.book_id or record.book.bookId) or "")
+    if uid=="" or book_id=="" then return false,"chapter_identity_missing" end
+    local generation=tonumber(self.record_generation or 0) or 0
+    local path=tostring(record.path or "")
+    local record_snapshot={book=U.copy(record.book or {}),record=U.copy(record.record or {}),
+        variant=record.variant,path=record.path}
+    local reader=self.reader
+    return self.async:run("web_source_preparation",function()
+        local prepared,why=SourcePosition.ensureWebChapterSource(reader,record_snapshot,anchor)
+        return {prepared=prepared,error=why}
+    end,function(result)
+        local current=self:record()
+        if generation~=tonumber(self.record_generation or 0) or not current
+            or tostring(current.book and current.book.book_id or "")~=book_id
+            or tostring(current.path or "")~=path then
+            callback(false,"stale_reading_session",uid)
+            return
+        end
+        local payload=result and result.ok==true and type(result.value)=="table" and result.value or nil
+        local prepared=payload and payload.prepared or nil
+        if type(prepared)=="table" and prepared.ready==true then
+            logger.info("[MiuRead][WebSourcePrewarm] ready", "book=",book_id,
+                "chapter=",uid,"cache=",tostring(prepared.cache_hit==true))
+            callback(true,nil,uid)
+        else
+            local why=tostring(payload and payload.error or (result and result.error) or "prewarm_failed")
+            logger.warn("[MiuRead][WebSourcePrewarm] unavailable", "book=",book_id,
+                "chapter=",uid,"reason=",why)
+            callback(false,why,uid)
+        end
+    end,tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
+end
+
 function Sync:_source_position_async(callback, options)
     options=type(options)=="table" and options or {}
     local detached=options.detached==true
@@ -1553,12 +1599,6 @@ function Sync:_source_position_async(callback, options)
     launch_network=function()
         if self.async:busy() then return false,"source_worker_busy" end
         return self.async:run("progress_source_position_network", function()
-            -- Do not spend the 40-second resolver budget sleeping through a
-            -- known 429 cooldown. Keep the anchor for later offline recovery.
-            if reader and reader.http then
-                reader.http.rate_limit_fail_fast_default=true
-                reader.http.rate_limit_retries=0
-            end
             local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=false,force_refresh=true,force_refresh_uid=tostring(anchor.chapter_uid or "")})
             return {position=value,error=source_error}
         end,function(result) on_phase_result("network",result) end,
@@ -2637,7 +2677,6 @@ function Sync:mark_verified(book_id, reason, local_percent, remote_percent, posi
         verified_catalog_hash=catalog_hash~="" and catalog_hash or nil,
         report_core_map_hash=core_hash~="" and core_hash or nil,
         progress_local_percent=verified_local, pending=false,
-        progress_verified_read_event_seq=tonumber(session_before.local_position_event_seq or 0) or 0,
         position_state=position_state,
     })
     self.store:update_cached_progress(book_id, verified_local)
@@ -2671,9 +2710,11 @@ function Sync:_save_local_snapshot(book_id,position)
         if previous and same_position(previous,snapshot) then
             event_updated=tonumber(previous.updated_at or session.local_read_event_at or 0) or 0
         else
-            -- last_activity also changes on Sync:start(), so it cannot prove
-            -- a user moved the page; use the separately recorded page event.
-            event_updated=tonumber(session.local_read_event_at or 0) or 0
+            -- Reading-event time is independent from exact source mapping.
+            -- Page movement updates last_activity even if chapter/co mapping later fails.
+            local activity=tonumber(self.last_activity or 0) or 0
+            local durable_event=tonumber(session.local_read_event_at or 0) or 0
+            event_updated=math.max(activity,durable_event)
         end
     end
     -- A first technical snapshot created merely because the book opened is not
@@ -4514,8 +4555,7 @@ function Sync:_load_daemon_context()
     if tonumber(envelope.generation or -1)~=tonumber(daemon.generation or 0)
         or tostring(envelope.controller_token or "")~=tostring(self.controller_token or "")
         or tostring(envelope.login_session_id or "")~=tostring(auth.login_session_id or "")
-        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=
-            math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
+        or math.max(0,tonumber(envelope.auth_revision or 0) or 0)~=math.max(0,tonumber(auth.auth_revision or 0) or 0)
         or tostring(envelope.account_vid or "")~=tostring(account.vid or "")
         or tostring(envelope.book_id or "")~=tostring(daemon.book_id or daemon.final_book_id or "")
         or tostring(envelope.core_map_hash or "")~=tostring(daemon.core_map_hash or "") then
@@ -4558,8 +4598,7 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         fields[#fields+1]="wr_wrpa"
     end
     if #fields==0 then return false,current_revision end
-    local global_revision=math.max(0,tonumber((current_auth or self.store:auth()).auth_revision or 0) or 0)
-    local saved,save_error=self.store:save_auth(candidate,{expected_revision=global_revision})
+    local saved,save_error=self.store:save_auth(candidate,{expected_revision=current_revision})
     if saved~=true then
         logger.warn("[MiuRead][ReadReport] stale background credential update ignored",
             "revision=",tostring(current_revision),
@@ -4567,7 +4606,7 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         return false,current_revision
     end
     local updated=self.store:auth()
-    local new_revision=math.max(0,tonumber(updated.web_auth_revision or updated.auth_revision or 0) or 0)
+    local new_revision=math.max(0,tonumber(updated.auth_revision or 0) or 0)
     if new_revision==current_revision then
         logger.info("[MiuRead][ReadReport] background credential update already current",
             "revision=",tostring(new_revision),"fields=",table.concat(fields,","))
@@ -4577,48 +4616,6 @@ function Sync:_adopt_daemon_credential_update(status,current_auth,current_revisi
         "from_revision=",tostring(current_revision),"to_revision=",tostring(new_revision),
         "fields=",table.concat(fields,","))
     return true,new_revision
-end
-
--- Same-account Web credential rotations can be rebound by advancing the
--- existing worker generation. The single worker serializes old requests and
--- keeps the old 15/60-second clock when its session/segment tokens match.
--- A real login/account transition is never silently repaired.
-function Sync:_rebind_web_readtime_identity(status,current_auth,current_revision)
-    local daemon=self.daemon
-    if not daemon or self.reading_time_backend~="web" or self:web_readtime_disabled()
-        or self.suspended or self.quiescing or self.reading_end_finalized
-        or self.auth_transitioning or self._smart_handoff
-        or (self.host and (self.host._reading_end_sync_active or self.host._reading_end_barrier_active))
-        or not self.current or not self.current.book then return false end
-    local auth=current_auth or self.store:auth()
-    local vid=tostring((auth.account or {}).vid or "")
-    local session=tostring(auth.login_session_id or "")
-    if vid=="" or session=="" or tostring(daemon.login_session_id or "")~=session
-        or tostring(daemon.account_vid or "")~=vid
-        or tostring(status.login_session_id or "")~=session
-        or tostring(status.account_vid or "")~=vid
-        or tostring(daemon.book_id or "")~=tostring(self.current.book.book_id or "")
-        or tostring(((auth.cookies or {}).wr_skey) or "")=="" then return false end
-    local key=session..":"..vid..":"..tostring(current_revision)
-    local now=os.time()
-    if self._web_rebind_key~=key then
-        self._web_rebind_key=key
-        self._web_rebind_count=0
-        self._web_rebind_at=0
-    end
-    if self._web_rebind_count>=2 then return false end
-    if now-(self._web_rebind_at or 0)<25 then return true end
-    self._web_rebind_at=now
-    self._web_rebind_count=self._web_rebind_count+1
-    -- If the Web clock was actually inactive, it must start a NEW segment:
-    -- otherwise the idle gap could be added to the next server report.
-    if daemon.active~=true then self:_ensure_reading_time_ids(false,true) end
-    local ok,err=self:start("web_auth_rebind")
-    if ok then self._web_recovery_pending=true;self._web_recovery_started=now end
-    logger.info("[MiuRead][ReadReport] same-account Web credential rebind",
-        "ok=",tostring(ok),"attempt=",tostring(self._web_rebind_count),
-        "revision=",tostring(current_revision),"error=",tostring(err or "-"))
-    return ok==true
 end
 
 function Sync:_import_daemon_status(force)
@@ -4634,7 +4631,7 @@ function Sync:_import_daemon_status(force)
     local auth=self.store:auth()
     local account=type(auth.account)=="table" and auth.account or {}
     local current_session=tostring(auth.login_session_id or "")
-    local current_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
+    local current_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local current_vid=tostring(account.vid or "")
     local status_session=tostring(status.login_session_id or "")
     local status_revision=math.max(0,tonumber(status.auth_revision or 0) or 0)
@@ -4656,14 +4653,6 @@ function Sync:_import_daemon_status(force)
             daemon.stale_identity_fingerprint=fingerprint
             daemon.stale_identity_count=1
         end
-        if status_session==current_session and status_vid==current_vid
-            and current_session~="" and current_vid~="" and status_revision~=current_revision then
-            if self:_rebind_web_readtime_identity(status,auth,current_revision) then
-                daemon.stale_identity_count=0
-                daemon.stale_identity_fingerprint=nil
-                return
-            end
-        end
         if daemon.stale_identity_count==1 then
             logger.warn("[MiuRead][ReadReport] stale login identity detected",
                 "reason=",table.concat(reasons,","),"status_revision=",tostring(status_revision),
@@ -4679,12 +4668,6 @@ function Sync:_import_daemon_status(force)
         return
     end
 
-    -- Do not show "recording" before the worker has acknowledged our new
-    -- generation and Web login revision. A matching status ends recovery.
-    if self._web_recovery_pending==true
-        and tostring(status.state or "")~="service_waiting" then
-        self._web_recovery_pending=false
-    end
     local status_book_id = tostring(status.book_id or daemon.book_id or daemon.final_book_id or "")
     local expected_book_id=tostring(daemon.book_id or daemon.final_book_id or "")
     if status_book_id~="" and expected_book_id~="" and status_book_id~=expected_book_id then return end
@@ -5117,7 +5100,7 @@ function Sync:_start_daemon(reason)
     local auth = self.store:auth()
     local current_account=type(auth.account)=="table" and auth.account or {}
     local login_session_id=tostring(auth.login_session_id or "")
-    local auth_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
+    local auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
     local account_vid=tostring(current_account.vid or "")
     if login_session_id=="" or account_vid=="" then
         self.state="stopped"
@@ -5499,26 +5482,7 @@ function Sync:switch_smart_time_backend(online,reason)
         self._smart_handoff.reconnect_requested=true
         return true
     end
-    if self.reading_time_backend==target then
-        if target~="web" then return true end
-        local daemon=self.daemon
-        if daemon and daemon.active and not daemon.identity_stale
-            and (not daemon.pid or process_alive(daemon.pid)) then return true end
-        if daemon and daemon.final_flush_pending then return false,"Web 写入正在结算" end
-        -- The selected route is not proof that its service is alive. Only
-        -- recovery while a real reader session is open is allowed. No replay.
-        local now=os.time()
-        if now-(tonumber(self._smart_web_recovery_at) or 0)<25 then
-            return false,"Web 服务恢复冷却中"
-        end
-        self._smart_web_recovery_at=now
-        self:_ensure_reading_time_ids(false,true)
-        local ok,err=self:start("smart_web_service_recovery")
-        if ok then self._web_recovery_pending=true;self._web_recovery_started=now end
-        logger.info("[MiuRead][ReadTimeRoute] web service recovery",
-            "ok=",tostring(ok),"error=",tostring(err or "-"))
-        return ok,err
-    end
+    if self.reading_time_backend==target then return true end
     if self.reading_time_backend~="web" and self.reading_time_backend~="eink" then return false end
     local previous=self.reading_time_backend
     if previous=="web" then
@@ -5549,7 +5513,6 @@ function Sync:switch_smart_time_backend(online,reason)
                 return
             end
             self.reading_time_backend="eink"
-            self._web_recovery_pending=false
             local controller=self:offline_time_controller()
             if controller.task then UIManager:unschedule(controller.task);controller.task=nil end
             local ok,err=self:start("smart_network_offline")
@@ -5993,12 +5956,6 @@ function Sync:on_reader_ready()
     self.last_page = nil
     self.session_started_at = os.time()
     self.reading_time_backend=nil
-    self._web_rebind_key=nil
-    self._web_rebind_count=0
-    self._web_rebind_at=0
-    self._smart_web_recovery_at=0
-    self._web_recovery_pending=false
-    self._web_recovery_started=0
     self:_ensure_reading_time_ids(true,true)
     self.resume_after_finalizer=false
     self.first_success_notified = false
@@ -6017,7 +5974,7 @@ function Sync:on_reader_ready()
     self:_resolve_reader_record(self.record_generation, 1)
 end
 
-function Sync:on_page(page, genuine_user_event)
+function Sync:on_page(page)
     -- beta.5: local freshness belongs to progress reconciliation, not to the
     -- optional reading-time feature. Always track real page movement for a
     -- recognised WeRead session, even when time reporting is disabled.
@@ -6032,31 +5989,6 @@ function Sync:on_page(page, genuine_user_event)
     if page ~= self.last_page then
         self.last_page = page
         self.last_activity = os.time()
-        -- A programmatic cloud jump can emit PageUpdate. It must NOT be
-        -- counted as a human reading event merely because the page changed.
-        if genuine_user_event==true and type(self.current.book)=="table" then
-            local book_id=tostring(self.current.book.book_id or self.current.book.bookId or "")
-            if book_id~="" then
-                local next_seq,event_error
-                if type(self.store.record_user_position_event)=="function" then
-                    next_seq,event_error=self.store:record_user_position_event(book_id)
-                else
-                    -- Test/store adapters without the new durable method.
-                    local Event=require("miuread.position_event")
-                    next_seq=Event.next_sequence(self.store:session(book_id) or {})
-                    local _,saved,err=self.store:save_session(book_id,{
-                        local_position_event_seq=next_seq,local_read_event_at=os.time(),
-                    },true)
-                    if saved==false then next_seq=nil;event_error=err end
-                end
-                if next_seq then
-                    logger.info("[MiuRead][PositionEvent] user page movement", "book=",book_id,"seq=",next_seq)
-                else
-                    logger.warn("[MiuRead][PositionEvent] durable save failed", "book=",book_id,
-                        "reason=",tostring(event_error or "unknown"))
-                end
-            end
-        end
         if self.time_enabled==true then self:_write_daemon_control(true, false) end
     end
 end
@@ -6101,7 +6033,7 @@ function Sync:on_suspend(options)
             and math.max(0,math.floor(tonumber(saved.pending_report_seconds) or 0)) or 0
         local patch={
             last_read_at=now,last_read_path=r.path,
-            local_read_event_at=tonumber(saved.local_read_event_at or 0) or 0,
+            local_read_event_at=math.max(tonumber(saved.local_read_event_at or 0) or 0,tonumber(self.last_activity or 0) or 0),
             -- Never invent suspend-time debt. Preserve only seconds previously
             -- proven unsent by the background reporter; suspended wall-clock
             -- time itself is still excluded from reading time.
@@ -6218,7 +6150,7 @@ function Sync:on_close(options)
                     saved_at=now, reason="close",
                 },
                 last_read_at=now,last_read_path=r.path,
-                local_read_event_at=tonumber(session.local_read_event_at or 0) or 0,
+                local_read_event_at=math.max(tonumber(session.local_read_event_at or 0) or 0,tonumber(self.last_activity or 0) or 0),
                 progress_local_percent=position and position.progress or nil,
                 last_close_path=path,last_close_at=now,
             }, false)

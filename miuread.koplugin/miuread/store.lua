@@ -281,7 +281,7 @@ local PROGRESS_SYNC_RESET_KEYS={
     -- local_read_event_at is reconciliation metadata, not the KOReader page.
     -- Keeping it across a clean-state reset can immediately recreate an
     -- ambiguous-clock conflict against the freshly fetched server baseline.
-    "local_read_event_at","progress_write_guard","progress_verified_read_event_seq",
+    "local_read_event_at",
     "pending_progress","pending_progress_coordinate",
     "progress_sync_state","progress_sync_message","progress_upload_state","progress_upload_error",
     "progress_upload_pending_at","progress_upload_submitted_at","progress_upload_verified_at",
@@ -1565,9 +1565,6 @@ function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
-    -- Legacy auth records have no Web-specific revision. Seed from the global
-    -- revision once; subsequent E-Ink-only token rotations preserve it.
-    auth.web_auth_revision=math.max(0,tonumber(auth.web_auth_revision) or auth.auth_revision)
     auth.mp_cookie_header=nil
     auth.mp_extra_headers=nil
     auth.mp_referer=nil
@@ -1596,7 +1593,7 @@ local function same_native_shelf_credentials(a,b)
     end
     return true
 end
-local function same_web_credentials(a,b)
+local function same_auth_credentials(a,b)
     a=sanitized_auth(a); b=sanitized_auth(b)
     local aa=type(a.account)=="table" and a.account or {}
     local ba=type(b.account)=="table" and b.account or {}
@@ -1606,10 +1603,6 @@ local function same_web_credentials(a,b)
         and tostring(a.wr_ticket or "")==tostring(b.wr_ticket or "")
         and tostring(a.wr_wrpa or "")==tostring(b.wr_wrpa or "")
         and same_login_cookies(a.cookies,b.cookies)
-end
-local function same_auth_credentials(a,b)
-    a=sanitized_auth(a); b=sanitized_auth(b)
-    return same_web_credentials(a,b)
         and same_native_shelf_credentials(a.native_shelf,b.native_shelf)
 end
 function Store:auth() return sanitized_auth(self:get("auth",{})) end
@@ -1624,11 +1617,6 @@ function Store:save_auth(v,opt)
         return false,"登录凭据已经更新，已忽略旧任务结果"
     end
     local credentials_changed=not same_auth_credentials(current,incoming)
-    local web_changed=not same_web_credentials(current,incoming)
-    -- This counter is ONLY for the long-lived Web read-report worker. The
-    -- global CAS counter still advances for Native token rotation, protecting
-    -- writes from asynchronous workers; Native changes never stop Web time.
-    incoming.web_auth_revision=current.web_auth_revision+(web_changed and 1 or 0)
     if credentials_changed then
         if opt.replace_login~=true and current_revision>0 and incoming_revision~=current_revision then
             return false,"登录凭据版本已经变化，已拒绝旧凭据覆盖"
@@ -1648,10 +1636,6 @@ function Store:save_auth(v,opt)
 end
 function Store:auth_revision()
     return math.max(0,tonumber(self:auth().auth_revision or 0) or 0)
-end
-function Store:web_auth_revision()
-    local auth=self:auth()
-    return math.max(0,tonumber(auth.web_auth_revision) or tonumber(auth.auth_revision) or 0)
 end
 function Store:clear_native_shelf_auth()
     local auth=self:auth()
@@ -2504,25 +2488,6 @@ function Store:save_session(id,patch,flush_now)
                 "sequence=",task_seq,"abandoned=",abandoned)
         end
     end
-    -- Never let a detached caller overwrite a newer genuine page event.
-    if incoming.local_position_event_seq~=nil then
-        local incoming_event=tonumber(incoming.local_position_event_seq or 0) or 0
-        local current_event=tonumber(current.local_position_event_seq or 0) or 0
-        if incoming_event<current_event then
-            incoming.local_position_event_seq=current_event
-            if incoming.local_read_event_at~=nil then
-                incoming.local_read_event_at=math.max(
-                    tonumber(incoming.local_read_event_at or 0) or 0,
-                    tonumber(current.local_read_event_at or 0) or 0)
-            end
-        end
-    end
-    -- A background coordinate queue is a REPLACEMENT, not a deep-merge patch.
-    -- Merging its indexed jobs would resurrect completed chapters and replay
-    -- Web requests after a successful cache fill.
-    if incoming.progress_source_backfill~=nil then
-        current.progress_source_backfill=nil
-    end
     a[k]=U.merge(current,incoming)
     local _,removed=compact_session_row(a[k],keep_chapters)
     if removed>0 then
@@ -2537,26 +2502,6 @@ function Store:save_session(id,patch,flush_now)
     end
     return a[k],true
 end
--- Genuine page events use the on-disk watermark, not only this Store's
--- potentially stale session. Persist immediately so the independent Home and
--- Reader instances cannot restart the event counter at 1 or reuse an ID.
-function Store:record_user_position_event(id)
-    local key=tostring(id or "")
-    if key=="" then return nil,"book_missing" end
-    local live=self:session(key) or {}
-    local disk_data=not self.isolated and self:_read_settings_file() or nil
-    local persisted=type(disk_data)=="table" and type(disk_data.sessions)=="table"
-        and disk_data.sessions[key] or {}
-    local Event=require("miuread.position_event")
-    local next_seq=math.max(Event.next_sequence(live),Event.next_sequence(persisted))
-    local _,saved,err=self:save_session(key,{
-        local_position_event_seq=next_seq,
-        local_read_event_at=os.time(),
-    },true)
-    if saved~=true then return nil,err or "event_persist_failed" end
-    return next_seq
-end
-
 function Store:invalidate_book_sync_context(id,reason,core_map_hash)
     local sessions=self:get("sessions",{})
     local key=tostring(id or "")
@@ -2784,7 +2729,6 @@ local PROGRESS_SESSION_FIELDS={
     "progress_resolution_choice","progress_resolution_fingerprint","progress_resolution_at",
     "local_display_progress","local_display_progress_at","local_display_xpointer","local_display_progress_source",
     "last_verified_exact_position","pending_unresolved_position","local_read_event_at",
-    "local_position_event_seq","progress_verified_read_event_seq","progress_write_guard",
 }
 
 -- Fields that belong to the synchronization control plane. When the on-disk
@@ -2849,18 +2793,6 @@ local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
         if type(disk_row)=="table" then
             local memory_row=type(memory_sessions[id])=="table" and memory_sessions[id] or nil
             if memory_row then
-                -- Real page-movement event IDs are independent from progress
-                -- transaction IDs: a stale Home instance must never roll back
-                -- the reader's latest event just because its progress job has
-                -- a larger sequence or timestamp.
-                local disk_event=tonumber(disk_row.local_position_event_seq or 0) or 0
-                local memory_event=tonumber(memory_row.local_position_event_seq or 0) or 0
-                if disk_event>memory_event then
-                    memory_row.local_position_event_seq=disk_event
-                    memory_row.local_read_event_at=math.max(
-                        tonumber(memory_row.local_read_event_at or 0) or 0,
-                        tonumber(disk_row.local_read_event_at or 0) or 0)
-                end
                 local disk_epoch=math.max(1,tonumber(disk_row.progress_epoch or 1) or 1)
                 local memory_epoch=math.max(1,tonumber(memory_row.progress_epoch or 1) or 1)
                 local disk_seq=progress_session_sequence(disk_row)
@@ -2887,17 +2819,8 @@ local function merge_newer_progress_sessions(memory_sessions,disk_sessions)
                         memory_row[field]=U.copy(disk_row[field])
                     end
                 end
-                -- Both branches above can copy an older local event along with
-                -- an otherwise newer progress transaction. Restore the max.
-                if disk_event>0 or memory_event>0 then
-                    memory_row.local_position_event_seq=math.max(disk_event,memory_event)
-                    memory_row.local_read_event_at=math.max(
-                        tonumber(memory_row.local_read_event_at or 0) or 0,
-                        tonumber(disk_row.local_read_event_at or 0) or 0)
-                end
             elseif progress_session_sequence(disk_row)>0
-                or (tonumber(disk_row.progress_epoch or 1) or 1)>1
-                or (tonumber(disk_row.local_position_event_seq or 0) or 0)>0 then
+                or (tonumber(disk_row.progress_epoch or 1) or 1)>1 then
                 memory_sessions[id]=U.copy(disk_row)
             end
         end

@@ -1,6 +1,6 @@
 local f=assert(io.open("miuread.koplugin/main.lua","rb")); local s=f:read("*a"); f:close()
 for _,needle in ipairs{
-    "[MiuRead][OpenSync] soft timeout; reconciliation continues in background", "OPEN_SYNC_SOFT_TIMEOUT_SECONDS", "LATE_REMOTE_APPLY_WINDOW_SECONDS",
+    "正在后台确认云端位置", "OPEN_SYNC_SOFT_TIMEOUT_SECONDS", "LATE_REMOTE_APPLY_WINDOW_SECONDS",
     "_show_position_undo", "_G.__MIUREAD_POSITION_RESOLUTION.decide",
     "self._progress_write_fences", "remote_newer_pending", "remote_exact_unresolved",
     "text_anchor_rescue", "bounded percent fallback", "未覆盖云端",

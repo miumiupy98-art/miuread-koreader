@@ -1,8 +1,5 @@
 name: Release stable full package
 
-# Both manual and Tag builds only generate Stable metadata in the runner.
-# Never commit release metadata to main or synchronize main into beta.
-
 on:
   push:
     tags:
@@ -76,13 +73,17 @@ jobs:
 
           git fetch --force --tags origin
 
-          # Both manual and Tag releases generate version, Stable channel and
-          # release notes in this temporary workspace only. Never push these
-          # generated files back to main or beta.
-          python3 .github/scripts/sync_release_identity.py \
-            --channel stable \
-            --version "$VERSION" \
-            --tag "$RELEASE_TAG"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # Manual releases can prepare and commit new stable metadata.
+            python3 .github/scripts/sync_release_identity.py \
+              --channel stable \
+              --version "$VERSION" \
+              --tag "$RELEASE_TAG"
+          else
+            # A tag is immutable: its version/changelog/channel must ALREADY
+            # match. Validation below will reject mismatches without rewriting.
+            echo "Tag $RELEASE_TAG: 仅校验 Tag 对应源码，不自动修改版本文件。"
+          fi
 
           RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
@@ -241,6 +242,14 @@ jobs:
             exit 1
           fi
 
+      - name: Run Lua syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+          find miuread.koplugin -type f -name '*.lua' -print0 | xargs -0 -n1 luac5.1 -p
+
       - name: Build stable full package and manifest
         shell: bash
         run: |
@@ -327,39 +336,120 @@ jobs:
           )
           PY
 
-      - name: Ensure immutable release tag (without updating main)
+      - name: Verify stable package and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -t "dist/$PACKAGE_NAME"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import hashlib
+          import json
+          import os
+          import sys
+
+          package = Path("dist") / os.environ["PACKAGE_NAME"]
+          manifest = json.loads(Path("dist/update.json").read_text(encoding="utf-8"))
+          summary = Path("update-summary.txt").read_text(encoding="utf-8").strip()
+          required = {
+              "miuread.koplugin/_meta.lua",
+              "miuread.koplugin/main.lua",
+              "miuread.koplugin/miuread/config.lua",
+              "miuread.koplugin/LICENSE",
+              "miuread.koplugin/NOTICE",
+              "miuread.koplugin/THIRD_PARTY_NOTICES",
+          }
+          forbidden_names = {".DS_Store", "miuread.lua", "settings.reader.lua"}
+          forbidden_suffixes = {".md", ".epub", ".log"}
+
+          with ZipFile(package) as archive:
+              names = archive.namelist()
+              damaged = archive.testzip()
+
+          errors = []
+          if damaged:
+              errors.append(f"ZIP 损坏：{damaged}")
+          for name in sorted(required.difference(names)):
+              errors.append(f"安装包缺少：{name}")
+          for name in names:
+              path = Path(name)
+              if not name.startswith("miuread.koplugin/"):
+                  errors.append(f"安装包根目录错误：{name}")
+              if (
+                  path.name in forbidden_names
+                  or path.suffix.lower() in forbidden_suffixes
+                  or "__MACOSX" in path.parts
+              ):
+                  errors.append(f"不应进入安装包：{name}")
+          if manifest.get("version") != os.environ["VERSION"]:
+              errors.append("更新清单版本错误")
+          if manifest.get("channel") != "stable":
+              errors.append("更新清单通道错误")
+          if manifest.get("notes") != summary or manifest.get("summary") != summary:
+              errors.append("线上更新摘要错误")
+          if len(summary.splitlines()) > 4 or len(summary) > 180:
+              errors.append("设备更新摘要超过 4 行或 180 个字符")
+          if manifest.get("size") != package.stat().st_size:
+              errors.append("更新清单文件大小错误")
+          if manifest.get("sha256") != hashlib.sha256(package.read_bytes()).hexdigest():
+              errors.append("更新清单 SHA-256 错误")
+
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+          print(f"正式版安装包检查通过，共 {len(names)} 个条目。")
+          PY
+
+      - name: Commit stable identity and ensure immutable tag
         shell: bash
         run: |
           set -euo pipefail
           SOURCE_SHA="$(git rev-parse HEAD)"
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            # Refuse to release stale source if main moved while we built.
             git fetch origin main --quiet
             REMOTE_MAIN_SHA="$(git rev-parse origin/main)"
             if [ "$SOURCE_SHA" != "$REMOTE_MAIN_SHA" ]; then
-              echo "::error::main 在打包期间发生变化，请从最新 main 重新发布。"
+              echo "::error::main 在本次发布测试期间发生变化；请重新运行。"
               exit 1
             fi
           fi
 
-          # A version Tag records the source commit. The package is produced
-          # from the same source with generated channel/version metadata.
+          # Avoid modifying a tag even when the release retry uses an old name.
           TAG_SHA="$(git rev-parse -q --verify "refs/tags/$RELEASE_TAG^{commit}" 2>/dev/null || true)"
           if [ -n "$TAG_SHA" ]; then
-            if [ "$TAG_SHA" != "$SOURCE_SHA" ]; then
-              echo "::error::$RELEASE_TAG 已指向另一个提交，不移动已有 Tag；请使用新版本号。"
+            if ! git diff --quiet -- \
+                miuread.koplugin/miuread/config.lua \
+                miuread.koplugin/_meta.lua CHANGELOG.md; then
+              echo "::error::$RELEASE_TAG 已存在，不允许修改它的版本文件。"
               exit 1
             fi
-          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$TAG_SHA" != "$SOURCE_SHA" ]; then
+              echo "::error::$RELEASE_TAG 已存在于不同提交，禁止移动 Tag；请使用新版本号。"
+              exit 1
+            fi
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            git add -- miuread.koplugin/miuread/config.lua miuread.koplugin/_meta.lua CHANGELOG.md
+            if ! git diff --cached --quiet; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git commit -m "chore(release): prepare $RELEASE_TAG"
+              git push origin HEAD:main
+            fi
+          fi
+
+          RELEASE_SOURCE_SHA="$(git rev-parse HEAD)"
+          if [ -z "$TAG_SHA" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "$RELEASE_TAG" "$SOURCE_SHA"
+            git tag "$RELEASE_TAG" "$RELEASE_SOURCE_SHA"
             git push origin "refs/tags/$RELEASE_TAG"
-          else
-            echo "::error::Tag 触发任务无法找到 Tag：$RELEASE_TAG"
-            exit 1
           fi
-          echo "RELEASE_SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "RELEASE_SOURCE_SHA=$RELEASE_SOURCE_SHA" >> "$GITHUB_ENV"
 
       - name: Create or update stable release
         shell: bash
@@ -390,6 +480,31 @@ jobs:
           if [ "$COUNT" != "1" ]; then
             echo "::error::Release 中应有且只有一个 $PACKAGE_NAME。"
             exit 1
+          fi
+
+      - name: Quick-check public download URL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$PACKAGE_NAME"
+          EXPECTED="$(python3 -c 'import json; print(json.load(open("dist/update.json"))["sha256"])')"
+          success=0
+          for attempt in 1 2 3; do
+            rm -f dist/public-download.zip
+            if curl --fail --location --silent --show-error \
+                --connect-timeout 5 --max-time 20 \
+                --output dist/public-download.zip "$URL"; then
+              ACTUAL="$(sha256sum dist/public-download.zip | awk '{print $1}')"
+              if [ "$ACTUAL" = "$EXPECTED" ]; then
+                success=1
+                break
+              fi
+            fi
+            [ "$attempt" = "3" ] || sleep 2
+          done
+          if [ "$success" != "1" ]; then
+            echo "::warning::Release 已由 GitHub API 确认上传，但当前 runner 暂时无法从公开 CDN 回读；继续发布正式清单。"
           fi
 
       - name: Publish fixed stable channel manifest
@@ -432,3 +547,49 @@ jobs:
             echo "::warning::正式清单已由 GitHub API 上传，但当前 runner 暂时无法从公开 CDN 回读。"
           fi
 
+      - name: Sync released main history back to beta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main beta
+          MAIN_SHA="$(git rev-parse origin/main)"
+          BETA_SHA="$(git rev-parse origin/beta)"
+
+          if [ "$MAIN_SHA" != "$RELEASE_SOURCE_SHA" ]; then
+            echo "::warning::main 已在发布过程中继续前进，跳过自动回同步 beta。"
+            exit 0
+          fi
+
+          # 只有在 beta 确实已经被本次 main 吸收时才自动回同步。
+          # 若 beta 在发布期间又有新提交，不强行改写，避免覆盖新开发内容。
+          if ! git merge-base --is-ancestor "$BETA_SHA" "$MAIN_SHA"; then
+            echo "::warning::beta 已有未包含在本次正式版中的新提交，跳过自动回同步。"
+            exit 0
+          fi
+
+          git checkout -B beta-sync "$BETA_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # main 相对 beta 只应增加正式版身份/记录及可能的正式热修。
+          # 合并历史后恢复 beta 自身的版本号和默认通道，避免下一次 beta -> main
+          # 因发布身份不同产生重复冲突。
+          git merge --no-ff --no-commit "$MAIN_SHA"
+          git restore --source="$BETA_SHA" --staged --worktree -- \
+            miuread.koplugin/miuread/config.lua \
+            miuread.koplugin/_meta.lua
+
+          if git diff --cached --quiet; then
+            git merge --abort || true
+            echo "beta 已包含正式发布历史，无需回同步。"
+            exit 0
+          fi
+
+          git commit -m "同步正式版 $VERSION 发布记录回 beta" \
+            -m "保留 beta 自身版本与内测通道，仅同步 main 的正式发布历史，减少下一次合并冲突。"
+
+          if ! git push origin "HEAD:beta"; then
+            echo "::warning::beta 在回同步期间发生变化，未覆盖新提交；本次正式版发布不受影响。"
+            exit 0
+          fi

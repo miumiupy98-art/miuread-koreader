@@ -1,4 +1,3 @@
-from release_version_contract import assert_beta_identity
 """6.3.0-beta.6 compatibility: verify E-Ink-only policy at every Web elapsed-time entry.
 
 Source contracts complement the actual Worker test in test_beta17_worker_and_comments.lua.
@@ -14,7 +13,8 @@ class EinkOnlyRoute(unittest.TestCase):
         store=read('miuread.koplugin/miuread/store.lua')
         self.assertIn('time_eink_only=false',store)
         config=read('miuread.koplugin/miuread/config.lua')
-        assert_beta_identity(self)
+        self.assertIn('VERSION = "6.5.0-beta.8"',config)
+        self.assertIn('version = "6.5.0-beta.8"',read('miuread.koplugin/_meta.lua'))
     def test_web_is_forbidden_at_scheduling_and_control(self):
         sync=read('miuread.koplugin/miuread/sync.lua')
         self.assertIn('function Sync:web_readtime_disabled()',sync)

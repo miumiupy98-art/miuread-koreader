@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 from datetime import datetime
@@ -45,23 +44,13 @@ def previous_tag(channel: str, current_tag: str, version: str) -> str | None:
     if current is None:
         return None
     candidates: list[tuple[tuple[int, ...], str]] = []
-    # When the workflow provides published Beta tags, ignore Tags whose
-    # GitHub Release failed and has no downloadable installation package.
-    published = os.environ.get("MIUREAD_PUBLISHED_BETA_TAGS") if channel == "beta" else None
-    allowed = set(published.split(",")) if published is not None else None
     for tag in run("git", "tag", "--list").splitlines():
         tag = tag.strip()
         if not tag or tag == current_tag or not tag.startswith("v"):
             continue
-        if allowed is not None and tag not in allowed:
-            continue
         parsed = parser(tag[1:])
         if parsed is not None and parsed < current:
-            if channel != "beta" or subprocess.run(
-                ["git", "merge-base", "--is-ancestor", tag, "HEAD"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            ).returncode == 0:
-                candidates.append((parsed, tag))
+            candidates.append((parsed, tag))
     return max(candidates)[1] if candidates else None
 
 
@@ -70,8 +59,6 @@ def clean_subject(subject: str) -> str | None:
     if not subject:
         return None
     # 发布机制自己产生的提交不进入下一版说明。
-    if re.match(r"(?i)^chore\(release\):", subject):
-        return None
     if re.fullmatch(r"同步 (?:Beta|正式) 版本至 .+", subject):
         return None
     if re.fullmatch(r"同步Beta版本至 .+", subject):

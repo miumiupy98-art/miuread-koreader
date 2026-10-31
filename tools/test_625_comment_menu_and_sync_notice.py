@@ -12,10 +12,13 @@ class Beta5Notices(unittest.TestCase):
     def test_comment_menu_exact_items_and_actions(self):
         main = src('main.lua')
         body = main.split('function Plugin:_comment_fetch_mode_menu(', 1)[1].split('function Plugin:_show_reader_comment_center', 1)[0]
-        labels = ['获取/更新当前章节评论', '获取/更新指定章节范围', '自动预载下一章评论']
+        labels = ['当前章节', '指定章节范围', '更新当前章节', '更新指定范围']
         offsets = [body.index('label="' + label + '"') for label in labels]
         self.assertEqual(offsets, sorted(offsets))
+        self.assertNotIn('自选范围（默认）', body)
+        self.assertIn('select_range(false)', body)
         self.assertIn('select_range(true)', body)
+        self.assertIn('_fetch_current_chapter_comments(false,back_callback)', body)
         self.assertIn('_fetch_current_chapter_comments(true,back_callback)', body)
         self.assertIn('opaque_fullscreen=true', body)
         # The range editor still defaults to at most ten chapters and shares one picker.

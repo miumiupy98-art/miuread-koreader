@@ -131,7 +131,7 @@ local POSITION_SNAPSHOT_FIELDS = {
     "native_offset","chapter_word_count","total_word_count","words_before","chapter_percent","chapter_ratio",
     "summary","safe","precise","standalone","source","selection_reason","conflict",
     "updated_at","updated","fetched_at","captured_at","submitted_at","server_updated","saved_at",
-    "progress_sequence","progress_epoch","local_position_event_seq","display_progress_quality","display_catalog_source","display_page_token",
+    "progress_sequence","progress_epoch","display_progress_quality","display_catalog_source","display_page_token",
     "precision_ms","precision_anchor","precision_anchor_chars","precision_chapter_chars","precision_cache_hit",
     "inverse_chapter_uid","inverse_chapter_offset","mapping_error","pending_reason","coordinate_captured_at",
 }
