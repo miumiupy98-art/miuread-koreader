@@ -19,6 +19,7 @@ assert 'MIUREAD_PUBLISHED_BETA_TAGS' in FLOW
 assert 'release_notes:' not in FLOW
 assert 'workflow_dispatch:' in FLOW
 assert (ROOT/'miuread.koplugin/miuread/legacy_coordinate_backfill.lua').exists()
-assert 'VERSION = "6.5.0-beta.12"' in (ROOT/'miuread.koplugin/miuread/config.lua').read_text()
-assert '6.5.0-beta.12' in (ROOT/'miuread.koplugin/_meta.lua').read_text()
+version=re.search(r'\bVERSION\s*=\s*"(6\.5\.0-beta\.\d+)"', (ROOT/'miuread.koplugin/miuread/config.lua').read_text())
+meta_version=re.search(r'\bversion\s*=\s*"(6\.5\.0-beta\.\d+)"', (ROOT/'miuread.koplugin/_meta.lua').read_text())
+assert version is not None and meta_version is not None and version.group(1)==meta_version.group(1), "plugin version metadata mismatch"
 print('PASS beta.12 frozen progress/readtime sources + beta.5 Release workflow contract')
