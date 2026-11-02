@@ -137,6 +137,7 @@ function Adapter.run(job)
         response = result.result or {},
         error = result.error,
         error_kind = result.error_kind,
+        anchor_reason = result.anchor_reason,
         path = path,
         legacy_context = context,
         context_changed = result.context_changed == true,

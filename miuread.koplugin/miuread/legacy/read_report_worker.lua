@@ -4,6 +4,7 @@ local Content = require("miuread.legacy.content")
 local WeRead = require("miuread.legacy.weread")
 local Http = require("miuread.http")
 local U = require("miuread.util")
+local Config = require("miuread.config")
 
 local Worker = {}
 
@@ -804,31 +805,29 @@ function Worker.run(job)
     local protocol_time_only = job.time_only == true and not reading_time_compat
     local position_override
     if reading_time_compat then
-        -- The position-bearing time POST uses a single Web wire tuple per
-        -- live reader session. Never use arbitrary Kindle coordinates, an
-        -- Agent gateway tuple, or a previous session's cached position.
+        -- Web time needs protocol coordinates, NOT a completed Kindle progress
+        -- transaction. Prefer one validated Web tuple; a recent observation
+        -- may be reused across a reader UI rebuild, without a session-time
+        -- fence. Never invent ci/co/pr or promote Agent coordinates here.
         local session_id=tostring(job.reading_time_session_id or "")
-        local session_started=tonumber(session_id:match("^session%-(%d+)%-"))
         local saved=type(book.session_time_anchor)=="table" and book.session_time_anchor or nil
         if session_id~="" and tostring(book.session_time_anchor_session or "")==session_id
             and saved then
             position_override=normalize_cloud_anchor(saved,{})
         end
         if not position_override then
-            -- The normal reader Web API already obtained the server's raw
-            -- position; the old Legacy GET uses a different authentication
-            -- route and may return '参数格式错误'. Never call it a second time.
-            -- A tuple observed before this reading session is not a new
-            -- opening snapshot even if it happens to be in the Store.
+            -- The reader's normal Web API supplies this tuple. A fresh-enough
+            -- Web observation remains usable after font/page rebuild; age is
+            -- relative to NOW, not to the UI reader session start.
             local anchor=type(job.cloud_anchor)=="table" and job.cloud_anchor or {}
             local source=tostring(anchor.source or "")
             local observed_at=tonumber(anchor.fetched_at)
             local from_web=source=="web_cookie" or source=="web"
                 or source=="web_progress" or source=="web_cookie_progress"
             local same_book=tostring(anchor.book_id or "")==book_id
-            local fresh=session_started~=nil and observed_at~=nil
-                and observed_at>=session_started-2
-                and observed_at<=os.time()+5
+            local max_age=math.max(30,tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600)
+            local fresh=observed_at~=nil and observed_at<=os.time()+5
+                and observed_at>=os.time()-max_age
             local idx=tonumber(anchor.chapter_idx)
             local uid=tostring(anchor.chapter_uid or "")
             local catalog_idx=nil
@@ -847,8 +846,12 @@ function Worker.run(job)
             if not position_override then
                 return finish(settings,book,{
                     ok=false,
-                    error="opening Web session position not ready or untrusted",
+                    error="Web time position unavailable, stale or invalid",
                     error_kind="context",
+                    anchor_reason=(not same_book and "wrong_book")
+                        or (not from_web and "web_source_missing")
+                        or (not fresh and "wire_age_invalid")
+                        or "chapter_or_index_invalid",
                     meta={request_dispatched=false},
                 },context_changed)
             end

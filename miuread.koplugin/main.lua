@@ -1908,9 +1908,12 @@ function Plugin:_show_auth_notice()
     local channel_key=tostring(health.last_error_channel or "")
     local channel=AUTH_CHANNEL_LABELS[channel_key] or "在线功能"
     local annotation_forbidden=channel_key=="annotations" and tostring(health.last_error_code or "")=="403"
+    local web_time_auth=channel_key=="read_report" or channel_key=="progress"
     local notice_text=annotation_forbidden
         and "正文下载仍可使用，但划线与想法接口拒绝访问。插件已保留正文、已有批注和下载断点；基础登录不会因此判定失效。"
-        or "自动续期、原请求重试和备用登录通道均未恢复此功能。其他本地功能和已缓存内容仍会保留；此时才建议重新扫码。"
+        or (web_time_auth
+            and "微信读书 Web 登录授权已过期，自动恢复未成功。Web 阅读时间可能无法上传；Agent 进度获取仍可能正常。重新扫码后将读取当前书籍 Web 位置并尝试恢复时间同步。"
+            or "自动续期未恢复此功能；本地书籍与下载记录仍然保留。可重新扫码登录。")
     local dialog
     local function close()
         if self._auth_notice_dialog==dialog then self._auth_notice_dialog=nil end
@@ -2192,8 +2195,11 @@ function Plugin:on_readtime_route_change(target,previous,reason)
         self:status_toast("阅读时间",previous=="eink" and "网络已恢复，Web 阅读时间同步已启动"
             or "Web 阅读时间同步已启动",3)
     elseif target=="eink" then
-        self:status_toast("阅读时间",previous=="web" and "网络已断开，阅读时间已转为本地记录"
-            or "网络未连接，阅读时间将在本地记录",4)
+        local web_failure=tostring(reason or ""):find("web_",1,true)~=nil
+        self:status_toast("阅读时间",web_failure and
+            "Web 时间暂不可用，已由 E-Ink 接管后续计时"
+            or (previous=="web" and "网络已断开，阅读时间已转为本地记录"
+            or "网络未连接，阅读时间将在本地记录"),4)
     end
 end
 
@@ -2245,8 +2251,16 @@ function Plugin:show_account_status()
         end
         rows[#rows+1]={text="阅读时间",separator=true,enabled=false}
         rows[#rows+1]={text="上传方式",post_text=label,enabled=false}
-        rows[#rows+1]={text="待同步",post_text=seconds_label(summary.pending),enabled=false}
-        rows[#rows+1]={text="待确认",post_text=seconds_label(summary.unknown),enabled=false}
+        rows[#rows+1]={text="E-Ink 待同步",post_text=seconds_label(summary.pending),enabled=false}
+        rows[#rows+1]={text="E-Ink 待确认",post_text=seconds_label(summary.unknown),enabled=false}
+        local book=self:_current_book_record()
+        if book and book.book then
+            local sid=tostring(book.book.book_id or "")
+            local web_pending=self.store:session(sid) or {}
+            if web_pending.pending_report_safe==true then
+                rows[#rows+1]={text="Web 明确未发送",post_text=seconds_label(web_pending.pending_report_seconds),enabled=false}
+            end
+        end
         local reason=summary.blocked or summary.capture_error or summary.error
             or ((summary.control or {}).reason)
         if reason then rows[#rows+1]={text="阻塞原因",post_text=tostring(reason),enabled=false} end
@@ -23947,7 +23961,10 @@ function Plugin:sync_diagnostics_menu()
                 self:info("当前时间由 E-Ink 负责，不能使用 Web 30 秒时长测试。\n\nE-Ink 记录将在结束阅读后或仅 E-Ink 模式联网时按队列规则上传。")
                 return
             end
-            if not self.sync:record() then self:info("请先打开一本觅阅下载的书籍。") return end
+            if not (self.sync:record() or self:_current_book_record()) then
+                self:info("尚未识别到当前觅阅书籍。请确认书籍已打开；如果刚进入阅读器，可稍后重试。")
+                return
+            end
             self:status_toast("阅读时间测试","正在上传 30 秒……",3)
             self.sync:test_upload(function(ok,result,position,value)
                 if ok then
@@ -23962,8 +23979,10 @@ function Plugin:sync_diagnostics_menu()
         {text="检查后台任务状态",callback=function() self:show_sync_background_status() end},
         {text="查看详细错误",callback=function() self:show_sync_status(true) end},
         {text="重置本书同步状态",callback=function()
-            local r=self.sync:record()
-            if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
+            local r=self.sync:record() or self:_current_book_record()
+            if not r or not r.book then
+                self:info("当前书籍身份尚未就绪，无法重置同步状态。") return
+            end
             local id=tostring(r.book.book_id)
             UIManager:show(ConfirmBox:new{text="重置本书的阅读进度同步状态？\n\n不会删除书籍、本机阅读位置、划线、想法或账号。批注同步状态不会改变。",ok_callback=function()
                 -- beta.16: use the same comprehensive reset as the one-shot
@@ -23997,8 +24016,10 @@ function Plugin:sync_diagnostics_menu()
             end})
         end},
         {text="重新检查本书批注同步",callback=function()
-            local r=self.sync:record()
-            if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
+            local r=self.sync:record() or self:_current_book_record()
+            if not r or not r.book then
+                self:info("当前书籍身份尚未就绪，无法重置同步状态。") return
+            end
             local id=tostring(r.book.book_id or "")
             local changed,err=LocalAnnotationDatabase.retry_failures(self.store,id)
             if changed==nil then self:info("无法重新检查本书批注：\n"..tostring(err or "未知错误")); return end
@@ -28274,7 +28295,7 @@ function Plugin:_show_sync_repair_prompt(err,kind,book_id)
     end
     dialog=ConfirmBox:new{
         text="《"..title.."》阅读同步失败\n\n"..detail
-            .."\n\n本次失败的阅读时间不会补传。其他书籍不受影响。",
+            .."\n\n阅读进度与时间分别处理；明确未发出的时间将等待安全恢复。",
         ok_text="修复同步", cancel_text="稍后",
         ok_callback=function() close(); self:repair_current_sync() end,
         cancel_callback=close,
@@ -28283,10 +28304,22 @@ function Plugin:_show_sync_repair_prompt(err,kind,book_id)
 end
 
 function Plugin:on_auth_required(channel,err)
-    local notify=tostring(channel or "")~="read_report"
-    local marked=self:_mark_auth_problem(channel,err,notify)
-    if marked and not notify then
-        self:status_toast("阅读时长同步","登录验证暂时失败，时长已保留，请恢复登录后重试",5)
+    local text=tostring(err or "")
+    local confirmed=text:find("微信登录授权已过期",1,true)~=nil
+        or text:find("[MiuReadAuthConfirmedExpired]",1,true)~=nil
+    local notify=confirmed or tostring(channel or "")~="read_report"
+    if confirmed then
+        -- One actionable QR prompt for each credential revision; periodic
+        -- Web worker errors must not show the same dialog every minute.
+        local auth=self.store:auth() or {}
+        local key=tostring(auth.login_session_id or "")..":"..
+            tostring(auth.web_auth_revision or auth.auth_revision or 0)..":"..tostring(channel or "")
+        if self._web_auth_notice_once==key then notify=false
+        else self._web_auth_notice_once=key end
+    end
+    local marked=self:_mark_auth_problem(channel,err,notify,confirmed)
+    if marked and not notify and not confirmed and tostring(channel)=="read_report" then
+        self:status_toast("阅读时间","Web 登录暂时异常，正在等待恢复",4)
     end
     return marked
 end
@@ -28318,15 +28351,20 @@ end
 function Plugin:on_read_report_failure(err,kind,book_id)
     kind=tostring(kind or "")
     if kind=="authentication" or Http.is_auth_error(err) then
-        self:_mark_auth_problem("read_report",err,false)
+        self:on_auth_required("read_report",err)
         return
     end
     if kind=="context" or kind=="position" then self:_show_sync_repair_prompt(err,"context",book_id) end
 end
 function Plugin:_current_book_record()
+    -- The Sync record can be recovered after an earlier transient negative
+    -- session classification. A verified library path is stronger evidence
+    -- than the opening UI's one-time classification result.
+    local r=self.sync:record()
+    if r then return r end
     if not self:_reader_session_is_weread() then return nil end
     self.store:reload()
-    local r=self.sync:record()
+    r=self.sync:record()
     if r then return r end
     local doc=self.ui and self.ui.document
     local path=doc and (doc.file or (doc.getFilePath and doc:getFilePath()))

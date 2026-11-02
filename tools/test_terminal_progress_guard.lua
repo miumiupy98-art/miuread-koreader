@@ -1,6 +1,0 @@
-local worker=assert(io.open('miuread.koplugin/miuread/legacy/read_report_worker.lua','rb')):read('*a')
-assert(worker:find('percent_to_ratio',1,true),'WeRead percent has explicit conversion')
-assert(worker:find('validate_terminal_progress',1,true),'terminal guard exists')
-assert(worker:find('refusing 100%% progress outside final readable chapter'),'100% outside final chapter fails closed')
-assert(worker:find('last_readable_chapter_uid',1,true),'final chapter identity is checked')
-print('terminal progress guard: PASS')

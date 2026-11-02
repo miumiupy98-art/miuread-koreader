@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "6.5.0-beta.17",
+    VERSION = "6.5.0-beta.18",
     SCHEMA = 136,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
@@ -104,13 +104,15 @@ local C = {
     -- The background timer reports at 15s then every configured interval.
     -- ReaderUI itself never performs the Web reading-time network write.
     READ_FIRST_DELAY = 15,
-    -- beta.24 never replays historical/suspend reading-time debt. Normal
-    -- reports stay on the established one-minute cadence and every request is
-    -- independently capped, avoiding burst uploads after reconnect/resume.
+    -- Each POST is capped at 60 seconds; SAFE, pre-dispatch-only backlog is
+    -- recovered gradually, not rewritten as a single unbounded request.
     READ_REPORT_MAX_ELAPSED_SECONDS = 60,
-    -- Reading time is best-effort: never persist/replay historical missed time.
-    -- Progress recovery remains independent and durable.
-    READ_TIME_BEST_EFFORT = true,
+    -- beta.18: persist ONLY intervals provably rejected before HTTP dispatch.
+    -- Already-dispatched/uncertain intervals must never be replayed.
+    READ_TIME_BEST_EFFORT = false,
+    -- Cached Web wire position can outlive the KOReader reader instance;
+    -- request a new observation if it is older than this bound.
+    READ_TIME_WIRE_MAX_AGE_SECONDS = 600,
     READ_TIME_MAX_ATTEMPTS = 2,
     -- beta.13: progress writes have priority over periodic reading-time writes.
     -- The fence is a soft preemption: an already-dispatched time request is

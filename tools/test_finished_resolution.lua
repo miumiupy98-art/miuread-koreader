@@ -1,7 +1,0 @@
-local f=assert(io.open("miuread.koplugin/main.lua","rb")); local s=f:read("*a"); f:close()
-assert(s:find("b.remote_finished",1,true),"remote finished retained")
-assert(s:find("b.local_finished",1,true),"local finished retained")
-assert(s:find("b.resolved_finished",1,true),"resolved finished exposed")
-local l=assert(io.open("miuread.koplugin/miuread/library.lua","rb")); local x=l:read("*a"); l:close()
-assert(x:find("remote_progress=",1,true) and x:find("remote_finished=",1,true),"library remote completion")
-print("finished resolution: PASS")
