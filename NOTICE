@@ -21,3 +21,8 @@ MiuRead is an unofficial community project. It is not affiliated with,
 endorsed by, or sponsored by WeRead, Tencent, KOReader, or the upstream
 project maintainers. All product names and trademarks belong to their
 respective owners.
+
+The bundled monochrome weread.svg is an independently redrawn e-ink
+adaptation referencing the publicly displayed WeRead app icon (open book
+and message bubble). WeRead and its marks belong to Tencent; this plugin
+is not Tencent-endorsed or official.

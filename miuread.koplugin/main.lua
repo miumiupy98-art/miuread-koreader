@@ -3684,6 +3684,10 @@ function Plugin:_home_preferences()
         if home.header_items[key]==nil then home.header_items[key]=true; changed=true end
     end
     if home.show_clock_card==nil then home.show_clock_card=true; changed=true end
+    if home.embedded_stats_mode~='none' and home.embedded_stats_mode~='weread'
+        and home.embedded_stats_mode~='local' and home.embedded_stats_mode~='both' then
+        home.embedded_stats_mode='both'; changed=true
+    end
     if tonumber(home.layout_version)~=24 then home.layout_version=24; changed=true end
     if home.layout_style~="compact" and home.layout_style~="desk" then
         home.layout_style="desk"
@@ -11776,6 +11780,13 @@ function Plugin:_home_stats_visibility(home)
     return home.show_weread_stats~=false,home.show_local_stats~=false
 end
 
+function Plugin:_home_stats_data_needed(home)
+    home=type(home)=='table' and home or self:_home_preferences()
+    local mode=tostring(home.embedded_stats_mode or 'both')
+    return home.show_weread_stats~=false or mode=='weread' or mode=='both',
+        home.show_local_stats~=false or mode=='local' or mode=='both'
+end
+
 function Plugin:_set_home_clock_card_visible(enabled)
     local home,preferences=self:_home_preferences()
     enabled=enabled==true
@@ -11821,20 +11832,39 @@ function Plugin:_set_home_stats_visibility(kind,enabled)
 end
 
 function Plugin:home_stats_settings_menu()
+    local names={none='不显示',weread='仅微信读书',['local']='仅本地阅读',both='微信读书 + 本地阅读'}
+    local function option(mode,label)
+        return {text=label,checked_func=function()
+            return self:_home_preferences().embedded_stats_mode==mode
+        end,callback=function()
+            local home,prefs=self:_home_preferences()
+            if home.embedded_stats_mode==mode then return end
+            home.embedded_stats_mode=mode
+            local saved,err=self:_save_home_preferences(home,prefs)
+            if not saved then self:info('内嵌阅读统计设置未保存：'..tostring(err or '未知错误'));return end
+            self:_refresh_home_view(nil,'content')
+            self:_schedule_home_stats_idle_refresh(2.5)
+        end}
+    end
     return {
+        {text='最近阅读内显示统计',post_text=names[self:_home_preferences().embedded_stats_mode] or '微信读书 + 本地阅读',
+            sub_item_table={
+                option('none','不显示'),option('weread','仅微信读书'),
+                option('local','仅本地阅读'),option('both','微信读书 + 本地阅读'),
+            }},
         {text="显示大时钟",checked_func=function()
             return self:_home_preferences().show_clock_card~=false
         end,keep_menu_open=true,callback=function()
             local home=self:_home_preferences()
             self:_set_home_clock_card_visible(home.show_clock_card==false)
         end},
-        {text="显示微信读书统计",post_text="隐藏后主页不再刷新微信读书统计",checked_func=function()
+        {text="显示微信读书统计",post_text="控制独立统计模块；内嵌统计可继续更新",checked_func=function()
             return self:_home_preferences().show_weread_stats~=false
         end,keep_menu_open=true,callback=function()
             local home=self:_home_preferences()
             self:_set_home_stats_visibility("weread",home.show_weread_stats==false)
         end},
-        {text="显示本地阅读统计",post_text="隐藏后主页不再读取本地阅读统计",checked_func=function()
+        {text="显示本地阅读统计",post_text="控制独立统计模块；内嵌统计可继续更新",checked_func=function()
             return self:_home_preferences().show_local_stats~=false
         end,keep_menu_open=true,callback=function()
             local home=self:_home_preferences()
@@ -11926,7 +11956,7 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
             return
         end
 
-        local show_weread,show_local=self:_home_stats_visibility()
+        local show_weread,show_local=self:_home_stats_data_needed()
         if not show_weread and not show_local then
             self._home_stats_refresh_task=nil
             return
@@ -11994,7 +12024,7 @@ function Plugin:_schedule_home_stats_idle_refresh(delay)
                 end
                 self._home_stats_apply_task=nil
                 local update={}
-                local show_weread_now,show_local_now=self:_home_stats_visibility()
+                local show_weread_now,show_local_now=self:_home_stats_data_needed()
                 if need_local then
                     self._home_local_stats_cache=type(value.local_stats)=="table" and value.local_stats or nil
                     self._home_local_stats_cache_at=os.time()
@@ -18504,6 +18534,33 @@ function Plugin:_schedule_reader_close_settle(path,session_generation,reason)
     return self:_schedule_reader_return_finish(generation,.10,reason or "document closed")
 end
 
+function Plugin:_home_show_recent_book_intro(book)
+    book=type(book)=='table' and book or {}
+    local title=U.trim(tostring(book.title or '未命名'))
+    local intro=U.trim(tostring(book.description or book.intro or book.summary or ''))
+    if intro=='' then
+        self:info('《'..title..'》暂无完整简介。可通过书籍操作刷新元数据。')
+        return false
+    end
+    local items={}
+    for _,field in ipairs({book.author,book.category,book.publisher}) do
+        local value=U.trim(tostring(field or ''))
+        if value~='' then items[#items+1]=value end
+    end
+    local content=(#items>0 and table.concat(items,' · ')..'\n\n' or '')..intro
+    local ok,viewer=pcall(require,'ui/widget/textviewer')
+    if ok and viewer and type(viewer.new)=='function' then
+        local created,widget=pcall(viewer.new,viewer,{title='书籍介绍 · '..title,text=content,text_type='book_info'})
+        if created and widget then
+            widget._miuread_transient=true
+            UIManager:show(widget)
+            return true
+        end
+    end
+    self:info(title..'\n\n'..content)
+    return true
+end
+
 function Plugin:_home_prepare_hero_book(book)
     if type(book)~="table" then return nil end
     local hero_path=LocalLibrary.normalize(book.file or "")
@@ -18531,6 +18588,7 @@ function Plugin:_home_prepare_hero_book(book)
     hero.edition_text=nil
     hero.on_tap=function(anchor,ges) self:_home_open_book(hero,anchor,ges,true) end
     hero.on_history=function() self:show_home_reading_history() end
+    hero.on_intro=function() self:_home_show_recent_book_intro(hero) end
     return hero
 end
 
@@ -18765,6 +18823,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         show_weread_stats=home.show_weread_stats~=false,
         show_local_stats=home.show_local_stats~=false,
         show_clock_card=home.show_clock_card~=false,
+        embedded_stats_mode=home.embedded_stats_mode or 'both',
         show_shelf_covers=self:_shelf_covers_enabled(self.store:preferences()),
         layout_style=home.layout_style,
         display_size=home.display_size,
@@ -18837,7 +18896,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     self._home_refresh_pending=false
     self:_home_schedule_clock()
     self:_home_schedule_device_state_probe(.65)
-    local show_weread_stats,show_local_stats=self:_home_stats_visibility(home)
+    local show_weread_stats,show_local_stats=self:_home_stats_data_needed(home)
     if show_weread_stats or show_local_stats then
         self:_schedule_home_stats_idle_refresh(4.5)
     else
