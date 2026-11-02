@@ -7920,7 +7920,7 @@ function Plugin:_home_local_is_miuread_file(path,index,deep)
     -- have the same filename as an old MiuRead download. Moved/renamed MiuRead
     -- EPUBs are identified from their embedded source marker below.
     if deep==true and path:lower():match("%.epub$") and self.store and type(self.store.epub_identity_light)=="function" then
-        local ok,identity=pcall(self.store.epub_identity_light,self.store,path)
+        local ok,identity=pcall(self.store.epub_identity_light,self.store,path,true)
         if ok and type(identity)=="table" and tostring(identity.book_id or "")~="" then return true end
     end
     return false

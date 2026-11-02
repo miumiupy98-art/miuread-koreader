@@ -2023,6 +2023,110 @@ local function filename_key(path)
     return name:gsub("　", "")
 end
 
+local function zip_u16(data,pos)
+    local a,b=data:byte(pos,pos+1)
+    if not a or not b then return nil end
+    return a+b*256
+end
+
+local function zip_u32(data,pos)
+    local a,b,c,d=data:byte(pos,pos+3)
+    if not a or not b or not c or not d then return nil end
+    return a+b*256+c*65536+d*16777216
+end
+
+local function zip_probe_miuread_entries(path)
+    local file=io.open(path,"rb")
+    if not file then return nil end
+    local size=file:seek("end") or 0
+    if size<22 then file:close(); return nil end
+    local tail_len=math.min(size,65558)
+    local tail_offset=size-tail_len
+    file:seek("set",tail_offset)
+    local tail=file:read(tail_len) or ""
+    local marker,at=nil,1
+    while true do
+        local found=tail:find("PK\005\006",at,true)
+        if not found then break end
+        marker=found; at=found+1
+    end
+    if not marker or marker+21>#tail then file:close(); return nil end
+    local count=zip_u16(tail,marker+10)
+    local central_size=zip_u32(tail,marker+12)
+    local central_offset=zip_u32(tail,marker+16)
+    if not count or not central_size or not central_offset
+        or count==0xFFFF or central_size==0xFFFFFFFF or central_offset==0xFFFFFFFF
+        or central_offset+central_size>size then
+        file:close(); return nil
+    end
+    local cd_data
+    if central_size==0 then
+        cd_data=""
+    elseif central_offset>=tail_offset then
+        local start_idx=(central_offset-tail_offset)+1
+        cd_data=tail:sub(start_idx,start_idx+central_size-1)
+        if #cd_data~=central_size then file:close(); return nil end
+    else
+        file:seek("set",central_offset)
+        cd_data=file:read(central_size) or ""
+        if #cd_data~=central_size then file:close(); return nil end
+    end
+    local entries={}
+    local pos=1
+    for _=1,count do
+        if pos+45>#cd_data or cd_data:sub(pos,pos+3)~="PK\001\002" then
+            file:close(); return nil
+        end
+        local method=zip_u16(cd_data,pos+10) or -1
+        local compressed=zip_u32(cd_data,pos+20) or 0
+        local uncompressed=zip_u32(cd_data,pos+24) or 0
+        local name_len=zip_u16(cd_data,pos+28) or 0
+        local extra_len=zip_u16(cd_data,pos+30) or 0
+        local comment_len=zip_u16(cd_data,pos+32) or 0
+        local local_offset=zip_u32(cd_data,pos+42)
+        local name_start=pos+46
+        local name_end=name_start+name_len-1
+        local next_pos=name_end+extra_len+comment_len+1
+        if not local_offset or name_end>#cd_data or next_pos-1>#cd_data then
+            file:close(); return nil
+        end
+        local name=cd_data:sub(name_start,name_end)
+        if name=="OEBPS/miuread.json" or name=="OEBPS/package.opf" then
+            entries[name]={
+                method=method,
+                compressed=compressed,
+                uncompressed=uncompressed,
+                offset=local_offset,
+            }
+        end
+        pos=next_pos
+    end
+    local contents={}
+    for _,target in ipairs({"OEBPS/miuread.json","OEBPS/package.opf"}) do
+        local entry=entries[target]
+        if entry and entry.method==0 and entry.uncompressed==entry.compressed
+            and entry.uncompressed>=0 and entry.uncompressed<=262144
+            and entry.offset+30+entry.uncompressed<=size then
+            file:seek("set",entry.offset)
+            local header=file:read(30)
+            if header and #header==30 and header:sub(1,4)=="PK\003\004" then
+                local name_len=zip_u16(header,27) or 0
+                local extra_len=zip_u16(header,29) or 0
+                local data_offset=entry.offset+30+name_len+extra_len
+                if data_offset+entry.uncompressed<=size then
+                    file:seek("set",data_offset)
+                    local data=file:read(entry.uncompressed)
+                    if data and #data==entry.uncompressed then
+                        contents[target]=data
+                    end
+                end
+            end
+        end
+    end
+    file:close()
+    return {is_zip=true,entries=entries,contents=contents}
+end
+
 local function identity_from_blob(blob,identity)
     blob=tostring(blob or "")
     identity=type(identity)=="table" and identity or {}
@@ -2043,13 +2147,47 @@ local function identity_from_blob(blob,identity)
         or tonumber(blob:match('"progress_source_book_version"%s*:%s*(%d+)'))
     if identity.standalone==nil and blob:match('"standalone"%s*:%s*true') then identity.standalone=true end
     identity.chapter_uid=identity.chapter_uid or blob:match('"chapter_uid"%s*:%s*"?([^",}%s]+)')
-    identity.title=identity.title or xml_unescape(blob:match("<dc:title[^>]*>(.-)</dc:title>"))
-    identity.author=identity.author or xml_unescape(blob:match("<dc:creator[^>]*>(.-)</dc:creator>"))
+    local title_match=blob:match("<dc:title[^>]*>(.-)</dc:title>")
+    if tostring(identity.title or "")=="" and title_match then
+        identity.title=xml_unescape(title_match)
+    elseif identity.title==nil then
+        identity.title=""
+    end
+    local author_match=blob:match("<dc:creator[^>]*>(.-)</dc:creator>")
+    if tostring(identity.author or "")=="" and author_match then
+        identity.author=xml_unescape(author_match)
+    elseif identity.author==nil then
+        identity.author=""
+    end
     return identity
 end
 
-function Store:epub_identity_light(path)
+function Store:epub_identity_light(path,require_book_id)
     if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
+    local probe=zip_probe_miuread_entries(path)
+    if probe and probe.is_zip then
+        local raw_json=probe.contents["OEBPS/miuread.json"]
+        local raw_opf=probe.contents["OEBPS/package.opf"]
+        local identity={}
+        if raw_json then
+            identity=identity_from_blob(raw_json,identity)
+            local ok,value=pcall(Json.decode,raw_json)
+            if ok and type(value)=="table" then identity=U.merge(identity,value) end
+        end
+        if raw_opf then
+            identity=identity_from_blob(raw_opf,identity)
+        end
+        if require_book_id==true then
+            if tostring(identity.book_id or "")~="" then return identity end
+        else
+            if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
+        end
+        local has_unresolved_json=probe.entries["OEBPS/miuread.json"]~=nil and raw_json==nil
+        local has_unresolved_opf=probe.entries["OEBPS/package.opf"]~=nil and raw_opf==nil
+        if not has_unresolved_json and (require_book_id==true or not has_unresolved_opf) then
+            return nil
+        end
+    end
     local file=io.open(path,"rb")
     if not file then return nil end
     local size=file:seek("end") or 0
@@ -2062,14 +2200,56 @@ function Store:epub_identity_light(path)
     end
     file:close()
     local identity=identity_from_blob(head.."\n"..tail,{})
+    if require_book_id==true then
+        if tostring(identity.book_id or "")~="" then return identity end
+        return nil
+    end
     if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
     return nil
 end
 
-function Store:epub_identity(path)
-    local identity=self:epub_identity_light(path) or {}
-    if tostring(identity.book_id or "")~="" then return identity end
+function Store:epub_identity(path,require_book_id)
     if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
+    local probe=zip_probe_miuread_entries(path)
+    if probe and probe.is_zip then
+        local identity={}
+        local raw_json=probe.contents["OEBPS/miuread.json"]
+        local raw_opf=probe.contents["OEBPS/package.opf"]
+        if raw_json then
+            identity=identity_from_blob(raw_json,identity)
+            local ok,value=pcall(Json.decode,raw_json)
+            if ok and type(value)=="table" then identity=U.merge(identity,value) end
+        end
+        if raw_opf then
+            identity=identity_from_blob(raw_opf,identity)
+        end
+        if tostring(identity.book_id or "")~="" then return identity end
+        local quoted
+        if not raw_json and probe.entries["OEBPS/miuread.json"]~=nil then
+            quoted=quoted or U.shell_quote(path)
+            local raw=read_pipe("unzip -p "..quoted.." OEBPS/miuread.json 2>/dev/null")
+            if raw then
+                identity=identity_from_blob(raw,identity)
+                local ok,value=pcall(Json.decode,raw)
+                if ok and type(value)=="table" then identity=U.merge(identity,value) end
+            end
+        end
+        if tostring(identity.book_id or "")~="" then return identity end
+        if not raw_opf and probe.entries["OEBPS/package.opf"]~=nil
+            and (require_book_id~=true or probe.entries["OEBPS/miuread.json"]~=nil) then
+            quoted=quoted or U.shell_quote(path)
+            local opf=read_pipe("unzip -p "..quoted.." OEBPS/package.opf 2>/dev/null")
+            if opf then identity=identity_from_blob(opf,identity) end
+        end
+        if require_book_id==true then
+            if tostring(identity.book_id or "")~="" then return identity end
+            return nil
+        end
+        if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
+        return nil
+    end
+    local identity=self:epub_identity_light(path,require_book_id) or {}
+    if tostring(identity.book_id or "")~="" then return identity end
     local quoted=U.shell_quote(path)
     local raw=read_pipe("unzip -p "..quoted.." OEBPS/miuread.json 2>/dev/null")
     if raw then
@@ -2078,6 +2258,10 @@ function Store:epub_identity(path)
     end
     local opf=read_pipe("unzip -p "..quoted.." OEBPS/package.opf 2>/dev/null")
     if opf then identity=identity_from_blob(opf,identity) end
+    if require_book_id==true then
+        if tostring(identity.book_id or "")~="" then return identity end
+        return nil
+    end
     if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
     return nil
 end
@@ -2382,7 +2566,7 @@ end
 function Store:recover_miuread_file(path,relink)
     local book,record,kind=self:file_record_fast(path,relink)
     if book then return book,record,kind,"record" end
-    local meta=self:epub_identity(path)
+    local meta=self:epub_identity(path,true)
     local book_id=type(meta)=="table" and tostring(meta.book_id or "") or ""
     if book_id=="" then return nil end
     book,record,kind=self:file_record_from_identity(path,meta,relink)
