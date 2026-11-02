@@ -7402,40 +7402,42 @@ function Plugin:_wifi_resume_recover(source)
     end
 
     local requested=false
-    -- Prefer KOReader's device-owned restore path on every platform that
-    -- provides it. Kobo implements this via restore-wifi-async.sh; MiuRead must
-    -- not manipulate dhcpcd/wpa_supplicant itself.
     if NetworkMgr.pending_connection==true or NetworkMgr.pending_connectivity_check==true then
         requested=true
         logger.info("[MiuRead][WiFi] resume reuses KOReader connection attempt",
             "source=",tostring(source or "resume"))
+    elseif type(NetworkMgr.enableWifi)=="function" then
+        -- Use KOReader's complete Wi-Fi backend (connect/reconnect + status
+        -- notifications). Kindle restoreWifiAsync only powers on the radio and
+        -- can leave wifid enabled with no SSID, as seen on Kindle Voyage.
+        local ok_enable,value=pcall(NetworkMgr.enableWifi,NetworkMgr,complete,false)
+        requested=ok_enable and value~=false
+        if not ok_enable then
+            logger.warn("[MiuRead][WiFi] resume enable failed",tostring(value))
+        end
     elseif type(NetworkMgr.restoreWifiAsync)=="function"
         and type(NetworkMgr.scheduleConnectivityCheck)=="function" then
-        if UIManager and Event then pcall(UIManager.broadcastEvent,UIManager,Event:new("NetworkConnecting")) end
         local ok_restore,restore_err=pcall(NetworkMgr.restoreWifiAsync,NetworkMgr)
         if ok_restore then
             local ok_check,check_err=pcall(NetworkMgr.scheduleConnectivityCheck,NetworkMgr,complete)
             requested=ok_check==true
-            if not ok_check then
-                logger.warn("[MiuRead][WiFi] resume connectivity check failed",tostring(check_err))
-            end
+            if not ok_check then logger.warn("[MiuRead][WiFi] resume check failed",tostring(check_err)) end
         else
             logger.warn("[MiuRead][WiFi] resume restore failed",tostring(restore_err))
         end
-    elseif type(NetworkMgr.enableWifi)=="function" then
-        local ok_enable,value=pcall(NetworkMgr.enableWifi,NetworkMgr,complete,false)
-        requested=ok_enable and value~=false
-    elseif radio~=true then
-        requested=self:_wifi_start(NetworkMgr,source)==true
     end
 
-    self:_wifi_schedule_reconcile(source,true,{
-        delays={.8,3,6,12,24,40,48},fail_on_timeout=true,notify=true,
-    })
+    if requested then
+        self:_wifi_schedule_reconcile(source,true,{
+            delays={.8,3,6,12,24,40,48},fail_on_timeout=true,notify=true,
+        })
+    else
+        require("miuread.network_health").note_failure("resume:request_failed")
+    end
     logger.info("[MiuRead][WiFi] resume recovery requested",
         "source=",tostring(source or "resume"),"requested=",tostring(requested),
         "radio=",tostring(radio),"connected=",tostring(connected))
-    return requested,"requested"
+    return requested,requested and "requested" or "request_failed"
 end
 
 function Plugin:_wifi_start(NetworkMgr,source)
@@ -7448,40 +7450,32 @@ function Plugin:_wifi_start(NetworkMgr,source)
         self:_wifi_refresh_state(tostring(source or "toggle")..":connected")
     end
 
-    -- Kindle's native Wi-Fi service may need several seconds to reconnect a saved
-    -- profile. Avoid an immediate scan here: on KPW5 that scan can finish before
-    -- wifid has associated, causing NetworkMgr to report a false failure.
-    local is_kindle=false
-    if type(Device.isKindle)=="function" then
-        local ok,value=pcall(Device.isKindle,Device)
-        is_kindle=ok and value==true
+    -- Manual Wi-Fi actions must use KOReader's interactive connection path.
+    -- On Kindle, restoreWifiAsync turns the radio on but does *not* guarantee
+    -- association with a saved SSID; use the native reconnect/network picker.
+    if NetworkMgr.pending_connection==true or NetworkMgr.pending_connectivity_check==true then
+        logger.info("[MiuRead][WiFi] manual start uses existing attempt", "source=",tostring(source))
+        self:_wifi_schedule_reconcile(source,true)
+        return true
     end
     local ok=false
-    if is_kindle and type(NetworkMgr.restoreWifiAsync)=="function"
-        and type(NetworkMgr.scheduleConnectivityCheck)=="function" then
-        if NetworkMgr.pending_connectivity_check==true and type(NetworkMgr.unscheduleConnectivityCheck)=="function" then
-            pcall(NetworkMgr.unscheduleConnectivityCheck,NetworkMgr)
-        end
-        if UIManager and Event then pcall(UIManager.broadcastEvent,UIManager,Event:new("NetworkConnecting")) end
-        local ok_restore,err=pcall(NetworkMgr.restoreWifiAsync,NetworkMgr)
-        if ok_restore then
-            local ok_check,check_err=pcall(NetworkMgr.scheduleConnectivityCheck,NetworkMgr,complete)
-            ok=ok_check==true
-            if not ok_check then logger.warn("[MiuRead][WiFi] Kindle connectivity check failed",tostring(check_err)) end
-        else
-            logger.warn("[MiuRead][WiFi] Kindle restore failed",tostring(err))
-        end
-        if ok then logger.info("[MiuRead][WiFi] Kindle saved-network restore requested","source=",tostring(source or "toggle")) end
-    elseif type(NetworkMgr.toggleWifiOn)=="function" then
-        -- This is a direct user action. Passing interactive=true prevents
-        -- KOReader from treating a still-connecting radio as a background failure.
-        ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,complete,false,true)
+    if type(NetworkMgr.toggleWifiOn)=="function" then
+        local called,err=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,complete,false,true)
+        ok=called and err~=false
+        if not called then logger.warn("[MiuRead][WiFi] interactive toggle failed",tostring(err)) end
+    elseif type(NetworkMgr.enableWifi)=="function" then
+        local called,value=pcall(NetworkMgr.enableWifi,NetworkMgr,complete,true)
+        ok=called and value~=false
+        if not called then logger.warn("[MiuRead][WiFi] interactive enable failed",tostring(value)) end
     elseif type(NetworkMgr.turnOnWifi)=="function" then
-        ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,complete,true)
+        local called,value=pcall(NetworkMgr.turnOnWifi,NetworkMgr,complete,true)
+        ok=called and value~=false
     end
     if ok then
         HomeData.invalidate_device_state()
-        self:_wifi_schedule_reconcile(source,true)
+        self:_wifi_schedule_reconcile(source,true,{fail_on_timeout=true,notify=true})
+    else
+        require("miuread.network_health").note_failure("manual_wifi_start_failed")
     end
     return ok==true
 end
@@ -7520,9 +7514,9 @@ end
 function Plugin:_reader_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_wifi_state_snapshot(NetworkMgr)==true
+    local radio,connected=self:_wifi_state_snapshot(NetworkMgr)
     local ok
-    if on then
+    if radio==true and connected==true then
         ok=self:_wifi_stop(NetworkMgr,"reader")
         if ok then self:toast("正在关闭 Wi-Fi",1.5) end
     else
@@ -7625,10 +7619,16 @@ function Plugin:_home_wifi_details()
         {text="查看可用网络",post_text="使用 KOReader 网络管理",close_before_action=true,callback=function()
             return self:_home_wifi_settings()
         end},
-        {text=state.wifi_on==false and "开启 Wi-Fi" or (state.wifi_on==true and "关闭 Wi-Fi" or "管理 Wi-Fi 开关"),close_before_action=true,callback=function()
+        {text=state.wifi_on==false and "开启 Wi-Fi" or (connected and "关闭 Wi-Fi" or "重新连接 Wi-Fi"),close_before_action=true,callback=function()
             return self:_home_wifi_toggle()
         end},
     }
+    if state.wifi_on==true and not connected then
+        rows[#rows+1]={text="关闭 Wi-Fi 无线电",close_before_action=true,callback=function()
+            local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
+            return ok_nm and NetworkMgr and self:_wifi_stop(NetworkMgr,"home") or false
+        end}
+    end
     return self:list("Wi-Fi",rows)
 end
 
@@ -12442,9 +12442,9 @@ end
 function Plugin:_home_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_wifi_state_snapshot(NetworkMgr)==true
+    local radio,connected=self:_wifi_state_snapshot(NetworkMgr)
     local ok
-    if on then
+    if radio==true and connected==true then
         ok=self:_wifi_stop(NetworkMgr,"home")
         if ok then self:toast("正在关闭 Wi-Fi",1.5) end
     else
@@ -25925,9 +25925,9 @@ function Plugin:_sync_home_pending(options)
             release_manual()
             return false
         end
-        if self:_network_radio_hint()==false then
+        if not self:is_online() then
             logger.warn("[MiuRead][SyncAction] finish",
-                "source=",source,"result=blocked","reason=wifi_off")
+                "source=",source,"result=blocked","reason=wifi_not_connected")
             if not silent then self:info("当前 Wi-Fi 未开启。\n\n同步失败项目仍保留在本机；网络恢复后可再次点击同步。") end
             release_manual()
             return false
@@ -25961,9 +25961,9 @@ function Plugin:_sync_home_pending(options)
             release_manual()
             return false
         end
-        if radio==false then
+        if radio==false or not self:is_online() then
             logger.warn("[MiuRead][SyncAction] finish",
-                "source=",source,"result=blocked","reason=wifi_off")
+                "source=",source,"result=blocked","reason=wifi_not_connected")
             self:info("当前 Wi-Fi 未开启。\n\n同步失败项目仍保留在本机；网络恢复后可再次点击同步。")
             release_manual()
             return false
@@ -32259,35 +32259,31 @@ end
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
 function Plugin:onNetworkConnected()
-    self:_schedule_smart_readtime_route(true,"network_connected")
+    -- KOReader may announce this before Kindle wifid has an IP route. A radio
+    -- enabled without an SSID must not wake cloud uploads or Web-first routing.
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
     local generation=self._network_recovery_generation
-    UIManager:scheduleIn(.8,function()
+    logger.info("[MiuRead][ResumeSync] link event; checking connectivity", "generation=",generation)
+    self:_wait_for_network("network-restored-sync",function(ready)
         if generation~=tonumber(self._network_recovery_generation) then return end
+        if not ready then
+            logger.warn("[MiuRead][ResumeSync] network_wait_timeout","source=network_restored")
+            return
+        end
+        logger.info("[MiuRead][ResumeSync] network_online","source=network_restored")
+        self:_schedule_smart_readtime_route(true,"network_restored")
         self.sync:wake_offline_reading_time()
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self:_sync_home_pending({silent=true,source="network_restored"})
-            if tostring(self._home_active_section or "shelf")=="shelf" then self:_home_refresh_remote(false,false) end
+            if tostring(self._home_active_section or "shelf")=="shelf" then
+                self:_home_refresh_remote(false,false)
+            end
         elseif self.ui and self.ui.document and self:_reader_session_is_weread() then
             self:_schedule_next_comment_preload(3)
             local prefs=self.store:preferences().sync or {}
             if prefs.auto_latest_position~=false and not self._progress_check_running then
-                logger.info("[MiuRead][ResumeSync] waiting_network","source=network_restored")
-                self:_wait_for_network("reader-progress-online",function(ready)
-                    if not (self.ui and self.ui.document) then return end
-                    if ready then
-                        if not self._progress_check_running then
-                            logger.info("[MiuRead][ResumeSync] network_online","source=network_restored")
-                            logger.info("[MiuRead][ResumeSync] reconcile_started","source=network_restored")
-                            self:ensure_read_report_progress("network_restored",true)
-                        end
-                    else
-                        local r=self.sync:record()
-                        if r then self:_save_progress_state(tostring(r.book.book_id),"waiting_network",
-                            "网络恢复尚未完成，保留本地位置等待后续同步",nil,nil) end
-                        logger.warn("[MiuRead][ResumeSync] network_wait_timeout","source=network_restored")
-                    end
-                end,{minimum_delay=2.5,max_wait=45,interval=1,require_online=true})
+                logger.info("[MiuRead][ResumeSync] reconcile_started","source=network_restored")
+                self:ensure_read_report_progress("network_restored",true)
             end
         end
         if HomeView.is_shown() and not self:_active_reader_ui() then
@@ -32298,7 +32294,7 @@ function Plugin:onNetworkConnected()
         end
         self:_schedule_hibernated_download_resume("network restored")
         self:_legacy_coordinate_schedule(18,"network restored")
-    end)
+    end,{initial_delay=.8,minimum_delay=2.5,max_wait=45,interval=2,require_online=true})
     return false
 end
 
@@ -32306,6 +32302,8 @@ function Plugin:onNetworkDisconnected()
     self:_legacy_coordinate_pause("network disconnected")
     self:_cancel_next_comment_preload("network disconnected")
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
+    -- Cancel callbacks from an obsolete connect event; leave durable queues intact.
+    if self._network_wait_tokens then self._network_wait_tokens["network-restored-sync"]=nil end
     self:_schedule_smart_readtime_route(false,"network_disconnected")
     logger.info("[MiuRead][Network] disconnected; safe sync remains durable")
     return false
