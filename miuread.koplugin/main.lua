@@ -3680,9 +3680,10 @@ function Plugin:_home_preferences()
     -- B5: preserve the existing appearance for upgrades; every item may be hidden.
     if home.header_visible==nil then home.header_visible=true; changed=true end
     if type(home.header_items)~="table" then home.header_items={}; changed=true end
-    for _,key in ipairs({"title","account","wifi","bluetooth","sync","battery","tools"}) do
+    for _,key in ipairs({"title","account","wifi","bluetooth","sync","battery","time","tools"}) do
         if home.header_items[key]==nil then home.header_items[key]=true; changed=true end
     end
+    if home.show_clock_card==nil then home.show_clock_card=true; changed=true end
     if tonumber(home.layout_version)~=24 then home.layout_version=24; changed=true end
     if home.layout_style~="compact" and home.layout_style~="desk" then
         home.layout_style="desk"
@@ -4613,6 +4614,7 @@ function Plugin:_home_refresh_header_now(force_device,force_sync)
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=force_sync==true and self:_home_sync_status_label(true) or self:_home_sync_status_label_cached(),
         battery_text=self:_home_battery_text(),
+        time_text=self:_display_time("%H:%M"),
     }
 end
 
@@ -4663,11 +4665,10 @@ function Plugin:_home_schedule_clock()
     end
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
     HomeData.quick_power_state(true)
-    HomeView.update_header{battery_text=self:_home_battery_text()}
-    HomeView.update_dashboard{
-        clock_text=self:_display_time("%H:%M"),
-        date_text=self:_home_date_text(),
-    }
+    HomeView.update_header{battery_text=self:_home_battery_text(),time_text=self:_display_time("%H:%M")}
+    if self:_home_preferences().show_clock_card~=false then
+        HomeView.update_dashboard{clock_text=self:_display_time("%H:%M"),date_text=self:_home_date_text()}
+    end
     local task
     task=function()
         if generation~=self._home_clock_generation or self._home_clock_task~=task then return end
@@ -4681,11 +4682,10 @@ function Plugin:_home_schedule_clock()
             -- and partially replace its contents on e-ink devices.
             if not self:_home_modal_surface_active() then
                 HomeData.quick_power_state(true)
-                HomeView.update_header{battery_text=self:_home_battery_text()}
-                HomeView.update_dashboard{
-                    clock_text=self:_display_time("%H:%M"),
-                    date_text=self:_home_date_text(),
-                }
+                HomeView.update_header{battery_text=self:_home_battery_text(),time_text=self:_display_time("%H:%M")}
+                if self:_home_preferences().show_clock_card~=false then
+                    HomeView.update_dashboard{clock_text=self:_display_time("%H:%M"),date_text=self:_home_date_text()}
+                end
             end
         end
         local now=os.time()
@@ -6261,9 +6261,9 @@ function Plugin:_toggle_home_lockscreen()
     self:_refresh_home_view(home.lockscreen_recent and "主页锁屏将显示最近阅读封面" or "已恢复 KOReader 原锁屏设置","header")
 end
 
-local HOME_HEADER_KEYS={"title","account","wifi","bluetooth","sync","battery","tools"}
+local HOME_HEADER_KEYS={"title","account","wifi","bluetooth","sync","battery","time","tools"}
 local HOME_HEADER_LABELS={title="觅阅标题",account="账号",wifi="Wi-Fi 状态",bluetooth="蓝牙状态",
-    sync="同步状态",battery="电量",tools="工具入口"}
+    sync="同步状态",battery="电量",time="时间",tools="工具入口"}
 
 function Plugin:_set_home_header_item(key,visible)
     if not HOME_HEADER_LABELS[key] then return false end
@@ -7541,7 +7541,15 @@ function Plugin:_reader_wifi_settings(back_callback)
             if ok_list and type(networks)=="table" then
                 local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
-                    local dialog=NetworkSetting:new{network_list=sanitized_network_list(networks)}
+                    local visible_networks=sanitized_network_list(networks)
+                    local screen=Device.screen
+                    local row_height=screen:scaleBySize(44)
+                    local list_height=math.min(math.floor(screen:getHeight()*.70),
+                        math.max(screen:scaleBySize(58),row_height*math.max(1,#visible_networks)+screen:scaleBySize(12)))
+                    logger.info("[MiuRead][WiFi] reader network picker", "scanned=",tostring(#networks),
+                        "visible=",tostring(#visible_networks),"height=",tostring(list_height))
+                    local dialog=NetworkSetting:new{network_list=visible_networks,height=list_height}
+                    dialog._miuread_modal_surface=true
                     local original_on_close=dialog.onCloseWidget
                     dialog.onCloseWidget=function(widget)
                         if type(original_on_close)=="function" then
@@ -7597,7 +7605,7 @@ end
 function Plugin:_home_header_visibility_label()
     local home=self:_home_preferences()
     if home.header_visible==false then return "已隐藏" end
-    local fields={"title","account","wifi","bluetooth","sync","battery","tools"}
+    local fields={"title","account","wifi","bluetooth","sync","battery","time","tools"}
     local visible=type(home.header_items)=="table" and home.header_items or {}
     for _,key in ipairs(fields) do
         if visible[key]==false then return "部分隐藏" end
@@ -11768,6 +11776,21 @@ function Plugin:_home_stats_visibility(home)
     return home.show_weread_stats~=false,home.show_local_stats~=false
 end
 
+function Plugin:_set_home_clock_card_visible(enabled)
+    local home,preferences=self:_home_preferences()
+    enabled=enabled==true
+    if (home.show_clock_card~=false)==enabled then return false end
+    home.show_clock_card=enabled
+    local saved,err=self:_save_home_preferences(home,preferences)
+    if not saved then
+        logger.warn("[MiuRead][HomeClock] setting save failed",tostring(err or "unknown"))
+        self:info("时钟显示设置保存失败")
+        return false
+    end
+    self:_refresh_home_view(enabled and "大时钟已显示" or "大时钟已隐藏","page")
+    return true
+end
+
 function Plugin:_home_stats_visibility_label(home)
     local show_weread,show_local=self:_home_stats_visibility(home)
     if show_weread and show_local then return "微信读书 + 本地阅读" end
@@ -11799,6 +11822,12 @@ end
 
 function Plugin:home_stats_settings_menu()
     return {
+        {text="显示大时钟",checked_func=function()
+            return self:_home_preferences().show_clock_card~=false
+        end,keep_menu_open=true,callback=function()
+            local home=self:_home_preferences()
+            self:_set_home_clock_card_visible(home.show_clock_card==false)
+        end},
         {text="显示微信读书统计",post_text="隐藏后主页不再刷新微信读书统计",checked_func=function()
             return self:_home_preferences().show_weread_stats~=false
         end,keep_menu_open=true,callback=function()
@@ -11811,7 +11840,7 @@ function Plugin:home_stats_settings_menu()
             local home=self:_home_preferences()
             self:_set_home_stats_visibility("local",home.show_local_stats==false)
         end},
-        {text="布局规则",post_text="只显示一个时自动扩展；全部隐藏时放大时间卡",enabled=false},
+        {text="布局规则",post_text="可单独隐藏时钟或统计；其余卡片自动扩展",enabled=false},
     }
 end
 
@@ -12462,8 +12491,8 @@ function Plugin:_home_wifi_settings()
     -- actually closed. Refreshing while it is visible rebuilds the home view
     -- over the picker and makes the network list disappear immediately.
     local function refresh_after_picker_close()
-        UIManager:scheduleIn(.15,function()
-            self:_refresh_home_view(nil,"header")
+        UIManager:scheduleIn(.18,function()
+            self:_refresh_home_view(nil,"page")
         end)
     end
 
@@ -12474,8 +12503,16 @@ function Plugin:_home_wifi_settings()
             if ok_list and type(networks)=="table" then
                 local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
+                    local visible_networks=sanitized_network_list(networks)
+                    local screen=Device.screen
+                    local row_height=screen:scaleBySize(44)
+                    local list_height=math.min(math.floor(screen:getHeight()*.70),
+                        math.max(screen:scaleBySize(58),row_height*math.max(1,#visible_networks)+screen:scaleBySize(12)))
+                    logger.info("[MiuRead][WiFi] home network picker", "scanned=",tostring(#networks),
+                        "visible=",tostring(#visible_networks),"height=",tostring(list_height))
                     local dialog=NetworkSetting:new{
-                        network_list=sanitized_network_list(networks),
+                        network_list=visible_networks,height=list_height,
+                        _miuread_modal_surface=true,
                         -- Deliberately omit connect_callback here. KOReader
                         -- auto-dismisses an already-connected network picker
                         -- when that callback is present. The close hook below
@@ -18719,6 +18756,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label_cached(),
         battery_text=self:_home_battery_text(),
+        time_text=self:_display_time("%H:%M"),
         account_name=self:_home_account_name(),
         clock_text=self:_display_time("%H:%M"),
         date_text=self:_home_date_text(),
@@ -18726,6 +18764,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         local_stats=self:_home_local_stats_card(local_reading_stats),
         show_weread_stats=home.show_weread_stats~=false,
         show_local_stats=home.show_local_stats~=false,
+        show_clock_card=home.show_clock_card~=false,
+        show_shelf_covers=self:_shelf_covers_enabled(self.store:preferences()),
         layout_style=home.layout_style,
         display_size=home.display_size,
         hero=hero,
@@ -19876,8 +19916,10 @@ function Plugin:book_menu(b,back_callback)
     if preferred and preferred.file and U.file_exists(preferred.file) then
         items[#items+1]={text="阅读已下载书籍",callback=function() self:open_file(preferred.file) end}
     end
-    items[#items+1]={text=(preferred and preferred.file and U.file_exists(preferred.file)) and "更新正文" or "下载书籍",
-        callback=function() self:choose_download(b,nil,false) end}
+    local clean_action=self:_home_variant_download_action(b,false)
+    items[#items+1]={text=clean_action.label or "下载正文",callback=clean_action.callback}
+    local notes_action=self:_home_variant_download_action(b,true)
+    items[#items+1]={text=notes_action.label or "下载正文与公开想法",callback=notes_action.callback}
     items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
     if self:_has_range_variant(b.bookId) then
         items[#items+1]={text="扩展已有章节",sub_item_table_func=function() return self:range_extend_menu(b) end}
@@ -28646,7 +28688,18 @@ function Plugin:scan_downloaded_books_for_integrity_repair()
 end
 
 function Plugin:_toggle_preference(key)
-    local p=self.store:preferences(); p[key]=not p[key]; self.store:save_preferences(p)
+    local p=self.store:preferences()
+    if key=="shelf_covers" then
+        p[key]=p[key]==false
+    else
+        p[key]=not p[key]
+    end
+    self.store:save_preferences(p)
+    if key=="shelf_covers" then
+        -- Cover visibility changes geometry in both the hero and shelf. A
+        -- full page rebuild also invalidates the rendered shelf-layer cache.
+        self:_refresh_home_view(p[key] and "书架封面已显示" or "书架封面已隐藏","page")
+    end
 end
 
 

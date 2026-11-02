@@ -121,6 +121,9 @@ end
 function M.plugin_interface(plugin)
     return {
         reader_toolbar_row(plugin),
+        {text="显示书架封面",checked_func=function()
+            return plugin.store:preferences().shelf_covers~=false
+        end,keep_menu_open=true,callback=function() plugin:_toggle_preference("shelf_covers") end},
     }
 end
 

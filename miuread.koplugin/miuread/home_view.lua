@@ -306,7 +306,7 @@ local function home_card_outer_inset()
     return math.max(1, UiScale.dp(2, 2, 3))
 end
 
-local function hero_card(book, width, height, callback, compact, hold_callback, shelf_cover_w, shelf_cover_h)
+local function hero_card(book, width, height, callback, compact, hold_callback, shelf_cover_w, shelf_cover_h, show_cover)
     local frame_inset = home_card_outer_inset()
     local frame_w = math.max(1, width - frame_inset * 2)
     local frame_h = math.max(1, height - frame_inset * 2)
@@ -346,9 +346,16 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     else
         cover_w = math.min(width_cap, math.max(1, math.floor(cover_h * .715)))
     end
-    local cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05)
-        or placeholder(cover_w, cover_h, book.title, book.author)
+    local cover
     local gap = math.max(UiScale.dp(8, 6, 13), math.floor(width * .018))
+    if show_cover==false then
+        cover_w=0
+        cover_h=0
+        gap=0
+    else
+        cover=image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05)
+            or placeholder(cover_w, cover_h, book.title, book.author)
+    end
     local text_w = math.max(1, inner_w - cover_w - gap)
     local history_h = UiScale.dp(22, 20, 30)
     local history_w = book.on_history and math.max(UiScale.dp(52, 46, 72), math.floor(text_w * .31)) or 0
@@ -463,12 +470,16 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     end
 
     local body = OverlapGroup:new{dimen = Geom:new{w = inner_w, h = inner_h}, allow_mirroring = false}
-    body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = 0, HorizontalGroup:new{
-        align = "center",
-        CenterContainer:new{dimen = Geom:new{w = cover_w, h = body_h}, cover},
-        HorizontalSpan:new{width = gap},
-        CenterContainer:new{dimen = Geom:new{w = text_w, h = body_h}, info},
-    }}
+    if show_cover==false then
+        body[#body + 1] = CenterContainer:new{dimen=Geom:new{w=text_w,h=body_h},info}
+    else
+        body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = 0, HorizontalGroup:new{
+            align = "center",
+            CenterContainer:new{dimen = Geom:new{w = cover_w, h = body_h}, cover},
+            HorizontalSpan:new{width = gap},
+            CenterContainer:new{dimen = Geom:new{w = text_w, h = body_h}, info},
+        }}
+    end
     local title_y = body_h + section_gap
     body[#body + 1] = OffsetContainer:new{x_off = 0, y_off = title_y, title}
     local progress_y = title_y + title_h + section_gap
@@ -606,7 +617,7 @@ local function shelf_cover_target_size(width, height, oversample)
     return math.max(1,math.floor(cover_w*scale+.5)),math.max(1,math.floor(cover_h*scale+.5))
 end
 
-local function shelf_book_card(book, width, height, callback, hold_callback)
+local function shelf_book_card(book, width, height, callback, hold_callback, show_cover)
     if book and (book.local_folder==true or book.kind=="folder") then
         return shelf_folder_card(book,width,height,callback)
     end
@@ -633,6 +644,33 @@ local function shelf_book_card(book, width, height, callback, hold_callback)
     local status_important = status == "失败" or status == "待修复" or status == "排队中"
         or status == "批注待修复"
     if not status_important then status = "" end
+
+    if show_cover==false then
+        -- Keep the existing grid positions and hit targets. Show information
+        -- instead of a cover placeholder; never load an image in this branch.
+        local inset=UiScale.dp(6,5,10)
+        local content_w=math.max(1,width-inset*2)
+        local content_h=math.max(1,height-inset*2)
+        local book_title=U.trim(tostring(book.title or "未命名"))
+        local author=U.trim(tostring(book.author or ""))
+        local title_height=math.max(1,math.floor(content_h*.47))
+        local author_height=math.max(1,math.floor(content_h*.24))
+        local status_height=math.max(1,content_h-title_height-author_height)
+        local body=VerticalGroup:new{align="center",
+            Ui.textbox(book_title,content_w,title_height,face("cfont",11.0,15.5),
+                {bold=true,alignment="center",fgcolor=Blitbuffer.COLOR_BLACK}),
+            Ui.textbox(author,content_w,author_height,face("smallinfofont",8.7,12.2),
+                {alignment="center",fgcolor=Blitbuffer.COLOR_BLACK}),
+            Ui.textbox(download_active and "下载中" or (status~="" and status or reading_badge),
+                content_w,status_height,face("smallinfofont",8.5,11.8),
+                {alignment="center",fgcolor=Blitbuffer.COLOR_BLACK}),
+        }
+        return tappable(width,height,fixed_frame(width,height,{
+            bordersize=UiScale.line("thin"),radius=UiScale.radius(5,4,9),
+            padding=inset,background=Blitbuffer.COLOR_WHITE,color=Blitbuffer.COLOR_GRAY,
+        },body),function(anchor,ges) if callback then callback(book,anchor,ges) end end,
+            hold_callback and function(anchor) hold_callback(book,anchor) end or nil)
+    end
 
     local title_h = math.max(UiScale.dp(29, 25, 40), math.min(UiScale.dp(39, 32, 47), math.floor(height * .155)))
     local status_h = status ~= "" and UiScale.dp(18, 15, 25) or 0
@@ -1013,6 +1051,8 @@ function HomeWidget:_build_header(children, m)
     local account_width=math.min(math.floor(header_w*.22),measured(account,label_face,true)+inside*2)
     local battery_width=math.max(min_hit,icon_size+UiScale.dp(3,2,5)+measured("100%",label_face,true)+inside*2)
     local sync_width=math.min(math.floor(header_w*.19),icon_size+UiScale.dp(3,2,5)+measured(sync,label_face,true)+inside*2)
+    local time_string=tostring(self.opts.time_text or "--:--")
+    local time_cell
     add("title",measured(self.opts.title or "觅阅",title_face,true)+inside*2,function(w)
         return Ui.text(self.opts.title or "觅阅",w,m.header_h,title_face,{bold=true})
     end,nil,0)
@@ -1039,6 +1079,10 @@ function HomeWidget:_build_header(children, m)
         battery_cell=Ui.textbox(battery,math.max(1,w-icon_w),m.header_h,label_face,{bold=true,alignment="center"})
         return HorizontalGroup:new{align="center",Ui.icon("battery",icon_size,m.header_h,icon_size),battery_cell}
     end,self.opts.on_battery,2)
+    add("time",measured(time_string,label_face,true)+inside*2,function(w)
+        time_cell=Ui.textbox(time_string,w,m.header_h,label_face,{bold=true,alignment="center",halign="center"})
+        return time_cell
+    end,nil,1)
     add("tools",min_hit,function(w)
         return Ui.icon("menu",w,m.header_h,icon_size,{icon_key="menu"})
     end,function()
@@ -1062,6 +1106,7 @@ function HomeWidget:_build_header(children, m)
         account=account_cell and account_cell[1] or nil,
         sync=sync_cell and sync_cell[1] or nil,
         battery=battery_cell and battery_cell[1] or nil,
+        time=time_cell and time_cell[1] or nil,
     }
     self:_add(children,header_x,m.margin,header)
     self:_add(children,m.margin,m.margin+m.header_h,LineWidget:new{
@@ -1107,7 +1152,7 @@ function HomeWidget:_render_grid(children, m, x, y, width, height, books, on_ope
         local item_w = card_w
         local item_x = x + col * (card_w + col_gap)
         local item_y = y + row * (card_h + row_gap)
-        self:_add(children,item_x,item_y,shelf_book_card(book, item_w, card_h, on_open, on_hold))
+        self:_add(children,item_x,item_y,shelf_book_card(book, item_w, card_h, on_open, on_hold,self.opts.show_shelf_covers~=false))
         if self._building_shelf_slots and not folder then
             local key=shelf_book_key(book)
             if key~="" then
@@ -1323,10 +1368,12 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         end
         local available_h = math.max(1, bottom - y)
         local hero_w = math.max(UiScale.dp(205, 180, 300), math.floor(w * .245))
-        local dashboard_w = math.max(UiScale.dp(205, 180, 300), math.floor(w * .245))
+        local dashboard_visible=self.opts.show_clock_card~=false
+            or self.opts.show_weread_stats~=false or self.opts.show_local_stats~=false
+        local dashboard_w = dashboard_visible and math.max(UiScale.dp(205, 180, 300), math.floor(w * .245)) or 0
         local dashboard_x = x + hero_w + gap
-        local shelf_x = dashboard_x + dashboard_w + gap
-        local shelf_w = math.max(1, w - hero_w - dashboard_w - gap * 2)
+        local shelf_x = dashboard_x + (dashboard_visible and dashboard_w + gap or 0)
+        local shelf_w = math.max(1, w - hero_w - (dashboard_visible and dashboard_w + gap * 2 or gap))
         if build_static then
             local shelf_sy = y + tabs_h + math.max(3, math.floor(gap * .35))
             if subtabs_h > 0 then shelf_sy = shelf_sy + subtabs_h + math.max(2, math.floor(gap * .25)) end
@@ -1337,7 +1384,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
                 self:_add(children, x, y, hero_card(self.opts.hero, hero_w, available_h, self.opts.hero.on_tap, compact,
-                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h))
+                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h,self.opts.show_shelf_covers~=false))
             else
                 self:_add(children, x, y, welcome_card(hero_w, available_h, self.opts.on_empty_account))
             end
@@ -1348,24 +1395,24 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local show_weread=self.opts.show_weread_stats~=false
             local show_local=self.opts.show_local_stats~=false
             local stats_count=(show_weread and 1 or 0)+(show_local and 1 or 0)
-            local clock_h
-            if stats_count==0 then
-                clock_h=dashboard_h
-            else
-                clock_h=math.max(UiScale.dp(66, 58, 90), math.floor((dashboard_h - dash_gap * 2) * .32))
-            end
-            local clock_card, clock_refs = dashboard_clock_card(dashboard_w, clock_h,
-                self.opts.clock_text, self.opts.date_text)
-            self:_add(children, dashboard_x, dashboard_y, clock_card)
-            self._dashboard_text_refs={clock=clock_refs.time, date=clock_refs.date}
+            local show_clock=self.opts.show_clock_card~=false
+            local clock_h=0
+            self._dashboard_text_refs={}
             self._dashboard_card_slots={}
-            self._dashboard_field_dimens={
-                clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
-                date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
-            }
+            self._dashboard_field_dimens={}
+            if show_clock then
+                clock_h=stats_count==0 and dashboard_h
+                    or math.max(UiScale.dp(66,58,90),math.floor((dashboard_h-dash_gap*2)*.32))
+                local clock_card,clock_refs=dashboard_clock_card(dashboard_w,clock_h,
+                    self.opts.clock_text,self.opts.date_text)
+                self:_add(children,dashboard_x,dashboard_y,clock_card)
+                self._dashboard_text_refs={clock=clock_refs.time,date=clock_refs.date}
+                self._dashboard_field_dimens.clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h}
+                self._dashboard_field_dimens.date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h}
+            end
             if stats_count>0 then
-                local stats_y=dashboard_y+clock_h+dash_gap
-                local stats_total_h=math.max(1,dashboard_h-clock_h-dash_gap)
+                local stats_y=dashboard_y+(show_clock and clock_h+dash_gap or 0)
+                local stats_total_h=math.max(1,dashboard_h-(show_clock and clock_h+dash_gap or 0))
                 if stats_count==1 then
                     local title=show_weread and "微信读书" or "本地阅读"
                     local data=show_weread and self.opts.weread_stats or self.opts.local_stats
@@ -1419,7 +1466,10 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         or math.max(UiScale.dp(292, 265, 350), math.min(UiScale.dp(372, 326, 410), math.floor(m.body_h * .30)))
     if y + hero_h < bottom then
         if build_static then
-            local hero_w = math.max(UiScale.dp(250, 215, 350), math.floor((w - gap) * .50))
+            local dashboard_visible=self.opts.show_clock_card~=false
+                or self.opts.show_weread_stats~=false or self.opts.show_local_stats~=false
+            local hero_w = dashboard_visible
+                and math.max(UiScale.dp(250, 215, 350), math.floor((w - gap) * .50)) or w
             local dashboard_x = x + hero_w + gap
             local dashboard_w = math.max(1, w - hero_w - gap)
             local shelf_y = y + hero_h + gap
@@ -1433,7 +1483,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
                 self:_add(children, x, y, hero_card(self.opts.hero, hero_w, hero_h, self.opts.hero.on_tap, compact,
-                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h))
+                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h,self.opts.show_shelf_covers~=false))
             else
                 self:_add(children, x, y, welcome_card(hero_w, hero_h, self.opts.on_empty_account))
             end
@@ -1447,20 +1497,24 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local show_weread=self.opts.show_weread_stats~=false
             local show_local=self.opts.show_local_stats~=false
             local stats_count=(show_weread and 1 or 0)+(show_local and 1 or 0)
-            local clock_h=stats_count==0 and dashboard_h
-                or math.max(UiScale.dp(68, 60, 92), math.floor((dashboard_h - dash_gap) * .29))
-            local clock_card, clock_refs = dashboard_clock_card(dashboard_w, clock_h,
-                self.opts.clock_text, self.opts.date_text)
-            self:_add(children, dashboard_x, dashboard_y, clock_card)
-            self._dashboard_text_refs={clock=clock_refs.time, date=clock_refs.date}
+            local show_clock=self.opts.show_clock_card~=false
+            local clock_h=0
+            self._dashboard_text_refs={}
             self._dashboard_card_slots={}
-            self._dashboard_field_dimens={
-                clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
-                date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h},
-            }
+            self._dashboard_field_dimens={}
+            if show_clock then
+                clock_h=stats_count==0 and dashboard_h
+                    or math.max(UiScale.dp(68,60,92),math.floor((dashboard_h-dash_gap)*.29))
+                local clock_card,clock_refs=dashboard_clock_card(dashboard_w,clock_h,
+                    self.opts.clock_text,self.opts.date_text)
+                self:_add(children,dashboard_x,dashboard_y,clock_card)
+                self._dashboard_text_refs={clock=clock_refs.time,date=clock_refs.date}
+                self._dashboard_field_dimens.clock=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h}
+                self._dashboard_field_dimens.date=Geom:new{x=dashboard_x,y=dashboard_y,w=dashboard_w,h=clock_h}
+            end
             if stats_count>0 then
-                local stats_y=dashboard_y+clock_h+dash_gap
-                local stats_h=math.max(1,dashboard_h-clock_h-dash_gap)
+                local stats_y=dashboard_y+(show_clock and clock_h+dash_gap or 0)
+                local stats_h=math.max(1,dashboard_h-(show_clock and clock_h+dash_gap or 0))
                 if stats_count==1 then
                     local title=show_weread and "微信读书" or "本地阅读"
                     local data=show_weread and self.opts.weread_stats or self.opts.local_stats
@@ -1723,6 +1777,7 @@ function HomeWidget:updateHeader(fields)
         account_name={ref="account",default="未登录"},
         sync_text={ref="sync",default="已同步"},
         battery_text={ref="battery",default="--%"},
+        time_text={ref="time",default="--:--"},
     }
     if fields.wifi_text~=nil then self.opts.wifi_text=fields.wifi_text end
     if fields.bluetooth_text~=nil then self.opts.bluetooth_text=fields.bluetooth_text end
