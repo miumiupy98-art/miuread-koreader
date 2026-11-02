@@ -32112,15 +32112,20 @@ function Plugin:onReaderReady()
     self:_mark_reader_busy(3)
     logger.info("[MiuRead][Sync] reader ready","session=",tostring(self._reader_session_generation or 0),
         "rebuild=",tostring(had_candidate==true),"preserved=",tostring(preserve_session==true))
-    local open_sync_prefs=self.store:preferences().sync or {}
-    local open_sync_requested=self:_reader_session_is_weread() and preserve_session~=true
-        and open_sync_prefs.auto_latest_position~=false and open_sync_prefs.pull_on_open~=false
-    local guard_seconds=preserve_session==true and .20 or tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .75
-    if open_sync_requested then
-        guard_seconds=math.max(guard_seconds,(tonumber(Config.OPEN_SYNC_SOFT_TIMEOUT_SECONDS) or 2.5)+.4)
+    local is_weread=self:_reader_session_is_weread()
+    local open_sync_requested=false
+    if is_weread and preserve_session~=true then
+        local open_sync_prefs=self.store:preferences().sync or {}
+        open_sync_requested=open_sync_prefs.auto_latest_position~=false and open_sync_prefs.pull_on_open~=false
     end
-    self:_arm_reader_gesture_guard(guard_seconds,
-        continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or (open_sync_requested and "latest position sync" or "reader open")))
+    if is_weread or self:_reader_panel_active() then
+        local guard_seconds=preserve_session==true and .20 or tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .75
+        if open_sync_requested then
+            guard_seconds=math.max(guard_seconds,(tonumber(Config.OPEN_SYNC_SOFT_TIMEOUT_SECONDS) or 2.5)+.4)
+        end
+        self:_arm_reader_gesture_guard(guard_seconds,
+            continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or (open_sync_requested and "latest position sync" or "reader open")))
+    end
     if open_sync_requested then
         local opening_book
         if ready_path then opening_book=select(1,self.store:file_record_fast(ready_path,false)) end
@@ -32272,15 +32277,17 @@ function Plugin:onReaderReady()
         logger.info("[MiuRead][ReaderSession] cloud reader-ready work skipped",
             "kind=",self:_reader_session_kind())
     end
-    local device_task
-    device_task=function()
-        if self._miuread_suspended==true or HOME_SESSION.suspended==true then return end
-        if not (self.ui and self.ui.document) or reader_close_active()
-            or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session then return end
-        if not self:_reader_background_idle() then UIManager:scheduleIn(.75,device_task); return end
-        HomeData.quick_device_state(true)
+    if self:_reader_session_is_weread() or self:_reader_panel_active() then
+        local device_task
+        device_task=function()
+            if self._miuread_suspended==true or HOME_SESSION.suspended==true then return end
+            if not (self.ui and self.ui.document) or reader_close_active()
+                or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session then return end
+            if not self:_reader_background_idle() then UIManager:scheduleIn(.75,device_task); return end
+            HomeData.quick_device_state(true)
+        end
+        UIManager:scheduleIn(1.8,device_task)
     end
-    UIManager:scheduleIn(1.8,device_task)
     if had_candidate then
         UIManager:scheduleIn(.18,function()
             if self.ui and self.ui.document
