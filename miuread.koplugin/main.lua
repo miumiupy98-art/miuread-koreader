@@ -6680,7 +6680,11 @@ function Plugin:_reader_toolbar_mode()
 end
 
 function Plugin:_reader_toolbar_enabled()
-    local reader=self:_reader_preferences()
+    local raw_prefs=(self.store and type(self.store.get)=="function") and self.store:get("preferences",nil) or nil
+    local reader=type(raw_prefs)=="table" and type(raw_prefs.reader_ui)=="table" and raw_prefs.reader_ui or nil
+    if not reader or reader.enabled==nil or reader.plugin_mode_enabled==nil then
+        reader=self:_reader_preferences()
+    end
     if self:_reader_toolbar_mode()=="desktop" then
         return reader.enabled~=false
     end
@@ -13418,13 +13422,19 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
 end
 
 function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
-    if self._reader_toolbar_state_task then UIManager:unschedule(self._reader_toolbar_state_task) end
+    if self._reader_toolbar_state_task then
+        UIManager:unschedule(self._reader_toolbar_state_task)
+        self._reader_toolbar_state_task=nil
+    end
+    if not (self.ui and self.ui.document) or not self:_reader_panel_active() then
+        return false
+    end
     local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
     local requested=tonumber(page)
     local task
     task=function()
         if self._reader_toolbar_state_task~=task then return end
-        if self._miuread_suspended==true or HOME_SESSION.suspended==true then
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true or not self:_reader_panel_active() then
             self._reader_toolbar_state_task=nil
             return
         end
@@ -17558,6 +17568,9 @@ function Plugin:_show_reader_quick_panel_now()
     if not (self.ui and self.ui.document) then return false end
     local started=monotonic_wall_time()
     self:_mark_reader_busy(2)
+    if tonumber(self:_reader_toolbar_cache().updated_at or 0)==0 then
+        self:_refresh_reader_toolbar_state_cache(nil)
+    end
     local options=self:_reader_quick_panel_options()
     local options_done=monotonic_wall_time()
     if not options then return false end
@@ -17938,12 +17951,19 @@ function Plugin:_sync_reader_toolbar_hooks(reason)
         return false
     end
     if not self:_reader_panel_active() then
+        if self._reader_toolbar_state_task then
+            UIManager:unschedule(self._reader_toolbar_state_task)
+            self._reader_toolbar_state_task=nil
+        end
         self:_uninstall_reader_toolbar_hooks(readerui,reason or "mode disabled")
         return false
     end
     self:_reader_toolbar_hook_token(readerui)
     self:_install_reader_menu_bridge()
     self:_install_reader_quick_panel_zone()
+    if tonumber(self:_reader_toolbar_cache().updated_at or 0)==0 then
+        self:_schedule_reader_toolbar_state_refresh(nil,.05)
+    end
     self:_input_lifecycle("reader_toolbar","install",reason or "reader active")
     logger.info("[MiuRead][ReaderToolbar] hooks synchronized",
         "mode=",self:_reader_toolbar_mode(),"reason=",tostring(reason or "reader active"))
