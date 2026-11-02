@@ -520,6 +520,238 @@ local function hero_card(book, width, height, callback, compact, hold_callback, 
     return layers
 end
 
+-- Use the original, full-width horizontal recent-book layout when every
+-- dashboard module is hidden. It restores the pre-reading-dashboard reading
+-- hierarchy without changing the compact dashboard/two-column layout.
+-- Full-width recent book: the small stats share existing *internal* space.
+-- No dashboard card or additional home geometry is created.
+local function hero_card_classic(book, width, height, callback, hold_callback, show_cover, stats_mode,
+        weread_stats, local_stats, on_weread_stats, on_local_stats)
+    local frame_inset = home_card_outer_inset()
+    local frame_w = math.max(1, width - frame_inset * 2)
+    local frame_h = math.max(1, height - frame_inset * 2)
+    local pad = math.max(UiScale.dp(7, 6, 12),
+        math.min(UiScale.dp(12, 10, 18), math.floor(math.min(frame_w, frame_h) * .030)))
+    local inner_w = math.max(1, frame_w - pad * 2)
+    local inner_h = math.max(1, frame_h - pad * 2)
+    local cover_w, cover_h, cover = 0, 0, nil
+    local gap = 0
+    if show_cover ~= false then
+        cover_w = math.max(1, math.min(math.floor(inner_w * .255), math.floor(inner_h * .68)))
+        cover_h = math.min(inner_h, math.max(1, math.floor(cover_w / .68)))
+        gap = math.max(UiScale.dp(9, 7, 14), math.floor(width * .014))
+        cover = image_widget(book.home_cover_path or book.cover_path, cover_w, cover_h, .05)
+            or placeholder(cover_w, cover_h, book.title, book.author)
+    end
+    local text_x = cover_w + gap
+    local text_w = math.max(1, inner_w - text_x)
+    local history_w = book.on_history and math.max(UiScale.dp(55, 48, 80), math.floor(text_w * .15)) or 0
+    local title_w = math.max(1, text_w - (history_w > 0 and history_w + UiScale.dp(5, 4, 8) or 0))
+    local title_h = math.min(math.floor(inner_h * .27), UiScale.dp(49, 43, 68))
+    title_h = math.max(1, title_h)
+    local row_h = math.max(UiScale.dp(19, 17, 28), math.min(UiScale.dp(25, 22, 35), math.floor(inner_h * .12)))
+    local function clean(value) return U.trim(tostring(value or '')) end
+    local author, category, publisher = clean(book.author), clean(book.category), clean(book.publisher)
+    local date = clean(book.published_date or book.publishTime)
+    local timestamp = tonumber(date)
+    if timestamp and timestamp > 1000000000 then
+        if timestamp > 100000000000 then timestamp = timestamp / 1000 end
+        local ok, year = pcall(os.date, '%Y', timestamp)
+        date = ok and tostring(year or '') or ''
+    else
+        date = date:match('^(%d%d%d%d)') or U.utf8_truncate(date, 12, '…')
+    end
+    local source = clean(book.source_text)
+    if source == '' then
+        local key = tostring(book.unified_source or book.external_source or book.source or '')
+        source = key == 'local' and '本地书' or '微信读书'
+    end
+    local meta = {}
+    for _, value in ipairs({author, category}) do if value ~= '' then meta[#meta + 1] = value end end
+    local published = {}
+    for _, value in ipairs({source, publisher, date}) do
+        if value ~= '' then published[#published + 1] = value end
+    end
+    local progress_num = tonumber(book.progress)
+    local progress_known = book.progress_known ~= false and progress_num ~= nil
+    local progress_text = progress_known and
+        ('阅读至 ' .. string.format('%.1f', math.max(0, math.min(100, progress_num))):gsub('%.0$', '') .. '%')
+        or '阅读进度 —'
+    if clean(book.last_read_text) ~= '' then progress_text = progress_text .. ' · ' .. clean(book.last_read_text) end
+    -- Book metadata and introductory prose are not interchangeable. In
+    -- particular, do not display a translator/language fallback as an intro.
+    local description = clean(book.description or book.intro or book.summary)
+    local intro_available = description ~= ''
+    if not intro_available then description = '暂无简介' end
+
+    -- Both sources may be displayed, one may be displayed, or neither.
+    -- They occupy the vacant top-right of the existing text column only.
+    local show_wechat = stats_mode == 'weread' or stats_mode == 'both'
+    local show_local = stats_mode == 'local' or stats_mode == 'both'
+    local source_count = (show_wechat and 1 or 0) + (show_local and 1 or 0)
+    -- beta.23: use slightly less width for mini-stats, while giving their
+    -- two groups more *vertical* breathing room inside the existing hero.
+    -- Neither value feeds home hero height or bookshelf layout calculations.
+    local stats_gap = math.max(UiScale.dp(9, 8, 13), math.floor(text_w * .018))
+    local stats_w = source_count > 0 and math.max(1, math.floor(text_w * .37)) or 0
+    local min_stats_w = UiScale.dp(116, 104, 164)
+    local min_meta_w = UiScale.dp(146, 128, 206)
+    stats_w = math.min(stats_w, math.max(0, text_w - stats_gap - min_meta_w))
+    local mid_h = math.min(math.max(0, inner_h - title_h),
+        math.max(row_h * 3, math.floor(inner_h * (source_count > 0 and .465 or 0))))
+    if source_count == 0 or stats_w < min_stats_w or mid_h < UiScale.dp(59, 52, 81) then
+        source_count=0;show_wechat=false;show_local=false;stats_w=0
+        mid_h=math.min(math.max(0,inner_h-title_h),row_h*3)
+    end
+    local meta_w = source_count > 0 and math.max(1, text_w - stats_w - stats_gap) or text_w
+    -- The introduction is placed beneath both ordinary metadata and stats,
+    -- with a small inset.  No extra row/card is allocated outside hero_card.
+    local intro_inset = source_count > 0 and UiScale.dp(3, 2, 5) or 0
+    local intro_y = math.min(inner_h,
+        math.max(title_h + row_h * 3, title_h + mid_h) + intro_inset)
+    local intro_h = math.max(0, inner_h - intro_y)
+    local content = OverlapGroup:new{dimen=Geom:new{w=inner_w,h=inner_h},allow_mirroring=false}
+    local function put(x,y,child)
+        content[#content+1] = OffsetContainer:new{x_off=x,y_off=y,child}
+    end
+    if cover then put(0, math.max(0, math.floor((inner_h-cover_h)*.40)), cover) end
+    put(text_x,0, TextBoxWidget:new{
+        text=clean(book.title) ~= '' and clean(book.title) or '未命名',
+        face=face('cfont',17,22),bold=true,width=title_w,height=title_h,
+        height_adjust=false,height_overflow_show_ellipsis=true,fgcolor=Blitbuffer.COLOR_BLACK,
+    })
+    if history_w > 0 then
+        put(text_x+text_w-history_w,0,Ui.text('历史 ›',history_w,
+            math.max(UiScale.dp(22,20,30), math.floor(title_h*.58)),
+            face('smallinfofont',9.8,13.5),{bold=true,halign='right'}))
+    end
+    local info_lines={table.concat(meta,' · '),progress_text,table.concat(published,' · ')}
+    for i,value in ipairs(info_lines) do
+        put(text_x,title_h+(i-1)*row_h,TextBoxWidget:new{
+            text=value,face=face('smallinfofont',10.5,15),bold=i==2,
+            width=meta_w,height=row_h,height_adjust=false,
+            height_overflow_show_ellipsis=true,fgcolor=Blitbuffer.COLOR_BLACK,
+        })
+    end
+
+    local stat_hits = {}
+    local function time_label(stats)
+        stats=type(stats)=='table' and stats or {}
+        if stats.available==false or tonumber(stats.today_seconds)==nil then return '—' end
+        local seconds=math.max(0, math.floor(tonumber(stats.today_seconds) or 0))
+        local hours=math.floor(seconds/3600)
+        local minutes=math.floor(seconds%3600/60)
+        return hours>0 and (tostring(hours)..'时'..tostring(minutes)..'分') or (tostring(minutes)..'分')
+    end
+    local function week_line(stats, area_w, area_h)
+        stats=type(stats)=='table' and stats or {}
+        local days=type(stats.daily)=='table' and stats.daily or {}
+        local threshold=math.max(0, tonumber(stats.threshold) or 1)
+        local label_h=math.max(1,math.floor(area_h*.43))
+        local mark_h=math.max(1,area_h-label_h)
+        local cell_w=math.max(1,math.floor(area_w/7))
+        local labels={'一','二','三','四','五','六','日'}
+        local group=OverlapGroup:new{dimen=Geom:new{w=area_w,h=area_h},allow_mirroring=false}
+        for i=1,7 do
+            local x=(i-1)*cell_w
+            local w=(i==7) and math.max(1,area_w-x) or cell_w
+            group[#group+1]=OffsetContainer:new{x_off=x,y_off=0,
+                Ui.textbox(labels[i],w,label_h,face('smallinfofont',8.1,10.9,6.8),
+                    {bold=true,halign='center',alignment='center'})}
+            local day=days[i] or {}
+            local checked=stats.available~=false and (tonumber(day.seconds) or 0)>=threshold and day.future~=true
+            local diameter=math.max(3, math.min(math.floor(cell_w*.41), math.floor(mark_h*.58)))
+            local circle=fixed_frame(diameter,diameter,{
+                bordersize=checked and 0 or math.max(1,UiScale.line('thin')),
+                padding=0,radius=math.floor(diameter/2),
+                background=checked and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+                color=Blitbuffer.COLOR_BLACK,
+            },Widget:new{dimen=Geom:new{w=1,h=1}})
+            group[#group+1]=OffsetContainer:new{
+                x_off=x+math.max(0,math.floor((w-diameter)/2)),
+                y_off=label_h+math.max(0,math.floor((mark_h-diameter)/2)),circle}
+        end
+        return group
+    end
+    local stats_x = text_x + meta_w + stats_gap
+    local stats_top_pad = source_count > 0 and UiScale.dp(2, 2, 4) or 0
+    local group_gap = source_count == 2 and UiScale.dp(8, 7, 12) or 0
+    local usable_stat_h = math.max(1, mid_h - 2 * stats_top_pad - group_gap)
+    local group_h = math.max(1, math.floor(usable_stat_h / math.max(1, source_count)))
+    -- A single source should remain a compact two-line item, not vertically
+    -- stretch to fill the space intended for two separate sources.
+    if source_count == 1 then
+        group_h = math.min(group_h, math.max(UiScale.dp(54, 47, 74), math.floor(mid_h * .53)))
+    end
+    local stat_y = title_h + stats_top_pad
+    if source_count == 1 then stat_y = title_h + math.max(0, math.floor((mid_h - group_h) / 2)) end
+    local function add_stat(index,title,icon_key,stats,kind)
+        local y = stat_y + (index-1) * (group_h + group_gap)
+        local h = math.min(group_h, math.max(1, inner_h - y))
+        -- Compress the title/icon footprint, not the day markers' legibility.
+        local header_h = math.min(h, math.max(UiScale.dp(17, 15, 24), math.floor(h * .31)))
+        local icon_w = math.min(header_h, UiScale.dp(15, 13, 21))
+        put(stats_x,y,Ui.icon(icon_key,icon_w,header_h,math.max(1,icon_w-1)))
+        local source_w = math.max(1,math.floor(stats_w * .63)-icon_w)
+        put(stats_x+icon_w,y,Ui.text(title,source_w,header_h,face('smallinfofont',9.6,13),
+            {bold=true,halign='left'}))
+        local right_x=stats_x+icon_w+source_w
+        put(right_x,y,Ui.text(time_label(stats),math.max(1,stats_x+stats_w-right_x),header_h,
+            face('smallinfofont',9.6,13),{bold=true,halign='right'}))
+        if h-header_h>=UiScale.dp(18,16,25) then
+            local week_top = math.min(UiScale.dp(2, 2, 3), math.max(0, h-header_h-UiScale.dp(18,16,25)))
+            put(stats_x,y+header_h+week_top,week_line(stats,stats_w,h-header_h-week_top))
+        end
+        stat_hits[#stat_hits+1]={kind=kind,x=stats_x,y=y,w=stats_w,h=h}
+    end
+    if source_count>0 then
+        local index=0
+        if show_wechat then index=index+1;add_stat(index,'微信读书','weread',weread_stats,'weread') end
+        if show_local then index=index+1;add_stat(index,'本地阅读','book',local_stats,'local') end
+    end
+
+    if intro_h>0 and description~='' then
+        put(text_x,intro_y,TextBoxWidget:new{
+            text=description,face=face('smallinfofont',10.6,14.6),width=text_w,height=intro_h,
+            height_adjust=false,height_overflow_show_ellipsis=true,fgcolor=Blitbuffer.COLOR_BLACK,
+        })
+    end
+    local frame=OverlapGroup:new{dimen=Geom:new{w=width,h=height},allow_mirroring=false}
+    frame[#frame+1]=OffsetContainer:new{x_off=frame_inset,y_off=frame_inset,
+        fixed_frame(frame_w,frame_h,{
+            bordersize=math.max(UiScale.line('thin'),1),radius=UiScale.radius(9,6,15),
+            padding=pad,background=Blitbuffer.COLOR_WHITE,color=Blitbuffer.COLOR_DARK_GRAY,
+        },content)}
+
+    -- One input owner prevents nested tap/hold priority bugs on old Kindle.
+    -- Rectangles are computed in the same inner coordinate system as painting.
+    local function on_card_tap(anchor,gesture)
+        local pos=gesture and gesture.pos
+        if pos and anchor and tonumber(anchor.x) and tonumber(anchor.y)
+            and tonumber(pos.x) and tonumber(pos.y) then
+            local x=pos.x-anchor.x-frame_inset-pad
+            local y=pos.y-anchor.y-frame_inset-pad
+            if x>=0 and y>=0 and x<inner_w and y<inner_h then
+                if book.on_history and x>=text_x+text_w-history_w and y<title_h then
+                    book.on_history();return
+                end
+                if book.on_intro and intro_available and x>=text_x and y>=intro_y then
+                    book.on_intro();return
+                end
+                for _,hit in ipairs(stat_hits) do
+                    if x>=hit.x and x<hit.x+hit.w and y>=hit.y and y<hit.y+hit.h then
+                        if hit.kind=='weread' and on_weread_stats then on_weread_stats();return end
+                        if hit.kind=='local' and on_local_stats then on_local_stats();return end
+                    end
+                end
+            end
+        end
+        if callback then callback(anchor,gesture) end
+    end
+    return tappable(width,height,frame,on_card_tap,
+        function(anchor) if hold_callback then hold_callback(book,anchor) end end)
+end
+
 local function welcome_card(width, height, callback)
     local inset = math.max(1, UiScale.dp(2, 2, 3))
     local layers = OverlapGroup:new{dimen = Geom:new{w = width, h = height}, allow_mirroring = false}
@@ -1461,13 +1693,25 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         return
     end
 
-    local hero_h = compact
-        and math.max(UiScale.dp(238, 215, 292), math.min(UiScale.dp(315, 276, 350), math.floor(m.body_h * .26)))
-        or math.max(UiScale.dp(292, 265, 350), math.min(UiScale.dp(372, 326, 410), math.floor(m.body_h * .30)))
+    local dashboard_visible = self.opts.show_clock_card~=false
+        or self.opts.show_weread_stats~=false or self.opts.show_local_stats~=false
+    -- If all dashboard cards are hidden, restore the pre-dashboard full-width
+    -- compact hero. The reclaimed vertical space belongs to the bookshelf.
+    local hero_h
+    if not dashboard_visible then
+        local has_description = self.opts.hero
+            and U.trim(tostring(self.opts.hero.description or self.opts.hero.intro or self.opts.hero.summary or '')) ~= ''
+        local ratio = has_description and .245 or .205
+        hero_h = compact
+            and math.max(UiScale.dp(190, 180, 245), math.min(UiScale.dp(250, 220, 285), math.floor(m.body_h * ratio)))
+            or math.max(UiScale.dp(220, 205, 300), math.min(UiScale.dp(290, 265, 340), math.floor(m.body_h * ratio)))
+    else
+        hero_h = compact
+            and math.max(UiScale.dp(238, 215, 292), math.min(UiScale.dp(315, 276, 350), math.floor(m.body_h * .26)))
+            or math.max(UiScale.dp(292, 265, 350), math.min(UiScale.dp(372, 326, 410), math.floor(m.body_h * .30)))
+    end
     if y + hero_h < bottom then
         if build_static then
-            local dashboard_visible=self.opts.show_clock_card~=false
-                or self.opts.show_weread_stats~=false or self.opts.show_local_stats~=false
             local hero_w = dashboard_visible
                 and math.max(UiScale.dp(250, 215, 350), math.floor((w - gap) * .50)) or w
             local dashboard_x = x + hero_w + gap
@@ -1482,8 +1726,15 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             local _, _, _, _, shelf_card_w, shelf_card_h = self:_grid_geometry(m, w, shelf_grid_h, #books, 2)
             local shelf_cover_w, shelf_cover_h = shelf_cover_target_size(shelf_card_w, shelf_card_h, 1.0)
             if self.opts.hero then
-                self:_add(children, x, y, hero_card(self.opts.hero, hero_w, hero_h, self.opts.hero.on_tap, compact,
-                    self.opts.on_hold_book, shelf_cover_w, shelf_cover_h,self.opts.show_shelf_covers~=false))
+                if dashboard_visible then
+                    self:_add(children, x, y, hero_card(self.opts.hero, hero_w, hero_h, self.opts.hero.on_tap, compact,
+                        self.opts.on_hold_book, shelf_cover_w, shelf_cover_h,self.opts.show_shelf_covers~=false))
+                else
+                    self:_add(children, x, y, hero_card_classic(self.opts.hero, hero_w, hero_h,
+                        self.opts.hero.on_tap, self.opts.on_hold_book, self.opts.show_shelf_covers~=false,
+                        self.opts.embedded_stats_mode or 'both',self.opts.weread_stats,self.opts.local_stats,
+                        self.opts.on_weread_stats,self.opts.on_local_stats))
+                end
             else
                 self:_add(children, x, y, welcome_card(hero_w, hero_h, self.opts.on_empty_account))
             end
@@ -1876,6 +2127,13 @@ function HomeWidget:updateDashboard(fields)
     end
 
     if not changed then return true end
+    local mode=tostring(self.opts.embedded_stats_mode or 'both')
+    local classic=self.opts.show_clock_card==false and self.opts.show_weread_stats==false
+        and self.opts.show_local_stats==false
+    if classic and mode~='none' and (fields.weread_stats~=nil or fields.local_stats~=nil) then
+        -- updateHero reuses the same static geometry; no extra dashboard slot.
+        return self:updateHero(self.opts.hero)
+    end
     if fallback or not changed_region then return self:update(self.opts,"content") end
     local safety=UiScale.dp(3,2,5)
     local x=math.max(0,(changed_region.x or 0)-safety)
