@@ -1,2 +1,0 @@
-Version: 6.5.0-beta.12
-旧版 EPUB Web 定位后台补全；原生 KOReader 锁屏；主页快捷菜单；评论获取与更新合并；Beta 发布流程恢复 beta.5。

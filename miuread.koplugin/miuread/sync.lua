@@ -21,7 +21,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 33
+local READ_REPORT_SERVICE_VERSION = 34
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -463,7 +463,22 @@ function Sync:record()
     local path=self:_document_path()
     if not path then return nil end
     if self.current and self.current.path==path then return self.current end
-    if self.record_checked_path==path then return nil end
+    if self.record_checked_path==path then
+        -- A negative classification is not permanent: download completion,
+        -- EPUB relinking or metadata recovery may have added this exact path
+        -- since the first check. A cheap library lookup avoids a deep EPUB
+        -- scan on every menu interaction.
+        local book,record,variant=self.store:file_record_fast(path,false)
+        local current=self:_usable_record(book,record,variant,path)
+        if current then
+            self.record_checked_path=nil
+            self.current=current
+            logger.info("[MiuRead][Sync] previously missing book now identified",
+                "book=",tostring(book.book_id or ""))
+            return current
+        end
+        return nil
+    end
     local finder=type(self.store.file_record_fast)=="function" and self.store.file_record_fast or self.store.file_record
     local book,record,variant=finder(self.store,path,true)
     local current=self:_usable_record(book,record,variant,path)
@@ -2565,7 +2580,14 @@ function Sync:remote(book_id, callback, options)
             return
         end
         if not detached then self.last_error=nil end
-        if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"progress") end
+        -- Agent fallback can resolve overall progress even when Web Cookie
+        -- GET failed. Never clear Web-channel authentication health on Agent
+        -- success alone.
+        if web then
+            if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"progress") end
+        elseif Http.is_auth_error(value.web_error or "") and self.host.on_auth_required then
+            pcall(self.host.on_auth_required,self.host,"progress",value.web_error)
+        end
         local remote_snapshot=strip_progress_sources(remote)
         local session_before=self.store:session(book_id) or {}
         local position_state=type(session_before.position_state)=="table" and U.copy(session_before.position_state) or {version=1}
@@ -2904,7 +2926,6 @@ function Sync:_mark_repair_required(book_id, kind, err, suppress_prompt)
             last_error=err,
             last_error_kind=kind,
             last_error_at=os.time(),
-            pending_report_seconds=0,
         })
         self.state="waiting"
         return false
@@ -2917,7 +2938,6 @@ function Sync:_mark_repair_required(book_id, kind, err, suppress_prompt)
         sync_repair_kind=kind,
         sync_repair_error=err,
         sync_repair_at=os.time(),
-        pending_report_seconds=0,
         last_error=err,
         consecutive_failures=self.consecutive_failures,
     })
@@ -2988,7 +3008,6 @@ function Sync:repair_current(callback)
     local prior_error=tostring(session.sync_repair_error or session.last_error or self.last_error or "")
     self.store:save_session(book_id,{
         last_stage="正在检查登录与当前书籍同步状态",
-        pending_report_seconds=0,
         book_core_map_hash=core_hash,
     })
     self.state="repairing"
@@ -3551,9 +3570,12 @@ function Sync:retry_safe_reading_time(book_id,record_override,position_override,
         callback(false,"缺少安全的位置锚点，不能重传阅读时间","context"); return false
     end
     local anchor=self:remote_wire_anchor(book_id)
-    if not anchor then
-        logger.info("[MiuRead][ReadingTimeRetry] no cached remote wire anchor; worker will refresh server position",
-            "book=",book_id)
+    local age=anchor and (os.time()-(tonumber(anchor.fetched_at) or 0)) or math.huge
+    local from_web=anchor and (anchor.source=="web_cookie" or anchor.source=="web"
+        or anchor.source=="web_progress" or anchor.source=="web_cookie_progress")
+    if not from_web or age<0 or age>(tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600) then
+        callback(false,"没有近期已验证的 Web 原始位置；请先打开本书恢复 Web 位置", "context")
+        return false
     end
     local core_hash=self:_core_map_hash(record_override)
     local maximum=math.max(10,tonumber(Config.READ_REPORT_MAX_ELAPSED_SECONDS) or 60)
@@ -4445,7 +4467,13 @@ function Sync:_load_readtime_recovery(book_id,core_map_hash)
     local entry=type(data.entries)=="table" and data.entries[key] or nil
     if entry~=nil then
         local identity=self:_readtime_recovery_identity(book_id,core_map_hash)
-        if self:_readtime_recovery_matches(entry,identity) then
+        local same_identity=self:_readtime_recovery_matches(entry,identity)
+        local same_account_relogin=type(entry)=="table"
+            and tostring(entry.book_id or "")==identity.book_id
+            and tostring(entry.account_vid or "")~=""
+            and tostring(entry.account_vid or "")==identity.account_vid
+            and tostring(entry.core_map_hash or "")==identity.core_map_hash
+        if same_identity or same_account_relogin then
             local seconds=entry.pending_report_safe==true
                 and math.max(0,math.floor(tonumber(entry.pending_report_seconds) or 0)) or 0
             return seconds,true,read_error
@@ -4804,6 +4832,8 @@ function Sync:_import_daemon_status(force)
 
     if status.accepted then
         self.daemon_health_restart_count=0
+        self._smart_web_unavailable=false
+        self._smart_web_unavailable_reason=nil
         self.pending_report_status_at=tonumber(status.completed_at) or os.time()
         self.state = daemon.active and "waiting" or "stopped"
         self.session_uploads = self.session_uploads + 1
@@ -4895,10 +4925,45 @@ function Sync:_import_daemon_status(force)
         self.state = daemon.active and "waiting" or "stopped"
         local report_error=tostring(status.error)
         if time_only then
-            -- Reading-time failure is intentionally invisible to the global sync
-            -- health UI. The service gets one runtime retry, then drops it.
+            -- Time remains independent from precise-progress success. Expose
+            -- its own failure status without turning it into a progress error.
             self.last_error=nil
             self.last_error_kind=nil
+            self.last_stage="Web 阅读时间暂未上传："..tostring(report_error)
+            if error_kind=="authentication" and self.host and self.host.on_auth_required then
+                pcall(self.host.on_auth_required,self.host,"read_report",report_error)
+            end
+            if not final_flush and status.request_dispatched~=true
+                and (error_kind=="context" or error_kind=="position") then
+                local active_id=status_book_id
+                UIManager:scheduleIn(.2,function()
+                    if not self.daemon or not self.daemon.active then return end
+                    if error_kind=="context" then
+                        self:_recover_web_time_anchor(active_id,"pre_dispatch_context",function(ok,why)
+                            if not ok and why~="refresh_cooldown" and why~="refresh_in_progress"
+                                and self:reading_time_mode()=="smart" then
+                                self._smart_web_unavailable=true
+                                self._smart_web_unavailable_reason=Http.is_auth_error(why or "")
+                                    and "authentication" or "context"
+                                self:switch_smart_time_backend(false,"web_anchor_unavailable")
+                            end
+                        end)
+                    elseif self:reading_time_mode()=="smart" then
+                        -- 100%/terminal validation remains intact on Web; E-Ink
+                        -- can count NEW time under its independent protocol.
+                        self._smart_web_unavailable=true
+                        self._smart_web_unavailable_reason="position"
+                        self:switch_smart_time_backend(false,"web_position_guard")
+                    end
+                end)
+            elseif not final_flush and error_kind=="authentication"
+                and self:reading_time_mode()=="smart" then
+                self._smart_web_unavailable=true
+                self._smart_web_unavailable_reason="authentication"
+                UIManager:scheduleIn(.2,function()
+                    self:switch_smart_time_backend(false,"web_auth_unavailable")
+                end)
+            end
         else
             self.last_error=report_error
             self.last_error_kind=error_kind
@@ -5136,14 +5201,15 @@ function Sync:_start_daemon(reason)
         return false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码"
     end
     self.pending_report_status_at=os.time()
-    -- beta.13 restores ONLY provably-unsent reading time. Legacy debt without
-    -- `pending_report_safe=true` is discarded because it may already have been
-    -- accepted by WeRead and replaying it would double-count reading time.
-    -- 6.2.0-beta.2: time is best-effort; no historical seconds are replayed
-    -- across reader sessions or process restarts. Progress recovery is separate.
+    -- beta.18: restore only a journal entry with a matching account/book/core.
+    -- A legacy session setting without an authoritative journal is NOT safe
+    -- replay evidence. The service carries only provably pre-dispatch seconds.
     local carry_elapsed=0
-    self.pending_report_elapsed=0
-    self:_save_safe_pending_state(book_id,0,core_hash)
+    if Config.READ_TIME_BEST_EFFORT~=true then
+        local restored,found=self:_load_readtime_recovery(book_id,core_hash)
+        if found then carry_elapsed=math.max(0,tonumber(restored) or 0) end
+    end
+    self.pending_report_elapsed=carry_elapsed
     local existing_job=read_json_file(daemon.paths.job) or {}
     local same_account=tostring(existing_job.login_session_id or "")==login_session_id
         and math.max(0,tonumber(existing_job.auth_revision or 0) or 0)==auth_revision
@@ -5498,12 +5564,46 @@ end
 
 -- Smart mode moves ownership of *new* seconds only. Existing Web requests
 -- are never transferred to the E-Ink ledger or replayed after interruption.
+-- Recheck a transient Web failure at a low rate while E-Ink owns NEW time.
+-- Confirmed authentication failures require QR login, not periodic GET spam.
+function Sync:_schedule_smart_web_reprobe()
+    if self._smart_web_reprobe_task or self._smart_web_unavailable_reason~="context" then return end
+    if self:reading_time_mode()~="smart" then return end
+    local task
+    task=function()
+        if self._smart_web_reprobe_task~=task then return end
+        self._smart_web_reprobe_task=nil
+        if self._smart_web_unavailable_reason~="context" or self.reading_time_backend~="eink"
+            or self.suspended or not self.current or self:reading_time_mode()~="smart" then return end
+        if not (self.host and type(self.host.is_online)=="function" and self.host:is_online()) then
+            self:_schedule_smart_web_reprobe()
+            return
+        end
+        local book_id=tostring(self.current.book and self.current.book.book_id or "")
+        self:_recover_web_time_anchor(book_id,"smart_reprobe",function(ok,err)
+            if ok and self.reading_time_backend=="eink" then
+                self._smart_web_unavailable=false
+                self._smart_web_unavailable_reason=nil
+                self:switch_smart_time_backend(true,"web_recovered")
+            elseif self.reading_time_backend=="eink" then
+                if Http.is_auth_error(err or "") then
+                    self._smart_web_unavailable_reason="authentication"
+                else
+                    self:_schedule_smart_web_reprobe()
+                end
+            end
+        end)
+    end
+    self._smart_web_reprobe_task=task
+    UIManager:scheduleIn(120,task)
+end
+
 function Sync:switch_smart_time_backend(online,reason)
     if self:reading_time_mode()~="smart" or (self.store:preferences().sync or {}).time_enabled~=true
         or self.suspended or self.quiescing
         or self.reading_end_finalized or not self.current
         or not (self.host and self.host.ui and self.host.ui.document) then return false end
-    local target=online and "web" or "eink"
+    local target=(online and self._smart_web_unavailable~=true) and "web" or "eink"
     if target=="web" and self._smart_handoff then
         -- Reconnect happened before the old Web writer acknowledged stop.
         -- Defer re-start until that same barrier completes; starting a new
@@ -5535,7 +5635,8 @@ function Sync:switch_smart_time_backend(online,reason)
                 return
             end
             if self.current~=handoff.record or self:reading_time_mode()~="smart" then return end
-            if handoff.reconnect_requested or (self.host and type(self.host.is_online)=="function" and self.host:is_online()) then
+            if self._smart_web_unavailable~=true and
+                (handoff.reconnect_requested or (self.host and type(self.host.is_online)=="function" and self.host:is_online())) then
                 -- The old request has finished. Now a fresh Web clock can be
                 -- started without accidentally double-submitting its tail.
                 self:start("smart_online_restored_during_handoff")
@@ -5551,6 +5652,9 @@ function Sync:switch_smart_time_backend(online,reason)
                     self.host:on_readtime_route_change("unavailable",previous,self.last_stage)
                 end
                 return
+            end
+            if self._smart_web_unavailable_reason=="context" then
+                self:_schedule_smart_web_reprobe()
             end
             logger.info("[MiuRead][ReadTimeRoute] smart switch", "from=",previous,
                 "to=eink", "reason=",tostring(reason))
@@ -6319,6 +6423,54 @@ function Sync:invalidate_login_session(reason)
     return true
 end
 
+-- beta.18: refresh the time wire through the SAME public Web progress
+-- path as normal opening sync. Never use the legacy Agent coordinate here.
+-- This is a bounded recovery request, not a GET on every 60s timer tick.
+function Sync:_recover_web_time_anchor(book_id,reason,callback)
+    callback=type(callback)=="function" and callback or function() end
+    book_id=tostring(book_id or "")
+    local current=self.current
+    if not current or tostring(current.book and current.book.book_id or "")~=book_id
+        or self.suspended or self.quiescing or self.reading_end_finalized then
+        callback(false,"reader_not_active")
+        return false
+    end
+    local now=os.time()
+    if self._time_wire_refresh_busy==true then
+        callback(false,"refresh_in_progress")
+        return false
+    end
+    if self._time_wire_refresh_book==book_id
+        and now-(tonumber(self._time_wire_refresh_at) or 0)<45 then
+        callback(false,"refresh_cooldown")
+        return false
+    end
+    self._time_wire_refresh_busy=true
+    self._time_wire_refresh_book=book_id
+    self._time_wire_refresh_at=now
+    local identity=tostring(self.reading_time_session_id or "")
+    logger.info("[MiuRead][ReadTimeAnchor] refresh started","book=",book_id,"reason=",tostring(reason or "retry"))
+    -- detached avoids disrupting the independent precise-position sync UI.
+    self:remote(book_id,function(remote,err)
+        self._time_wire_refresh_busy=false
+        local still_current=self.current and tostring(self.current.book and self.current.book.book_id or "")==book_id
+            and tostring(self.reading_time_session_id or "")==identity
+        if still_current and remote and tostring(remote.source or "")=="web_cookie" then
+            self._smart_web_unavailable=false
+            self._smart_web_unavailable_reason=nil
+            self:_write_daemon_control(self.daemon and self.daemon.active==true,true,{_time_only=true})
+            logger.info("[MiuRead][ReadTimeAnchor] Web position restored","book=",book_id)
+            callback(true)
+        else
+            logger.warn("[MiuRead][ReadTimeAnchor] Web refresh failed", "book=",book_id,
+                "reason=",tostring(err or "no_web_position"))
+            callback(false,err or "no_web_position")
+        end
+    end,{web_only=true,raw_coordinate=true,update_cloud_anchor=false,
+        detached=true,record_snapshot=current})
+    return true
+end
+
 function Sync:on_auth_restored()
     self.auth_transitioning=false
     self:wake_offline_reading_time()
@@ -6332,8 +6484,28 @@ function Sync:on_auth_restored()
     if not record or self.suspended then return false end
     if self.store:preferences().sync.time_enabled~=true then return false end
     self.state="waiting"
-    self.last_stage="登录已恢复，正在重建上传上下文"
-    return self:start("auth_restored") == true
+    self.last_stage="登录已恢复，正在重新读取 Web 位置"
+    if self:reading_time_mode()=="eink" then return self:start("auth_restored") == true end
+    -- A new credential must not reuse a previous credential's Web time wire.
+    self._time_wire_refresh_at=0
+    local book_id=tostring(record.book.book_id or "")
+    return self:_recover_web_time_anchor(book_id,"auth_restored",function(ok,err)
+        if not self.current or tostring(self.current.book and self.current.book.book_id or "")~=book_id then return end
+        if ok then
+            self._smart_web_unavailable=false
+            if self:reading_time_mode()=="smart" and self.reading_time_backend=="eink" then
+                self:switch_smart_time_backend(true,"auth_restored")
+            else
+                self:start("auth_restored_web_ready")
+            end
+        else
+            self.last_stage="Web 登录已恢复，但位置尚不可用："..tostring(err or "未知错误")
+            if self:reading_time_mode()=="smart" then
+                self._smart_web_unavailable=true
+                self:switch_smart_time_backend(false,"auth_web_position_unavailable")
+            end
+        end
+    end)==true
 end
 
 function Sync:status_label()

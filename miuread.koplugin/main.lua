@@ -1908,9 +1908,12 @@ function Plugin:_show_auth_notice()
     local channel_key=tostring(health.last_error_channel or "")
     local channel=AUTH_CHANNEL_LABELS[channel_key] or "在线功能"
     local annotation_forbidden=channel_key=="annotations" and tostring(health.last_error_code or "")=="403"
+    local web_time_auth=channel_key=="read_report" or channel_key=="progress"
     local notice_text=annotation_forbidden
         and "正文下载仍可使用，但划线与想法接口拒绝访问。插件已保留正文、已有批注和下载断点；基础登录不会因此判定失效。"
-        or "自动续期、原请求重试和备用登录通道均未恢复此功能。其他本地功能和已缓存内容仍会保留；此时才建议重新扫码。"
+        or (web_time_auth
+            and "微信读书 Web 登录授权已过期，自动恢复未成功。Web 阅读时间可能无法上传；Agent 进度获取仍可能正常。重新扫码后将读取当前书籍 Web 位置并尝试恢复时间同步。"
+            or "自动续期未恢复此功能；本地书籍与下载记录仍然保留。可重新扫码登录。")
     local dialog
     local function close()
         if self._auth_notice_dialog==dialog then self._auth_notice_dialog=nil end
@@ -2192,8 +2195,11 @@ function Plugin:on_readtime_route_change(target,previous,reason)
         self:status_toast("阅读时间",previous=="eink" and "网络已恢复，Web 阅读时间同步已启动"
             or "Web 阅读时间同步已启动",3)
     elseif target=="eink" then
-        self:status_toast("阅读时间",previous=="web" and "网络已断开，阅读时间已转为本地记录"
-            or "网络未连接，阅读时间将在本地记录",4)
+        local web_failure=tostring(reason or ""):find("web_",1,true)~=nil
+        self:status_toast("阅读时间",web_failure and
+            "Web 时间暂不可用，已由 E-Ink 接管后续计时"
+            or (previous=="web" and "网络已断开，阅读时间已转为本地记录"
+            or "网络未连接，阅读时间将在本地记录"),4)
     end
 end
 
@@ -2245,8 +2251,16 @@ function Plugin:show_account_status()
         end
         rows[#rows+1]={text="阅读时间",separator=true,enabled=false}
         rows[#rows+1]={text="上传方式",post_text=label,enabled=false}
-        rows[#rows+1]={text="待同步",post_text=seconds_label(summary.pending),enabled=false}
-        rows[#rows+1]={text="待确认",post_text=seconds_label(summary.unknown),enabled=false}
+        rows[#rows+1]={text="E-Ink 待同步",post_text=seconds_label(summary.pending),enabled=false}
+        rows[#rows+1]={text="E-Ink 待确认",post_text=seconds_label(summary.unknown),enabled=false}
+        local book=self:_current_book_record()
+        if book and book.book then
+            local sid=tostring(book.book.book_id or "")
+            local web_pending=self.store:session(sid) or {}
+            if web_pending.pending_report_safe==true then
+                rows[#rows+1]={text="Web 明确未发送",post_text=seconds_label(web_pending.pending_report_seconds),enabled=false}
+            end
+        end
         local reason=summary.blocked or summary.capture_error or summary.error
             or ((summary.control or {}).reason)
         if reason then rows[#rows+1]={text="阻塞原因",post_text=tostring(reason),enabled=false} end
@@ -3666,9 +3680,10 @@ function Plugin:_home_preferences()
     -- B5: preserve the existing appearance for upgrades; every item may be hidden.
     if home.header_visible==nil then home.header_visible=true; changed=true end
     if type(home.header_items)~="table" then home.header_items={}; changed=true end
-    for _,key in ipairs({"title","account","wifi","bluetooth","sync","battery","tools"}) do
+    for _,key in ipairs({"title","account","wifi","bluetooth","sync","battery","time","tools"}) do
         if home.header_items[key]==nil then home.header_items[key]=true; changed=true end
     end
+    if home.show_clock_card==nil then home.show_clock_card=true; changed=true end
     if tonumber(home.layout_version)~=24 then home.layout_version=24; changed=true end
     if home.layout_style~="compact" and home.layout_style~="desk" then
         home.layout_style="desk"
@@ -4599,6 +4614,7 @@ function Plugin:_home_refresh_header_now(force_device,force_sync)
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=force_sync==true and self:_home_sync_status_label(true) or self:_home_sync_status_label_cached(),
         battery_text=self:_home_battery_text(),
+        time_text=self:_display_time("%H:%M"),
     }
 end
 
@@ -4649,11 +4665,10 @@ function Plugin:_home_schedule_clock()
     end
     if not HomeView.is_shown() or self:_active_reader_ui() then return false end
     HomeData.quick_power_state(true)
-    HomeView.update_header{battery_text=self:_home_battery_text()}
-    HomeView.update_dashboard{
-        clock_text=self:_display_time("%H:%M"),
-        date_text=self:_home_date_text(),
-    }
+    HomeView.update_header{battery_text=self:_home_battery_text(),time_text=self:_display_time("%H:%M")}
+    if self:_home_preferences().show_clock_card~=false then
+        HomeView.update_dashboard{clock_text=self:_display_time("%H:%M"),date_text=self:_home_date_text()}
+    end
     local task
     task=function()
         if generation~=self._home_clock_generation or self._home_clock_task~=task then return end
@@ -4667,11 +4682,10 @@ function Plugin:_home_schedule_clock()
             -- and partially replace its contents on e-ink devices.
             if not self:_home_modal_surface_active() then
                 HomeData.quick_power_state(true)
-                HomeView.update_header{battery_text=self:_home_battery_text()}
-                HomeView.update_dashboard{
-                    clock_text=self:_display_time("%H:%M"),
-                    date_text=self:_home_date_text(),
-                }
+                HomeView.update_header{battery_text=self:_home_battery_text(),time_text=self:_display_time("%H:%M")}
+                if self:_home_preferences().show_clock_card~=false then
+                    HomeView.update_dashboard{clock_text=self:_display_time("%H:%M"),date_text=self:_home_date_text()}
+                end
             end
         end
         local now=os.time()
@@ -6247,9 +6261,9 @@ function Plugin:_toggle_home_lockscreen()
     self:_refresh_home_view(home.lockscreen_recent and "主页锁屏将显示最近阅读封面" or "已恢复 KOReader 原锁屏设置","header")
 end
 
-local HOME_HEADER_KEYS={"title","account","wifi","bluetooth","sync","battery","tools"}
+local HOME_HEADER_KEYS={"title","account","wifi","bluetooth","sync","battery","time","tools"}
 local HOME_HEADER_LABELS={title="觅阅标题",account="账号",wifi="Wi-Fi 状态",bluetooth="蓝牙状态",
-    sync="同步状态",battery="电量",tools="工具入口"}
+    sync="同步状态",battery="电量",time="时间",tools="工具入口"}
 
 function Plugin:_set_home_header_item(key,visible)
     if not HOME_HEADER_LABELS[key] then return false end
@@ -7388,40 +7402,42 @@ function Plugin:_wifi_resume_recover(source)
     end
 
     local requested=false
-    -- Prefer KOReader's device-owned restore path on every platform that
-    -- provides it. Kobo implements this via restore-wifi-async.sh; MiuRead must
-    -- not manipulate dhcpcd/wpa_supplicant itself.
     if NetworkMgr.pending_connection==true or NetworkMgr.pending_connectivity_check==true then
         requested=true
         logger.info("[MiuRead][WiFi] resume reuses KOReader connection attempt",
             "source=",tostring(source or "resume"))
+    elseif type(NetworkMgr.enableWifi)=="function" then
+        -- Use KOReader's complete Wi-Fi backend (connect/reconnect + status
+        -- notifications). Kindle restoreWifiAsync only powers on the radio and
+        -- can leave wifid enabled with no SSID, as seen on Kindle Voyage.
+        local ok_enable,value=pcall(NetworkMgr.enableWifi,NetworkMgr,complete,false)
+        requested=ok_enable and value~=false
+        if not ok_enable then
+            logger.warn("[MiuRead][WiFi] resume enable failed",tostring(value))
+        end
     elseif type(NetworkMgr.restoreWifiAsync)=="function"
         and type(NetworkMgr.scheduleConnectivityCheck)=="function" then
-        if UIManager and Event then pcall(UIManager.broadcastEvent,UIManager,Event:new("NetworkConnecting")) end
         local ok_restore,restore_err=pcall(NetworkMgr.restoreWifiAsync,NetworkMgr)
         if ok_restore then
             local ok_check,check_err=pcall(NetworkMgr.scheduleConnectivityCheck,NetworkMgr,complete)
             requested=ok_check==true
-            if not ok_check then
-                logger.warn("[MiuRead][WiFi] resume connectivity check failed",tostring(check_err))
-            end
+            if not ok_check then logger.warn("[MiuRead][WiFi] resume check failed",tostring(check_err)) end
         else
             logger.warn("[MiuRead][WiFi] resume restore failed",tostring(restore_err))
         end
-    elseif type(NetworkMgr.enableWifi)=="function" then
-        local ok_enable,value=pcall(NetworkMgr.enableWifi,NetworkMgr,complete,false)
-        requested=ok_enable and value~=false
-    elseif radio~=true then
-        requested=self:_wifi_start(NetworkMgr,source)==true
     end
 
-    self:_wifi_schedule_reconcile(source,true,{
-        delays={.8,3,6,12,24,40,48},fail_on_timeout=true,notify=true,
-    })
+    if requested then
+        self:_wifi_schedule_reconcile(source,true,{
+            delays={.8,3,6,12,24,40,48},fail_on_timeout=true,notify=true,
+        })
+    else
+        require("miuread.network_health").note_failure("resume:request_failed")
+    end
     logger.info("[MiuRead][WiFi] resume recovery requested",
         "source=",tostring(source or "resume"),"requested=",tostring(requested),
         "radio=",tostring(radio),"connected=",tostring(connected))
-    return requested,"requested"
+    return requested,requested and "requested" or "request_failed"
 end
 
 function Plugin:_wifi_start(NetworkMgr,source)
@@ -7434,40 +7450,32 @@ function Plugin:_wifi_start(NetworkMgr,source)
         self:_wifi_refresh_state(tostring(source or "toggle")..":connected")
     end
 
-    -- Kindle's native Wi-Fi service may need several seconds to reconnect a saved
-    -- profile. Avoid an immediate scan here: on KPW5 that scan can finish before
-    -- wifid has associated, causing NetworkMgr to report a false failure.
-    local is_kindle=false
-    if type(Device.isKindle)=="function" then
-        local ok,value=pcall(Device.isKindle,Device)
-        is_kindle=ok and value==true
+    -- Manual Wi-Fi actions must use KOReader's interactive connection path.
+    -- On Kindle, restoreWifiAsync turns the radio on but does *not* guarantee
+    -- association with a saved SSID; use the native reconnect/network picker.
+    if NetworkMgr.pending_connection==true or NetworkMgr.pending_connectivity_check==true then
+        logger.info("[MiuRead][WiFi] manual start uses existing attempt", "source=",tostring(source))
+        self:_wifi_schedule_reconcile(source,true)
+        return true
     end
     local ok=false
-    if is_kindle and type(NetworkMgr.restoreWifiAsync)=="function"
-        and type(NetworkMgr.scheduleConnectivityCheck)=="function" then
-        if NetworkMgr.pending_connectivity_check==true and type(NetworkMgr.unscheduleConnectivityCheck)=="function" then
-            pcall(NetworkMgr.unscheduleConnectivityCheck,NetworkMgr)
-        end
-        if UIManager and Event then pcall(UIManager.broadcastEvent,UIManager,Event:new("NetworkConnecting")) end
-        local ok_restore,err=pcall(NetworkMgr.restoreWifiAsync,NetworkMgr)
-        if ok_restore then
-            local ok_check,check_err=pcall(NetworkMgr.scheduleConnectivityCheck,NetworkMgr,complete)
-            ok=ok_check==true
-            if not ok_check then logger.warn("[MiuRead][WiFi] Kindle connectivity check failed",tostring(check_err)) end
-        else
-            logger.warn("[MiuRead][WiFi] Kindle restore failed",tostring(err))
-        end
-        if ok then logger.info("[MiuRead][WiFi] Kindle saved-network restore requested","source=",tostring(source or "toggle")) end
-    elseif type(NetworkMgr.toggleWifiOn)=="function" then
-        -- This is a direct user action. Passing interactive=true prevents
-        -- KOReader from treating a still-connecting radio as a background failure.
-        ok=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,complete,false,true)
+    if type(NetworkMgr.toggleWifiOn)=="function" then
+        local called,err=pcall(NetworkMgr.toggleWifiOn,NetworkMgr,complete,false,true)
+        ok=called and err~=false
+        if not called then logger.warn("[MiuRead][WiFi] interactive toggle failed",tostring(err)) end
+    elseif type(NetworkMgr.enableWifi)=="function" then
+        local called,value=pcall(NetworkMgr.enableWifi,NetworkMgr,complete,true)
+        ok=called and value~=false
+        if not called then logger.warn("[MiuRead][WiFi] interactive enable failed",tostring(value)) end
     elseif type(NetworkMgr.turnOnWifi)=="function" then
-        ok=pcall(NetworkMgr.turnOnWifi,NetworkMgr,complete,true)
+        local called,value=pcall(NetworkMgr.turnOnWifi,NetworkMgr,complete,true)
+        ok=called and value~=false
     end
     if ok then
         HomeData.invalidate_device_state()
-        self:_wifi_schedule_reconcile(source,true)
+        self:_wifi_schedule_reconcile(source,true,{fail_on_timeout=true,notify=true})
+    else
+        require("miuread.network_health").note_failure("manual_wifi_start_failed")
     end
     return ok==true
 end
@@ -7506,9 +7514,9 @@ end
 function Plugin:_reader_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_wifi_state_snapshot(NetworkMgr)==true
+    local radio,connected=self:_wifi_state_snapshot(NetworkMgr)
     local ok
-    if on then
+    if radio==true and connected==true then
         ok=self:_wifi_stop(NetworkMgr,"reader")
         if ok then self:toast("正在关闭 Wi-Fi",1.5) end
     else
@@ -7533,7 +7541,15 @@ function Plugin:_reader_wifi_settings(back_callback)
             if ok_list and type(networks)=="table" then
                 local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
-                    local dialog=NetworkSetting:new{network_list=sanitized_network_list(networks)}
+                    local visible_networks=sanitized_network_list(networks)
+                    local screen=Device.screen
+                    local row_height=screen:scaleBySize(44)
+                    local list_height=math.min(math.floor(screen:getHeight()*.70),
+                        math.max(screen:scaleBySize(58),row_height*math.max(1,#visible_networks)+screen:scaleBySize(12)))
+                    logger.info("[MiuRead][WiFi] reader network picker", "scanned=",tostring(#networks),
+                        "visible=",tostring(#visible_networks),"height=",tostring(list_height))
+                    local dialog=NetworkSetting:new{network_list=visible_networks,height=list_height}
+                    dialog._miuread_modal_surface=true
                     local original_on_close=dialog.onCloseWidget
                     dialog.onCloseWidget=function(widget)
                         if type(original_on_close)=="function" then
@@ -7589,7 +7605,7 @@ end
 function Plugin:_home_header_visibility_label()
     local home=self:_home_preferences()
     if home.header_visible==false then return "已隐藏" end
-    local fields={"title","account","wifi","bluetooth","sync","battery","tools"}
+    local fields={"title","account","wifi","bluetooth","sync","battery","time","tools"}
     local visible=type(home.header_items)=="table" and home.header_items or {}
     for _,key in ipairs(fields) do
         if visible[key]==false then return "部分隐藏" end
@@ -7611,10 +7627,16 @@ function Plugin:_home_wifi_details()
         {text="查看可用网络",post_text="使用 KOReader 网络管理",close_before_action=true,callback=function()
             return self:_home_wifi_settings()
         end},
-        {text=state.wifi_on==false and "开启 Wi-Fi" or (state.wifi_on==true and "关闭 Wi-Fi" or "管理 Wi-Fi 开关"),close_before_action=true,callback=function()
+        {text=state.wifi_on==false and "开启 Wi-Fi" or (connected and "关闭 Wi-Fi" or "重新连接 Wi-Fi"),close_before_action=true,callback=function()
             return self:_home_wifi_toggle()
         end},
     }
+    if state.wifi_on==true and not connected then
+        rows[#rows+1]={text="关闭 Wi-Fi 无线电",close_before_action=true,callback=function()
+            local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
+            return ok_nm and NetworkMgr and self:_wifi_stop(NetworkMgr,"home") or false
+        end}
+    end
     return self:list("Wi-Fi",rows)
 end
 
@@ -11754,6 +11776,21 @@ function Plugin:_home_stats_visibility(home)
     return home.show_weread_stats~=false,home.show_local_stats~=false
 end
 
+function Plugin:_set_home_clock_card_visible(enabled)
+    local home,preferences=self:_home_preferences()
+    enabled=enabled==true
+    if (home.show_clock_card~=false)==enabled then return false end
+    home.show_clock_card=enabled
+    local saved,err=self:_save_home_preferences(home,preferences)
+    if not saved then
+        logger.warn("[MiuRead][HomeClock] setting save failed",tostring(err or "unknown"))
+        self:info("时钟显示设置保存失败")
+        return false
+    end
+    self:_refresh_home_view(enabled and "大时钟已显示" or "大时钟已隐藏","page")
+    return true
+end
+
 function Plugin:_home_stats_visibility_label(home)
     local show_weread,show_local=self:_home_stats_visibility(home)
     if show_weread and show_local then return "微信读书 + 本地阅读" end
@@ -11785,6 +11822,12 @@ end
 
 function Plugin:home_stats_settings_menu()
     return {
+        {text="显示大时钟",checked_func=function()
+            return self:_home_preferences().show_clock_card~=false
+        end,keep_menu_open=true,callback=function()
+            local home=self:_home_preferences()
+            self:_set_home_clock_card_visible(home.show_clock_card==false)
+        end},
         {text="显示微信读书统计",post_text="隐藏后主页不再刷新微信读书统计",checked_func=function()
             return self:_home_preferences().show_weread_stats~=false
         end,keep_menu_open=true,callback=function()
@@ -11797,7 +11840,7 @@ function Plugin:home_stats_settings_menu()
             local home=self:_home_preferences()
             self:_set_home_stats_visibility("local",home.show_local_stats==false)
         end},
-        {text="布局规则",post_text="只显示一个时自动扩展；全部隐藏时放大时间卡",enabled=false},
+        {text="布局规则",post_text="可单独隐藏时钟或统计；其余卡片自动扩展",enabled=false},
     }
 end
 
@@ -12428,9 +12471,9 @@ end
 function Plugin:_home_wifi_toggle()
     local ok_nm,NetworkMgr=pcall(require,"ui/network/manager")
     if not ok_nm or not NetworkMgr then self:info("当前设备无法使用网络设置"); return false end
-    local on=self:_wifi_state_snapshot(NetworkMgr)==true
+    local radio,connected=self:_wifi_state_snapshot(NetworkMgr)
     local ok
-    if on then
+    if radio==true and connected==true then
         ok=self:_wifi_stop(NetworkMgr,"home")
         if ok then self:toast("正在关闭 Wi-Fi",1.5) end
     else
@@ -12448,8 +12491,8 @@ function Plugin:_home_wifi_settings()
     -- actually closed. Refreshing while it is visible rebuilds the home view
     -- over the picker and makes the network list disappear immediately.
     local function refresh_after_picker_close()
-        UIManager:scheduleIn(.15,function()
-            self:_refresh_home_view(nil,"header")
+        UIManager:scheduleIn(.18,function()
+            self:_refresh_home_view(nil,"page")
         end)
     end
 
@@ -12460,8 +12503,16 @@ function Plugin:_home_wifi_settings()
             if ok_list and type(networks)=="table" then
                 local ok_widget,NetworkSetting=pcall(require,"ui/widget/networksetting")
                 if ok_widget and NetworkSetting and type(NetworkSetting.new)=="function" then
+                    local visible_networks=sanitized_network_list(networks)
+                    local screen=Device.screen
+                    local row_height=screen:scaleBySize(44)
+                    local list_height=math.min(math.floor(screen:getHeight()*.70),
+                        math.max(screen:scaleBySize(58),row_height*math.max(1,#visible_networks)+screen:scaleBySize(12)))
+                    logger.info("[MiuRead][WiFi] home network picker", "scanned=",tostring(#networks),
+                        "visible=",tostring(#visible_networks),"height=",tostring(list_height))
                     local dialog=NetworkSetting:new{
-                        network_list=sanitized_network_list(networks),
+                        network_list=visible_networks,height=list_height,
+                        _miuread_modal_surface=true,
                         -- Deliberately omit connect_callback here. KOReader
                         -- auto-dismisses an already-connected network picker
                         -- when that callback is present. The close hook below
@@ -18705,6 +18756,7 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         bluetooth_text=self:_home_bluetooth_text(),
         sync_text=self:_home_sync_status_label_cached(),
         battery_text=self:_home_battery_text(),
+        time_text=self:_display_time("%H:%M"),
         account_name=self:_home_account_name(),
         clock_text=self:_display_time("%H:%M"),
         date_text=self:_home_date_text(),
@@ -18712,6 +18764,8 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
         local_stats=self:_home_local_stats_card(local_reading_stats),
         show_weread_stats=home.show_weread_stats~=false,
         show_local_stats=home.show_local_stats~=false,
+        show_clock_card=home.show_clock_card~=false,
+        show_shelf_covers=self:_shelf_covers_enabled(self.store:preferences()),
         layout_style=home.layout_style,
         display_size=home.display_size,
         hero=hero,
@@ -19862,8 +19916,10 @@ function Plugin:book_menu(b,back_callback)
     if preferred and preferred.file and U.file_exists(preferred.file) then
         items[#items+1]={text="阅读已下载书籍",callback=function() self:open_file(preferred.file) end}
     end
-    items[#items+1]={text=(preferred and preferred.file and U.file_exists(preferred.file)) and "更新正文" or "下载书籍",
-        callback=function() self:choose_download(b,nil,false) end}
+    local clean_action=self:_home_variant_download_action(b,false)
+    items[#items+1]={text=clean_action.label or "下载正文",callback=clean_action.callback}
+    local notes_action=self:_home_variant_download_action(b,true)
+    items[#items+1]={text=notes_action.label or "下载正文与公开想法",callback=notes_action.callback}
     items[#items+1]={text="按章节下载",callback=function() self:chapters(b) end}
     if self:_has_range_variant(b.bookId) then
         items[#items+1]={text="扩展已有章节",sub_item_table_func=function() return self:range_extend_menu(b) end}
@@ -23947,7 +24003,10 @@ function Plugin:sync_diagnostics_menu()
                 self:info("当前时间由 E-Ink 负责，不能使用 Web 30 秒时长测试。\n\nE-Ink 记录将在结束阅读后或仅 E-Ink 模式联网时按队列规则上传。")
                 return
             end
-            if not self.sync:record() then self:info("请先打开一本觅阅下载的书籍。") return end
+            if not (self.sync:record() or self:_current_book_record()) then
+                self:info("尚未识别到当前觅阅书籍。请确认书籍已打开；如果刚进入阅读器，可稍后重试。")
+                return
+            end
             self:status_toast("阅读时间测试","正在上传 30 秒……",3)
             self.sync:test_upload(function(ok,result,position,value)
                 if ok then
@@ -23962,8 +24021,10 @@ function Plugin:sync_diagnostics_menu()
         {text="检查后台任务状态",callback=function() self:show_sync_background_status() end},
         {text="查看详细错误",callback=function() self:show_sync_status(true) end},
         {text="重置本书同步状态",callback=function()
-            local r=self.sync:record()
-            if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
+            local r=self.sync:record() or self:_current_book_record()
+            if not r or not r.book then
+                self:info("当前书籍身份尚未就绪，无法重置同步状态。") return
+            end
             local id=tostring(r.book.book_id)
             UIManager:show(ConfirmBox:new{text="重置本书的阅读进度同步状态？\n\n不会删除书籍、本机阅读位置、划线、想法或账号。批注同步状态不会改变。",ok_callback=function()
                 -- beta.16: use the same comprehensive reset as the one-shot
@@ -23997,8 +24058,10 @@ function Plugin:sync_diagnostics_menu()
             end})
         end},
         {text="重新检查本书批注同步",callback=function()
-            local r=self.sync:record()
-            if not r or not r.book then self:info("请先打开一本觅阅下载的书籍。") return end
+            local r=self.sync:record() or self:_current_book_record()
+            if not r or not r.book then
+                self:info("当前书籍身份尚未就绪，无法重置同步状态。") return
+            end
             local id=tostring(r.book.book_id or "")
             local changed,err=LocalAnnotationDatabase.retry_failures(self.store,id)
             if changed==nil then self:info("无法重新检查本书批注：\n"..tostring(err or "未知错误")); return end
@@ -25904,9 +25967,9 @@ function Plugin:_sync_home_pending(options)
             release_manual()
             return false
         end
-        if self:_network_radio_hint()==false then
+        if not self:is_online() then
             logger.warn("[MiuRead][SyncAction] finish",
-                "source=",source,"result=blocked","reason=wifi_off")
+                "source=",source,"result=blocked","reason=wifi_not_connected")
             if not silent then self:info("当前 Wi-Fi 未开启。\n\n同步失败项目仍保留在本机；网络恢复后可再次点击同步。") end
             release_manual()
             return false
@@ -25940,9 +26003,9 @@ function Plugin:_sync_home_pending(options)
             release_manual()
             return false
         end
-        if radio==false then
+        if radio==false or not self:is_online() then
             logger.warn("[MiuRead][SyncAction] finish",
-                "source=",source,"result=blocked","reason=wifi_off")
+                "source=",source,"result=blocked","reason=wifi_not_connected")
             self:info("当前 Wi-Fi 未开启。\n\n同步失败项目仍保留在本机；网络恢复后可再次点击同步。")
             release_manual()
             return false
@@ -28274,7 +28337,7 @@ function Plugin:_show_sync_repair_prompt(err,kind,book_id)
     end
     dialog=ConfirmBox:new{
         text="《"..title.."》阅读同步失败\n\n"..detail
-            .."\n\n本次失败的阅读时间不会补传。其他书籍不受影响。",
+            .."\n\n阅读进度与时间分别处理；明确未发出的时间将等待安全恢复。",
         ok_text="修复同步", cancel_text="稍后",
         ok_callback=function() close(); self:repair_current_sync() end,
         cancel_callback=close,
@@ -28283,10 +28346,22 @@ function Plugin:_show_sync_repair_prompt(err,kind,book_id)
 end
 
 function Plugin:on_auth_required(channel,err)
-    local notify=tostring(channel or "")~="read_report"
-    local marked=self:_mark_auth_problem(channel,err,notify)
-    if marked and not notify then
-        self:status_toast("阅读时长同步","登录验证暂时失败，时长已保留，请恢复登录后重试",5)
+    local text=tostring(err or "")
+    local confirmed=text:find("微信登录授权已过期",1,true)~=nil
+        or text:find("[MiuReadAuthConfirmedExpired]",1,true)~=nil
+    local notify=confirmed or tostring(channel or "")~="read_report"
+    if confirmed then
+        -- One actionable QR prompt for each credential revision; periodic
+        -- Web worker errors must not show the same dialog every minute.
+        local auth=self.store:auth() or {}
+        local key=tostring(auth.login_session_id or "")..":"..
+            tostring(auth.web_auth_revision or auth.auth_revision or 0)..":"..tostring(channel or "")
+        if self._web_auth_notice_once==key then notify=false
+        else self._web_auth_notice_once=key end
+    end
+    local marked=self:_mark_auth_problem(channel,err,notify,confirmed)
+    if marked and not notify and not confirmed and tostring(channel)=="read_report" then
+        self:status_toast("阅读时间","Web 登录暂时异常，正在等待恢复",4)
     end
     return marked
 end
@@ -28318,15 +28393,20 @@ end
 function Plugin:on_read_report_failure(err,kind,book_id)
     kind=tostring(kind or "")
     if kind=="authentication" or Http.is_auth_error(err) then
-        self:_mark_auth_problem("read_report",err,false)
+        self:on_auth_required("read_report",err)
         return
     end
     if kind=="context" or kind=="position" then self:_show_sync_repair_prompt(err,"context",book_id) end
 end
 function Plugin:_current_book_record()
+    -- The Sync record can be recovered after an earlier transient negative
+    -- session classification. A verified library path is stronger evidence
+    -- than the opening UI's one-time classification result.
+    local r=self.sync:record()
+    if r then return r end
     if not self:_reader_session_is_weread() then return nil end
     self.store:reload()
-    local r=self.sync:record()
+    r=self.sync:record()
     if r then return r end
     local doc=self.ui and self.ui.document
     local path=doc and (doc.file or (doc.getFilePath and doc:getFilePath()))
@@ -28608,7 +28688,18 @@ function Plugin:scan_downloaded_books_for_integrity_repair()
 end
 
 function Plugin:_toggle_preference(key)
-    local p=self.store:preferences(); p[key]=not p[key]; self.store:save_preferences(p)
+    local p=self.store:preferences()
+    if key=="shelf_covers" then
+        p[key]=p[key]==false
+    else
+        p[key]=not p[key]
+    end
+    self.store:save_preferences(p)
+    if key=="shelf_covers" then
+        -- Cover visibility changes geometry in both the hero and shelf. A
+        -- full page rebuild also invalidates the rendered shelf-layer cache.
+        self:_refresh_home_view(p[key] and "书架封面已显示" or "书架封面已隐藏","page")
+    end
 end
 
 
@@ -32221,35 +32312,31 @@ end
 function Plugin:onScreenResize() return self:onSetDimensions() end
 function Plugin:onRotation() return self:onSetDimensions() end
 function Plugin:onNetworkConnected()
-    self:_schedule_smart_readtime_route(true,"network_connected")
+    -- KOReader may announce this before Kindle wifid has an IP route. A radio
+    -- enabled without an SSID must not wake cloud uploads or Web-first routing.
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
     local generation=self._network_recovery_generation
-    UIManager:scheduleIn(.8,function()
+    logger.info("[MiuRead][ResumeSync] link event; checking connectivity", "generation=",generation)
+    self:_wait_for_network("network-restored-sync",function(ready)
         if generation~=tonumber(self._network_recovery_generation) then return end
+        if not ready then
+            logger.warn("[MiuRead][ResumeSync] network_wait_timeout","source=network_restored")
+            return
+        end
+        logger.info("[MiuRead][ResumeSync] network_online","source=network_restored")
+        self:_schedule_smart_readtime_route(true,"network_restored")
         self.sync:wake_offline_reading_time()
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self:_sync_home_pending({silent=true,source="network_restored"})
-            if tostring(self._home_active_section or "shelf")=="shelf" then self:_home_refresh_remote(false,false) end
+            if tostring(self._home_active_section or "shelf")=="shelf" then
+                self:_home_refresh_remote(false,false)
+            end
         elseif self.ui and self.ui.document and self:_reader_session_is_weread() then
             self:_schedule_next_comment_preload(3)
             local prefs=self.store:preferences().sync or {}
             if prefs.auto_latest_position~=false and not self._progress_check_running then
-                logger.info("[MiuRead][ResumeSync] waiting_network","source=network_restored")
-                self:_wait_for_network("reader-progress-online",function(ready)
-                    if not (self.ui and self.ui.document) then return end
-                    if ready then
-                        if not self._progress_check_running then
-                            logger.info("[MiuRead][ResumeSync] network_online","source=network_restored")
-                            logger.info("[MiuRead][ResumeSync] reconcile_started","source=network_restored")
-                            self:ensure_read_report_progress("network_restored",true)
-                        end
-                    else
-                        local r=self.sync:record()
-                        if r then self:_save_progress_state(tostring(r.book.book_id),"waiting_network",
-                            "网络恢复尚未完成，保留本地位置等待后续同步",nil,nil) end
-                        logger.warn("[MiuRead][ResumeSync] network_wait_timeout","source=network_restored")
-                    end
-                end,{minimum_delay=2.5,max_wait=45,interval=1,require_online=true})
+                logger.info("[MiuRead][ResumeSync] reconcile_started","source=network_restored")
+                self:ensure_read_report_progress("network_restored",true)
             end
         end
         if HomeView.is_shown() and not self:_active_reader_ui() then
@@ -32260,7 +32347,7 @@ function Plugin:onNetworkConnected()
         end
         self:_schedule_hibernated_download_resume("network restored")
         self:_legacy_coordinate_schedule(18,"network restored")
-    end)
+    end,{initial_delay=.8,minimum_delay=2.5,max_wait=45,interval=2,require_online=true})
     return false
 end
 
@@ -32268,6 +32355,8 @@ function Plugin:onNetworkDisconnected()
     self:_legacy_coordinate_pause("network disconnected")
     self:_cancel_next_comment_preload("network disconnected")
     self._network_recovery_generation=(tonumber(self._network_recovery_generation) or 0)+1
+    -- Cancel callbacks from an obsolete connect event; leave durable queues intact.
+    if self._network_wait_tokens then self._network_wait_tokens["network-restored-sync"]=nil end
     self:_schedule_smart_readtime_route(false,"network_disconnected")
     logger.info("[MiuRead][Network] disconnected; safe sync remains durable")
     return false

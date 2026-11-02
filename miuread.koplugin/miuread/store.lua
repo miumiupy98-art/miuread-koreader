@@ -307,12 +307,9 @@ local function reset_progress_sync_session(row,reason)
     row.progress_epoch=previous_epoch+1
     row.progress_state_reset_at=os.time()
     row.progress_state_reset_reason=tostring(reason or "sync_state_reset")
-    -- Reading-time debt/context is best-effort. Never preserve a retry payload
-    -- across the position reset, but keep confirmed reading-time totals/history.
-    if tonumber(row.pending_report_seconds or 0)~=0 then changed=changed+1 end
-    if row.pending_report_safe==true then changed=changed+1 end
-    row.pending_report_seconds=0
-    row.pending_report_safe=false
+    -- beta.18: resetting a precise-progress transaction must not erase the
+    -- independent Web time journal. Matching account/core is enforced at
+    -- recovery, so a new core never replays an old book's SAFE seconds.
     return row,changed+1
 end
 

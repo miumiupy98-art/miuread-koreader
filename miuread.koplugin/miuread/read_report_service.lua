@@ -126,6 +126,7 @@ local function public_result(result)
         payload_public = result.payload_public,
         request_dispatched = result.request_dispatched == true
             or (type(result.meta)=="table" and result.meta.request_dispatched==true),
+        anchor_reason = result.anchor_reason,
         meta = result.meta,
     }
 end
@@ -173,6 +174,7 @@ function Service.run(job)
     local blocked = false
     local carry_remaining = 0
     local progress_fence_seq = 0
+    local last_anchor_signal = ""
 
     local function reader_busy_until()
         if reader_busy_path == "" then return 0 end
@@ -321,6 +323,10 @@ function Service.run(job)
             generation=generation,seq=sequence,state="reporting",accepted=nil,
             attempted_at=attempted_at,elapsed_seconds=elapsed,final_flush=final_flush==true,
             flush_reason=reason,time_only=time_only,report_mode=report_mode,next_due=0,
+            -- Current in-flight request (including previous SAFE carry) is
+            -- no longer provably unsent once Adapter.run begins. Preserve
+            -- only the overflow not included in this request.
+            pending_elapsed=leftover,safe_pending=leftover>0,
             writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
         })
         local ok, result = pcall(Adapter.run, report_job)
@@ -410,7 +416,9 @@ function Service.run(job)
             out.final_flush = final_flush == true
             out.flush_reason = reason
             if not final_flush and carry_remaining>0 and (result.accepted or uncertain) then
-                delay=math.min(delay,10)
+                -- Catch up safely without producing a 60s POST storm after
+                -- long offline periods (at most two backlog writes/minute).
+                delay=math.min(delay,30)
             end
             out.retry_delay = delay
             if final_flush then
@@ -529,6 +537,7 @@ function Service.run(job)
                 consecutive_failures = 0
                 consecutive_unconfirmed = 0
                 blocked = false
+                last_anchor_signal=""
                 if tostring(loaded.action or "")=="reset_auth" then
                     book={}
                     auth={}
@@ -623,6 +632,18 @@ function Service.run(job)
                 end
             end
 
+            -- A genuinely new Web wire observation may unlock previously
+            -- unsent intervals. Only shorten the existing retry, never GET
+            -- from this service or create a second reading-time owner.
+            local signal=tostring(control.remote_wire_fetched_at or "")..":"..
+                tostring(control.remote_wire_chapter_uid or "")..":"..
+                tostring(control.remote_wire_chapter_offset or "")
+            if signal~="::" and signal~=last_anchor_signal then
+                last_anchor_signal=signal
+                if active and carry_remaining>0 and next_due>os.time()+3 then
+                    next_due=os.time()+3
+                end
+            end
             local requested_fence_seq=tonumber(control.writer_barrier_seq or 0) or 0
             if control.progress_fence==true then
                 -- Progress writes and reading-time writes share /web/book/read.
@@ -641,7 +662,8 @@ function Service.run(job)
                 progress_fence_seq=0
                 last_flush_seq=flush_seq
                 next_due=0
-                carry_remaining=0
+                -- E-Ink takes future time; previously provable UNSENT Web
+                -- seconds stay in their Web journal until Web can resume.
                 write_service_status({generation=generation,seq=sequence,state="inactive",
                     accepted=false,elapsed_seconds=0,next_due=0,
                     writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0})
