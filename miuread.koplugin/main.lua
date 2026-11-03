@@ -783,6 +783,7 @@ function Plugin:init()
         self:_set_navigation_state("home","home plugin initialized")
     else
         self:_set_navigation_state("native","file manager plugin initialized")
+        self:_abort_rebuild_candidate_on_filemanager("filemanager init")
     end
     -- Keep the annotation-mark preference in the first CRE stylesheet so a
     -- hidden-mark book does not need a second full re-render after opening.
@@ -31834,6 +31835,20 @@ function Plugin:_finalize_reader_instance_close(closing_path,session_generation,
     return true
 end
 
+function Plugin:_abort_rebuild_candidate_on_filemanager(reason)
+    if not reader_rebuild_active() or READER_REBUILD.internal_hint==true then return false end
+    if self:_active_reader_ui() or HomeView.is_shown() or not self:_filemanager_instance() then return false end
+    local old_owner=READER_REBUILD.owner
+    local old_path=READER_REBUILD.reader_file
+    local old_session=READER_REBUILD.session_generation
+    self:_reader_rebuild_cancel(reason or "filemanager active",true)
+    if old_owner and type(old_owner._finalize_reader_instance_close)=="function" then
+        pcall(old_owner._finalize_reader_instance_close,old_owner,old_path,old_session,
+            {reason=reason or "filemanager active"})
+    end
+    return true
+end
+
 function Plugin:_finish_reader_rebuild_candidate(generation,reason)
     if generation~=(tonumber(READER_REBUILD.generation) or 0)
         or not reader_rebuild_active() then return false end
@@ -31865,8 +31880,10 @@ function Plugin:_finish_reader_rebuild_candidate(generation,reason)
         return true
     end
 
+    local filemanager_visible=not READER_REBUILD.internal_hint
+        and not HomeView.is_shown() and self:_filemanager_instance()~=nil
     local elapsed=math.max(0,monotonic_wall_time()-(tonumber(READER_REBUILD.started_clock) or monotonic_wall_time()))
-    if elapsed<(tonumber(READER_REBUILD.max_wait) or 2.4) then
+    if not filemanager_visible and elapsed<(tonumber(READER_REBUILD.max_wait) or 2.4) then
         local task
         task=function()
             if self._reader_rebuild_task~=task then return end
@@ -34432,8 +34449,14 @@ function Plugin:onCloseDocument()
     -- close is confirmed. This keeps same-book reloads cheap and invisible.
     local setting_hint=reader_native_setting_active(closing_path)
     local typography_hint=setting_hint and tostring(READER_NATIVE_SETTING.label or ""):match("^Typography")~=nil
-    local tearing_down=self.ui and self.ui.tearing_down==true
+    local tearing_down=type(self.ui)=="table"
+        and (rawget(self.ui,"tearing_down")==true or rawget(self.ui,"reloading")==true)
     local internal_hint=tearing_down or setting_hint
+    if not internal_hint and not self:_home_enabled() and not self:_reader_session_is_weread() then
+        self:_reader_rebuild_cancel("native reader closed in plugin mode",true)
+        return self:_finalize_reader_instance_close(closing_path,session_generation,
+            {reason="native document close"})
+    end
     logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
         "book=",tostring(closing_path or ""),"session=",tostring(session_generation),
         "tearing_down=",tostring(tearing_down),
