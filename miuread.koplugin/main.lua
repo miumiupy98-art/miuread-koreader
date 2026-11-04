@@ -751,15 +751,21 @@ function Plugin:init()
     -- cache; the real probe is deferred to a bounded subprocess after the UI is
     -- responsive. Legacy lockscreen derivative cleanup is deferred for the same
     -- reason: neither task is required to enter KOReader.
+    local raw_prefs=self.store and self.store.db and type(self.store.db.data)=="table"
+        and self.store.db.data.preferences or nil
     local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
     if runtime_mode~="desktop" and runtime_mode~="plugin" then
-        local configured=((self.store:preferences().home_ui or {}).enabled~=false)
+        local home_ui=type(raw_prefs)=="table" and raw_prefs.home_ui
+            or (self.store:preferences().home_ui or {})
+        local configured=(type(home_ui)=="table" and home_ui.enabled~=false)
         runtime_mode=configured and "desktop" or "plugin"
         rawset(_G,RUNTIME_MODE_KEY,runtime_mode)
     end
     self._runtime_mode=runtime_mode
     logger.info("[MiuRead][Mode] runtime frozen",tostring(runtime_mode))
-    local timezone_ok,timezone_error=TimeZone.apply((self.store:preferences() or {}).time_display)
+    local time_display=type(raw_prefs)=="table" and raw_prefs.time_display or nil
+    if time_display==nil then time_display=(self.store:preferences() or {}).time_display end
+    local timezone_ok,timezone_error=TimeZone.apply(time_display)
     if not timezone_ok then logger.warn("[MiuRead][TimeZone] startup apply failed",tostring(timezone_error or "unknown")) end
     self._reader_context=self.ui and self.ui.document~=nil
     if self._reader_context then
@@ -1162,20 +1168,22 @@ function Plugin:init()
     -- Extension install staging is independent from book-download checkpoints.
     -- Clean only stale extension-center artifacts after startup is responsive;
     -- recent .part files remain available for Range resume.
-    UIManager:scheduleIn(2.0,function()
-        local ok,center=pcall(require,"miuread.extension_center")
-        if ok and center and type(center.cleanup_stale)=="function" then
-            local cleaned_ok,cleaned=pcall(center.cleanup_stale,self,false)
-            if not cleaned_ok then logger.warn("[MiuRead][Extensions] startup temp cleanup failed",tostring(cleaned)) end
-        end
-        if ok and center and type(center.maybe_auto_check)=="function" then
-            UIManager:scheduleIn(2.5,function()
-                if self:_active_reader_ui() then return end
-                local check_ok,check_err=pcall(center.maybe_auto_check,self,"startup_idle")
-                if not check_ok then logger.warn("[MiuRead][Extensions] startup update discovery failed",tostring(check_err)) end
-            end)
-        end
-    end)
+    if not self._reader_context then
+        UIManager:scheduleIn(2.0,function()
+            local ok,center=pcall(require,"miuread.extension_center")
+            if ok and center and type(center.cleanup_stale)=="function" then
+                local cleaned_ok,cleaned=pcall(center.cleanup_stale,self,false)
+                if not cleaned_ok then logger.warn("[MiuRead][Extensions] startup temp cleanup failed",tostring(cleaned)) end
+            end
+            if ok and center and type(center.maybe_auto_check)=="function" then
+                UIManager:scheduleIn(2.5,function()
+                    if self:_active_reader_ui() then return end
+                    local check_ok,check_err=pcall(center.maybe_auto_check,self,"startup_idle")
+                    if not check_ok then logger.warn("[MiuRead][Extensions] startup update discovery failed",tostring(check_err)) end
+                end)
+            end
+        end)
+    end
     Actions.register()
     if self:_home_enabled() then install_home_screensaver_patch() end
     if self:_home_enabled() and not DIRECT_MENU_INSERTED then
@@ -1221,9 +1229,11 @@ function Plugin:init()
     -- has had a chance to instantiate user plugins. Missing providers fall back
     -- to the user's last native cover; a pending “安装并使用” resumes without
     -- making the user reopen the settings page.
-    UIManager:scheduleIn(.35,function() self:_reconcile_lockscreen_provider(true) end)
     if not self._reader_context then
-        UIManager:scheduleIn(1.6,function() self:_resume_pending_lockscreen_provider() end)
+        if self:_home_enabled() then
+            UIManager:scheduleIn(.35,function() self:_reconcile_lockscreen_provider(true) end)
+            UIManager:scheduleIn(1.6,function() self:_resume_pending_lockscreen_provider() end)
+        end
         UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
         UIManager:scheduleIn(1.4,function() self:_show_auth_notice() end)
         UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
@@ -34477,6 +34487,10 @@ function Plugin:onFlushSettings()
     end
     self:_flush_reader_checkpoint("flush_settings",true)
     self:_flush_cover_index()
+    if not self:_home_enabled() and not self:_reader_session_is_weread()
+        and not self.store._deferred_dirty then
+        return
+    end
     self.store:flush()
 end
 

@@ -1558,7 +1558,10 @@ function Store:set(k,v)
     if self._migration_batch==true then return true end
     return self:flush("set:"..tostring(k))
 end
-function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
+function Store:set_deferred(k,v)
+    self._deferred_dirty=true
+    self.db:saveSetting(k,v)
+end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
@@ -3043,14 +3046,21 @@ local function settings_equal(a,b,seen)
     if type(a)=="number" and type(b)=="number" then return tostring(a)==tostring(b) end
     if type(a)~="table" or type(b)~="table" then return false end
     seen=seen or {}
-    if seen[a]==b then return true end
+    if seen[a]~=nil then return seen[a]==b end
     seen[a]=b
     for key,value in pairs(a) do
-        if not settings_equal(value,b[key],seen) then return false end
+        if not settings_equal(value,b[key],seen) then
+            seen[a]=nil
+            return false
+        end
     end
     for key in pairs(b) do
-        if a[key]==nil then return false end
+        if a[key]==nil then
+            seen[a]=nil
+            return false
+        end
     end
+    seen[a]=nil
     return true
 end
 
@@ -3061,23 +3071,39 @@ end
 -- depth they have in the file, so the joined chunk is valid exactly when every
 -- entry is. Returns nil when compact serialization cannot represent the data,
 -- or nil plus the parse error when an entry is invalid.
-local function incremental_settings_payload(data,path,previous_entries)
+local function incremental_settings_payload(data,path,previous_entries,disk_data)
     local entries,parts,parsed={},{},{}
+    local changed=type(previous_entries)~="table" or type(disk_data)~="table"
     for key,value in pairs(data) do
         local entry=previous_entries and previous_entries[key]
-        if not entry or not settings_equal(value,entry.value) then
+        local old_entry_value=entry and entry.value
+        if not entry or not settings_equal(value,old_entry_value) then
+            if not changed and (old_entry_value==disk_data[key] or not settings_equal(value,disk_data[key])) then
+                changed=true
+            end
             local text=compact_settings({[key]=value})
             if not text then return nil end
             text=text:sub(2,-2)
             local valid,parse_error,wrapped=settings_payload_valid("return {"..text.."}")
             if not valid then return nil,parse_error end
             entry={text=text,value=wrapped[key]}
+        elseif not changed and disk_data[key]~=old_entry_value
+            and not settings_equal(disk_data[key],old_entry_value) then
+            changed=true
         end
         entries[key]=entry
         parts[#parts+1]=entry.text
         parsed[key]=entry.value
     end
-    return "-- "..tostring(path or "").."\nreturn {"..table.concat(parts).."}\n",parsed,entries
+    if not changed and type(disk_data)=="table" then
+        for key in pairs(disk_data) do
+            if data[key]==nil then
+                changed=true
+                break
+            end
+        end
+    end
+    return "-- "..tostring(path or "").."\nreturn {"..table.concat(parts).."}\n",parsed,entries,changed
 end
 
 function Store:flush(reason)
@@ -3106,8 +3132,12 @@ function Store:flush(reason)
     end
     -- Compare with the freshly read file, not a cached dirty flag: callers may
     -- mutate nested settings and detached workers may advance progress on disk.
-    if disk_data and settings_equal(self.db.data,disk_data) then
+    local snapshot=self._validated_settings
+    local previous_entries=type(snapshot)=="table" and snapshot.data==disk_data
+        and type(snapshot.entries)=="table" and snapshot.entries or nil
+    if disk_data and not previous_entries and settings_equal(self.db.data,disk_data) then
         self._pending_home_navigation=nil
+        self._deferred_dirty=false
         local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
         if elapsed_ms>=250 then
             logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
@@ -3115,11 +3145,28 @@ function Store:flush(reason)
         end
         return true
     end
+    local prebuilt_payload,prebuilt_detail,prebuilt_entries
+    local prebuilt_checked=false
+    if disk_data and previous_entries then
+        local changed
+        prebuilt_checked=true
+        prebuilt_payload,prebuilt_detail,prebuilt_entries,changed=incremental_settings_payload(
+            self.db.data,self.settings_path,previous_entries,disk_data)
+        if prebuilt_payload and not changed then
+            self._pending_home_navigation=nil
+            self._deferred_dirty=false
+            local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
+            if elapsed_ms>=250 then
+                logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
+                    "elapsed_ms=",tostring(elapsed_ms))
+            end
+            return true
+        end
+    end
     local previous_path=self.settings_path..".previous"
     if not self.isolated then
         -- When the backup already holds exactly the bytes on disk, a .previous
         -- copy would only duplicate it; keep it whenever that is not known.
-        local snapshot=self._validated_settings
         local backup_matches=disk_data~=nil and snapshot~=nil and snapshot.data==disk_data
             and snapshot.backed_up==true
         if disk_data and not backup_matches then U.copy_file(self.settings_path,previous_path) end
@@ -3130,10 +3177,17 @@ function Store:flush(reason)
     -- Validate the complete chunk in memory, atomically replace the target, and
     -- keep the last valid generation if anything fails.
     local payload,validated_data,validated_entries
-    local previous_entries=self._validated_settings and self._validated_settings.entries
+    local all_previous_entries=self._validated_settings and self._validated_settings.entries
     local function attempt_write()
-        local built,detail,entries=incremental_settings_payload(
-            self.db.data,self.settings_path,previous_entries)
+        local built,detail,entries
+        if prebuilt_checked then
+            built,detail,entries=prebuilt_payload,prebuilt_detail,prebuilt_entries
+            prebuilt_checked=false
+            prebuilt_payload,prebuilt_detail,prebuilt_entries=nil,nil,nil
+        else
+            built,detail,entries=incremental_settings_payload(
+                self.db.data,self.settings_path,all_previous_entries)
+        end
         if built then
             payload,validated_data,validated_entries=built,detail,entries
         elseif detail then
@@ -3199,6 +3253,7 @@ function Store:flush(reason)
     end
     self._validated_settings={payload=payload,data=validated_data,entries=validated_entries,backed_up=backed_up==true}
     self._pending_home_navigation=nil
+    self._deferred_dirty=false
     local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
     if elapsed_ms>=250 or reason=="set:auth" then
         logger.info("[MiuRead][StorePerf] full settings flush",
@@ -3254,6 +3309,7 @@ function Store:reload()
     -- Reload fresh worker results without discarding deferred tab/page choices.
     -- Only navigation is overlaid; all other settings and library data reload.
     restore_home_navigation(self,navigation)
+    self._deferred_dirty=false
     if not self.isolated then
         local valid=self:_read_settings_file()~=nil
         local snapshot=self._validated_settings
