@@ -798,8 +798,6 @@ function Plugin:init()
         self:_install_marks_getCssText_wrapper(self.ui.styletweak)
         self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
     end
-    -- Internal thought links must also work on keyboard-only/non-touch devices.
-    self:_install_thought_link_guard()
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._download_ui_yield_path="/tmp/miuread-download-ui-yield.until"
@@ -18282,6 +18280,13 @@ function Plugin:_finish_page_transition(delay,reason)
         UIManager:unschedule(self._page_transition_release_task)
         self._page_transition_release_task=nil
     end
+    if not self:_page_transition_active() and transition_started<=0 then
+        self._page_transition_state="idle"
+        if self.download_task and self.download_task:is_paused() then
+            self.download_task:resume("page_transition")
+        end
+        return false
+    end
     local task
     task=function()
         if self._page_transition_release_task~=task
@@ -31501,6 +31506,9 @@ function Plugin:_record_recent_read(path,book,record)
     local book_id=tostring((book and (book.book_id or book.bookId))
         or (record and (record.book_id or record.bookId)) or "")
     if path=="" and book_id=="" then return false end
+    if book_id=="" and not self:_home_enabled() and not self:_reader_session_is_weread() then
+        return false
+    end
     local stamp=os.time()
     local key=book_id~="" and ("book:"..book_id) or ("file:"..LocalLibrary.normalize(path))
     local session_generation=math.max(0,tonumber(HOME_SESSION.reader_session_generation or self._reader_session_generation or 0) or 0)
