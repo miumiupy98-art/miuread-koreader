@@ -4247,6 +4247,7 @@ function Sync:_ensure_daemon()
     local service_job = {
         parent_pid = current_pid(),
         service_version = READ_REPORT_SERVICE_VERSION,
+        data_dir = self.store.data_dir,
         poll_interval = 1,
         job_path = paths.job,
         control_path = paths.control,
@@ -4359,6 +4360,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
             core_map_hash = tostring(d.core_map_hash or existing.core_map_hash or ""),
             record_generation = tonumber(d.record_generation or existing.record_generation or 0) or 0,
             time_only = time_only,
+            time_diagnostics = (self.store:get("preferences", {}).sync or {}).time_diagnostics == true,
             web_time_disabled = self:web_readtime_disabled(),
             progress_ratio = position and report_ratio_from_position(position) or tonumber(existing.progress_ratio) or 0,
             local_chapter_uid = position and position.chapter_uid or existing.local_chapter_uid,
