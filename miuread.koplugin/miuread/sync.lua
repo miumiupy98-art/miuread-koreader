@@ -21,7 +21,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 34
+local READ_REPORT_SERVICE_VERSION = 35
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -2391,7 +2391,8 @@ local function remote_wire_anchor_from(value, state)
         source=tostring(value.source or state or "remote_wire"),
         state=tostring(state or "remote_wire_observed"),
         server_updated=tonumber(value.updated_at or value.updated),
-        fetched_at=tonumber(value.fetched_at) or os.time(),
+        -- Reading an old snapshot cannot establish when WeRead returned it.
+        fetched_at=tonumber(value.fetched_at),
         saved_at=os.time(),
     }
 end
