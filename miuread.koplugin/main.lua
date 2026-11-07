@@ -2194,7 +2194,7 @@ function Plugin:eink_authorization_menu()
 end
 
 function Plugin:on_offline_readtime_uploaded(seconds)
-    self:status_toast("阅读时间","离线阅读时间已上传（"..tostring(math.floor(tonumber(seconds) or 0)).." 秒）",3)
+    self:status_toast("阅读时间","收到离线时长补传回执（"..tostring(math.floor(tonumber(seconds) or 0)).." 秒）",3)
 end
 
 function Plugin:on_readtime_route_change(target,previous,reason)
@@ -24723,19 +24723,27 @@ function Plugin:_progress_sync_issue_items()
 end
 
 function Plugin:_reading_time_sync_issue_items()
-    if Config.READ_TIME_BEST_EFFORT==true then return {} end
+    if Config.READ_TIME_BEST_EFFORT==true or not self.sync then return {} end
     local sessions=self:_persisted_sessions()
     local library=self:_persisted_library()
+    local recovery=self.sync:_readtime_recovery_table()
+    local auth=self.store:auth()
+    local vid=tostring((auth.account or {}).vid or "")
+    if vid=="" then return {} end
     local items={}
-    for id,session in pairs(sessions) do
-        if type(session)=="table" and type(library[tostring(id)])=="table" then
-            local seconds=session.pending_report_safe==true
-                and math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0)) or 0
+    for id,entry in pairs(recovery.entries) do
+        if type(entry)=="table" and tostring(entry.account_vid or "")==vid and type(library[tostring(id)])=="table" then
+            local seconds=entry.pending_report_safe==true
+                and math.max(0,math.floor(tonumber(entry.pending_report_seconds) or 0)) or 0
             if seconds>0 then
+                local session=sessions[tostring(id)] or {}
                 local book=library[tostring(id)] or {}
                 local title=U.trim(tostring(book.title or book.bookTitle or ""))
                 if title=="" then title="书籍 "..tostring(id) end
                 local record_snapshot,record_error=self:_stored_progress_record(tostring(id))
+                local core_hash=tostring(entry.core_map_hash or "")
+                local core_matches=record_snapshot~=nil and core_hash~=""
+                    and core_hash==self.sync:_core_map_hash(record_snapshot)
                 local position=type(session.local_position_snapshot)=="table"
                     and U.copy(session.local_position_snapshot) or nil
                 local replayable=self:_progress_snapshot_replayable(position)
@@ -24762,11 +24770,11 @@ function Plugin:_reading_time_sync_issue_items()
                 items[#items+1]={
                     book_id=tostring(id),title=title,seconds=seconds,
                     record_snapshot=record_snapshot,position=position,
-                    can_retry=record_snapshot~=nil and replayable==true,
-                    reason=record_snapshot and (replayable and "明确尚未发送，可安全重新同步"
-                        or "缺少可用于安全上报的位置锚点")
+                    can_retry=core_matches and replayable==true,
+                    reason=record_snapshot and (not core_matches and "待报记录对应的书籍版本已变化"
+                        or (replayable and "明确尚未发送，可安全重新同步" or "缺少可用于安全上报的位置锚点"))
                         or ("缺少本地书籍记录："..tostring(record_error or "unknown")),
-                    updated_at=tonumber(session.last_attempt or session.last_read_at or 0) or 0,
+                    updated_at=tonumber(entry.updated_at) or 0,
                 }
             end
         end
@@ -26198,6 +26206,10 @@ function Plugin:reading_time_menu()
     local prefs=self.store:preferences().sync or {}
     local controller=self.sync:offline_time_controller()
     local summary=controller and controller:summary() or {pending=0,unknown=0,in_flight=0}
+    local pending_label=reading_time_duration(summary.pending)
+    if (summary.in_flight or 0)>0 then
+        pending_label=pending_label.."（上传中 "..reading_time_duration(summary.in_flight).."）"
+    end
     local rows={
         {text="启用阅读时长同步",icon_key="power",post_text=self:reading_time_status_label(),checked_func=function()
             return (self.store:preferences().sync or {}).time_enabled==true
@@ -26207,7 +26219,7 @@ function Plugin:reading_time_menu()
         {text="当前时间通道",icon_key="wifi",post_text=self:_reading_time_status_label(),enabled=false},
         {text="E-Ink 客户端授权",icon_key="shield-check",post_text=self:_eink_auth_status_text(summary),
             sub_item_table_func=function() return self:eink_authorization_menu() end},
-        {text="离线待上传",icon_key="upload",post_text=reading_time_duration(summary.pending),enabled=false},
+        {text="离线待上传",icon_key="upload",post_text=pending_label,enabled=false},
         {text="待确认",icon_key="history",post_text=reading_time_duration(summary.unknown),
             enabled=(summary.unknown or 0)>0,
             sub_item_table_func=(summary.unknown or 0)>0 and function() return self:reading_time_unknown_menu() end or nil},
@@ -26233,6 +26245,7 @@ function Plugin:reading_time_diagnostics_menu()
     local control=summary.control or {}
     local reasons={authentication="登录或授权需要恢复",network="网络暂不可用",rate_limited="接口限频，正在等待冷却",
         prepare_failed="上传准备失败，将自动重试",config_token_missing="服务端未返回签名配置，将自动重试",
+        overlapping_reading_time_hour="同一小时的离线记录超过 60 分钟，待传记录已保留",
         signature_token_invalid="服务端签名配置异常，将自动重试",web_request_failed="Web 上传准备失败，将自动重试",
         worker_unavailable="后台任务暂不可用；可稍后点击立即同步重试"}
     if control.reason then rows[#rows+1]={text=reasons[control.reason] or "等待下次同步",enabled=false} end

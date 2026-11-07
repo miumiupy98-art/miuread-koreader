@@ -165,8 +165,7 @@ function M:collect(account,window_id,spans,now,close)
         return {seconds=seconds,rows=rows},changed
     end)
 end
-function M:pending(account,now,eligible,max_seconds)
-    local limit=math.min(600,math.max(60,tonumber(max_seconds) or 600))
+function M:pending(account,now,eligible)
     return self:_access(account,function(data)
         local items={}
         for _,row in pairs(data.items) do
@@ -177,9 +176,7 @@ function M:pending(account,now,eligible,max_seconds)
         local batch={rows={},seconds=0}
         for _,row in ipairs(items) do
             if not batch.book_id then batch.book_id=row.book_id; batch.book_version=row.book_version or 0 end
-            if row.book_id==batch.book_id then
-                if (row.book_version or 0)~=batch.book_version then break end
-                if #batch.rows>=100 or batch.seconds+row.duration>limit then break end
+            if row.book_id==batch.book_id and (row.book_version or 0)==batch.book_version then
                 batch.rows[#batch.rows+1]=row
                 batch.seconds=batch.seconds+row.duration
             end

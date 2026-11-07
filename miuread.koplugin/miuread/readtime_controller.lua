@@ -356,6 +356,7 @@ function M:send()
                 or message:find("signature feature invalid",1,true) then reason="signature_token_invalid"
             elseif message:find("config token unavailable",1,true) then reason="config_token_missing"
             elseif message:find("reading_time_position_unavailable",1,true) then reason="position_unavailable"
+            elseif message:find("overlapping reading-time hour",1,true) then reason="overlapping_reading_time_hour"
             elseif Http.is_auth_error(prepared) then reason="authentication"
             elseif Http.is_network_error and Http.is_network_error(prepared) then reason="network" end
             if limited then reason="rate_limited" end
@@ -405,6 +406,7 @@ function M:send()
         end
         self:log("receipt",result.state,{book_id=batch.book_id,batch_id=id,seconds=batch.seconds,
             rows=#batch.rows,reason=result.error,code=result.code,status=result.status,
+            request_dispatched=result.dispatched,local_cooldown=result.local_cooldown,wait_seconds=result.retry_after,
             elapsed_ms=math.floor((Log.now()-started)*1000)})
         return result
     end,function(result)

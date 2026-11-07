@@ -43,12 +43,16 @@ function M.prepare(native,book_id,rows)
     return {body=body,credentials=credentials,before=before,token_source=source}
 end
 function M.send(http,prepared,before_dispatch)
-    -- Persist dispatch ownership before entering HTTP. No renewal, automatic
-    -- transport retry or channel fallback is allowed after this boundary.
-    if before_dispatch and before_dispatch()~=true then return {state="pending",dispatched=false,error="claim_failed"} end
     local options=Client.request_options(prepared.credentials,{5,20})
+    local dispatched=false
+    -- The HTTP layer first checks the local cooldown. Claim only when the
+    -- request can enter the transport, with retries disabled by request_options.
+    options.before_dispatch=function()
+        dispatched=not before_dispatch or before_dispatch()==true
+        return dispatched
+    end
     local ok,value=pcall(http.post_json,http,BASE.."/book/batchUploadProgress",prepared.body,options)
-    if ok and type(value)=="table" and (value.succ==true or tonumber(value.succ)==1) then
+    if dispatched and ok and type(value)=="table" and (value.succ==true or tonumber(value.succ)==1) then
         return {state="confirmed",dispatched=true}
     end
     -- Even an HTTP error can follow a committed write. Keep a separate unknown
@@ -57,10 +61,12 @@ function M.send(http,prepared,before_dispatch)
     local limited=not ok and Http.rate_limit_details(value)
     local code=type(value)=="table" and tonumber(value.errCode or value.errcode)
         or tonumber(text:match("error_code=(%-?%d+)"))
-    return {state="unknown",dispatched=true,error=limited and "rate_limited"
+    return {state=dispatched and "unknown" or "pending",dispatched=dispatched,error=limited and "rate_limited"
+        or (not dispatched and "claim_failed")
         or (not ok and Http.is_auth_error(value) and "authentication")
         or (ok and "unconfirmed_response" or "request_failed"),
         retry_after=limited and limited.wait_seconds,
+        local_cooldown=limited and limited.local_cooldown,
         code=limited and limited.code or code,status=tonumber(text:match("HTTP (%d+)"))}
 end
 return M

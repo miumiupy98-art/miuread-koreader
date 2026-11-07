@@ -170,6 +170,7 @@ function Service.run(job)
     local next_due = 0
     local last_control_state = nil
     local last_report_at = 0
+    local last_observed_activity
     local last_flush_seq = 0
     local consecutive_failures = 0
     local consecutive_unconfirmed = 0
@@ -280,12 +281,12 @@ function Service.run(job)
         -- response was lost. This preserves genuine reading time without the
         -- double-counting risk of replaying an uncertain HTTP write.
         local maximum=math.max(10,tonumber(Config.READ_REPORT_MAX_ELAPSED_SECONDS) or 60)
-        local fresh_elapsed=math.max(1,math.floor(tonumber(elapsed) or interval))
+        local fresh_elapsed=math.max(0,math.floor(tonumber(elapsed) or interval))
         -- In best-effort mode, old missing intervals are not a transferable debt.
         local safe_carry=Config.READ_TIME_BEST_EFFORT==true and 0
             or math.max(0,math.floor(tonumber(carry_remaining) or 0))
         local available_elapsed=safe_carry+fresh_elapsed
-        local report_elapsed=math.max(1,math.min(maximum,available_elapsed))
+        local report_elapsed=math.min(maximum,available_elapsed)
         local carry_used=math.min(safe_carry,report_elapsed)
         local leftover=math.max(0,available_elapsed-report_elapsed)
         elapsed=report_elapsed
@@ -566,6 +567,7 @@ function Service.run(job)
                     auth={}
                     next_due=0
                     last_report_at=os.time()
+                    last_observed_activity=nil
                     carry_remaining=0
                     os.remove(context_path)
                     write_service_status({
@@ -593,6 +595,7 @@ function Service.run(job)
                         -- counted or replayed.
                         next_due = now + first_delay
                         last_report_at = now
+                        last_observed_activity = nil
                         SubprocessHygiene.reset_resolver()
                     end
                     write_context()
@@ -650,10 +653,30 @@ function Service.run(job)
                     local first_delay = math.max(5, math.min(interval, tonumber(current_job.first_delay) or interval))
                     local now = os.time()
                     last_report_at = now
+                    last_observed_activity = nil
                     next_due = now + first_delay
                     SubprocessHygiene.reset_resolver()
                 end
             end
+
+            local now = os.time()
+            local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
+            local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
+            local activity = tonumber(control.last_activity) or 0
+            activity = activity>0 and math.min(activity,now) or now
+            if active or pending_flush then
+                if last_observed_activity and activity>last_observed_activity+idle_timeout then
+                    -- Preserve the unreported active prefix, then start the clock
+                    -- at the page event that ended the idle interval.
+                    if Config.READ_TIME_BEST_EFFORT~=true then
+                        carry_remaining=carry_remaining+math.max(0,last_observed_activity+idle_timeout-last_report_at)
+                    end
+                    last_report_at=math.max(last_report_at,activity)
+                end
+                last_observed_activity=activity
+            end
+            local active_until=activity+idle_timeout
+            local elapsed_since_report=math.max(0,math.min(now,active_until)-last_report_at)
 
             -- A genuinely new Web wire observation may unlock previously
             -- unsent intervals. Only shorten the existing retry, never GET
@@ -693,13 +716,7 @@ function Service.run(job)
             elseif pending_flush then
                 progress_fence_seq=0
                 last_flush_seq = flush_seq
-                local now = os.time()
-                local elapsed
-                if control.flush_auto==true then
-                    elapsed=math.max(0,now-last_report_at)
-                else
-                    elapsed=tonumber(control.flush_elapsed) or math.max(0,now-last_report_at)
-                end
+                local elapsed=control.flush_auto~=true and tonumber(control.flush_elapsed) or elapsed_since_report
                 elapsed=math.floor(math.max(0,elapsed))
                 if elapsed + math.max(0,tonumber(carry_remaining) or 0) >= MIN_FINAL_SECONDS then
                     next_due = run_report(control, elapsed, true, tostring(control.flush_reason or "stop"))
@@ -723,24 +740,17 @@ function Service.run(job)
                 end
             elseif active and not blocked then
                 progress_fence_seq=0
-                local now = os.time()
-                local interval = math.max(10, tonumber(current_job.interval) or tonumber(Config.READ_INTERVAL) or 60)
-                local idle_timeout = math.max(interval, tonumber(current_job.idle_timeout) or 600)
-                local last_activity = tonumber(control.last_activity) or now
-                local idle = now - last_activity
-
                 if now >= next_due then
                     local time_only=current_job.time_only==true or control.time_only==true
                     local busy_until=time_only and 0 or reader_busy_until()
                     if busy_until > now then
                         next_due = math.max(next_due, busy_until + 1)
-                    elseif idle <= idle_timeout then
+                    elseif now <= active_until and (elapsed_since_report>0 or carry_remaining>0) then
                         -- 6.2: time is an independent, bounded 15/60-second
                         -- report; periodic cloud-progress writes remain disabled.
                         -- The worker obtains the live Web wire position before
                         -- each time POST. An unsafe/missing anchor fails closed.
-                        local elapsed = math.max(1, now - last_report_at)
-                        next_due = run_report(control, elapsed, false, "interval")
+                        next_due = run_report(control, elapsed_since_report, false, "interval")
                     else
                         next_due = now + interval
                     end
