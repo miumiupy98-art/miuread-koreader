@@ -2185,7 +2185,7 @@ function Plugin:eink_authorization_menu()
 end
 
 function Plugin:on_offline_readtime_uploaded(seconds)
-    self:status_toast("阅读时间","离线阅读时间已上传（"..tostring(math.floor(tonumber(seconds) or 0)).." 秒）",3)
+    self:status_toast("阅读时间","收到离线时长补传回执（"..tostring(math.floor(tonumber(seconds) or 0)).." 秒）",3)
 end
 
 function Plugin:on_readtime_route_change(target,previous,reason)
@@ -24687,19 +24687,27 @@ function Plugin:_progress_sync_issue_items()
 end
 
 function Plugin:_reading_time_sync_issue_items()
-    if Config.READ_TIME_BEST_EFFORT==true then return {} end
+    if Config.READ_TIME_BEST_EFFORT==true or not self.sync then return {} end
     local sessions=self:_persisted_sessions()
     local library=self:_persisted_library()
+    local recovery=self.sync:_readtime_recovery_table()
+    local auth=self.store:auth()
+    local vid=tostring((auth.account or {}).vid or "")
+    if vid=="" then return {} end
     local items={}
-    for id,session in pairs(sessions) do
-        if type(session)=="table" and type(library[tostring(id)])=="table" then
-            local seconds=session.pending_report_safe==true
-                and math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0)) or 0
+    for id,entry in pairs(recovery.entries) do
+        if type(entry)=="table" and tostring(entry.account_vid or "")==vid and type(library[tostring(id)])=="table" then
+            local seconds=entry.pending_report_safe==true
+                and math.max(0,math.floor(tonumber(entry.pending_report_seconds) or 0)) or 0
             if seconds>0 then
+                local session=sessions[tostring(id)] or {}
                 local book=library[tostring(id)] or {}
                 local title=U.trim(tostring(book.title or book.bookTitle or ""))
                 if title=="" then title="书籍 "..tostring(id) end
                 local record_snapshot,record_error=self:_stored_progress_record(tostring(id))
+                local core_hash=tostring(entry.core_map_hash or "")
+                local core_matches=record_snapshot~=nil and core_hash~=""
+                    and core_hash==self.sync:_core_map_hash(record_snapshot)
                 local position=type(session.local_position_snapshot)=="table"
                     and U.copy(session.local_position_snapshot) or nil
                 local replayable=self:_progress_snapshot_replayable(position)
@@ -24726,11 +24734,11 @@ function Plugin:_reading_time_sync_issue_items()
                 items[#items+1]={
                     book_id=tostring(id),title=title,seconds=seconds,
                     record_snapshot=record_snapshot,position=position,
-                    can_retry=record_snapshot~=nil and replayable==true,
-                    reason=record_snapshot and (replayable and "明确尚未发送，可安全重新同步"
-                        or "缺少可用于安全上报的位置锚点")
+                    can_retry=core_matches and replayable==true,
+                    reason=record_snapshot and (not core_matches and "待报记录对应的书籍版本已变化"
+                        or (replayable and "明确尚未发送，可安全重新同步" or "缺少可用于安全上报的位置锚点"))
                         or ("缺少本地书籍记录："..tostring(record_error or "unknown")),
-                    updated_at=tonumber(session.last_attempt or session.last_read_at or 0) or 0,
+                    updated_at=tonumber(entry.updated_at) or 0,
                 }
             end
         end

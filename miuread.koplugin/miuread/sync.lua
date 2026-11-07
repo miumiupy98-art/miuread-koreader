@@ -3209,7 +3209,8 @@ function Sync:upload(elapsed, callback, options)
     -- beta.17: a reading-time context repair flag must not veto a valid,
     -- independent Kindle progress-only upload. The worker still validates its
     -- own current credentials, native chapter and payload before dispatch.
-    if session.sync_repair_required==true and options.repair~=true and options.progress_only~=true then
+    if session.sync_repair_required==true and options.repair~=true and options.progress_only~=true
+        and not options.reading_time_retry then
         local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
         if repair_kind~="context" then
             self:_clear_noncontext_repair_flag(book_id,session,"upload_reclassified")
@@ -3252,7 +3253,7 @@ function Sync:upload(elapsed, callback, options)
     self:_decorate_legacy_context(legacy_book, record)
     local position_snapshot=type(options.position_override)=="table" and U.copy(options.position_override)
         or self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
-    self:_save_local_snapshot(book_id,position_snapshot)
+    if not options.reading_time_retry then self:_save_local_snapshot(book_id,position_snapshot) end
     if type(position_snapshot)~="table" or position_snapshot.safe~=true or position_snapshot.progress==nil
         or tostring(position_snapshot.chapter_uid or "")=="" then
         local mapping_error=type(position_snapshot)=="table" and position_snapshot.mapping_error or "position_unavailable"
@@ -3292,6 +3293,7 @@ function Sync:upload(elapsed, callback, options)
             force_context = options.force_context == true,
             time_only = options.time_only == true,
             report_mode = options.report_mode,
+            reading_time_session_id = options.reading_time_session_id,
             cloud_anchor = type(options.cloud_anchor)=="table" and U.copy(options.cloud_anchor) or nil,
         }
     end, function(result)
@@ -3360,10 +3362,12 @@ function Sync:upload(elapsed, callback, options)
             local kind=Http.is_auth_error(self.last_error) and "authentication"
                 or ((Http.is_network_error and Http.is_network_error(self.last_error)) and "transport" or "context")
             logger.warn("[MiuRead][ReadReport] worker failed", tostring(self.last_error))
-            self:_record_report_issue(book_id,kind,self.last_error,{
-                force_repair_required=options.repair==true,
-                suppress_prompt=options.repair==true,
-            })
+            if not options.reading_time_retry then
+                self:_record_report_issue(book_id,kind,self.last_error,{
+                    force_repair_required=options.repair==true,
+                    suppress_prompt=options.repair==true,
+                })
+            end
             emit_callback(false, self.last_error,nil,
                 {error_kind=kind,request_dispatched=true,dispatch_state_uncertain=true})
             return
@@ -3425,7 +3429,7 @@ function Sync:upload(elapsed, callback, options)
             local target_label=options.progress_only and "阅读进度" or "阅读时长"
             local message="微信读书未明确确认本次"..target_label.."（"..tostring(value.error or "无明确回执").."）"
             self.last_response_summary=value.response_summary or value.error
-            self:_record_report_issue(book_id,"unconfirmed",message)
+            if not options.reading_time_retry then self:_record_report_issue(book_id,"unconfirmed",message) end
             self.store:save_session(book_id,{
                 last_response_summary=self.last_response_summary,
                 last_http_code=self.last_http_code,
@@ -3472,10 +3476,12 @@ function Sync:upload(elapsed, callback, options)
                 "local_idx=", tostring(public.local_chapter_idx or "-"),
                 "remote_uid=", tostring(public.remote_chapter_uid or "-"),
                 "remote_idx=", tostring(public.remote_chapter_idx or "-"))
-            self:_record_report_issue(book_id,self.last_error_kind,self.last_error,{
-                force_repair_required=options.repair==true,
-                suppress_prompt=options.repair==true,
-            })
+            if not options.reading_time_retry then
+                self:_record_report_issue(book_id,self.last_error_kind,self.last_error,{
+                    force_repair_required=options.repair==true,
+                    suppress_prompt=options.repair==true,
+                })
+            end
             emit_callback(false, self.last_error, position, value)
             return
         end
@@ -3487,7 +3493,7 @@ function Sync:upload(elapsed, callback, options)
         if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"read_report") end
         self.failure_notified = false
         local patch={
-            local_percent=position.progress,
+            local_percent=not options.reading_time_retry and position.progress or nil,
             pending=nil,
             synckey=response_synckey(response) or legacy_context.synckey or session.synckey,
             last_error=false,
@@ -3557,12 +3563,8 @@ function Sync:retry_safe_reading_time(book_id,record_override,position_override,
         return true
     end
     book_id=tostring(book_id or "")
-    local session=book_id~="" and (self.store:session(book_id) or {}) or {}
-    local seconds=session.pending_report_safe==true
-        and math.max(0,math.floor(tonumber(session.pending_report_seconds) or 0)) or 0
-    if book_id=="" or seconds<=0 then callback(true,"没有可安全重试的阅读时间","empty"); return true end
     if type(record_override)~="table" or not record_override.book
-        or tostring(record_override.book.book_id or record_override.book.bookId or "")~=book_id then
+        or book_id=="" or tostring(record_override.book.book_id or record_override.book.bookId or "")~=book_id then
         callback(false,"缺少本地书籍同步上下文","context"); return false
     end
     local position=type(position_override)=="table" and U.copy(position_override) or nil
@@ -3570,70 +3572,91 @@ function Sync:retry_safe_reading_time(book_id,record_override,position_override,
         or tostring(position.chapter_uid or position.chapterUid or "")=="" then
         callback(false,"缺少安全的位置锚点，不能重传阅读时间","context"); return false
     end
-    local anchor=self:remote_wire_anchor(book_id)
-    local age=anchor and (os.time()-(tonumber(anchor.fetched_at) or 0)) or math.huge
-    local from_web=anchor and (anchor.source=="web_cookie" or anchor.source=="web"
-        or anchor.source=="web_progress" or anchor.source=="web_cookie_progress")
-    if not from_web or age<0 or age>(tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600) then
-        callback(false,"没有近期已验证的 Web 原始位置；请先打开本书恢复 Web 位置", "context")
-        return false
-    end
+    record_override=U.copy(record_override)
+    record_override.book.book_id=book_id
     local core_hash=self:_core_map_hash(record_override)
+    local identity=self:_readtime_recovery_identity(book_id,core_hash)
     local maximum=math.max(10,tonumber(Config.READ_REPORT_MAX_ELAPSED_SECONDS) or 60)
-    local remaining=seconds
-    local finished=false
-    local function finish(ok,message,kind)
-        if finished then return end
-        finished=true
-        callback(ok,message,kind)
+    local accepted_seconds=0
+    local function same_login()
+        return self:_readtime_recovery_matches(identity,self:_readtime_recovery_identity(book_id,core_hash))
     end
-    -- Only provably UNSENT seconds can enter this queue.  After each accepted
-    -- batch save the remainder before beginning the next request, so a crash or
-    -- timeout cannot make the entire original interval replay twice.
-    local send_next
-    send_next=function()
-        if finished then return false end
+    local function reading_active()
+        return (self.daemon and (self.daemon.active or self.daemon.final_flush_pending))
+            or (self.host and type(self.host._active_reader_ui)=="function" and self.host:_active_reader_ui())
+    end
+    local function save_remaining(seconds)
+        -- This journal is authoritative on restart. A settings-only fallback
+        -- could leave an older, larger journal balance eligible for replay.
+        if self:_write_readtime_recovery(book_id,seconds,core_hash)~=true then return false end
+        self.store:save_session(book_id,{pending_report_seconds=seconds,pending_report_safe=seconds>0},false)
+        return true
+    end
+    local function send_next()
+        if not same_login() then callback(false,"登录状态已变化","authentication"); return false end
+        local remaining,found,journal_error=self:_load_readtime_recovery(book_id,core_hash)
+        if not found or journal_error then
+            callback(false,"无法确认待报时长属于当前账号和书籍","context")
+            return false
+        end
         if remaining<=0 then
+            if accepted_seconds==0 then callback(true,"没有可安全重试的阅读时间","empty"); return true end
             self.store:save_session(book_id,{
                 report_state="ok",last_error=false,last_error_kind=false,
                 last_unconfirmed=false,last_unconfirmed_at=false,
                 last_report_reason="safe_retry_all_batches_accepted",last_upload=os.time(),
-                last_elapsed=seconds,
+                last_elapsed=accepted_seconds,
             })
-            finish(true,"微信读书已确认接收全部待报时长","accepted")
+            callback(true,"微信读书已确认接收待报时长","accepted")
             return true
         end
-        if self.host and type(self.host._active_reader_ui)=="function"
-            and self.host:_active_reader_ui() then
-            finish(false,"正在阅读；剩余时长已保留，结束阅读后再补报","reading_active")
+        if reading_active() or self.busy then
+            callback(false,"阅读或同步正在进行；剩余时长已保留","busy")
             return false
         end
+        local anchor=self:remote_wire_anchor(book_id)
+        local age=anchor and (os.time()-(tonumber(anchor.fetched_at) or 0)) or math.huge
+        local from_web=anchor and (anchor.source=="web_cookie" or anchor.source=="web"
+            or anchor.source=="web_progress" or anchor.source=="web_cookie_progress")
+        if not from_web or age<0 or age>(tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600) then
+            callback(false,"没有近期已验证的 Web 原始位置；请先打开本书恢复 Web 位置","context")
+            return false
+        end
+        anchor.book_id=book_id
         local chunk=math.min(maximum,remaining)
-        local completed=false
-        local started=self:upload(chunk,function(ok,result,_position,value)
-            if completed or finished then return end
+        local reserved=remaining-chunk
+        if not save_remaining(reserved) then
+            callback(false,"无法保存待报时长，本批未发送","storage")
+            return false
+        end
+        self.readtime_retry_sequence=(self.readtime_retry_sequence or 0)+1
+        local started,synchronous_result,completed
+        local function on_result(ok,result,uploaded_position,value)
+            if started==nil then synchronous_result={ok,result,uploaded_position,value}; return end
+            if completed then return end
             completed=true
+            if not same_login() then callback(false,"登录状态已变化","authentication"); return end
             value=type(value)=="table" and value or {}
             local meta=type(value.meta)=="table" and value.meta or {}
             local kind=tostring(value.error_kind or "")
             if ok==true then
-                remaining=remaining-chunk
-                self:_save_safe_pending_state(book_id,remaining,core_hash)
+                accepted_seconds=accepted_seconds+chunk
                 logger.info("[MiuRead][ReadingTimeRetry] batch accepted",
-                    "book=",book_id,"seconds=",tostring(chunk),"remaining=",tostring(remaining))
-                -- The next batch is dispatched only after the previous worker
-                -- has completed and only while outside an active ReaderUI.
+                    "book=",book_id,"seconds=",tostring(chunk),"remaining=",tostring(reserved))
                 UIManager:scheduleIn(.15,send_next)
                 return
             end
-            local dispatch_unknown=value.uncertain==true or kind=="unconfirmed"
-                or (kind=="transport" and meta.request_dispatched==true)
-                or value.dispatch_state_uncertain==true
-            if dispatch_unknown then
-                -- The attempted chunk might have reached WeRead; never replay
-                -- it.  The unattempted remainder is still provably safe.
-                remaining=math.max(0,remaining-chunk)
-                self:_save_safe_pending_state(book_id,remaining,core_hash)
+            local unsent=not started or ((value.request_dispatched==false or meta.request_dispatched==false)
+                and value.request_dispatched~=true and meta.request_dispatched~=true
+                and value.dispatch_state_uncertain~=true and value.uncertain~=true)
+            if unsent then
+                local current,still_found,read_error=self:_load_readtime_recovery(book_id,core_hash)
+                if reading_active() or not still_found or read_error or current~=reserved or not save_remaining(remaining) then
+                    callback(false,"本批未发送，但待报记录已变化或无法恢复","storage")
+                    return
+                end
+                callback(false,tostring(result or value.error or "阅读时间同步失败"),kind~="" and kind or "failed")
+            else
                 self.store:save_session(book_id,{
                     report_state="unconfirmed",
                     last_unconfirmed=tostring(result or value.response_summary or "请求已发出但结果不明确"),
@@ -3641,30 +3664,27 @@ function Sync:retry_safe_reading_time(book_id,record_override,position_override,
                     last_report_reason="safe_retry_chunk_unconfirmed",
                 })
                 logger.warn("[MiuRead][ReadingTimeRetry] uncertain chunk excluded from replay",
-                    "book=",book_id,"attempted=",tostring(chunk),"safe_remaining=",tostring(remaining))
-                finish(false,"本次请求的结果不确定；未尝试的剩余时长已安全保留","unconfirmed")
-                return
+                    "book=",book_id,"attempted=",tostring(chunk),"safe_remaining=",tostring(reserved))
+                callback(false,"本次请求的结果不确定；未尝试的剩余时长已安全保留","unconfirmed")
             end
-            -- A proven pre-dispatch failure leaves the current batch and all
-            -- later batches unchanged in the safe durable journal.
-            logger.warn("[MiuRead][ReadingTimeRetry] batch rejected, safe time retained",
-                "book=",book_id,"remaining=",tostring(remaining),"kind=",kind)
-            finish(false,tostring(result or value.error or "阅读时间同步失败"),kind~="" and kind or "failed")
-        end,{
+        end
+        started=self:upload(chunk,on_result,{
             silent=true,
             reading_time_retry=true,
+            transactional_context=true,
             time_only=true,
             report_mode="reading_time_compat",
+            reading_time_session_id=tostring(self.controller_token)..":safe_retry:"..tostring(self.readtime_retry_sequence),
             cloud_anchor=anchor,
             position_override=position,
             record_override=record_override,
             allow_same_book_generation_change=true,
             allow_book_switch_result=true,
         })
-        if not started and not completed then
-            finish(false,"阅读时间同步任务暂时不可用；剩余时长已保留","busy")
-        end
-        return started~=false
+        started=started==true
+        if synchronous_result then on_result(unpack(synchronous_result,1,4))
+        elseif not started then on_result(false,"阅读时间同步任务暂时不可用") end
+        return started
     end
     return send_next()
 end
