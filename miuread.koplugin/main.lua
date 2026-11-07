@@ -751,15 +751,21 @@ function Plugin:init()
     -- cache; the real probe is deferred to a bounded subprocess after the UI is
     -- responsive. Legacy lockscreen derivative cleanup is deferred for the same
     -- reason: neither task is required to enter KOReader.
+    local raw_prefs=self.store and self.store.db and type(self.store.db.data)=="table"
+        and self.store.db.data.preferences or nil
     local runtime_mode=rawget(_G,RUNTIME_MODE_KEY)
     if runtime_mode~="desktop" and runtime_mode~="plugin" then
-        local configured=((self.store:preferences().home_ui or {}).enabled~=false)
+        local home_ui=type(raw_prefs)=="table" and raw_prefs.home_ui
+            or (self.store:preferences().home_ui or {})
+        local configured=(type(home_ui)=="table" and home_ui.enabled~=false)
         runtime_mode=configured and "desktop" or "plugin"
         rawset(_G,RUNTIME_MODE_KEY,runtime_mode)
     end
     self._runtime_mode=runtime_mode
     logger.info("[MiuRead][Mode] runtime frozen",tostring(runtime_mode))
-    local timezone_ok,timezone_error=TimeZone.apply((self.store:preferences() or {}).time_display)
+    local time_display=type(raw_prefs)=="table" and raw_prefs.time_display or nil
+    if time_display==nil then time_display=(self.store:preferences() or {}).time_display end
+    local timezone_ok,timezone_error=TimeZone.apply(time_display)
     if not timezone_ok then logger.warn("[MiuRead][TimeZone] startup apply failed",tostring(timezone_error or "unknown")) end
     self._reader_context=self.ui and self.ui.document~=nil
     if self._reader_context then
@@ -783,6 +789,7 @@ function Plugin:init()
         self:_set_navigation_state("home","home plugin initialized")
     else
         self:_set_navigation_state("native","file manager plugin initialized")
+        self:_abort_rebuild_candidate_on_filemanager("filemanager init")
     end
     -- Keep the annotation-mark preference in the first CRE stylesheet so a
     -- hidden-mark book does not need a second full re-render after opening.
@@ -791,8 +798,6 @@ function Plugin:init()
         self:_install_marks_getCssText_wrapper(self.ui.styletweak)
         self._annotation_mark_style_hidden=self:_annotation_mark_hide_css()~=nil
     end
-    -- Internal thought links must also work on keyboard-only/non-touch devices.
-    self:_install_thought_link_guard()
     self._reader_active_path="/tmp/miuread-reader-active.flag"
     self._reader_busy_path="/tmp/miuread-reader-busy.until"
     self._download_ui_yield_path="/tmp/miuread-download-ui-yield.until"
@@ -1161,20 +1166,22 @@ function Plugin:init()
     -- Extension install staging is independent from book-download checkpoints.
     -- Clean only stale extension-center artifacts after startup is responsive;
     -- recent .part files remain available for Range resume.
-    UIManager:scheduleIn(2.0,function()
-        local ok,center=pcall(require,"miuread.extension_center")
-        if ok and center and type(center.cleanup_stale)=="function" then
-            local cleaned_ok,cleaned=pcall(center.cleanup_stale,self,false)
-            if not cleaned_ok then logger.warn("[MiuRead][Extensions] startup temp cleanup failed",tostring(cleaned)) end
-        end
-        if ok and center and type(center.maybe_auto_check)=="function" then
-            UIManager:scheduleIn(2.5,function()
-                if self:_active_reader_ui() then return end
-                local check_ok,check_err=pcall(center.maybe_auto_check,self,"startup_idle")
-                if not check_ok then logger.warn("[MiuRead][Extensions] startup update discovery failed",tostring(check_err)) end
-            end)
-        end
-    end)
+    if not self._reader_context then
+        UIManager:scheduleIn(2.0,function()
+            local ok,center=pcall(require,"miuread.extension_center")
+            if ok and center and type(center.cleanup_stale)=="function" then
+                local cleaned_ok,cleaned=pcall(center.cleanup_stale,self,false)
+                if not cleaned_ok then logger.warn("[MiuRead][Extensions] startup temp cleanup failed",tostring(cleaned)) end
+            end
+            if ok and center and type(center.maybe_auto_check)=="function" then
+                UIManager:scheduleIn(2.5,function()
+                    if self:_active_reader_ui() then return end
+                    local check_ok,check_err=pcall(center.maybe_auto_check,self,"startup_idle")
+                    if not check_ok then logger.warn("[MiuRead][Extensions] startup update discovery failed",tostring(check_err)) end
+                end)
+            end
+        end)
+    end
     Actions.register()
     if self:_home_enabled() then install_home_screensaver_patch() end
     if self:_home_enabled() and not DIRECT_MENU_INSERTED then
@@ -1220,9 +1227,11 @@ function Plugin:init()
     -- has had a chance to instantiate user plugins. Missing providers fall back
     -- to the user's last native cover; a pending “安装并使用” resumes without
     -- making the user reopen the settings page.
-    UIManager:scheduleIn(.35,function() self:_reconcile_lockscreen_provider(true) end)
     if not self._reader_context then
-        UIManager:scheduleIn(1.6,function() self:_resume_pending_lockscreen_provider() end)
+        if self:_home_enabled() then
+            UIManager:scheduleIn(.35,function() self:_reconcile_lockscreen_provider(true) end)
+            UIManager:scheduleIn(1.6,function() self:_resume_pending_lockscreen_provider() end)
+        end
         UIManager:scheduleIn(.8,function() if not self:_current_document_path() then self:_install_pending_downloads(false) end end)
         UIManager:scheduleIn(1.4,function() self:_show_auth_notice() end)
         UIManager:scheduleIn(5.0,function() self:maybe_auto_check_update(false) end)
@@ -6680,7 +6689,11 @@ function Plugin:_reader_toolbar_mode()
 end
 
 function Plugin:_reader_toolbar_enabled()
-    local reader=self:_reader_preferences()
+    local raw_prefs=(self.store and type(self.store.get)=="function") and self.store:get("preferences",nil) or nil
+    local reader=type(raw_prefs)=="table" and type(raw_prefs.reader_ui)=="table" and raw_prefs.reader_ui or nil
+    if not reader or reader.enabled==nil or reader.plugin_mode_enabled==nil then
+        reader=self:_reader_preferences()
+    end
     if self:_reader_toolbar_mode()=="desktop" then
         return reader.enabled~=false
     end
@@ -7916,7 +7929,7 @@ function Plugin:_home_local_is_miuread_file(path,index,deep)
     -- have the same filename as an old MiuRead download. Moved/renamed MiuRead
     -- EPUBs are identified from their embedded source marker below.
     if deep==true and path:lower():match("%.epub$") and self.store and type(self.store.epub_identity_light)=="function" then
-        local ok,identity=pcall(self.store.epub_identity_light,self.store,path)
+        local ok,identity=pcall(self.store.epub_identity_light,self.store,path,true)
         if ok and type(identity)=="table" and tostring(identity.book_id or "")~="" then return true end
     end
     return false
@@ -13418,13 +13431,19 @@ function Plugin:_refresh_reader_toolbar_state_cache(page)
 end
 
 function Plugin:_schedule_reader_toolbar_state_refresh(page,delay)
-    if self._reader_toolbar_state_task then UIManager:unschedule(self._reader_toolbar_state_task) end
+    if self._reader_toolbar_state_task then
+        UIManager:unschedule(self._reader_toolbar_state_task)
+        self._reader_toolbar_state_task=nil
+    end
+    if not (self.ui and self.ui.document) or not self:_reader_panel_active() then
+        return false
+    end
     local session=tonumber(HOME_SESSION.reader_session_generation or 0) or 0
     local requested=tonumber(page)
     local task
     task=function()
         if self._reader_toolbar_state_task~=task then return end
-        if self._miuread_suspended==true or HOME_SESSION.suspended==true then
+        if self._miuread_suspended==true or HOME_SESSION.suspended==true or not self:_reader_panel_active() then
             self._reader_toolbar_state_task=nil
             return
         end
@@ -17558,6 +17577,9 @@ function Plugin:_show_reader_quick_panel_now()
     if not (self.ui and self.ui.document) then return false end
     local started=monotonic_wall_time()
     self:_mark_reader_busy(2)
+    if tonumber(self:_reader_toolbar_cache().updated_at or 0)==0 then
+        self:_refresh_reader_toolbar_state_cache(nil)
+    end
     local options=self:_reader_quick_panel_options()
     local options_done=monotonic_wall_time()
     if not options then return false end
@@ -17938,12 +17960,19 @@ function Plugin:_sync_reader_toolbar_hooks(reason)
         return false
     end
     if not self:_reader_panel_active() then
+        if self._reader_toolbar_state_task then
+            UIManager:unschedule(self._reader_toolbar_state_task)
+            self._reader_toolbar_state_task=nil
+        end
         self:_uninstall_reader_toolbar_hooks(readerui,reason or "mode disabled")
         return false
     end
     self:_reader_toolbar_hook_token(readerui)
     self:_install_reader_menu_bridge()
     self:_install_reader_quick_panel_zone()
+    if tonumber(self:_reader_toolbar_cache().updated_at or 0)==0 then
+        self:_schedule_reader_toolbar_state_refresh(nil,.05)
+    end
     self:_input_lifecycle("reader_toolbar","install",reason or "reader active")
     logger.info("[MiuRead][ReaderToolbar] hooks synchronized",
         "mode=",self:_reader_toolbar_mode(),"reason=",tostring(reason or "reader active"))
@@ -18250,6 +18279,13 @@ function Plugin:_finish_page_transition(delay,reason)
     if self._page_transition_release_task then
         UIManager:unschedule(self._page_transition_release_task)
         self._page_transition_release_task=nil
+    end
+    if not self:_page_transition_active() and transition_started<=0 then
+        self._page_transition_state="idle"
+        if self.download_task and self.download_task:is_paused() then
+            self.download_task:resume("page_transition")
+        end
+        return false
     end
     local task
     task=function()
@@ -31470,6 +31506,9 @@ function Plugin:_record_recent_read(path,book,record)
     local book_id=tostring((book and (book.book_id or book.bookId))
         or (record and (record.book_id or record.bookId)) or "")
     if path=="" and book_id=="" then return false end
+    if book_id=="" and not self:_home_enabled() and not self:_reader_session_is_weread() then
+        return false
+    end
     local stamp=os.time()
     local key=book_id~="" and ("book:"..book_id) or ("file:"..LocalLibrary.normalize(path))
     local session_generation=math.max(0,tonumber(HOME_SESSION.reader_session_generation or self._reader_session_generation or 0) or 0)
@@ -31814,6 +31853,20 @@ function Plugin:_finalize_reader_instance_close(closing_path,session_generation,
     return true
 end
 
+function Plugin:_abort_rebuild_candidate_on_filemanager(reason)
+    if not reader_rebuild_active() or READER_REBUILD.internal_hint==true then return false end
+    if self:_active_reader_ui() or HomeView.is_shown() or not self:_filemanager_instance() then return false end
+    local old_owner=READER_REBUILD.owner
+    local old_path=READER_REBUILD.reader_file
+    local old_session=READER_REBUILD.session_generation
+    self:_reader_rebuild_cancel(reason or "filemanager active",true)
+    if old_owner and type(old_owner._finalize_reader_instance_close)=="function" then
+        pcall(old_owner._finalize_reader_instance_close,old_owner,old_path,old_session,
+            {reason=reason or "filemanager active"})
+    end
+    return true
+end
+
 function Plugin:_finish_reader_rebuild_candidate(generation,reason)
     if generation~=(tonumber(READER_REBUILD.generation) or 0)
         or not reader_rebuild_active() then return false end
@@ -31845,8 +31898,10 @@ function Plugin:_finish_reader_rebuild_candidate(generation,reason)
         return true
     end
 
+    local filemanager_visible=not READER_REBUILD.internal_hint
+        and not HomeView.is_shown() and self:_filemanager_instance()~=nil
     local elapsed=math.max(0,monotonic_wall_time()-(tonumber(READER_REBUILD.started_clock) or monotonic_wall_time()))
-    if elapsed<(tonumber(READER_REBUILD.max_wait) or 2.4) then
+    if not filemanager_visible and elapsed<(tonumber(READER_REBUILD.max_wait) or 2.4) then
         local task
         task=function()
             if self._reader_rebuild_task~=task then return end
@@ -32092,15 +32147,20 @@ function Plugin:onReaderReady()
     self:_mark_reader_busy(3)
     logger.info("[MiuRead][Sync] reader ready","session=",tostring(self._reader_session_generation or 0),
         "rebuild=",tostring(had_candidate==true),"preserved=",tostring(preserve_session==true))
-    local open_sync_prefs=self.store:preferences().sync or {}
-    local open_sync_requested=self:_reader_session_is_weread() and preserve_session~=true
-        and open_sync_prefs.auto_latest_position~=false and open_sync_prefs.pull_on_open~=false
-    local guard_seconds=preserve_session==true and .20 or tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .75
-    if open_sync_requested then
-        guard_seconds=math.max(guard_seconds,(tonumber(Config.OPEN_SYNC_SOFT_TIMEOUT_SECONDS) or 2.5)+.4)
+    local is_weread=self:_reader_session_is_weread()
+    local open_sync_requested=false
+    if is_weread and preserve_session~=true then
+        local open_sync_prefs=self.store:preferences().sync or {}
+        open_sync_requested=open_sync_prefs.auto_latest_position~=false and open_sync_prefs.pull_on_open~=false
     end
-    self:_arm_reader_gesture_guard(guard_seconds,
-        continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or (open_sync_requested and "latest position sync" or "reader open")))
+    if is_weread or self:_reader_panel_active() then
+        local guard_seconds=preserve_session==true and .20 or tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .75
+        if open_sync_requested then
+            guard_seconds=math.max(guard_seconds,(tonumber(Config.OPEN_SYNC_SOFT_TIMEOUT_SECONDS) or 2.5)+.4)
+        end
+        self:_arm_reader_gesture_guard(guard_seconds,
+            continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or (open_sync_requested and "latest position sync" or "reader open")))
+    end
     if open_sync_requested then
         local opening_book
         if ready_path then opening_book=select(1,self.store:file_record_fast(ready_path,false)) end
@@ -32252,15 +32312,17 @@ function Plugin:onReaderReady()
         logger.info("[MiuRead][ReaderSession] cloud reader-ready work skipped",
             "kind=",self:_reader_session_kind())
     end
-    local device_task
-    device_task=function()
-        if self._miuread_suspended==true or HOME_SESSION.suspended==true then return end
-        if not (self.ui and self.ui.document) or reader_close_active()
-            or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session then return end
-        if not self:_reader_background_idle() then UIManager:scheduleIn(.75,device_task); return end
-        HomeData.quick_device_state(true)
+    if self:_reader_session_is_weread() or self:_reader_panel_active() then
+        local device_task
+        device_task=function()
+            if self._miuread_suspended==true or HOME_SESSION.suspended==true then return end
+            if not (self.ui and self.ui.document) or reader_close_active()
+                or tonumber(HOME_SESSION.reader_session_generation or 0)~=ready_session then return end
+            if not self:_reader_background_idle() then UIManager:scheduleIn(.75,device_task); return end
+            HomeData.quick_device_state(true)
+        end
+        UIManager:scheduleIn(1.8,device_task)
     end
-    UIManager:scheduleIn(1.8,device_task)
     if had_candidate then
         UIManager:scheduleIn(.18,function()
             if self.ui and self.ui.document
@@ -34405,8 +34467,14 @@ function Plugin:onCloseDocument()
     -- close is confirmed. This keeps same-book reloads cheap and invisible.
     local setting_hint=reader_native_setting_active(closing_path)
     local typography_hint=setting_hint and tostring(READER_NATIVE_SETTING.label or ""):match("^Typography")~=nil
-    local tearing_down=self.ui and self.ui.tearing_down==true
+    local tearing_down=type(self.ui)=="table"
+        and (rawget(self.ui,"tearing_down")==true or rawget(self.ui,"reloading")==true)
     local internal_hint=tearing_down or setting_hint
+    if not internal_hint and not self:_home_enabled() and not self:_reader_session_is_weread() then
+        self:_reader_rebuild_cancel("native reader closed in plugin mode",true)
+        return self:_finalize_reader_instance_close(closing_path,session_generation,
+            {reason="native document close"})
+    end
     logger.info("[MiuRead][Lifecycle] document disappeared","cause=unknown",
         "book=",tostring(closing_path or ""),"session=",tostring(session_generation),
         "tearing_down=",tostring(tearing_down),
@@ -34427,6 +34495,10 @@ function Plugin:onFlushSettings()
     end
     self:_flush_reader_checkpoint("flush_settings",true)
     self:_flush_cover_index()
+    if not self:_home_enabled() and not self:_reader_session_is_weread()
+        and not self.store._deferred_dirty then
+        return
+    end
     self.store:flush()
 end
 

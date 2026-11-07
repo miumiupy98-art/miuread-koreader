@@ -163,12 +163,115 @@ function LocalLibrary.is_likely_dictionary(path, title)
         or normalized:find("/dict/", 1, true) ~= nil
 end
 
+local function zip_u16(data, pos)
+    local a, b = data:byte(pos, pos + 1)
+    if not a or not b then return nil end
+    return a + b * 256
+end
+
+local function zip_u32(data, pos)
+    local a, b, c, d = data:byte(pos, pos + 3)
+    if not a or not b or not c or not d then return nil end
+    return a + b * 256 + c * 65536 + d * 16777216
+end
+
 function LocalLibrary.is_miuread_generated_epub(path)
     path = LocalLibrary.normalize(path)
     if path == "" or not path:lower():match("%.epub$") or not exists(path) then return false end
     local file = io.open(path, "rb")
     if not file then return false end
     local size = file:seek("end") or 0
+    if size >= 22 then
+        local tail_len = math.min(size, 65558)
+        local tail_offset = size - tail_len
+        file:seek("set", tail_offset)
+        local tail = file:read(tail_len) or ""
+        local marker, at = nil, 1
+        while true do
+            local found = tail:find("PK\005\006", at, true)
+            if not found then break end
+            marker = found; at = found + 1
+        end
+        if marker and marker + 21 <= #tail then
+            local count = zip_u16(tail, marker + 10)
+            local central_size = zip_u32(tail, marker + 12)
+            local central_offset = zip_u32(tail, marker + 16)
+            if count and central_size and central_offset
+                and count ~= 0xFFFF and central_size ~= 0xFFFFFFFF and central_offset ~= 0xFFFFFFFF
+                and central_offset + central_size <= size then
+                local cd_data
+                if central_size == 0 then
+                    cd_data = ""
+                elseif central_offset >= tail_offset then
+                    local start_idx = (central_offset - tail_offset) + 1
+                    cd_data = tail:sub(start_idx, start_idx + central_size - 1)
+                else
+                    file:seek("set", central_offset)
+                    cd_data = file:read(central_size) or ""
+                end
+                if cd_data and #cd_data == central_size then
+                    local pos = 1
+                    local valid_cd = true
+                    local opf_entry
+                    for _ = 1, count do
+                        if pos + 45 > #cd_data or cd_data:sub(pos, pos + 3) ~= "PK\001\002" then
+                            valid_cd = false
+                            break
+                        end
+                        local method = zip_u16(cd_data, pos + 10) or -1
+                        local compressed = zip_u32(cd_data, pos + 20) or 0
+                        local uncompressed = zip_u32(cd_data, pos + 24) or 0
+                        local name_len = zip_u16(cd_data, pos + 28) or 0
+                        local extra_len = zip_u16(cd_data, pos + 30) or 0
+                        local comment_len = zip_u16(cd_data, pos + 32) or 0
+                        local local_offset = zip_u32(cd_data, pos + 42)
+                        local name_start = pos + 46
+                        local name_end = name_start + name_len - 1
+                        local next_pos = name_end + extra_len + comment_len + 1
+                        if not local_offset or name_end > #cd_data or next_pos - 1 > #cd_data then
+                            valid_cd = false
+                            break
+                        end
+                        local name = cd_data:sub(name_start, name_end)
+                        if name == "OEBPS/miuread.json" then
+                            file:close()
+                            return true
+                        elseif name == "OEBPS/package.opf" then
+                            opf_entry = {
+                                method = method,
+                                compressed = compressed,
+                                uncompressed = uncompressed,
+                                offset = local_offset,
+                            }
+                        end
+                        pos = next_pos
+                    end
+                    if valid_cd then
+                        if opf_entry and opf_entry.method == 0
+                            and opf_entry.uncompressed == opf_entry.compressed
+                            and opf_entry.uncompressed >= 0 and opf_entry.uncompressed <= 262144
+                            and opf_entry.offset + 30 + opf_entry.uncompressed <= size then
+                            file:seek("set", opf_entry.offset)
+                            local header = file:read(30)
+                            if header and #header == 30 and header:sub(1, 4) == "PK\003\004" then
+                                local name_len = zip_u16(header, 27) or 0
+                                local extra_len = zip_u16(header, 29) or 0
+                                local data_offset = opf_entry.offset + 30 + name_len + extra_len
+                                if data_offset + opf_entry.uncompressed <= size then
+                                    file:seek("set", data_offset)
+                                    local data = file:read(opf_entry.uncompressed) or ""
+                                    file:close()
+                                    return data:find("miuread://book/", 1, true) ~= nil
+                                end
+                            end
+                        end
+                        file:close()
+                        return false
+                    end
+                end
+            end
+        end
+    end
     file:seek("set", 0)
     local head = file:read(math.min(size, 768 * 1024)) or ""
     local tail = ""

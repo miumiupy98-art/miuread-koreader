@@ -648,8 +648,10 @@ local function cleanup_stale_extension_temp(plugin,force)
             if ok then removed=removed+1 end
         end
     end
-    plugin.store:set_deferred(TEMP_CLEANUP_KEY,os.time())
-    plugin.store:flush()
+    if plugin and plugin.store then
+        plugin.store:set_deferred(TEMP_CLEANUP_KEY,os.time())
+        if removed>0 then plugin.store:flush() end
+    end
     if removed>0 then logger.info("[MiuRead][Extensions] stale temp cleaned","count=",tostring(removed)) end
     return removed
 end
