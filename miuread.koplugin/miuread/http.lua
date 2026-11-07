@@ -1070,6 +1070,9 @@ function Http:request(opt)
             "wait=",tostring(shared_remaining),"code=",tostring(code),"url=",Util.redact_url(opt.url or ""))
         self:_wait_rate_limit(shared_remaining,0,math.max(1,rate_retries),code)
     end
+    if type(opt.before_dispatch)=="function" and opt.before_dispatch()~=true then
+        error("request dispatch refused",0)
+    end
     local rate_attempt = 0
     local last_text, last_code, last_headers, last_url, last_error
 

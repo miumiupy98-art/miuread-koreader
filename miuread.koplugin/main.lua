@@ -26162,6 +26162,10 @@ function Plugin:reading_time_menu()
     local prefs=self.store:preferences().sync or {}
     local controller=self.sync:offline_time_controller()
     local summary=controller and controller:summary() or {pending=0,unknown=0,in_flight=0}
+    local pending_label=reading_time_duration(summary.pending)
+    if (summary.in_flight or 0)>0 then
+        pending_label=pending_label.."（上传中 "..reading_time_duration(summary.in_flight).."）"
+    end
     local rows={
         {text="启用阅读时长同步",icon_key="power",post_text=self:reading_time_status_label(),checked_func=function()
             return (self.store:preferences().sync or {}).time_enabled==true
@@ -26171,7 +26175,7 @@ function Plugin:reading_time_menu()
         {text="当前时间通道",icon_key="wifi",post_text=self:_reading_time_status_label(),enabled=false},
         {text="E-Ink 客户端授权",icon_key="shield-check",post_text=self:_eink_auth_status_text(summary),
             sub_item_table_func=function() return self:eink_authorization_menu() end},
-        {text="离线待上传",icon_key="upload",post_text=reading_time_duration(summary.pending),enabled=false},
+        {text="离线待上传",icon_key="upload",post_text=pending_label,enabled=false},
         {text="待确认",icon_key="history",post_text=reading_time_duration(summary.unknown),
             enabled=(summary.unknown or 0)>0,
             sub_item_table_func=(summary.unknown or 0)>0 and function() return self:reading_time_unknown_menu() end or nil},
@@ -26197,6 +26201,7 @@ function Plugin:reading_time_diagnostics_menu()
     local control=summary.control or {}
     local reasons={authentication="登录或授权需要恢复",network="网络暂不可用",rate_limited="接口限频，正在等待冷却",
         prepare_failed="上传准备失败，将自动重试",config_token_missing="服务端未返回签名配置，将自动重试",
+        overlapping_reading_time_hour="同一小时的离线记录超过 60 分钟，待传记录已保留",
         signature_token_invalid="服务端签名配置异常，将自动重试",web_request_failed="Web 上传准备失败，将自动重试",
         worker_unavailable="后台任务暂不可用；可稍后点击立即同步重试"}
     if control.reason then rows[#rows+1]={text=reasons[control.reason] or "等待下次同步",enabled=false} end
