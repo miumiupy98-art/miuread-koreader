@@ -21,7 +21,7 @@ Sync.__index = Sync
 local legacy_daemon_retired = false
 
 local CONTEXT_MAX_AGE = 15 * 60
-local READ_REPORT_SERVICE_VERSION = 34
+local READ_REPORT_SERVICE_VERSION = 35
 local FIRST_REPORT_DELAY = 15
 local FINAL_REPORT_MIN_SECONDS = 10
 local PRECISE_POSITION_LEAD_SECONDS = 12
@@ -2391,7 +2391,8 @@ local function remote_wire_anchor_from(value, state)
         source=tostring(value.source or state or "remote_wire"),
         state=tostring(state or "remote_wire_observed"),
         server_updated=tonumber(value.updated_at or value.updated),
-        fetched_at=tonumber(value.fetched_at) or os.time(),
+        -- Reading an old snapshot cannot establish when WeRead returned it.
+        fetched_at=tonumber(value.fetched_at),
         saved_at=os.time(),
     }
 end
@@ -4246,6 +4247,7 @@ function Sync:_ensure_daemon()
     local service_job = {
         parent_pid = current_pid(),
         service_version = READ_REPORT_SERVICE_VERSION,
+        data_dir = self.store.data_dir,
         poll_interval = 1,
         job_path = paths.job,
         control_path = paths.control,
@@ -4358,6 +4360,7 @@ function Sync:_write_daemon_control(active, immediate, extra)
             core_map_hash = tostring(d.core_map_hash or existing.core_map_hash or ""),
             record_generation = tonumber(d.record_generation or existing.record_generation or 0) or 0,
             time_only = time_only,
+            time_diagnostics = (self.store:get("preferences", {}).sync or {}).time_diagnostics == true,
             web_time_disabled = self:web_readtime_disabled(),
             progress_ratio = position and report_ratio_from_position(position) or tonumber(existing.progress_ratio) or 0,
             local_chapter_uid = position and position.chapter_uid or existing.local_chapter_uid,

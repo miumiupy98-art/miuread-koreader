@@ -580,14 +580,18 @@ local function validate_terminal_progress(book,position)
     return true
 end
 
-local function build_payload(book_id, elapsed_seconds, book, progress_ratio, time_only, position_override)
-    local position, position_error
-    if time_only ~= true then
-        position = type(position_override) == "table" and deepcopy(position_override) or nil
-        if not position then
-            position, position_error = estimate_position(book, progress_ratio)
-            if not position then return nil, position_error end
-        end
+local function build_payload(book_id, elapsed_seconds, book, progress_ratio, report_mode, position_override)
+    local time_only = report_mode == "time_only"
+    local position
+    if report_mode == "reading_time_compat" then
+        -- The validated Web tuple is echoed as received. A finished book can
+        -- have pr=100 while its last reading position is in an earlier chapter.
+        if not position_override then return nil, "validated Web time position unavailable" end
+        position = position_override
+    elseif not time_only then
+        local position_error
+        position, position_error = estimate_position(book, progress_ratio)
+        if not position then return nil, position_error end
         local terminal_ok,terminal_error=validate_terminal_progress(book,position)
         if not terminal_ok then return nil,terminal_error end
     end
@@ -627,9 +631,9 @@ local function build_payload(book_id, elapsed_seconds, book, progress_ratio, tim
     return payload, position, public
 end
 
-local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio, time_only, position_override)
+local function attempt_report(client, book_id, elapsed_seconds, book, progress_ratio, report_mode, position_override)
     local payload, position_or_error, payload_public = build_payload(
-        book_id, elapsed_seconds, book, progress_ratio, time_only, position_override)
+        book_id, elapsed_seconds, book, progress_ratio, report_mode, position_override)
     if not payload then
         return false, nil, tostring(position_or_error or "reading position unavailable"), "position", nil,
             {payload_fields_complete=false}, {request_dispatched=false}
@@ -761,7 +765,7 @@ function Worker.run(job)
         }, context_changed)
     end
 
-    local reading_time_compat = tostring(job.report_mode or "") == "reading_time_compat"
+    local reading_time_compat = job.time_only == true and job.report_mode == "reading_time_compat"
     if job.time_only == true and not reading_time_compat then
         -- Keep the lightweight path available for diagnostics/legacy callers,
         -- but normal automatic reading-time sync deliberately does not use it.
@@ -802,7 +806,8 @@ function Worker.run(job)
         }, true)
     end
 
-    local protocol_time_only = job.time_only == true and not reading_time_compat
+    local report_mode = reading_time_compat and "reading_time_compat"
+        or (job.time_only == true and "time_only" or "progress")
     local position_override
     if reading_time_compat then
         -- Web time needs protocol coordinates, NOT a completed Kindle progress
@@ -810,24 +815,32 @@ function Worker.run(job)
         -- may be reused across a reader UI rebuild, without a session-time
         -- fence. Never invent ci/co/pr or promote Agent coordinates here.
         local session_id=tostring(job.reading_time_session_id or "")
+        local anchor=type(job.cloud_anchor)=="table" and job.cloud_anchor or {}
+        local observed_at=tonumber(anchor.fetched_at)
+        local max_age=math.max(30,tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600)
+        local now=os.time()
         local saved=type(book.session_time_anchor)=="table" and book.session_time_anchor or nil
         if session_id~="" and tostring(book.session_time_anchor_session or "")==session_id
             and saved then
             position_override=normalize_cloud_anchor(saved,{})
+            -- Re-echoing a terminal tuple is safe only while the observation is
+            -- recent and no newer Web observation has superseded it.
+            local saved_at=tonumber(saved.fetched_at)
+            if position_override and position_override.progress==100
+                and (not saved_at or saved_at<now-max_age or saved_at>now+5
+                    or (observed_at and observed_at>saved_at)) then
+                position_override=nil
+            end
         end
         if not position_override then
             -- The reader's normal Web API supplies this tuple. A fresh-enough
             -- Web observation remains usable after font/page rebuild; age is
             -- relative to NOW, not to the UI reader session start.
-            local anchor=type(job.cloud_anchor)=="table" and job.cloud_anchor or {}
             local source=tostring(anchor.source or "")
-            local observed_at=tonumber(anchor.fetched_at)
             local from_web=source=="web_cookie" or source=="web"
                 or source=="web_progress" or source=="web_cookie_progress"
             local same_book=tostring(anchor.book_id or "")==book_id
-            local max_age=math.max(30,tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600)
-            local fresh=observed_at~=nil and observed_at<=os.time()+5
-                and observed_at>=os.time()-max_age
+            local fresh=observed_at~=nil and observed_at<=now+5 and observed_at>=now-max_age
             local idx=tonumber(anchor.chapter_idx)
             local uid=tostring(anchor.chapter_uid or "")
             local catalog_idx=nil
@@ -862,16 +875,17 @@ function Worker.run(job)
                 chapter_offset=position_override.chapter_offset,
                 protocol_progress=position_override.progress,
                 source="session_web_time_echo",
+                fetched_at=observed_at,
             }
             book.session_time_anchor_session=session_id
             context_changed=true
         end
     end
     local accepted, result, first_error, first_kind, first_position, first_public, first_meta = attempt_report(
-        client, book_id, elapsed_seconds, book, progress_ratio, protocol_time_only, position_override
+        client, book_id, elapsed_seconds, book, progress_ratio, report_mode, position_override
     )
     first_public = type(first_public) == "table" and first_public or {}
-    first_public.report_mode = tostring(job.report_mode or (protocol_time_only and "time_only" or "progress"))
+    first_public.report_mode = report_mode
     if accepted then
         return finish(settings, book, {
             ok = true,

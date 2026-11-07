@@ -7,6 +7,7 @@ local fields={"operation","phase","channel","outcome","reason","elapsed_ms","cod
     "wait_seconds","local_cooldown","native_stage","native_chapters","web_chapters",
     "native_annotations","web_annotations","native_translation","web_translation","failure_file","failure_line",
     "book_id","batch_id","source","seconds","rows","source_rows","hours","start_time","end_time",
+    "fresh_seconds","carry_seconds","pending_seconds","request_dispatched","dispatch_state_uncertain","protocol_progress",
     "chapter_uid","chapter_idx","chapter_offset","cloud_seconds","cloud_delta","position_unchanged",
     "token_source","feature_token_present","feature_token_type","config_token_present",
     "risk","book_version","book_version_source"}

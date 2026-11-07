@@ -2,6 +2,7 @@ local Json = require("miuread.json")
 local U = require("miuread.util")
 local Adapter = require("miuread.legacy_adapter_worker")
 local Config = require("miuread.config")
+local Log = require("miuread.diagnostic_log")
 local SubprocessHygiene = require("miuread.subprocess_hygiene")
 
 local Service = {}
@@ -138,6 +139,7 @@ function Service.run(job)
     local status_path = assert(job.status_path, "missing status path")
     local context_path = assert(job.context_path, "missing context path")
     local stop_path = assert(job.stop_path, "missing stop path")
+    local diagnostic_store = {data_dir=job.data_dir}
     local heartbeat_path = tostring(job.heartbeat_path or "")
     local owner_path = job.owner_path
     local lock_path = job.lock_path
@@ -202,6 +204,26 @@ function Service.run(job)
         return write_status(status_path,value)
     end
 
+    local function publish_report(control, status, fresh_seconds)
+        write_service_status(status)
+        if control.time_diagnostics~=true or not (current_job.time_only==true or control.time_only==true) then return end
+        local payload=status.payload_public or {}
+        local outcome=status.accepted and "accepted"
+            or (status.flush_skipped and "skipped" or status.state)
+        pcall(Log.record,diagnostic_store,{
+            operation="reading_time",phase="report",channel="web",outcome=outcome,
+            book_id=status.book_id,batch_id=tostring(status.generation).."-"..tostring(status.seq),
+            source=status.flush_reason,reason=not status.accepted and (status.anchor_reason or status.error_kind) or nil,
+            seconds=status.elapsed_seconds,fresh_seconds=fresh_seconds,
+            carry_seconds=status.carry_elapsed,pending_seconds=status.pending_elapsed,
+            request_dispatched=status.request_dispatched,dispatch_state_uncertain=status.dispatch_state_uncertain,
+            start_time=status.attempted_at,end_time=status.completed_at,
+            status=status.meta and status.meta.code,
+            chapter_uid=payload.report_chapter_uid,chapter_idx=payload.ci,
+            chapter_offset=payload.co,protocol_progress=payload.pr,
+        })
+    end
+
     local function write_context()
         if not current_job then return end
         return U.atomic_write(context_path,Json.encode({
@@ -242,14 +264,14 @@ function Service.run(job)
                 or tostring(control.local_chapter_offset_basis or "")~="wr_data_co")) then
             sequence=sequence+1
             blocked=true
-            write_service_status({
+            publish_report(control,{
                 seq=sequence,state="error",accepted=false,error_kind="context",
                 error="stale or unsafe book context refused before report",
                 paused=true,retry_delay=0,consecutive_failures=consecutive_failures+1,
-                attempted_at=os.time(),completed_at=os.time(),elapsed_seconds=0,
+                attempted_at=os.time(),completed_at=os.time(),elapsed_seconds=0,request_dispatched=false,
                 final_flush=final_flush==true,flush_reason=reason,next_due=0,time_only=time_only,
                 writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
-            })
+            },elapsed)
             consecutive_failures=consecutive_failures+1
             return 0
         end
@@ -319,16 +341,16 @@ function Service.run(job)
         }
         local attempted_at = os.time()
         heartbeat(true)
-        write_service_status({
+        publish_report(control,{
             generation=generation,seq=sequence,state="reporting",accepted=nil,
             attempted_at=attempted_at,elapsed_seconds=elapsed,final_flush=final_flush==true,
             flush_reason=reason,time_only=time_only,report_mode=report_mode,next_due=0,
             -- Current in-flight request (including previous SAFE carry) is
             -- no longer provably unsent once Adapter.run begins. Preserve
             -- only the overflow not included in this request.
-            pending_elapsed=leftover,safe_pending=leftover>0,
+            carry_elapsed=carry_used,pending_elapsed=leftover,safe_pending=leftover>0,
             writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
-        })
+        },fresh_elapsed)
         local ok, result = pcall(Adapter.run, report_job)
         heartbeat(true)
         local completed_at = os.time()
@@ -367,7 +389,7 @@ function Service.run(job)
             out.report_mode=report_mode
             out.writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
-            local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
+            local kind = not result.accepted and (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error)) or nil
             if kind == "transport" then SubprocessHygiene.reset_resolver() end
             if result.accepted then
                 consecutive_failures = 0
@@ -391,8 +413,8 @@ function Service.run(job)
             out.seq = sequence
             out.state = drop_time and "dropped" or (result.accepted and "waiting" or (uncertain and "unconfirmed" or "error"))
             out.uncertain = uncertain or nil
-            out.error_kind = kind or result.error_kind
-            out.paused = drop_time and false or blocked
+            out.error_kind = kind
+            out.paused = blocked and not drop_time
             if drop_time then
                 out.dropped_error=tostring(result.error or kind or "retry budget exhausted")
                 carry_remaining=0
@@ -434,7 +456,7 @@ function Service.run(job)
             out.book_id = tostring(current_job.book_id or "")
             out.core_map_hash=tostring(current_job.core_map_hash or "")
             out.record_generation=tonumber(current_job.record_generation or 0) or 0
-            write_service_status(out)
+            publish_report(control,out,fresh_elapsed)
             return out.next_due
         end
 
@@ -456,7 +478,7 @@ function Service.run(job)
         end
         local delay = drop_time and interval or retry_delay(kind, consecutive_failures, interval)
         local due = final_flush and 0 or (completed_at + delay)
-        write_service_status({
+        publish_report(control,{
             generation = generation,
             seq = sequence,
             state = drop_time and "dropped" or "error",
@@ -480,13 +502,14 @@ function Service.run(job)
             recovery_probe = false,
             final_flush = final_flush == true,
             flush_reason = reason,
+            time_only = time_only,
             report_mode = report_mode,
             next_due = due,
             book_id = tostring(current_job.book_id or ""),
             core_map_hash=tostring(current_job.core_map_hash or ""),
             record_generation=tonumber(current_job.record_generation or 0) or 0,
             writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
-        })
+        },fresh_elapsed)
         return due
     end
 
@@ -682,7 +705,7 @@ function Service.run(job)
                     next_due = run_report(control, elapsed, true, tostring(control.flush_reason or "stop"))
                 else
                     next_due = 0
-                    write_service_status({
+                    publish_report(control,{
                         generation = generation,
                         seq = sequence,
                         state = "inactive",
@@ -696,7 +719,7 @@ function Service.run(job)
                         book_id = tostring(current_job.book_id or ""),
                         writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0,
                         writer_barrier_reason=tostring(control.writer_barrier_reason or ""),
-                    })
+                    },elapsed)
                 end
             elseif active and not blocked then
                 progress_fence_seq=0
