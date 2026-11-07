@@ -818,9 +818,21 @@ function Downloader:new(reader, api, annotations, store, http)
     return setmetatable({reader=reader, api=api, annotations=annotations, store=store, http=http}, self)
 end
 
+-- The WeRead catalog is an ordered list; level=1 is a top-level chapter,
+-- level=2 a child, etc. Keep this presentation metadata independent from the
+-- chapterIdx/UID fields used by reading-progress synchronization.
 local function catalog_level(chapter)
     chapter = type(chapter) == "table" and chapter or {}
-    return tonumber(chapter.level or chapter.chapterLevel or chapter.chapter_level or chapter.depth)
+    local level=tonumber(chapter.level or chapter.chapterLevel or chapter.chapter_level or chapter.depth)
+    if not level or level < 0 or level ~= math.floor(level) then return nil end
+    return level
+end
+
+local function catalog_parent_uid(chapter)
+    chapter = type(chapter) == "table" and chapter or {}
+    local uid=tostring(chapter.parentChapterUid or chapter.parentUid
+        or chapter.parent_chapter_uid or chapter.parentChapterId or chapter.parentId or "")
+    return uid~="" and uid~="0" and uid or nil
 end
 
 local function catalog_has_children(source, index)
@@ -828,9 +840,44 @@ local function catalog_has_children(source, index)
     if type(chapter) ~= "table" then return false end
     local declared = tonumber(chapter.childCount or chapter.childrenCount or chapter.subChapterCount or 0) or 0
     if declared > 0 then return true end
-    local level = catalog_level(chapter)
-    local next_level = catalog_level(source[index + 1])
+    local level = chapter._miuread_toc_level or catalog_level(chapter)
+    local next_level = source[index + 1] and (source[index + 1]._miuread_toc_level
+        or catalog_level(source[index + 1])) or nil
     return level ~= nil and next_level ~= nil and next_level > level
+end
+
+-- Flatten only genuine nested catalog chapter rows. No synthetic UID is ever
+-- created: headings without an ID can enter navigation, not the download plan.
+local function flattened_catalog(source)
+    local out, visited={},{}
+    local function walk(entries,depth,parent_uid)
+        if type(entries)~="table" or depth>12 or #out>=12000 then return end
+        for _,row in ipairs(entries) do
+            if #out>=12000 then break end
+            if type(row)=="table" and not visited[row] then
+                visited[row]=true
+                local level=catalog_level(row)
+                if level==nil and depth>1 then level=depth end
+                row._miuread_toc_level=level
+                if catalog_parent_uid(row)==nil and parent_uid then
+                    row._miuread_toc_parent_uid=parent_uid
+                end
+                out[#out+1]=row
+                local uid=tostring(row.chapterUid or row.uid or "")
+                local children=row.children or row.childChapters or row.subChapters
+                if type(children)=="table" and #children>0 then
+                    walk(children,depth+1,uid~="" and uid or parent_uid)
+                end
+            end
+        end
+    end
+    walk(source,1,nil)
+    return out
+end
+
+local function catalog_anchor_rows(row)
+    local items=row.anchors or row.anchorInfos
+    return type(items)=="table" and items or nil
 end
 
 local function txt_catalog_title(title, chapter_idx)
@@ -848,7 +895,7 @@ function Downloader:catalog(id, request_options)
     request_options = type(request_options) == "table" and request_options or {}
     local catalog = self._download_api and self._download_api:catalog(id,request_options)
         or self.reader:catalog(id, request_options)
-    local source = catalog.updated or catalog.chapterInfos or catalog.chapters or {}
+    local source = flattened_catalog(catalog.updated or catalog.chapterInfos or catalog.chapters or {})
     -- chapterInfos does not reliably expose the book format. Use the reader
     -- page context when available; on failure keep the source titles unchanged.
     local book_format=tostring((catalog.book or {}).format or catalog.format or ""):lower()
@@ -863,17 +910,32 @@ function Downloader:catalog(id, request_options)
         logger.warn("[MiuRead][Download] book format unavailable; keeping raw catalog titles",
             "book=", tostring(id), "error=", ok_state and "reader context has no book info" or tostring(state))
     end
-    local out, seen = {}, {}
+    local out, seen, seen_toc, toc_rows = {}, {}, {}, {}
     for index, chapter in ipairs(source) do
         local uid = tostring(chapter.chapterUid or chapter.uid or "")
         chapter._miuread_has_children = catalog_has_children(source, index)
         chapter._miuread_catalog_index = index
+        chapter._miuread_toc_level = chapter._miuread_toc_level or catalog_level(chapter)
+        chapter._miuread_toc_parent_uid = chapter._miuread_toc_parent_uid or catalog_parent_uid(chapter)
+        local allowed=not self.reader._is_cover_chapter(chapter)
+            and not self.reader._is_unavailable_chapter(chapter)
+        if allowed and (uid=="" or not seen_toc[uid]) then
+            local title=tostring(chapter.title or ""):match("^%s*(.-)%s*$") or ""
+            if title~="" and (uid~="" or chapter._miuread_toc_level~=nil
+                or chapter._miuread_has_children) then
+                toc_rows[#toc_rows+1]={
+                    uid=uid,title=title,toc_level=chapter._miuread_toc_level,
+                    toc_parent_uid=chapter._miuread_toc_parent_uid,
+                    structural_heading=uid=="" or (type(self.reader._is_structure_chapter)=="function"
+                        and self.reader._is_structure_chapter(chapter)==true),
+                }
+            end
+            if uid~="" then seen_toc[uid]=true end
+        end
         -- Do not decide readability from title or wordCount. Those fields are
         -- hints only and are inconsistent for short, image-only and special
         -- catalog items. Actual EPUB/TXT responses determine the result.
-        if uid ~= "" and not seen[uid]
-            and not self.reader._is_cover_chapter(chapter)
-            and not self.reader._is_unavailable_chapter(chapter) then
+        if uid ~= "" and not seen[uid] and allowed then
             seen[uid] = true
             if book_format == "txt" then
                 chapter.title = txt_catalog_title(chapter.title, chapter.chapterIdx)
@@ -884,6 +946,7 @@ function Downloader:catalog(id, request_options)
             out[#out + 1] = chapter
         end
     end
+    catalog._miuread_toc_entries=toc_rows
     return catalog, out
 end
 
@@ -1028,6 +1091,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         map[#map + 1] = {
             uid=chapter.uid, index=chapter.index or index, title=chapter.title,
             word_count=chapter.word_count or 0, structural=chapter.structural == true,
+            toc_level=chapter.toc_level, toc_parent_uid=chapter.toc_parent_uid,
         }
     end
     local core_map_hash=BookIntegrity.core_map_hash(book.bookId,
@@ -1187,7 +1251,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         content_transform_version=CONTENT_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
-    },package_progress)
+    },package_progress,opt.toc_catalog)
     if not built then os.remove(temp_path); error(build_error) end
     local boundary_ok,boundary_error=pcall(package_guard,true)
     if not boundary_ok then os.remove(temp_path); error(boundary_error,0) end
@@ -1425,15 +1489,22 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     return record
 end
 
-local function append_entry(chapters, assets, css_list, css_seen, entry, body_source, style, chapter_assets, index)
+local function append_entry(chapters, assets, css_list, css_seen, entry, body_source, style, chapter_assets, index, catalog_chapter)
     style = migrate_cached_style_assets(style, chapter_assets, entry and entry.uid)
     css_add(css_list, css_seen, style)
     for _, asset in ipairs(chapter_assets or {}) do assets[#assets + 1] = asset end
+    -- The cached XHTML remains untouched. Its catalog row is refreshed on each
+    -- download/resume so a TOC-only change does not force chapter re-downloads.
     local chapter = {
         title=entry.title or ("第 " .. tostring(index) .. " 章"),
         uid=entry.uid, index=entry.index or index,
         word_count=tonumber(entry.word_count or 0) or 0,
         structural=entry.structural == true,
+        toc_level=catalog_chapter and (catalog_chapter._miuread_toc_level
+            or catalog_level(catalog_chapter)) or nil,
+        toc_parent_uid=catalog_chapter and (catalog_chapter._miuread_toc_parent_uid
+            or catalog_parent_uid(catalog_chapter)) or nil,
+        toc_anchors=catalog_chapter and catalog_anchor_rows(catalog_chapter) or nil,
         style=style,
     }
     if type(body_source) == "table" and body_source.path then
@@ -1654,6 +1725,9 @@ function Downloader:_book_once(input, opt, progress)
         end
     end
     local catalog, all = fetch_catalog_with_recovery()
+    -- Navigation metadata is ephemeral; it is not part of the cached chapter
+    -- payload, library chapter_map, progress core hash, or EPUB miuread.json.
+    opt.toc_catalog=catalog._miuread_toc_entries
     local full_catalog_map={}
     for index,chapter in ipairs(all or {}) do
         full_catalog_map[#full_catalog_map+1]={
@@ -1662,6 +1736,8 @@ function Downloader:_book_once(input, opt, progress)
             title=chapter.title,
             word_count=tonumber(chapter.wordCount or chapter.word_count) or 0,
             structural=chapter.structural==true,
+            toc_level=catalog_level(chapter),
+            toc_parent_uid=catalog_parent_uid(chapter),
         }
     end
     opt.full_catalog_map=full_catalog_map
@@ -2408,7 +2484,7 @@ function Downloader:_book_once(input, opt, progress)
                 -- Official preview limits are intentionally omitted.
             elseif final_path then
                 append_entry(rebuilt_chapters, rebuilt_assets, rebuilt_css_list, rebuilt_css_seen,
-                    entry, {path=final_path}, final_style, final_assets, index)
+                    entry, {path=final_path}, final_style, final_assets, index, chapter)
                 local chapter_images=type(entry.image_summary)=="table" and entry.image_summary or {}
                 rebuilt_images.chapters=rebuilt_images.chapters+1
                 for _,key in ipairs({

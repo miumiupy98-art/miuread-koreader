@@ -14,9 +14,15 @@ on:
         description: "要发布的 Beta 版本，例如 6.0.1-beta.2"
         required: true
         type: string
+      issue135_verified:
+        description: "已用真实多级目录书籍在 KOReader 上验证 #135，确认无回归后才自动关单"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: miuread-beta-release
@@ -299,6 +305,29 @@ jobs:
             exit 1
           fi
 
+      - name: Verify Lua syntax and scoped regressions before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq luajit
+          while IFS= read -r -d '' file; do
+            luajit -b "$file" /dev/null
+          done < <(find miuread.koplugin -name '*.lua' -type f -print0)
+          luajit tools/test_epub_identity_fast_path.lua
+          luajit tools/test_reader_local_book_isolation.lua
+          luajit tools/test_epub_multilevel_toc.lua "$RUNNER_TEMP/issue135-levels.epub"
+          luajit tools/test_issue135_catalog_pipeline.lua
+          luajit tools/test_issue135_navigation_edge_cases.lua "$RUNNER_TEMP/issue135-anchors.xhtml"
+          luajit tools/test_issue135_epub_integration.lua "$RUNNER_TEMP/issue135-integration.epub"
+          python3 tools/test_issue135_epub_xml.py "$RUNNER_TEMP/issue135-integration.epub"
+          python3 -m unittest tools/test_release_issue_automation.py -v
+
+      - name: Link explicitly selected issues in release notes
+        run: |
+          python3 tools/release_issue_automation.py prepare \
+            --tag "$RELEASE_TAG" --notes release-notes.md
+
       - name: Build beta full package and manifest
         shell: bash
         run: |
@@ -526,3 +555,22 @@ jobs:
           if [ "$success" != "1" ]; then
             echo "::warning::Beta 清单已由 GitHub API 上传，但当前 runner 暂时无法从公开 CDN 回读。"
           fi
+
+      - name: Verify published beta assets and close selected issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEVICE_VERIFIED: ${{ inputs.issue135_verified }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERIFIED_FLAG=()
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$DEVICE_VERIFIED" = "true" ]; then
+            VERIFIED_FLAG=(--device-verified)
+          fi
+          python3 tools/release_issue_automation.py close \
+            --tag "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --package "dist/$PACKAGE_NAME" \
+            --manifest "dist/$MANIFEST_NAME" \
+            --channel-tag "$CHANNEL_TAG" \
+            "${VERIFIED_FLAG[@]}"
