@@ -367,7 +367,7 @@ function Service.run(job)
             out.report_mode=report_mode
             out.writer_barrier_seq=tonumber(control.writer_barrier_seq or 0) or 0
             local uncertain = result.uncertain == true or tostring(result.error_kind or "") == "unconfirmed"
-            local kind = result.accepted and nil or (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error))
+            local kind = not result.accepted and (uncertain and "unconfirmed" or classify_error(result.error_kind,result.error)) or nil
             if kind == "transport" then SubprocessHygiene.reset_resolver() end
             if result.accepted then
                 consecutive_failures = 0
@@ -391,8 +391,8 @@ function Service.run(job)
             out.seq = sequence
             out.state = drop_time and "dropped" or (result.accepted and "waiting" or (uncertain and "unconfirmed" or "error"))
             out.uncertain = uncertain or nil
-            out.error_kind = kind or result.error_kind
-            out.paused = drop_time and false or blocked
+            out.error_kind = kind
+            out.paused = blocked and not drop_time
             if drop_time then
                 out.dropped_error=tostring(result.error or kind or "retry budget exhausted")
                 carry_remaining=0
@@ -480,6 +480,7 @@ function Service.run(job)
             recovery_probe = false,
             final_flush = final_flush == true,
             flush_reason = reason,
+            time_only = time_only,
             report_mode = report_mode,
             next_due = due,
             book_id = tostring(current_job.book_id or ""),
