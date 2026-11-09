@@ -5,6 +5,9 @@ local MenuIcons=require("miuread.menu_icons")
 
 local function comment_and_thought_menu(plugin)
     local rows={
+        {text="公开评论与本地 EPUB 关联",callback=function()
+            plugin:_show_reader_comment_center(function() plugin:_show_koreader_reader_menu() end)
+        end},
         {text="我的想法",callback=function()
             plugin:_show_reader_records("thought",function() plugin:_show_koreader_reader_menu() end)
         end},

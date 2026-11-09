@@ -13,6 +13,9 @@ local capabilities={
     store_categories={phase="store"},category_books={phase="store"},reading_stats={phase="statistics"},
     notebooks={phase="annotations"},bookmark_list={phase="annotations"},review_list_mine={phase="annotations"},
     underlines={phase="annotations"},readreviews={phase="annotations"},review_single={phase="annotations"},
+    -- Web-only, read-only supplemental public thought feed; no mutation.
+    chapter_public_reviews={phase="annotations",web_only=true},
+    review_comments={phase="annotations",web_only=true},
     add_bookmark={phase="annotations",write=true,coordinates=true},
     add_review={phase="annotations",write=true,coordinates=true},
     remove_bookmark={phase="annotations",write=true},remove_review={phase="annotations",write=true},

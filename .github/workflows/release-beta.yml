@@ -316,6 +316,8 @@ jobs:
           done < <(find miuread.koplugin -name '*.lua' -type f -print0)
           luajit tools/test_epub_identity_fast_path.lua
           luajit tools/test_reader_local_book_isolation.lua
+          luajit tools/test_readtime_batch_safety.lua
+          luajit tools/test_readtime_controller_quarantine.lua
           luajit tools/test_epub_multilevel_toc.lua "$RUNNER_TEMP/issue135-levels.epub"
           luajit tools/test_issue135_catalog_pipeline.lua
           luajit tools/test_issue135_navigation_edge_cases.lua "$RUNNER_TEMP/issue135-anchors.xhtml"

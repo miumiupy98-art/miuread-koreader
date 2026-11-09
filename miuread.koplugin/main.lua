@@ -2262,6 +2262,9 @@ function Plugin:show_account_status()
         rows[#rows+1]={text="上传方式",post_text=label,enabled=false}
         rows[#rows+1]={text="E-Ink 待同步",post_text=seconds_label(summary.pending),enabled=false}
         rows[#rows+1]={text="E-Ink 待确认",post_text=seconds_label(summary.unknown),enabled=false}
+        if (summary.quarantined or 0)>0 then
+            rows[#rows+1]={text="E-Ink 已隔离异常时长",post_text=seconds_label(summary.quarantined),enabled=false}
+        end
         local book=self:_current_book_record()
         if book and book.book then
             local sid=tostring(book.book.book_id or "")
@@ -15282,6 +15285,367 @@ function Plugin:_comment_fetch_mode_menu(back_callback)
     }
 end
 
+-- beta.27: local EPUB comment binding uses only the community API/cache.
+function Plugin:_local_comment_path()
+    if self:_reader_session_is_weread() or not (self.ui and self.ui.document) then return nil end
+    local path=tostring(self:_current_document_path() or "")
+    if path:lower():match("%.epub$") then return path end
+end
+function Plugin:_local_binding()
+    if not self._local_comments_binding then
+        self._local_comments_binding=require("miuread.local_book_binding"):new(self.store)
+    end
+    return self._local_comments_binding
+end
+function Plugin:_local_comment_entry()
+    local path=self:_local_comment_path()
+    if not path then return nil end
+    local binding=self:_local_binding()
+    local attr=lfs.attributes(path) or {}
+    local cache=self._local_comments_entry_cache
+    if cache and cache.path==path and cache.size==attr.size
+        and cache.mtime==attr.modification then return cache.entry end
+    local entry=binding:for_path(path)
+    self._local_comments_entry_cache={path=path,size=attr.size,mtime=attr.modification,entry=entry}
+    return entry
+end
+function Plugin:_local_comment_targets()
+    local path=self:_local_comment_path()
+    if not path then return {},nil,nil end
+    local entry=self:_local_comment_entry()
+    local Map=require("miuread.local_chapter_map")
+    local rows=Map.snapshot(self.ui)
+    local index=Map.current_index(self.ui)
+    return Map.targets(entry,rows,index),rows,index
+end
+function Plugin:_local_comment_enabled()
+    local entry=self:_local_comment_entry()
+    return entry and next(entry.books or {})~=nil or false
+end
+function Plugin:_local_bind_remote(book)
+    local path=self:_local_comment_path()
+    if not path then return false end
+    local id=tostring(book and (book.bookId or book.book_id) or "")
+    if id=="" then self:info("请选择有效的微信读书书籍") return false end
+    self:_request_catalog(book,"local-comment-catalog",function(rows)
+        if self:_local_comment_path()~=path then return end
+        if #rows==0 then self:info("微信读书未返回有效章节目录，暂不能建立绑定") return end
+        local ok,err=self:_local_binding():bind(path,book,rows)
+        if not ok then self:info("保存绑定失败："..tostring(err)) return end
+        self._local_comments_entry_cache=nil
+        self:_refresh_current_comment_overlay(true)
+        self:toast("已关联《"..tostring(book.title or id).."》("..tostring(#rows).." 章)",3)
+        self:_show_reader_comment_center()
+    end,{on_error=function(message) self:info("绑定失败："..tostring(message)) end})
+end
+function Plugin:_local_book_search(query)
+    query=U.trim(tostring(query or ""))
+    if query=="" then return end
+    if not self:require_login() or not self:is_online() then return end
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local api_mode=require("miuread.api_transport").preference(self.store)
+    self:_run_interactive_network("local-book-search", "local-book-search",function()
+        local store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
+        local api=Api:new(Http:new(store),store)
+        local ok,result=pcall(api.search,api,query,0,40)
+        local credentials,changed=store:snapshot()
+        return {request_ok=ok,data=ok and result or nil,error=not ok and tostring(result) or nil,
+            auth=credentials,auth_changed=changed}
+    end,function(reply)
+        local result=reply and reply.ok==true and reply.value or nil
+        if result and result.auth_changed==true then
+            self:_apply_interactive_auth{auth=result.auth,changed=true}
+        end
+        if not result or not result.request_ok then
+            self:info("搜索失败："..tostring(result and result.error or (reply and reply.error) or "未知错误"));return
+        end
+        local items={}
+        local function append(raw)
+            local book=normalize(raw)
+            if tostring(book.bookId or "")~="" then
+                items[#items+1]={label=tostring(book.title or book.bookId),
+                    value=tostring(book.author or ""),icon="current-book",callback=function()
+                        self:_local_bind_remote(book)
+                    end}
+            end
+        end
+        for _,row in ipairs(result.data.results or result.data.books or {}) do
+            if type(row.books)=="table" then
+                for _,book in ipairs(row.books) do append(book) end
+            else append(row) end
+        end
+        if #items==0 then self:info("未搜索到对应书籍，可使用手动 bookId") return end
+        ReaderListDialog.show{title="关联微信读书书籍",subtitle="选择正确的书籍版本",
+            items=items,page_size=8,on_back=function() self:_show_reader_comment_center() end}
+    end,{status_title="本地 EPUB",status_text="正在搜索微信读书书目…",timeout=40})
+end
+function Plugin:_local_book_search_dialog(manual)
+    local dialog
+    dialog=InputDialog:new{
+        title=manual and "输入微信读书 bookId" or "搜索微信读书书籍",
+        input="",buttons={{
+            {text="取消",id="close",callback=function() UIManager:close(dialog) end},
+            {text="确认",is_enter_default=true,callback=function()
+                local value=U.trim(dialog:getInputText())
+                UIManager:close(dialog)
+                if value=="" then return end
+                if manual then
+                    self:_local_bind_remote({bookId=value,title=value})
+                else self:_local_book_search(value) end
+            end},
+        }},
+    }
+    UIManager:show(dialog);dialog:onShowKeyboard()
+end
+function Plugin:_local_books_menu(back)
+    local path=self:_local_comment_path()
+    if not path then return false end
+    local entry=self:_local_comment_entry()
+    local items={}
+    for id,book in pairs(entry and entry.books or {}) do
+        local chosen_id=id
+        items[#items+1]={label=tostring(book.title or id),value=tostring(#(book.catalog or {})).." 章",
+            callback=function()
+                UIManager:show(ConfirmBox:new{
+                    text="解除《"..tostring(book.title).."》的评论关联？\n已下载的评论缓存不会删除。",
+                    ok_text="解除",cancel_text="取消",ok_callback=function()
+                        self:_local_binding():unbind(path,chosen_id)
+                        self:_refresh_current_comment_overlay(true)
+                        self:_show_reader_comment_center()
+                    end,
+                })
+            end}
+    end
+    table.sort(items,function(a,b) return a.label<b.label end)
+    return ReaderListDialog.show{title="已关联书籍",items=items,page_size=8,
+        on_back=back or function() self:_show_reader_comment_center() end}
+end
+function Plugin:_local_assign_chapter(index,append)
+    local path=self:_local_comment_path()
+    local entry=self:_local_comment_entry()
+    if not path or not entry then return false end
+    local items={}
+    for id,book in pairs(entry.books or {}) do
+        for _,chapter in ipairs(book.catalog or {}) do
+            local chosen_id,chosen_uid=id,tostring(chapter.chapterUid)
+            items[#items+1]={label=tostring(chapter.title or "章节"),
+                value=tostring(book.title or id),callback=function()
+                    local ok,err=self:_local_binding():assign(path,index,chosen_id,chosen_uid,append)
+                    if not ok then self:info("保存映射失败："..tostring(err)) return end
+                    self:_refresh_current_comment_overlay(true)
+                    self:toast("章节对应关系已保存",2)
+                    self:_show_reader_comment_center()
+                end}
+        end
+    end
+    return ReaderListDialog.show{title=append and "追加章节映射" or "选择对应章节",
+        subtitle="本地目录第 "..tostring(index).." 项",items=items,page_size=8,
+        on_back=function() self:_local_chapter_map_menu() end}
+end
+function Plugin:_local_chapter_map_menu()
+    local path=self:_local_comment_path()
+    if not path then return false end
+    local Map=require("miuread.local_chapter_map")
+    local rows=Map.snapshot(self.ui)
+    local entry=self:_local_comment_entry()
+    local index=Map.current_index(self.ui)
+    local items={}
+    if index then
+        items[#items+1]={label="按已缓存原文匹配本章",value="至少两条命中",
+            callback=function()
+                local vote,err=Map.vote_for_current(self.ui,rows,index,entry and entry.books,
+                    function(id,uid) return self.comment_sync:load(id,uid) end)
+                if not vote then self:info(err or "未找到匹配") return end
+                local ok,save_err=self:_local_binding():assign(path,index,vote.bookId,vote.chapterUid,false)
+                if not ok then self:info(tostring(save_err)) return end
+                self:_refresh_current_comment_overlay(true)
+                self:toast("已匹配："..tostring(vote.title).." ("..tostring(vote.score).." 条)",3)
+            end}
+    end
+    for i,row in ipairs(rows) do
+        local local_index=i
+        local found=Map.targets(entry,rows,i)
+        local value=#found>0 and (tostring(found[1].title)..(#found>1 and " +"..tostring(#found-1) or "")) or "未匹配"
+        items[#items+1]={label=tostring(row.title or "目录 "..i),value=U.utf8_truncate(value,20,"…"),
+            callback=function()
+                ReaderSettingsDialog.show{title="章节映射",subtitle=tostring(row.title or ""),
+                    on_back=function() self:_local_chapter_map_menu() end,
+                    sections={{rows={
+                        {label="替换映射",callback=function() self:_local_assign_chapter(local_index,false) end},
+                        {label="追加映射",callback=function() self:_local_assign_chapter(local_index,true) end},
+                        {label="清除手动映射",callback=function()
+                            self:_local_binding():clear_assignment(path,local_index)
+                            self:_refresh_current_comment_overlay(true)
+                            self:_local_chapter_map_menu()
+                        end},
+                    }}}}
+            end}
+    end
+    return ReaderListDialog.show{title="章节匹配管理",subtitle="标题匹配 / 原文辅助 / 手动修正",
+        items=items,page_size=10,on_back=function() self:_show_reader_comment_center() end}
+end
+function Plugin:_local_comment_fetch_current(back_callback)
+    local targets=self:_local_comment_targets()
+    if #targets==0 then
+        local Map=require("miuread.local_chapter_map")
+        local path=self:_local_comment_path()
+        local entry=self:_local_comment_entry()
+        local rows=Map.snapshot(self.ui)
+        local index=Map.current_index(self.ui)
+        local match=index and Map.vote_for_current(self.ui,rows,index,entry and entry.books,
+            function(book_id,uid) return self.comment_sync:load(book_id,uid) end)
+        if match then
+            self:_local_binding():assign(path,index,match.bookId,match.chapterUid,false)
+            self:_refresh_current_comment_overlay(true)
+            targets=self:_local_comment_targets()
+        end
+    end
+    if #targets==0 then
+        self:info("本章无法自动匹配。可先按关联书籍的章节范围获取评论，再使用章节匹配管理。")
+        return false
+    end
+    local function fetch(target)
+        local status=self.comment_sync:status(target.bookId,target.chapterUid)
+        local force=status.has_cache and (status.status=="cached" or status.status=="empty")
+        return self:_start_comment_range(target.book,{
+            {chapterUid=target.chapterUid,title=target.title}},1,1,force)
+    end
+    if #targets==1 then return fetch(targets[1]) end
+    local items={}
+    for _,target in ipairs(targets) do
+        local chosen=target
+        items[#items+1]={label=tostring(target.title),value=tostring(target.book.title),
+            callback=function() fetch(chosen) end}
+    end
+    return ReaderListDialog.show{title="获取本章评论",items=items,page_size=8,
+        on_back=back_callback or function() self:_show_reader_comment_center() end}
+end
+function Plugin:_local_comment_range_editor(book,back_callback)
+    local rows=book.catalog or {}
+    if #rows==0 then self:info("当前关联书籍没有章节目录") return false end
+    local first,last=1,math.min(#rows,10)
+    local refresh=false
+    local show_editor
+    local function choose(which)
+        return self:_comment_chapter_list_menu(book,rows,
+            which=="first" and "选择起始章节" or "选择结束章节",function(index)
+                if which=="first" then first=index;last=math.max(last,first)
+                else last=math.max(first,index) end
+                show_editor()
+            end,1,show_editor)
+    end
+    show_editor=function()
+        ReaderSettingsDialog.show{title="获取书籍公开评论",subtitle=tostring(book.title),
+            on_back=back_callback or function() self:_local_comment_fetch_menu() end,
+            sections={{title="",rows={
+                {label="起始章节",value=tostring(first),callback=function() choose("first") end},
+                {label="结束章节",value=tostring(last),callback=function() choose("last") end},
+                {label="更新已有评论",value=refresh and "是" or "否",callback=function()
+                    refresh=not refresh;show_editor()
+                end},
+                {label="开始获取",value=tostring(last-first+1).." 章",callback=function()
+                    self:_start_comment_range(book,rows,first,last,refresh)
+                end},
+            }}}}
+    end
+    return show_editor()
+end
+function Plugin:_local_comment_range_books(back_callback)
+    local entry=self:_local_comment_entry()
+    local items={}
+    for _,book in pairs(entry and entry.books or {}) do
+        local chosen=book
+        items[#items+1]={label=tostring(book.title),value=tostring(#(book.catalog or {})).." 章",
+            callback=function() self:_local_comment_range_editor(chosen,back_callback) end}
+    end
+    return ReaderListDialog.show{title="选择关联书籍",items=items,page_size=8,
+        on_back=back_callback or function() self:_show_reader_comment_center() end}
+end
+function Plugin:_local_comment_fetch_menu(back_callback)
+    ReaderSettingsDialog.show{title="获取 / 更新评论",
+        on_back=back_callback or function() self:_show_reader_comment_center() end,
+        sections={{title="",rows={
+            {label="当前章节",value="获取 / 更新",callback=function()
+                self:_local_comment_fetch_current(back_callback) end},
+            {label="指定章节范围",value="可选择关联书籍",callback=function()
+                self:_local_comment_range_books(back_callback) end},
+        }}}}
+    return true
+end
+function Plugin:_local_comment_cached_list(back_callback)
+    local targets=self:_local_comment_targets()
+    local items={}
+    for _,target in ipairs(targets) do
+        local groups=self.comment_sync:load(target.bookId,target.chapterUid) or {}
+        for _,group in ipairs(groups) do
+            for _,comment in ipairs(group.texts or {}) do
+                local chosen=target
+                local range=group.range
+                items[#items+1]={icon="comment",
+                    label=U.utf8_truncate(tostring(comment.content or ""),44,"…"),
+                    value=tostring(comment.author or ""),
+                    callback=function()
+                        self._opening_cached_comment=true
+                        self:_show_thought_href(Thoughts.href(chosen.bookId,chosen.chapterUid,range))
+                        self._opening_cached_comment=nil
+                    end}
+            end
+        end
+    end
+    if #items==0 then self:toast("当前章节暂无本地评论",2) return true end
+    return ReaderListDialog.show{title="本章评论",items=items,page_size=6,
+        on_back=back_callback or function() self:_show_reader_comment_center() end}
+end
+function Plugin:_show_comment_replies(review,info)
+    local id=U.trim(tostring(review and review.review_id or ""))
+    if id=="" then self:info("这条想法缺少 reviewId，无法查看回复") return false end
+    local Replies=require("miuread.review_replies")
+    local function show(data)
+        if not data then return false end
+        local items={}
+        for _,row in ipairs(data.items or {}) do
+            items[#items+1]={label=U.utf8_truncate(row.content,150,"…"),
+                value=row.author.." · ♥ "..tostring(row.likes or 0),
+                callback=function() self:info(row.author.."\n\n"..row.content) end}
+        end
+        if #items==0 then self:info("这条想法暂无回复") return true end
+        ReaderListDialog.show{title="想法回复",subtitle=tostring(#items).." / "..tostring(data.total).." 条",
+            items=items,page_size=6,on_back=function() self:_show_reader_comment_center() end}
+        return true
+    end
+    local cache=Replies.load(self.store,id,false)
+    if cache then return show(cache) end
+    if not self:is_online() then
+        local old=Replies.load(self.store,id,true)
+        if old then return show(old) end
+        self:info("离线且没有已缓存的回复") return false
+    end
+    local auth=U.copy(self.store:auth())
+    local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+    local api_mode=require("miuread.api_transport").preference(self.store)
+    self:_run_interactive_network("review-replies:"..id,"review-replies",function()
+        local store=interactive_child_store(auth,data_dir,temp_dir,api_mode)
+        local api=Api:new(Http:new(store),store):scope()
+        local ok,raw=pcall(api.review_comments,api,id,{bookId=info.book_id,chapterUid=info.chapter_uid})
+        local normalized,err
+        if ok then normalized,err=Replies.normalize(raw,id)
+        else err=tostring(raw) end
+        local credentials,changed=store:snapshot()
+        return {request_ok=normalized~=nil,result=normalized,error=err,
+            auth=credentials,auth_changed=changed}
+    end,function(reply)
+        local payload=reply and reply.ok and reply.value
+        if payload and payload.auth_changed then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
+        if not payload or not payload.request_ok then
+            self:info("获取回复失败："..tostring(payload and payload.error or reply and reply.error or "未知错误"))
+            return
+        end
+        Replies.save(self.store,payload.result)
+        show(payload.result)
+    end,{status_title="想法回复",status_text="正在获取回复…",timeout=35})
+end
+
 function Plugin:_show_reader_comment_center(back_callback)
     local function reopen() self:_show_reader_comment_center(back_callback) end
     -- Display available offline anchors. Never initiate network access here.
@@ -15306,16 +15670,39 @@ function Plugin:_show_reader_comment_center(back_callback)
             local cache=scope.book_id~="" and scope.chapter_uid~=""
                 and self.comment_sync:status(scope.book_id,scope.chapter_uid)
                 or {has_cache=false,status="not_fetched",comments=0}
+            if self:_local_comment_path() then
+                for _,target in ipairs(self:_local_comment_targets()) do
+                    local state=self.comment_sync:status(target.bookId,target.chapterUid)
+                    if state.has_cache then cache=state;break end
+                end
+            end
             local can_fetch=scope.book_id~="" and scope.chapter_uid~=""
+            local is_local=self:_local_comment_path()~=nil
+            local local_bound=is_local and self:_local_comment_enabled()
             local content_rows={
                 {icon="download",label="获取公开评论",value=self._comment_range_task and "任务进行中" or "当前章节 / 指定范围",
-                    enabled=scope.book_id~="",arrow=true,callback=function()
-                        self:_comment_fetch_mode_menu(reopen)
+                    enabled=scope.book_id~="" or local_bound,arrow=true,callback=function()
+                        if is_local then self:_local_comment_fetch_menu(reopen)
+                        else self:_comment_fetch_mode_menu(reopen) end
                     end},
                 {icon="comment",label="查看本章评论",value=self:_reader_comment_status_label(scope),
                     enabled=can_fetch and cache.has_cache,arrow=true,
-                    callback=function() self:_show_current_chapter_comments(scope,reopen) end},
+                    callback=function()
+                        if is_local then self:_local_comment_cached_list(reopen)
+                        else self:_show_current_chapter_comments(scope,reopen) end
+                    end},
             }
+            if is_local then
+                table.insert(content_rows,1,{icon="current-book",label="关联微信读书书籍",
+                    value=local_bound and "添加书籍" or "尚未关联",arrow=true,
+                    callback=function() self:_local_book_search_dialog(false) end})
+                content_rows[#content_rows+1]={icon="toc",label="章节匹配管理",arrow=true,
+                    enabled=local_bound,callback=function() self:_local_chapter_map_menu() end}
+                content_rows[#content_rows+1]={icon="settings",label="管理已关联书籍",arrow=true,
+                    enabled=local_bound,callback=function() self:_local_books_menu(reopen) end}
+                content_rows[#content_rows+1]={icon="link",label="手动输入 bookId",arrow=true,
+                    callback=function() self:_local_book_search_dialog(true) end}
+            end
             if self._comment_range_task then
                 content_rows[#content_rows+1]={icon="progress",label="评论获取任务",
                     value=self._comment_range_task.paused and "已暂停" or "后台进行",
@@ -17316,8 +17703,8 @@ function Plugin:_reader_control_categories()
         {icon="search",label="书内搜索",value="搜索当前书籍",callback=function() self:_reader_show_search(back_to("reading")) end},
         {icon="highlight",label="批注",value=self:_reader_annotation_summary_label(),callback=function() self:_show_reader_annotation_panel(back_to("reading")) end},
     }
-    if self:_reader_session_is_weread() then
-        local next_context=self:_chapter_prefetch_context()
+    if self:_reader_session_is_weread() or self:_local_comment_path() then
+        local next_context=self:_reader_session_is_weread() and self:_chapter_prefetch_context() or nil
         if next_context then
             table.insert(reading_items,3,{
                 icon="chevron-right",label="下一章",
@@ -17453,7 +17840,7 @@ function Plugin:_reader_quick_panel_options()
     local actions={
         definitions.search,
         definitions.annotations,
-        self:_reader_session_is_weread() and definitions.comments or definitions.toc,
+        (self:_reader_session_is_weread() or self:_local_comment_path()) and definitions.comments or definitions.toc,
         definitions.edge_guard,
     }
 
@@ -26249,6 +26636,10 @@ function Plugin:reading_time_diagnostics_menu()
         signature_token_invalid="服务端签名配置异常，将自动重试",web_request_failed="Web 上传准备失败，将自动重试",
         worker_unavailable="后台任务暂不可用；可稍后点击立即同步重试"}
     if control.reason then rows[#rows+1]={text=reasons[control.reason] or "等待下次同步",enabled=false} end
+    if (summary.quarantined or 0)>0 then
+        rows[#rows+1]={text="已隔离异常记录："..reading_time_duration(summary.quarantined),enabled=false}
+        rows[#rows+1]={text="未发送且不会自动重传；原始数据已保留，可导出运行日志核查",enabled=false}
+    end
     if (tonumber(control.next_send) or 0)>os.time() then rows[#rows+1]={text="下次尝试："..os.date("%m-%d %H:%M",control.next_send),enabled=false} end
     if summary.blocked then rows[#rows+1]={text="核对云端位置并恢复补传",callback=function()
         self:toast("正在核对云端位置…",2)
@@ -30530,7 +30921,16 @@ end
 
 function Plugin:_current_thought_favorite_scope()
     local scope={book_id="",book_title="",chapter_uid="",chapter_title=""}
-    if not self:_reader_session_is_weread() then return scope end
+    if not self:_reader_session_is_weread() then
+        local targets=self:_local_comment_targets()
+        if #targets>0 then
+            scope.book_id=targets[1].bookId
+            scope.book_title=tostring(targets[1].book.title or "")
+            scope.chapter_uid=tostring(targets[1].chapterUid)
+            scope.chapter_title=tostring(targets[1].title or "")
+        end
+        return scope
+    end
     local current=self:_current_book_record()
     if not (current and current.book) then return scope end
     local book=current.book or {}
@@ -31171,6 +31571,9 @@ function Plugin:_open_thought_info(info,generation)
                 self:_mark_reader_busy(30)
                 return self:_toggle_online_review_like(request,done)
             end,
+            on_replies=function(comment)
+                self:_show_comment_replies(comment,info)
+            end,
             on_error=function()
                 self:info("评论显示失败，窗口已安全关闭。当前阅读位置不会丢失。")
             end,
@@ -31191,7 +31594,7 @@ function Plugin:_open_thought_info(info,generation)
         if not popup then error("评论窗口未能加入界面") end
         self._thought_popup=popup
         self:_record_performance("thought_popup",elapsed_ms)
-        if token and token.index_hit~=true then
+        if token and token.index_hit~=true and self:_reader_session_is_weread() then
             UIManager:scheduleIn(.2,function() self:_schedule_current_book_repair_check(nil,true) end)
         end
     end,debug.traceback)
@@ -31315,7 +31718,7 @@ function Plugin:_install_comment_overlay()
     if not ui or not ui.document or not ui.view
         or type(ui.view.registerViewModule)~="function"
         or self:_current_book_supports_miuread_marks()
-        or not self:_reader_session_is_weread() then return false end
+        or not (self:_reader_session_is_weread() or self:_local_comment_enabled()) then return false end
     local doc=ui.document
     if type(doc.getXPointer)~="function"
         or type(doc.getScreenBoxesFromPositions)~="function"
@@ -31374,6 +31777,40 @@ function Plugin:_refresh_current_comment_overlay(force)
     if scope.book_id=="" or scope.chapter_uid=="" then
         overlay:setRecords({});return false
     end
+    if self:_local_comment_path() then
+        local targets,rows,index=self:_local_comment_targets()
+        local Map=require("miuread.local_chapter_map")
+        local bounds=index and Map.bounds(self.ui,rows,index)
+        if not bounds or #targets==0 then overlay:setRecords({});return false end
+        local path=self:_local_comment_path()
+        local key=tostring(path)..":"..tostring(index)..":"..table.concat((function()
+            local parts={}
+            for _,target in ipairs(targets) do parts[#parts+1]=target.bookId.."/"..target.chapterUid end
+            return parts
+        end)(),",")
+        if force~=true and self._comment_overlay_chapter==key then return true end
+        local binding=self:_local_binding()
+        local Locator=require("miuread.comment_locator")
+        local records={}
+        for _,target in ipairs(targets) do
+            local groups=self.comment_sync:load(target.bookId,target.chapterUid)
+            if type(groups)=="table" then
+                local remote_id,remote_uid=target.bookId,target.chapterUid
+                local record={local_bounds=bounds,local_document=true,
+                    location_get=function() return binding:locations(path,remote_id,remote_uid,index) end,
+                    location_save=function(entries) return binding:save_locations(path,remote_id,remote_uid,entries,index) end}
+                local ok,res=pcall(Locator.resolve,self.store,self.reader,self.ui,
+                    remote_id,remote_uid,record,groups)
+                if ok and type(res)=="table" then
+                    for _,item in ipairs(res) do records[#records+1]=item end
+                end
+            end
+        end
+        overlay:setRecords(records)
+        self._comment_overlay_chapter=key
+        UIManager:setDirty(self.ui,"ui")
+        return true
+    end
     local context=self:_current_book_record()
     if not context or not context.record then
         -- A stale reader session or missing book record must not leave marks
@@ -31411,7 +31848,8 @@ function Plugin:_refresh_current_comment_overlay(force)
 end
 
 function Plugin:_schedule_comment_overlay_refresh(force)
-    if not self:_thoughts_enabled() or not self:_reader_session_is_weread() then return end
+    if not self:_thoughts_enabled()
+        or not (self:_reader_session_is_weread() or self:_local_comment_enabled()) then return end
     if force~=true and self._comment_overlay and self.ui and self.ui.toc then
         local toc=self.ui.toc
         local xp=self.ui.rolling and self.ui.rolling.xpointer
@@ -32223,7 +32661,7 @@ function Plugin:onReaderReady()
             self:_setup_thought_tap()
             self:_sync_reader_annotation_mark_style("reader ready")
             logger.info("[MiuRead][ThoughtPopup] local tap ready before cloud sync")
-        elseif self:_reader_session_is_weread() then
+        elseif self:_reader_session_is_weread() or self:_local_comment_enabled() then
             self:_install_comment_overlay()
             self:_schedule_comment_overlay_refresh(false)
         end
@@ -32577,6 +33015,9 @@ function Plugin:onPageUpdate(page)
     -- lookup is delayed until the reader has been idle, keeping the flip path
     -- free of optional work.
     self:_schedule_reader_toolbar_state_refresh(current,.55)
+    if not weread and self:_local_comment_enabled() then
+        self:_schedule_comment_overlay_refresh(false)
+    end
     if weread then
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()

@@ -10,7 +10,7 @@ MODULE_PATH = Path(__file__).with_name("release_issue_automation.py")
 spec = importlib.util.spec_from_file_location("miuread_release_issues", MODULE_PATH)
 issues = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(issues)
-TAG = "v6.5.0-beta.24"
+TAG = "v6.5.0-beta.26"
 REPO = "miumiupy98-art/miuread-koreader"
 
 
@@ -18,7 +18,7 @@ class ReleaseIssuesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="miuread-issues-test-")
         root = Path(self.tmp.name)
-        self.package = root / "miuread-v6.5.0-beta.24-full.zip"
+        self.package = root / "miuread-v6.5.0-beta.26-full.zip"
         self.package.write_bytes(b"verified complete plugin archive")
         self.manifest = root / "update-beta.json"
         self.manifest.write_text(json.dumps({

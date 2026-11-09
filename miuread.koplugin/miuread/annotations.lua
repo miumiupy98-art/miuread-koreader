@@ -212,6 +212,74 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         if key~="" and not active_seen[key] then active_seen[key]=true; active_ranges[#active_ranges+1]=key end
     end
     if #active_ranges==0 then
+        -- A successful, empty /book/underlines reply is not proof that the
+        -- chapter has no public thoughts. This is particularly relevant to
+        -- user-imported books, where public thoughts may exist without
+        -- underline popularity ranges. Probe the bounded chapter feed only
+        -- for user-requested notes/comment work, never ordinary reading.
+        if options.probe_empty_underlines==true
+            and type(self.api.chapter_public_reviews)=="function" then
+            progress("thoughts",0,1,"检查章节公开想法")
+            local ok,feed=pcall(self.api.chapter_public_reviews,self.api,book_id,uid)
+            result.public_feed_probed=true
+            if ok and type(feed)=="table" then
+                local rows=array_from(feed,{"reviews","updated","list"})
+                if #rows==0 and type(feed.data)=="table" then
+                    rows=array_from(feed.data,{"reviews","updated","list"})
+                end
+                local grouped,order={},{}
+                for _,row in ipairs(rows) do
+                    if type(row)=="table" then
+                        local nested=type(row.review)=="table" and row.review or row
+                        local key=range_key(nested)
+                        if key=="" then key=range_key(row) end
+                        if key~="" then
+                            local feed_group=(type(row.pageReviews)=="table"
+                                or type(row.reviews)=="table" or type(row.updated)=="table")
+                                and row or {pageReviews={row}}
+                            local texts=review_texts(feed_group)
+                            if #texts>0 then
+                                if not grouped[key] then
+                                    grouped[key]={range=key,texts={},seen={}}
+                                    order[#order+1]=key
+                                end
+                                local group=grouped[key]
+                                for _,item in ipairs(texts) do
+                                    local id=tostring(item.review_id or "")
+                                    if id=="" then id=tostring(item.content or "").."\0"..tostring(item.author or "") end
+                                    if not group.seen[id] then
+                                        group.seen[id]=true
+                                        group.texts[#group.texts+1]=item
+                                        result.thought_entry_count=result.thought_entry_count+1
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                table.sort(order)
+                for _,key in ipairs(order) do
+                    local group=grouped[key]
+                    result.underlines[#result.underlines+1]={range=key}
+                    result.review_map[key]=group.texts
+                    result.review_groups[#result.review_groups+1]={range=key,texts=group.texts}
+                end
+                result.underline_count=#result.underlines
+                result.thought_count=#result.review_groups
+                result.public_feed_found=result.thought_entry_count
+                logger.info("[MiuRead][Comments] no-underline chapter feed",
+                    "book=",result.book_id,"chapter=",result.chapter_uid,
+                    "feed_rows=",#rows,"thoughts=",result.thought_entry_count)
+            else
+                -- The supplemental feed is optional. A failed probe must not
+                -- fail a valid text download or overwrite existing thoughts.
+                result.public_feed_error=ok and "invalid_response" or U.first_line(tostring(feed),100)
+                logger.warn("[MiuRead][Comments] no-underline chapter feed unavailable",
+                    "book=",result.book_id,"chapter=",result.chapter_uid,
+                    "reason=",result.public_feed_error)
+            end
+            progress("thoughts",1,1,"章节公开想法检查完成")
+        end
         result.review_complete=true
         result.complete=result.underline_request_ok and result.underlines_partial~=true
         return result

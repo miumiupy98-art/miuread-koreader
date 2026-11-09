@@ -47,6 +47,14 @@ function Locator.chapterBounds(ui,record,uid)
     local document=ui and ui.document
     if not document then return nil,"no_document" end
     local entry=type(record)=="table" and record or {}
+    if entry.local_document==true and type(entry.local_bounds)=="table" then
+        local local_bounds=entry.local_bounds
+        if valid(document,local_bounds.start)
+            and (local_bounds.ending==nil or valid(document,local_bounds.ending)) then
+            return {start=local_bounds.start,ending=local_bounds.ending},nil
+        end
+        return nil,"local_chapter_bounds_invalid"
+    end
     local map=type(entry.chapter_map)=="table" and entry.chapter_map or {}
     local readable={}
     for _,chapter in ipairs(map) do
@@ -176,7 +184,12 @@ function Locator.resolve(store,reader,ui,book_id,uid,record,groups)
     -- Offline only. Missing source is not a reason to trigger a network request.
     local raw=Source.readCachedChapter(store,book_id,uid)
     local raw_map=raw and Coord.build(raw) or nil
-    local locations=ThoughtDatabase.load_locations(store,book_id,uid) or {}
+    local locations
+    if type(record)=="table" and record.local_document==true then
+        locations=type(record.location_get)=="function" and record.location_get() or {}
+    else
+        locations=ThoughtDatabase.load_locations(store,book_id,uid) or {}
+    end
     local written,records,stats={}, {},{matched=0,unmatched=0}
     for _,group in ipairs(groups or {}) do
         local range=tostring(group.range or "")
@@ -208,7 +221,12 @@ function Locator.resolve(store,reader,ui,book_id,uid,record,groups)
         end
     end
     if #written>0 then
-        local saved,why=ThoughtDatabase.save_locations(store,book_id,uid,written)
+        local saved,why
+        if type(record)=="table" and record.local_document==true then
+            saved,why=record.location_save(written)
+        else
+            saved,why=ThoughtDatabase.save_locations(store,book_id,uid,written)
+        end
         if not saved then stats.error=tostring(why) end
     end
     return records,stats

@@ -98,6 +98,9 @@ function CommentSync:fetch(book_id, chapter_uid, options)
             options.progress or function() end,{
                 previous=previous,force_refresh=options.force==true or retry_full,
                 checkpoint=persist,
+                -- Comment fetches are explicit reader actions (or user-enabled
+                -- preloads); check the public feed when there are no ranges.
+                probe_empty_underlines=true,
             })
         return persist(fetched)
     end,debug.traceback)

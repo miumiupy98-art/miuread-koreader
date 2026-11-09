@@ -1842,7 +1842,10 @@ function Downloader:_book_once(input, opt, progress)
                     respect_reader_priority("annotation_batch")
                     if report_progress then report_progress(stage,current_index,total) end
                 end,
-                {previous=previous,checkpoint=persist_checkpoint})
+                {previous=previous,checkpoint=persist_checkpoint,
+                    -- Requested notes edition: a chapter can have public
+                    -- thoughts even if the underline-popularity list is empty.
+                    probe_empty_underlines=true})
             if type(fetched)=="table" then
                 for _,message in ipairs(fetched.errors or {}) do propagate_control_error(message) end
                 if fetched.rate_limited==true then error("[MiuReadRateLimit]",0) end
