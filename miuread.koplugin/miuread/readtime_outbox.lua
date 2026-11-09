@@ -6,6 +6,65 @@ local Clock=require("miuread.readtime_clock")
 local bit=require("bit")
 local M={}; M.__index=M
 local MAX_ROWS=50000
+-- Conservative resource budgets, not server-side protocol limits.  The first
+-- full hour is preferred; an unusually fragmented single hour may be split
+-- to keep the worker bounded.  The 3690s/123-row #184 case fits in one batch.
+local MAX_BATCH_ROWS=512
+local MAX_BATCH_HOUR_GROUPS=12
+local MAX_BATCH_SPAN_SECONDS=24*3600
+local MAX_QUARANTINE_PER_PASS=256
+
+local function row_id(row)
+    return tonumber(row.id) or 0
+end
+
+-- Identify deterministic overlaps ONLY for hours whose aggregate would be
+-- rejected by readtime_protocol.hours (>3600s).  Never guess that other
+-- apparently duplicated readings are unsafe, and never alter sent/unknown rows.
+local function overflow_overlap_rows(rows)
+    local hours={}
+    for _,row in ipairs(rows) do
+        local start=tonumber(row.start_time)
+        local left=tonumber(row.duration)
+        local zone=tostring(row.time_zone or "")
+        if start and start%1==0 and start>0 and left and left%1==0 and left>0
+            and left<=86400 and zone:match("^[+-]%d%d:%d%d$") then
+            local at=start
+            while left>0 do
+                local hour=at-at%3600
+                local seconds=math.min(left,hour+3600-at)
+                local key=tostring(hour)..":"..zone
+                local bucket=hours[key]
+                if not bucket then
+                    bucket={seconds=0,segments={}}
+                    hours[key]=bucket
+                end
+                bucket.seconds=bucket.seconds+seconds
+                bucket.segments[#bucket.segments+1]={start=at,finish=at+seconds,row=row}
+                at=at+seconds
+                left=left-seconds
+            end
+        end
+    end
+    local overlaps={}
+    for _,bucket in pairs(hours) do
+        if bucket.seconds>3600 then
+            table.sort(bucket.segments,function(a,b)
+                if a.start==b.start then return row_id(a.row)<row_id(b.row) end
+                return a.start<b.start
+            end)
+            local covered_until=-math.huge
+            for _,segment in ipairs(bucket.segments) do
+                if segment.start<covered_until then
+                    overlaps[segment.row.id]=segment.row
+                elseif not overlaps[segment.row.id] then
+                    covered_until=math.max(covered_until,segment.finish)
+                end
+            end
+        end
+    end
+    return overlaps
+end
 function M.new(store)
     return setmetatable({path=assert(store.data_dir).."/readtime-outbox.sqlite3"},M)
 end
@@ -165,27 +224,119 @@ function M:collect(account,window_id,spans,now,close)
         return {seconds=seconds,rows=rows},changed
     end)
 end
-function M:pending(account,now,eligible,max_seconds)
-    local limit=math.min(600,math.max(60,tonumber(max_seconds) or 600))
+function M:pending(account,now,eligible)
     return self:_access(account,function(data)
         local items={}
         for _,row in pairs(data.items) do
             if row.state=="pending" and (tonumber(row.retry_at) or 0)<=now
-                and (not eligible or eligible(row)) then items[#items+1]=U.copy(row) end
+                and (not eligible or eligible(row)) then items[#items+1]=row end
         end
-        table.sort(items,function(a,b) return tonumber(a.id)<tonumber(b.id) end)
-        local batch={rows={},seconds=0}
+        table.sort(items,function(a,b) return row_id(a)<row_id(b) end)
+        local batch={rows={},seconds=0,invalid_rows={}}
+        if #items==0 then return batch,false end
+        batch.book_id=items[1].book_id
+        batch.book_version=items[1].book_version or 0
+        local selected={}
         for _,row in ipairs(items) do
-            if not batch.book_id then batch.book_id=row.book_id; batch.book_version=row.book_version or 0 end
-            if row.book_id==batch.book_id then
-                if (row.book_version or 0)~=batch.book_version then break end
-                if #batch.rows>=100 or batch.seconds+row.duration>limit then break end
-                batch.rows[#batch.rows+1]=row
-                batch.seconds=batch.seconds+row.duration
+            if row.book_id==batch.book_id and (row.book_version or 0)==batch.book_version then
+                selected[#selected+1]=row
             end
         end
+        local overlapping=overflow_overlap_rows(selected)
+        local invalid={}
+        for _,row in ipairs(selected) do
+            if overlapping[row.id] then invalid[#invalid+1]=row end
+        end
+        for i=1,math.min(#invalid,MAX_QUARANTINE_PER_PASS) do
+            batch.invalid_rows[#batch.invalid_rows+1]=U.copy(invalid[i])
+        end
+        -- A batch containing an identifiable anomaly must not be sent until
+        -- the anomaly has been durably isolated in a separate transaction.
+        if #batch.invalid_rows>0 then return batch,false end
+
+        -- Group ready rows by starting hour and time zone, preferring complete
+        -- hours over an arbitrary split.  A single oversized hour is allowed
+        -- to split at the row limit so that it cannot stall all other books.
+        local groups,order={},{}
+        for _,row in ipairs(selected) do
+            local start=tonumber(row.start_time) or 0
+            local key=tostring(math.floor(start/3600))..":"..tostring(row.time_zone or "")
+            local group=groups[key]
+            if not group then
+                group={rows={},first=start,last=start}
+                groups[key]=group
+                order[#order+1]=group
+            end
+            group.rows[#group.rows+1]=row
+            group.first=math.min(group.first,start)
+            group.last=math.max(group.last,start+(tonumber(row.duration) or 0))
+        end
+        local first,last
+        for _,group in ipairs(order) do
+            local count=#batch.rows
+            local span_first=math.min(first or group.first,group.first)
+            local span_last=math.max(last or group.last,group.last)
+            if count>0 and (#batch.rows+#group.rows>MAX_BATCH_ROWS
+                or (span_last-span_first)>MAX_BATCH_SPAN_SECONDS) then break end
+            if count>0 and (batch.hour_groups or 0)>=MAX_BATCH_HOUR_GROUPS then break end
+            local take=math.min(#group.rows,MAX_BATCH_ROWS-count)
+            for i=1,take do
+                local row=group.rows[i]
+                batch.rows[#batch.rows+1]=U.copy(row)
+                batch.seconds=batch.seconds+(tonumber(row.duration) or 0)
+            end
+            batch.hour_groups=(batch.hour_groups or 0)+1
+            first,last=span_first,span_last
+            if take<#group.rows or #batch.rows>=MAX_BATCH_ROWS then break end
+        end
+        batch.hour_groups=nil  -- internal selection detail, not upload metadata
         return batch,false
     end,true)
+end
+
+-- Quarantine only deterministic unsent overlaps.  An isolated record stays in
+-- the SQLite ledger for diagnosis and must never be treated as an unknown POST
+-- receipt or silently deleted.  Do not change a row whose state/identity moved
+-- since the read-only selection: that could race with another worker.
+function M:quarantine(account,rows,reason)
+    if type(rows)~="table" or #rows==0 then return {rows=0,seconds=0} end
+    return self:_access(account,function(data)
+        for _,row in ipairs(rows) do
+            local saved=data.items[row.id]
+            if not saved or saved.state~="pending" or saved.book_id~=row.book_id
+                or (saved.book_version or 0)~=(row.book_version or 0)
+                or saved.start_time~=row.start_time or saved.duration~=row.duration
+                or saved.time_zone~=row.time_zone or (saved.risk or 0)~=(row.risk or 0) then
+                return false,false
+            end
+        end
+        local seconds=0
+        for _,row in ipairs(rows) do
+            local saved=data.items[row.id]
+            saved.state="quarantined"
+            saved.reason=reason or "overlapping_reading_time_hour"
+            saved.quarantined_at=os.time()
+            seconds=seconds+saved.duration
+        end
+        return {rows=#rows,seconds=seconds},true
+    end)
+end
+
+-- Defensive fallback if a protocol preflight rejects a batch despite the
+-- queue-side check.  The caller may continue with other rows only if at least
+-- one specific overlapping record is identified and quarantined.
+function M:quarantine_overlap_batch(account,rows)
+    local overlaps=overflow_overlap_rows(rows or {})
+    local bad={}
+    for _,row in ipairs(rows or {}) do
+        if overlaps[row.id] then bad[#bad+1]=row end
+    end
+    if #bad>MAX_QUARANTINE_PER_PASS then
+        local first={}
+        for i=1,MAX_QUARANTINE_PER_PASS do first[i]=bad[i] end
+        bad=first
+    end
+    return self:quarantine(account,bad,"overlapping_reading_time_hour")
 end
 function M:claim(account,batch,attempt)
     return self:_access(account,function(data)

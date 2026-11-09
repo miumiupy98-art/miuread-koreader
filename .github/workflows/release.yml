@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: miuread-stable-release
@@ -241,6 +242,11 @@ jobs:
             echo "::error::插件目录包含不应发布的文件。"
             exit 1
           fi
+
+      - name: Link explicitly selected issues in release notes
+        run: |
+          python3 tools/release_issue_automation.py prepare \
+            --tag "$RELEASE_TAG" --notes release-notes.md
 
       - name: Run Lua syntax checks
         shell: bash
@@ -593,3 +599,16 @@ jobs:
             echo "::warning::beta 在回同步期间发生变化，未覆盖新提交；本次正式版发布不受影响。"
             exit 0
           fi
+
+      - name: Verify published stable assets and close selected issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/release_issue_automation.py close \
+            --tag "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --package "dist/$PACKAGE_NAME" \
+            --manifest "dist/$MANIFEST_NAME" \
+            --channel-tag "$CHANNEL_TAG"

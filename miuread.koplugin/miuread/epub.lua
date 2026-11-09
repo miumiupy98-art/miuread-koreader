@@ -2,6 +2,7 @@ local bit = require("bit")
 local Json = require("miuread.json")
 local U = require("miuread.util")
 local AnnotationStyle = require("miuread.annotation_style")
+local Toc = require("miuread.toc")
 
 local E = {}
 local CHUNK_SIZE = 64 * 1024
@@ -231,7 +232,7 @@ local function binary_source(item)
     return tostring(item and item.data or "")
 end
 
-function E.build(path, book, chapters, css, assets, cover, meta, on_progress)
+function E.build(path, book, chapters, css, assets, cover, meta, on_progress, toc_catalog)
     chapters = chapters or {}
     assets = assets or {}
 
@@ -244,7 +245,7 @@ function E.build(path, book, chapters, css, assets, cover, meta, on_progress)
         '<item id="css" href="style.css" media-type="text/css"/>',
         '<item id="miu-meta" href="miuread.json" media-type="application/json"/>',
     }
-    local spine, nav, ncx = {}, {}, {}
+    local spine = {}
     local cover_meta = ""
     local inline_style = tostring(css or ""):find(AnnotationStyle.MARKER_BEGIN, 1, true)
         and AnnotationStyle.inline_style_tag()
@@ -279,19 +280,17 @@ function E.build(path, book, chapters, css, assets, cover, meta, on_progress)
     for index, chapter in ipairs(chapters) do
         local file = string.format("text/chapter-%04d.xhtml", index)
         local id = "c" .. tostring(index)
-        local title = chapter.title or ("Chapter " .. tostring(index))
         entries[#entries + 1] = {
             name = "OEBPS/" .. file,
             source = chapter_source(book, chapter, index, inline_style),
         }
         manifest[#manifest + 1] = '<item id="' .. id .. '" href="' .. file .. '" media-type="application/xhtml+xml"/>'
         spine[#spine + 1] = '<itemref idref="' .. id .. '"/>'
-        nav[#nav + 1] = '<li><a href="' .. file .. '">' .. U.xml(title) .. '</a></li>'
-        ncx[#ncx + 1] = '<navPoint id="n' .. tostring(index) .. '" playOrder="' .. tostring(index)
-            .. '"><navLabel><text>' .. U.xml(title)
-            .. '</text></navLabel><content src="' .. file .. '"/></navPoint>'
     end
 
+    -- EPUB 3 Navigation Document and EPUB 2 NCX must describe the same tree.
+    -- Spine and XHTML filenames retain their original order and identifiers.
+    local nav, ncx, toc_depth = Toc.build(chapters, U.xml, toc_catalog)
     local ident = "miuread-" .. U.id_name(book.bookId or book.book_id)
     local opf = '<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" unique-identifier="id" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">'
         .. ident .. '</dc:identifier><dc:title>' .. U.xml(book.title or "MiuRead")
@@ -309,13 +308,14 @@ function E.build(path, book, chapters, css, assets, cover, meta, on_progress)
     entries[#entries + 1] = {
         name = "OEBPS/nav.xhtml",
         source = '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>目录</title></head><body><nav epub:type="toc"><ol>'
-            .. table.concat(nav) .. '</ol></nav></body></html>',
+            .. nav .. '</ol></nav></body></html>',
     }
     entries[#entries + 1] = {
         name = "OEBPS/toc.ncx",
         source = '<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="'
-            .. ident .. '"/></head><docTitle><text>' .. U.xml(book.title or "MiuRead")
-            .. '</text></docTitle><navMap>' .. table.concat(ncx) .. '</navMap></ncx>',
+            .. ident .. '"/><meta name="dtb:depth" content="' .. tostring(toc_depth)
+            .. '"/></head><docTitle><text>' .. U.xml(book.title or "MiuRead")
+            .. '</text></docTitle><navMap>' .. ncx .. '</navMap></ncx>',
     }
     entries[#entries + 1] = {
         name = "OEBPS/style.css",

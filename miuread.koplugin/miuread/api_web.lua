@@ -763,6 +763,23 @@ function Api:review_single(review_id, context)
     return unwrap(data)
 end
 
+-- The replies endpoint is distinct from read-only review state/likes.
+function Api:review_comments(review_id,context)
+    local id=tostring(review_id or "")
+    if id=="" then error("reviewId missing") end
+    context=type(context)=="table" and context or {}
+    local url="https://weread.qq.com/web/review/single?reviewId="..Protocol.escape(id)
+        .."&commentsCount=50&commentsDirection=0&likesCount=0&synckey=0"
+    return self:_recover_web_once("review_comments",function()
+        return self.http:get_json(url,{
+            headers=annotation_write_headers(context.bookId or context.bookid,
+                context.chapterUid or context.chapteruid),
+            retries=0,rate_limit_retries=0,timeout={10,18},
+            pacing_scope="annotation-read",shared_pacing=true,min_interval=0.35,
+        })
+    end)
+end
+
 function Api:like_review(review_id, is_unlike, context)
     local id = tostring(review_id or "")
     if id == "" then error("reviewId missing") end

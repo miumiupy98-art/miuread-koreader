@@ -300,6 +300,23 @@ function M:send()
         return row.start_time+row.duration<=now
     end)
     if not batch then self.capture_error=err; return false end
+    if #batch.invalid_rows>0 then
+        local isolated,quarantine_error=self.queue:quarantine(vid,batch.invalid_rows,"overlapping_reading_time_hour")
+        if not isolated or isolated==false then
+            self.capture_error=quarantine_error or "quarantine_snapshot_changed"
+            self:log("quarantine","error",{reason=quarantine_error or "quarantine_snapshot_changed",
+                book_id=batch.book_id,request_dispatched=false})
+            self:schedule(60)
+            return false
+        end
+        self.summary_cache=nil
+        self:log("quarantine","error",{reason="overlapping_reading_time_hour",
+            book_id=batch.book_id,seconds=isolated.seconds,rows=isolated.rows,
+            request_dispatched=false})
+        -- Re-evaluate a fresh ledger snapshot before attempting another book.
+        self:schedule(10)
+        return false
+    end
     if #batch.rows==0 then
         self:schedule(60) -- e.g. timestamps still ahead after a clock correction
         return false
@@ -356,9 +373,18 @@ function M:send()
                 or message:find("signature feature invalid",1,true) then reason="signature_token_invalid"
             elseif message:find("config token unavailable",1,true) then reason="config_token_missing"
             elseif message:find("reading_time_position_unavailable",1,true) then reason="position_unavailable"
+            elseif message:find("overlapping reading-time hour",1,true) then reason="overlapping_reading_time_hour"
             elseif Http.is_auth_error(prepared) then reason="authentication"
             elseif Http.is_network_error and Http.is_network_error(prepared) then reason="network" end
             if limited then reason="rate_limited" end
+            if reason=="overlapping_reading_time_hour" then
+                local isolated=self.queue:quarantine_overlap_batch(vid,batch.rows)
+                if type(isolated)=="table" and isolated.rows>0 then
+                    self:log("quarantine","error",{reason=reason,book_id=batch.book_id,
+                        batch_id=id,rows=isolated.rows,seconds=isolated.seconds,request_dispatched=false})
+                    reason="overlapping_reading_time_hour_quarantined"
+                end
+            end
             self:log("preflight",limited and "rate_limited" or "error",{reason=reason,native_stage=phase,
                 book_id=batch.book_id,batch_id=id,status=tonumber(tostring(prepared):match("HTTP (%d+)")),
                 code=limited and limited.code or tonumber(tostring(prepared):match("error_code=(%-?%d+)")),
@@ -405,6 +431,7 @@ function M:send()
         end
         self:log("receipt",result.state,{book_id=batch.book_id,batch_id=id,seconds=batch.seconds,
             rows=#batch.rows,reason=result.error,code=result.code,status=result.status,
+            request_dispatched=result.dispatched,local_cooldown=result.local_cooldown,wait_seconds=result.retry_after,
             elapsed_ms=math.floor((Log.now()-started)*1000)})
         return result
     end,function(result)

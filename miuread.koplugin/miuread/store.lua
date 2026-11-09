@@ -1558,7 +1558,10 @@ function Store:set(k,v)
     if self._migration_batch==true then return true end
     return self:flush("set:"..tostring(k))
 end
-function Store:set_deferred(k,v) self.db:saveSetting(k,v) end
+function Store:set_deferred(k,v)
+    self._deferred_dirty=true
+    self.db:saveSetting(k,v)
+end
 local function sanitized_auth(value)
     local auth=U.merge(defaults.auth,value or {})
     auth.auth_revision=math.max(0,tonumber(auth.auth_revision or 0) or 0)
@@ -2023,6 +2026,110 @@ local function filename_key(path)
     return name:gsub("　", "")
 end
 
+local function zip_u16(data,pos)
+    local a,b=data:byte(pos,pos+1)
+    if not a or not b then return nil end
+    return a+b*256
+end
+
+local function zip_u32(data,pos)
+    local a,b,c,d=data:byte(pos,pos+3)
+    if not a or not b or not c or not d then return nil end
+    return a+b*256+c*65536+d*16777216
+end
+
+local function zip_probe_miuread_entries(path)
+    local file=io.open(path,"rb")
+    if not file then return nil end
+    local size=file:seek("end") or 0
+    if size<22 then file:close(); return nil end
+    local tail_len=math.min(size,65558)
+    local tail_offset=size-tail_len
+    file:seek("set",tail_offset)
+    local tail=file:read(tail_len) or ""
+    local marker,at=nil,1
+    while true do
+        local found=tail:find("PK\005\006",at,true)
+        if not found then break end
+        marker=found; at=found+1
+    end
+    if not marker or marker+21>#tail then file:close(); return nil end
+    local count=zip_u16(tail,marker+10)
+    local central_size=zip_u32(tail,marker+12)
+    local central_offset=zip_u32(tail,marker+16)
+    if not count or not central_size or not central_offset
+        or count==0xFFFF or central_size==0xFFFFFFFF or central_offset==0xFFFFFFFF
+        or central_offset+central_size>size then
+        file:close(); return nil
+    end
+    local cd_data
+    if central_size==0 then
+        cd_data=""
+    elseif central_offset>=tail_offset then
+        local start_idx=(central_offset-tail_offset)+1
+        cd_data=tail:sub(start_idx,start_idx+central_size-1)
+        if #cd_data~=central_size then file:close(); return nil end
+    else
+        file:seek("set",central_offset)
+        cd_data=file:read(central_size) or ""
+        if #cd_data~=central_size then file:close(); return nil end
+    end
+    local entries={}
+    local pos=1
+    for _=1,count do
+        if pos+45>#cd_data or cd_data:sub(pos,pos+3)~="PK\001\002" then
+            file:close(); return nil
+        end
+        local method=zip_u16(cd_data,pos+10) or -1
+        local compressed=zip_u32(cd_data,pos+20) or 0
+        local uncompressed=zip_u32(cd_data,pos+24) or 0
+        local name_len=zip_u16(cd_data,pos+28) or 0
+        local extra_len=zip_u16(cd_data,pos+30) or 0
+        local comment_len=zip_u16(cd_data,pos+32) or 0
+        local local_offset=zip_u32(cd_data,pos+42)
+        local name_start=pos+46
+        local name_end=name_start+name_len-1
+        local next_pos=name_end+extra_len+comment_len+1
+        if not local_offset or name_end>#cd_data or next_pos-1>#cd_data then
+            file:close(); return nil
+        end
+        local name=cd_data:sub(name_start,name_end)
+        if name=="OEBPS/miuread.json" or name=="OEBPS/package.opf" then
+            entries[name]={
+                method=method,
+                compressed=compressed,
+                uncompressed=uncompressed,
+                offset=local_offset,
+            }
+        end
+        pos=next_pos
+    end
+    local contents={}
+    for _,target in ipairs({"OEBPS/miuread.json","OEBPS/package.opf"}) do
+        local entry=entries[target]
+        if entry and entry.method==0 and entry.uncompressed==entry.compressed
+            and entry.uncompressed>=0 and entry.uncompressed<=262144
+            and entry.offset+30+entry.uncompressed<=size then
+            file:seek("set",entry.offset)
+            local header=file:read(30)
+            if header and #header==30 and header:sub(1,4)=="PK\003\004" then
+                local name_len=zip_u16(header,27) or 0
+                local extra_len=zip_u16(header,29) or 0
+                local data_offset=entry.offset+30+name_len+extra_len
+                if data_offset+entry.uncompressed<=size then
+                    file:seek("set",data_offset)
+                    local data=file:read(entry.uncompressed)
+                    if data and #data==entry.uncompressed then
+                        contents[target]=data
+                    end
+                end
+            end
+        end
+    end
+    file:close()
+    return {is_zip=true,entries=entries,contents=contents}
+end
+
 local function identity_from_blob(blob,identity)
     blob=tostring(blob or "")
     identity=type(identity)=="table" and identity or {}
@@ -2043,13 +2150,47 @@ local function identity_from_blob(blob,identity)
         or tonumber(blob:match('"progress_source_book_version"%s*:%s*(%d+)'))
     if identity.standalone==nil and blob:match('"standalone"%s*:%s*true') then identity.standalone=true end
     identity.chapter_uid=identity.chapter_uid or blob:match('"chapter_uid"%s*:%s*"?([^",}%s]+)')
-    identity.title=identity.title or xml_unescape(blob:match("<dc:title[^>]*>(.-)</dc:title>"))
-    identity.author=identity.author or xml_unescape(blob:match("<dc:creator[^>]*>(.-)</dc:creator>"))
+    local title_match=blob:match("<dc:title[^>]*>(.-)</dc:title>")
+    if tostring(identity.title or "")=="" and title_match then
+        identity.title=xml_unescape(title_match)
+    elseif identity.title==nil then
+        identity.title=""
+    end
+    local author_match=blob:match("<dc:creator[^>]*>(.-)</dc:creator>")
+    if tostring(identity.author or "")=="" and author_match then
+        identity.author=xml_unescape(author_match)
+    elseif identity.author==nil then
+        identity.author=""
+    end
     return identity
 end
 
-function Store:epub_identity_light(path)
+function Store:epub_identity_light(path,require_book_id)
     if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
+    local probe=zip_probe_miuread_entries(path)
+    if probe and probe.is_zip then
+        local raw_json=probe.contents["OEBPS/miuread.json"]
+        local raw_opf=probe.contents["OEBPS/package.opf"]
+        local identity={}
+        if raw_json then
+            identity=identity_from_blob(raw_json,identity)
+            local ok,value=pcall(Json.decode,raw_json)
+            if ok and type(value)=="table" then identity=U.merge(identity,value) end
+        end
+        if raw_opf then
+            identity=identity_from_blob(raw_opf,identity)
+        end
+        if require_book_id==true then
+            if tostring(identity.book_id or "")~="" then return identity end
+        else
+            if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
+        end
+        local has_unresolved_json=probe.entries["OEBPS/miuread.json"]~=nil and raw_json==nil
+        local has_unresolved_opf=probe.entries["OEBPS/package.opf"]~=nil and raw_opf==nil
+        if not has_unresolved_json and (require_book_id==true or not has_unresolved_opf) then
+            return nil
+        end
+    end
     local file=io.open(path,"rb")
     if not file then return nil end
     local size=file:seek("end") or 0
@@ -2062,14 +2203,56 @@ function Store:epub_identity_light(path)
     end
     file:close()
     local identity=identity_from_blob(head.."\n"..tail,{})
+    if require_book_id==true then
+        if tostring(identity.book_id or "")~="" then return identity end
+        return nil
+    end
     if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
     return nil
 end
 
-function Store:epub_identity(path)
-    local identity=self:epub_identity_light(path) or {}
-    if tostring(identity.book_id or "")~="" then return identity end
+function Store:epub_identity(path,require_book_id)
     if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return nil end
+    local probe=zip_probe_miuread_entries(path)
+    if probe and probe.is_zip then
+        local identity={}
+        local raw_json=probe.contents["OEBPS/miuread.json"]
+        local raw_opf=probe.contents["OEBPS/package.opf"]
+        if raw_json then
+            identity=identity_from_blob(raw_json,identity)
+            local ok,value=pcall(Json.decode,raw_json)
+            if ok and type(value)=="table" then identity=U.merge(identity,value) end
+        end
+        if raw_opf then
+            identity=identity_from_blob(raw_opf,identity)
+        end
+        if tostring(identity.book_id or "")~="" then return identity end
+        local quoted
+        if not raw_json and probe.entries["OEBPS/miuread.json"]~=nil then
+            quoted=quoted or U.shell_quote(path)
+            local raw=read_pipe("unzip -p "..quoted.." OEBPS/miuread.json 2>/dev/null")
+            if raw then
+                identity=identity_from_blob(raw,identity)
+                local ok,value=pcall(Json.decode,raw)
+                if ok and type(value)=="table" then identity=U.merge(identity,value) end
+            end
+        end
+        if tostring(identity.book_id or "")~="" then return identity end
+        if not raw_opf and probe.entries["OEBPS/package.opf"]~=nil
+            and (require_book_id~=true or probe.entries["OEBPS/miuread.json"]~=nil) then
+            quoted=quoted or U.shell_quote(path)
+            local opf=read_pipe("unzip -p "..quoted.." OEBPS/package.opf 2>/dev/null")
+            if opf then identity=identity_from_blob(opf,identity) end
+        end
+        if require_book_id==true then
+            if tostring(identity.book_id or "")~="" then return identity end
+            return nil
+        end
+        if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
+        return nil
+    end
+    local identity=self:epub_identity_light(path,require_book_id) or {}
+    if tostring(identity.book_id or "")~="" then return identity end
     local quoted=U.shell_quote(path)
     local raw=read_pipe("unzip -p "..quoted.." OEBPS/miuread.json 2>/dev/null")
     if raw then
@@ -2078,6 +2261,10 @@ function Store:epub_identity(path)
     end
     local opf=read_pipe("unzip -p "..quoted.." OEBPS/package.opf 2>/dev/null")
     if opf then identity=identity_from_blob(opf,identity) end
+    if require_book_id==true then
+        if tostring(identity.book_id or "")~="" then return identity end
+        return nil
+    end
     if tostring(identity.book_id or "")~="" or tostring(identity.title or "")~="" then return identity end
     return nil
 end
@@ -2382,7 +2569,7 @@ end
 function Store:recover_miuread_file(path,relink)
     local book,record,kind=self:file_record_fast(path,relink)
     if book then return book,record,kind,"record" end
-    local meta=self:epub_identity(path)
+    local meta=self:epub_identity(path,true)
     local book_id=type(meta)=="table" and tostring(meta.book_id or "") or ""
     if book_id=="" then return nil end
     book,record,kind=self:file_record_from_identity(path,meta,relink)
@@ -2859,14 +3046,21 @@ local function settings_equal(a,b,seen)
     if type(a)=="number" and type(b)=="number" then return tostring(a)==tostring(b) end
     if type(a)~="table" or type(b)~="table" then return false end
     seen=seen or {}
-    if seen[a]==b then return true end
+    if seen[a]~=nil then return seen[a]==b end
     seen[a]=b
     for key,value in pairs(a) do
-        if not settings_equal(value,b[key],seen) then return false end
+        if not settings_equal(value,b[key],seen) then
+            seen[a]=nil
+            return false
+        end
     end
     for key in pairs(b) do
-        if a[key]==nil then return false end
+        if a[key]==nil then
+            seen[a]=nil
+            return false
+        end
     end
+    seen[a]=nil
     return true
 end
 
@@ -2877,23 +3071,39 @@ end
 -- depth they have in the file, so the joined chunk is valid exactly when every
 -- entry is. Returns nil when compact serialization cannot represent the data,
 -- or nil plus the parse error when an entry is invalid.
-local function incremental_settings_payload(data,path,previous_entries)
+local function incremental_settings_payload(data,path,previous_entries,disk_data)
     local entries,parts,parsed={},{},{}
+    local changed=type(previous_entries)~="table" or type(disk_data)~="table"
     for key,value in pairs(data) do
         local entry=previous_entries and previous_entries[key]
-        if not entry or not settings_equal(value,entry.value) then
+        local old_entry_value=entry and entry.value
+        if not entry or not settings_equal(value,old_entry_value) then
+            if not changed and (old_entry_value==disk_data[key] or not settings_equal(value,disk_data[key])) then
+                changed=true
+            end
             local text=compact_settings({[key]=value})
             if not text then return nil end
             text=text:sub(2,-2)
             local valid,parse_error,wrapped=settings_payload_valid("return {"..text.."}")
             if not valid then return nil,parse_error end
             entry={text=text,value=wrapped[key]}
+        elseif not changed and disk_data[key]~=old_entry_value
+            and not settings_equal(disk_data[key],old_entry_value) then
+            changed=true
         end
         entries[key]=entry
         parts[#parts+1]=entry.text
         parsed[key]=entry.value
     end
-    return "-- "..tostring(path or "").."\nreturn {"..table.concat(parts).."}\n",parsed,entries
+    if not changed and type(disk_data)=="table" then
+        for key in pairs(disk_data) do
+            if data[key]==nil then
+                changed=true
+                break
+            end
+        end
+    end
+    return "-- "..tostring(path or "").."\nreturn {"..table.concat(parts).."}\n",parsed,entries,changed
 end
 
 function Store:flush(reason)
@@ -2922,8 +3132,12 @@ function Store:flush(reason)
     end
     -- Compare with the freshly read file, not a cached dirty flag: callers may
     -- mutate nested settings and detached workers may advance progress on disk.
-    if disk_data and settings_equal(self.db.data,disk_data) then
+    local snapshot=self._validated_settings
+    local previous_entries=type(snapshot)=="table" and snapshot.data==disk_data
+        and type(snapshot.entries)=="table" and snapshot.entries or nil
+    if disk_data and not previous_entries and settings_equal(self.db.data,disk_data) then
         self._pending_home_navigation=nil
+        self._deferred_dirty=false
         local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
         if elapsed_ms>=250 then
             logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
@@ -2931,11 +3145,28 @@ function Store:flush(reason)
         end
         return true
     end
+    local prebuilt_payload,prebuilt_detail,prebuilt_entries
+    local prebuilt_checked=false
+    if disk_data and previous_entries then
+        local changed
+        prebuilt_checked=true
+        prebuilt_payload,prebuilt_detail,prebuilt_entries,changed=incremental_settings_payload(
+            self.db.data,self.settings_path,previous_entries,disk_data)
+        if prebuilt_payload and not changed then
+            self._pending_home_navigation=nil
+            self._deferred_dirty=false
+            local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
+            if elapsed_ms>=250 then
+                logger.info("[MiuRead][StorePerf] settings unchanged","reason=",reason,
+                    "elapsed_ms=",tostring(elapsed_ms))
+            end
+            return true
+        end
+    end
     local previous_path=self.settings_path..".previous"
     if not self.isolated then
         -- When the backup already holds exactly the bytes on disk, a .previous
         -- copy would only duplicate it; keep it whenever that is not known.
-        local snapshot=self._validated_settings
         local backup_matches=disk_data~=nil and snapshot~=nil and snapshot.data==disk_data
             and snapshot.backed_up==true
         if disk_data and not backup_matches then U.copy_file(self.settings_path,previous_path) end
@@ -2946,10 +3177,17 @@ function Store:flush(reason)
     -- Validate the complete chunk in memory, atomically replace the target, and
     -- keep the last valid generation if anything fails.
     local payload,validated_data,validated_entries
-    local previous_entries=self._validated_settings and self._validated_settings.entries
+    local all_previous_entries=self._validated_settings and self._validated_settings.entries
     local function attempt_write()
-        local built,detail,entries=incremental_settings_payload(
-            self.db.data,self.settings_path,previous_entries)
+        local built,detail,entries
+        if prebuilt_checked then
+            built,detail,entries=prebuilt_payload,prebuilt_detail,prebuilt_entries
+            prebuilt_checked=false
+            prebuilt_payload,prebuilt_detail,prebuilt_entries=nil,nil,nil
+        else
+            built,detail,entries=incremental_settings_payload(
+                self.db.data,self.settings_path,all_previous_entries)
+        end
         if built then
             payload,validated_data,validated_entries=built,detail,entries
         elseif detail then
@@ -3015,6 +3253,7 @@ function Store:flush(reason)
     end
     self._validated_settings={payload=payload,data=validated_data,entries=validated_entries,backed_up=backed_up==true}
     self._pending_home_navigation=nil
+    self._deferred_dirty=false
     local elapsed_ms=math.floor((store_perf_clock()-flush_started)*1000+0.5)
     if elapsed_ms>=250 or reason=="set:auth" then
         logger.info("[MiuRead][StorePerf] full settings flush",
@@ -3070,6 +3309,7 @@ function Store:reload()
     -- Reload fresh worker results without discarding deferred tab/page choices.
     -- Only navigation is overlaid; all other settings and library data reload.
     restore_home_navigation(self,navigation)
+    self._deferred_dirty=false
     if not self.isolated then
         local valid=self:_read_settings_file()~=nil
         local snapshot=self._validated_settings

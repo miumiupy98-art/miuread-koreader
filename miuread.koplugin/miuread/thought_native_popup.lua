@@ -1187,7 +1187,7 @@ function NativePopup:_is_current_favorite(comment)
 end
 
 function NativePopup:_action_texts(comment)
-    return {"复制评论","复制原文+评论",self:_is_current_favorite(comment) and "取消收藏" or "收藏"}
+    return {"复制评论","复制原文+评论",self:_is_current_favorite(comment) and "取消收藏" or "收藏", "查看回复"}
 end
 
 function NativePopup:_handle_action(index,comment)
@@ -1202,6 +1202,15 @@ function NativePopup:_handle_action(index,comment)
     end
     if index==3 and type(self.toggle_favorite_callback)=="function" then
         pcall(self.toggle_favorite_callback,comment,self.source_text)
+        return true
+    end
+    if index==4 and type(self.on_replies_callback)=="function" then
+        local review_id=tostring(comment.review_id or "")
+        if review_id~="" then
+            local open_replies=self.on_replies_callback
+            self:_close()
+            UIManager:nextTick(function() open_replies(comment) end)
+        end
         return true
     end
     return true
@@ -1233,6 +1242,7 @@ function NativePopup:_show_action_menu(comment)
             {{text=texts[1],callback=function() return run(1) end}},
             {{text=texts[2],callback=function() return run(2) end}},
             {{text=texts[3],callback=function() return run(3) end}},
+            {{text=texts[4],callback=function() return run(4) end}},
         },
         close_callback=function()
             if self.action_dialog==dialog then self.action_dialog=nil end
@@ -1704,6 +1714,7 @@ function NativePopup:_reopen(opts)
     self.on_close_callback = opts.on_close
     self.on_interact_callback = opts.on_interact
     self.on_like_callback = opts.on_like
+    self.on_replies_callback = opts.on_replies
     self.on_error_callback = opts.on_error
     self.is_favorite_callback = opts.is_favorite_callback
     self.toggle_favorite_callback = opts.toggle_favorite_callback
@@ -1746,6 +1757,7 @@ function M.show(opts)
             on_close_callback = opts.on_close,
             on_interact_callback = opts.on_interact,
             on_like_callback = opts.on_like,
+            on_replies_callback = opts.on_replies,
             on_error_callback = opts.on_error,
             is_favorite_callback = opts.is_favorite_callback,
             toggle_favorite_callback = opts.toggle_favorite_callback,
@@ -1787,6 +1799,7 @@ function M.cleanup()
         popup.on_close_callback = nil
         popup.on_interact_callback = nil
         popup.on_like_callback = nil
+        popup.on_replies_callback = nil
         popup.on_error_callback = nil
         if popup[1] and type(popup[1].free) == "function" then
             pcall(popup[1].free, popup[1])

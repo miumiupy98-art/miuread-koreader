@@ -340,6 +340,9 @@ function DownloadTask:pause(reason)
     reason=tostring(reason or "manual")
     self:_cancel_deferred_resume(reason)
     local path=self:_control_pause_path()
+    if not path and TRANSIENT_PAUSE_REASONS and TRANSIENT_PAUSE_REASONS[reason] then
+        return false
+    end
     local reasons=self:_merged_pause_reasons(path)
     reasons[reason]=true
     local wrote=self:_write_pause_marker(path,reasons)
@@ -371,6 +374,12 @@ end
 function DownloadTask:resume(reason)
     local key=reason and tostring(reason) or nil
     if key and TRANSIENT_PAUSE_REASONS and TRANSIENT_PAUSE_REASONS[key] then
+        local path=self:_control_pause_path()
+        local reasons=self:_merged_pause_reasons(path)
+        local pending=self.deferred_resume_tasks and self.deferred_resume_tasks[key]~=nil
+        if not reasons[key] and not pending then
+            return next(reasons)==nil
+        end
         self:_cancel_deferred_resume(key)
         local delay=math.max(.5,tonumber(Config.DOWNLOAD_INTERACTION_RESUME_DELAY) or 2.5)
         local task
