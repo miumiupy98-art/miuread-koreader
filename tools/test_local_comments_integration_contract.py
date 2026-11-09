@@ -6,10 +6,16 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PLUG = ROOT / 'miuread.koplugin'
 
-class Beta27ContractTest(unittest.TestCase):
+class LocalCommentsContractTest(unittest.TestCase):
     def test_version_and_modules(self):
-        self.assertIn('6.5.0-beta.27', (PLUG / '_meta.lua').read_text())
-        self.assertIn('6.5.0-beta.27', (PLUG / 'miuread/config.lua').read_text())
+        meta = (PLUG / '_meta.lua').read_text(encoding='utf-8')
+        config = (PLUG / 'miuread/config.lua').read_text(encoding='utf-8')
+        version_re = r'\b(?:version|VERSION)\s*=\s*[\"](\d+\.\d+\.\d+-beta\.\d+)[\"]'
+        meta_version = re.search(version_re, meta)
+        config_version = re.search(version_re, config)
+        self.assertIsNotNone(meta_version)
+        self.assertIsNotNone(config_version)
+        self.assertEqual(meta_version.group(1), config_version.group(1))
         for name in ('local_book_binding', 'local_chapter_map', 'review_replies'):
             self.assertTrue((PLUG / f'miuread/{name}.lua').is_file(), name)
 
@@ -32,6 +38,12 @@ class Beta27ContractTest(unittest.TestCase):
         self.assertIn('record.location_save(written)', locator)
         self.assertIn('chapter_public_reviews={phase="annotations",web_only=true}', api)
         self.assertIn('review_comments={phase="annotations",web_only=true}', api)
+
+    def test_beta_ci_runs_local_comments_regressions(self):
+        workflow = (ROOT / '.github/workflows/release-beta.yml').read_text(encoding='utf-8')
+        self.assertIn('luajit tools/test_local_comments_beta27.lua', workflow)
+        self.assertIn('luajit tools/test_imported_public_comments.lua', workflow)
+        self.assertIn('python3 -m unittest tools/test_local_comments_integration_contract.py -v', workflow)
 
 if __name__ == '__main__':
     unittest.main()

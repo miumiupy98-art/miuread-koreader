@@ -139,6 +139,7 @@ load_plugin_methods(ROOT,{
     "_finish_page_transition",
     "_record_recent_read",
     "_abort_rebuild_candidate_on_filemanager",
+    "_local_comment_enabled",
     "onReaderReady",
     "onPageUpdate",
     "onCloseDocument",
@@ -153,6 +154,9 @@ local function new_plugin(opts)
     local state_refresh_calls=0
     local gesture_guard_calls=0
     local excerpt_calls=0
+    local overlay_install_calls=0
+    local overlay_refresh_calls=0
+    local cloud_page_calls=0
     local recent_persisted_calls=0
     local prefetch_prune_calls=0
     local flush_calls=0
@@ -194,7 +198,7 @@ local function new_plugin(opts)
             end,
         },
         sync={
-            on_page=function() end,
+            on_page=function() cloud_page_calls=cloud_page_calls+1 end,
             on_reader_ready=function() end,
         },
         _home_enabled=function() return opts.desktop_mode==true end,
@@ -232,6 +236,14 @@ local function new_plugin(opts)
         _ensure_reader_transition_guard=function() end,
         _reader_session_is_weread=function() return opts.is_weread==true end,
         _reader_session_kind=function() return opts.is_weread and "weread" or "local" end,
+        -- The real _local_comment_enabled() method is loaded from main.lua above.
+        -- Only its storage dependency is stubbed, so this test exercises the actual predicate.
+        _local_comment_entry=function()
+            if opts.local_comment_bound==true then
+                return {books={{book_id="fixture-book"}}}
+            end
+            return nil
+        end,
         _arm_reader_gesture_guard=function()
             gesture_guard_calls=gesture_guard_calls+1
         end,
@@ -251,9 +263,9 @@ local function new_plugin(opts)
         _schedule_chapter_navigation_context=function() end,
         _schedule_chapter_prefetch=function() end,
         _teardown_thought_tap=function() end,
-        _install_comment_overlay=function() end,
+        _install_comment_overlay=function() overlay_install_calls=overlay_install_calls+1 end,
         _schedule_thought_prewarm=function() end,
-        _schedule_comment_overlay_refresh=function() end,
+        _schedule_comment_overlay_refresh=function() overlay_refresh_calls=overlay_refresh_calls+1 end,
         _cancel_next_comment_preload=function() end,
         _cancel_comment_range_task=function() end,
         _teardown_comment_overlay=function() end,
@@ -282,6 +294,9 @@ local function new_plugin(opts)
                 state_refresh_calls=state_refresh_calls,
                 gesture_guard_calls=gesture_guard_calls,
                 excerpt_calls=excerpt_calls,
+                overlay_install_calls=overlay_install_calls,
+                overlay_refresh_calls=overlay_refresh_calls,
+                cloud_page_calls=cloud_page_calls,
                 recent_persisted_calls=recent_persisted_calls,
                 prefetch_prune_calls=prefetch_prune_calls,
                 flush_calls=flush_calls,
@@ -327,6 +342,27 @@ do
     assert(p:_reader_toolbar_cache().page==42,"onPageUpdate must still update cache.page in memory")
     assert(#scheduled==0,"toolbar state refresh timer must not be scheduled when toolbar is disabled")
     assert(p:_counters().state_refresh_calls==0,"state cache must not be refreshed when toolbar is disabled")
+    assert(p:_counters().overlay_refresh_calls==0,"unbound local EPUB must not refresh comment overlay")
+    assert(p:_counters().cloud_page_calls==0,"unbound local EPUB must not post a cloud page event")
+end
+
+-- 2b. Bound local EPUB refreshes community comment overlay without entering cloud sync.
+do
+    scheduled={}
+    unscheduled={}
+    local p=new_plugin({
+        local_comment_bound=true,
+        is_weread=false,
+        desktop_mode=false,
+        raw_prefs={reader_ui={enabled=true,plugin_mode_enabled=false}},
+    })
+    assert(p:_local_comment_enabled()==true,"local EPUB fixture should use actual binding predicate")
+    p:onPageUpdate(43)
+    local c=p:_counters()
+    assert(p:_reader_toolbar_cache().page==43,"bound local EPUB must update page cache")
+    assert(c.overlay_refresh_calls==1,"bound local EPUB should schedule one overlay refresh")
+    assert(c.cloud_page_calls==0,"bound local EPUB must not invoke WeRead page synchronization")
+    assert(#scheduled==0,"bound local EPUB with toolbar off must not schedule toolbar timers")
 end
 
 -- 3. Toolbar enabled: _sync_reader_toolbar_hooks schedules refresh, and _show_reader_quick_panel_now populates on demand

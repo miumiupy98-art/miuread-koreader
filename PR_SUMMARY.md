@@ -1,41 +1,35 @@
-# GitHub Pull Request — MiuRead v6.5.0-beta.27
+# GitHub Pull Request — MiuRead v6.5.0-beta.28
 
 ## Title
-feat: support local EPUB WeRead comments, chapter mapping, and thought replies (v6.5.0-beta.27)
+fix(ci): release beta.28 with corrected local EPUB regression fixture and full comment tests
 
 ## Summary
-- Add **local EPUB → WeRead book** binding via book search or explicit `bookId`. Store multiple book associations per local EPUB, with unlink and manual chapter assignment.
-- Match remote chapters by normalized local TOC heading; allow **multiple remote chapters per local TOC entry**. Provide explicit cached-quote assisted matching when at least two distinct excerpts are found in the current local chapter.
-- Reuse existing MiuRead comment fetch Worker, shared `ThoughtDatabase`/SQLite and reader comment overlay. Project excerpts into **the local EPUB's own XPointer positions** without modifying source EPUB bytes; keep local position cache namespaced by EPUB fingerprint, remote book, chapter, local TOC index.
-- Add read-only `/web/review/single` replies to the existing native thought popup's action menu; disk-cache normalized replies for 30 minutes, with offline reuse.
-- Wire `chapter_public_reviews` to the unified API and query a bounded chapter public feed if an explicit comment fetch returns no underlines. Use this in both reader-triggered and download-with-comments flows.
-- Add the same comment navigation from the built-in KOReader plugin menu. Preserve the normal cloud reader, readtime reporting, sync, downloader core, schema **136**, GitHub Actions and auto-tag workflow.
+- Advance the beta version to **6.5.0-beta.28**, with a changelog entry covering the CI correction and completed local EPUB community comment integration carried forward from beta.27.
+- Include the corrected `tools/test_reader_local_book_isolation.lua` from the beta.27 CI fix. The test now loads the actual `_local_comment_enabled` method from `main.lua` and simulates bound/unbound local EPUBs, instead of failing because its reduced test plugin lacks that method.
+- Extend the existing **Verify Lua syntax and scoped regressions before publishing** step to execute the beta.27 feature regressions (`test_local_comments_beta27.lua`, `test_imported_public_comments.lua`, and the integration-contract Python suite).
+- Generalize the integration-contract version assertion to check that the manifest-facing `_meta.lua` and `config.lua` versions match; rename it to `test_local_comments_integration_contract.py` to avoid baking beta.27 into future releases.
+- Preserve the existing manual and auto-Tag release paths, package naming, full archive manifest, release issue handling, OTA beta-channel, and existing KOReader plugin runtime behavior.
 
-## Principal files changed
-- `miuread.koplugin/main.lua` — reader UI actions, local binding and range-fetch entry points, overlay lifecycle, replies callback.
-- `miuread.koplugin/miuread/local_book_binding.lua` **new** — persistent EPUB fingerprint, multi-book bindings, manual maps and local location cache.
-- `miuread.koplugin/miuread/local_chapter_map.lua` **new** — TOC normalization, title matching, quote evidence and XPointer bounds.
-- `miuread.koplugin/miuread/review_replies.lua` **new** — reply normalization and disk caching.
-- `miuread.koplugin/miuread/api.lua`, `api_web.lua`, `annotations.lua` — supplementary public reviews and individual thought replies.
-- `miuread.koplugin/miuread/comment_locator.lua`, `comment_sync.lua`, `downloader.lua`, `thought_native_popup.lua`, `plugin_menu.lua` — minimal calls/integration and UI menu.
-- `miuread.koplugin/miuread/config.lua`, `miuread.koplugin/_meta.lua`, `CHANGELOG.md`, `README.md` — bump version and document usage.
-- `tools/test_local_comments_beta27.lua`, `tools/test_imported_public_comments.lua`, `tools/test_beta27_integration_contract.py` **new** — offline regression and structure checks.
+## Changed files relative to the corrected beta.27 source
+- `miuread.koplugin/_meta.lua`: version only.
+- `miuread.koplugin/miuread/config.lua`: version only.
+- `.github/workflows/release-beta.yml`: run the three local-comments regression suites before packaging.
+- `tools/test_local_comments_integration_contract.py`: rename and generalize previous beta.27 integration contract; verify CI includes all three tests.
+- `tools/test_beta27_integration_contract.py`: removed after rename.
+- `CHANGELOG.md`, `README.md`, `PR_SUMMARY.md`: release metadata and documentation.
 
-## Validation
-- Lua parser (`texlua loadfile`): 180 plugin Lua files, **0 parse failures**.
-- `tools/test_local_comments_beta27.lua`: **PASS** (bind/persist, multiple books, manual/title/quote matching, separate location caches, reply parser/cache).
-- `tools/test_imported_public_comments.lua`: **PASS** (empty underlines fallback, dedupe, network errors and normal range parsing).
-- Existing EPUB, readtime and release automation tests: **PASS** when compatible with available test runtime.
-- `tools/test_beta27_integration_contract.py`: **PASS** (version, wiring and no changes to Actions/automatic release configuration).
-- Real WeRead server calls, end-to-end Kindle/KOReader gestures, E-Ink redraw, and release workflows in GitHub are **NOT YET VERIFIED**.
+## Tests and validation
+- Existing fixture fix for `tools/test_reader_local_book_isolation.lua` is present in the release base.
+- Local plugin Lua syntax and executable mock tests must pass on GitHub Actions' **LuaJIT** runner before the full ZIP is published.
+- Python contract and release issue automation tests should pass without network calls.
+- A local package ZIP and SHA-256 digest are generated from the same `tools/build_package.py` used by the release workflow.
+- Actual WeRead network responses and Kindle/KOReader gestures remain unverified until device testing.
 
-## Caveats / QA required
-- Private WeRead uploads may not expose public reviews; an empty feed is not proof no reviews exist, nor an exhaustive list of all historical replies.
-- Different text editions/translations might be readable in the comment list but **not** have precise in-text markers. Current implementation supports reflowable EPUB and TOC-based chapters.
-- Test actual search, association, chapter fetch, inline mark taps, reply dialog and pause/recovery on hardware before production publication.
-- KOReader LuaJIT/Linux runtime is not fully replicated by the available `texlua` runner; two legacy suites requiring LuaJIT (`bit` and Lua 5.1 `setfenv`) were not counted as passing under the normal test invocation.
+## Release steps
+1. Merge the complete beta.28 source into the **beta** branch.
+2. Run **Release beta full package** with `workflow_dispatch` on branch `beta` and version `6.5.0-beta.28` (or push a new, immutable `v6.5.0-beta.28` tag pointing at the same commit).
+3. Confirm the Verify Lua step succeeds before expecting the full package or beta-channel manifest to be published.
+4. Do not rerun an older beta.27 failed workflow and expect it to pick up these changes.
 
-## Release and issue handling
-- Proposed release: **v6.5.0-beta.27**.
-- No `.github/workflows` or release issue auto-close configuration changes in this PR.
-- Do not close #135 based on these unit tests; its prior real-device verification requirement remains.
+## Scope
+No changes to book downloading, reading-time reporting, position sync, comment protocol, SQLite schema (136), or device UI beyond what is already in beta.27.
