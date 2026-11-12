@@ -92,12 +92,12 @@ function M.refresh(http,store)
     local current=store:auth()
     local vid,session=account(auth)
     local current_vid,current_session=account(current)
-    if current_vid~=vid or current_session~=session
-        or tonumber(current.auth_revision or 0)~=tonumber(auth.auth_revision or 0) then
+    if current_vid~=vid or current_session~=session then
         error("登录账号或凭据已变更，已忽略客户端续期")
     end
     current.native_shelf=renewed
-    local saved=store:save_auth(current,{expected_revision=tonumber(auth.auth_revision or 0) or 0})
+    local current_revision=tonumber(current.auth_revision or 0) or 0
+    local saved=store:save_auth(current,{expected_revision=current_revision})
     if saved~=true then error("客户端续期凭证未保存，请重试授权") end
     return renewed
 end

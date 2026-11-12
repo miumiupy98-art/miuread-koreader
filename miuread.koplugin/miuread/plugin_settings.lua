@@ -197,6 +197,7 @@ end
 
 function M.menu(plugin)
     local rows={
+        {text="微信读书账号",post_text=plugin:_account_status_label(),sub_item_table_func=function() return plugin:account_menu() end},
         {text="阅读与书库",sub_item_table_func=function() return M.reading_library(plugin) end},
         {text="同步与下载",sub_item_table_func=function() return M.sync_download(plugin) end},
     }
