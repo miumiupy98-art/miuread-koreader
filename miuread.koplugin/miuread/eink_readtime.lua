@@ -59,11 +59,15 @@ function M.send(http,prepared,before_dispatch)
     -- state; neither restarting nor reconnecting may replay these seconds.
     local text=not ok and tostring(value) or ""
     local limited=not ok and Http.rate_limit_details(value)
+    local is_auth=not ok and Http.is_auth_error(value)
     local code=type(value)=="table" and tonumber(value.errCode or value.errcode)
         or tonumber(text:match("error_code=(%-?%d+)"))
-    return {state=dispatched and "unknown" or "pending",dispatched=dispatched,error=limited and "rate_limited"
+    -- Authentication errors reject the request before write commitment; keep them
+    -- pending so they can be retried once authorization is renewed.
+    local state=(dispatched and not is_auth) and "unknown" or "pending"
+    return {state=state,dispatched=dispatched,error=limited and "rate_limited"
         or (not dispatched and "claim_failed")
-        or (not ok and Http.is_auth_error(value) and "authentication")
+        or (is_auth and "authentication")
         or (ok and "unconfirmed_response" or "request_failed"),
         retry_after=limited and limited.wait_seconds,
         local_cooldown=limited and limited.local_cooldown,

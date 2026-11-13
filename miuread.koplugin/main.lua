@@ -1767,7 +1767,24 @@ function Plugin:logged_in()
 end
 function Plugin:require_login()
     if not self:logged_in() then
-        self:info(_("Not logged in"))
+        local dialog
+        local function close()
+            if dialog then UIManager:close(dialog) end
+        end
+        dialog=ButtonDialog:new{
+            title="未登录微信读书\n\n请先扫码登录后再使用此功能。",
+            title_align="center",
+            buttons={
+                {{text="扫码登录",callback=function()
+                    close()
+                    if self.auth_flow and type(self.auth_flow.start)=="function" then
+                        self.auth_flow:start()
+                    end
+                end}},
+                {{text="取消",callback=close}},
+            },
+        }
+        UIManager:show(dialog)
         return false
     end
     return true
@@ -2158,7 +2175,17 @@ function Plugin:check_eink_authorization()
         local http=ChildHttp:new(child_store)
         local ok,value=pcall(http.get_json,http,"https://i.weread.qq.com/shelf/sync",
             Shelf.request_options(credential,{5,10}))
-        return {authorized=ok and type(value)=="table" and type(value.books)=="table",
+        if not ok and ChildHttp.is_auth_error(value) then
+            local renewed,new_cred=pcall(Shelf.refresh,http,child_store)
+            if renewed and new_cred then
+                credential=new_cred
+                ok,value=pcall(http.get_json,http,"https://i.weread.qq.com/shelf/sync",
+                    Shelf.request_options(credential,{5,10}))
+            end
+        end
+        local authorized=ok and type(value)=="table" and type(value.books)=="table"
+        return {authorized=authorized,
+            auth=authorized and child_store:auth() or nil,
             reason=ok and "unexpected_response" or tostring(value)}
     end,function(result)
         local now_auth=self.store:auth()
@@ -2169,6 +2196,16 @@ function Plugin:check_eink_authorization()
         self._eink_auth_check_at=os.time()
         self._eink_auth_check_ok=type(value)=="table" and value.authorized==true
         if self._eink_auth_check_ok then
+            if value.auth and type(value.auth.native_shelf)=="table" then
+                now_auth.native_shelf=value.auth.native_shelf
+                self.store:save_auth(now_auth)
+            end
+            if self.sync and type(self.sync.offline_time_controller)=="function" then
+                local controller=self.sync:offline_time_controller()
+                if controller and type(controller.authorization_restored)=="function" then
+                    controller:authorization_restored(self)
+                end
+            end
             self:status_toast("E-Ink 授权","服务器验证成功",3)
         else
             self:status_toast("E-Ink 授权","验证失败，请重新扫码或稍后重试",4)
@@ -12999,7 +13036,7 @@ function Plugin:show_home_quick_panel(more_expanded)
         miuread_settings={icon="⚙",icon_key="settings",label="觅阅设置",detail="",callback=function() self:_show_home_settings_center() end},
         koreader_settings={icon="⚙",icon_key="settings",label="KO设置",detail="",callback=function() self:_show_native_koreader_menu() end},
         koreader_file_manager={icon="▤",icon_key="file-manager",label="文件",detail="",callback=function() self:_home_open_koreader_filemanager(self:_home_root(),true) end},
-        return_koreader={icon="←",icon_key="return",label="返回",detail="",callback=function() self:_home_close_to_native(true) end},
+        return_koreader={icon="←",icon_key="return",label="返回KO",detail="",callback=function() self:_home_close_to_native(true) end},
         quit={icon="⏻",icon_key="quit",label="退出",detail="",callback=function(anchor) self:_quit_koreader(false,anchor) end},
         restart={icon="↺",icon_key="restart",label="重启",detail="",callback=function() self:_restart_koreader("home quick panel") end},
     }
