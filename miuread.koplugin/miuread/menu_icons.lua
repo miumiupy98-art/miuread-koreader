@@ -23,7 +23,7 @@ local EXACT={
     ["时间与时区"]="history",["锁屏壁纸"]="sleep",["觅阅阅读工具栏"]="tools",
     ["阅读与书库"]="book",["运行与兼容"]="device",["运行模式"]="device",["性能与兼容性"]="tools",
     ["使用提醒"]="info",["恢复全部使用提醒"]="refresh",
-    ["账号"]="user",["账号管理"]="user",["账号状态"]="user",["扫码登录"]="qr-code",
+    ["账号"]="user",["账号管理"]="user",["账号状态"]="user",["微信读书账号"]="user",["扫码登录"]="qr-code",
     ["重新扫码登录"]="qr-code",["退出登录"]="power-off",["基础登录"]="user",
     ["微信分组"]="folder",["接口通道"]="swap",["存储"]="file-manager",["存储管理"]="file-manager",
     ["运行与兼容"]="device",["系统维护"]="repair",["插件设置"]="settings",["觅阅设置"]="settings",

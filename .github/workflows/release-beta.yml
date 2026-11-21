@@ -320,6 +320,7 @@ jobs:
           luajit tools/test_imported_public_comments.lua
           luajit tools/test_readtime_batch_safety.lua
           luajit tools/test_readtime_controller_quarantine.lua
+          luajit tools/test_issue191_192_regression.lua
           luajit tools/test_epub_multilevel_toc.lua "$RUNNER_TEMP/issue135-levels.epub"
           luajit tools/test_issue135_catalog_pipeline.lua
           luajit tools/test_issue135_navigation_edge_cases.lua "$RUNNER_TEMP/issue135-anchors.xhtml"

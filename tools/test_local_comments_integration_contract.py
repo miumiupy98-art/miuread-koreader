@@ -10,7 +10,7 @@ class LocalCommentsContractTest(unittest.TestCase):
     def test_version_and_modules(self):
         meta = (PLUG / '_meta.lua').read_text(encoding='utf-8')
         config = (PLUG / 'miuread/config.lua').read_text(encoding='utf-8')
-        version_re = r'\b(?:version|VERSION)\s*=\s*[\"](\d+\.\d+\.\d+-beta\.\d+)[\"]'
+        version_re = r'\b(?:version|VERSION)\s*=\s*[\"](\d+\.\d+\.\d+(?:-beta\.\d+)?)[\"]'
         meta_version = re.search(version_re, meta)
         config_version = re.search(version_re, config)
         self.assertIsNotNone(meta_version)

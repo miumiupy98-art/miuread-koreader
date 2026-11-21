@@ -246,11 +246,17 @@ function M:adopt_auth(vid)
     local current=self.store:auth()
     local ok,saved=pcall(self.store.read_persisted,self.store,"auth")
     if ok and type(saved)=="table" and auth_account(saved)==vid and auth_account(current)==vid
-        and tostring(saved.login_session_id or "")==tostring(current.login_session_id or "")
-        and (tonumber(saved.auth_revision) or 0)>=(tonumber(current.auth_revision) or 0) then
-        -- Adopt a worker's successful Native renewal without reloading or
-        -- overwriting unrelated deferred preferences/navigation in the parent.
-        self.store:set_deferred("auth",saved)
+        and tostring(saved.login_session_id or "")==tostring(current.login_session_id or "") then
+        local saved_native=type(saved.native_shelf)=="table" and saved.native_shelf or nil
+        local cur_native=type(current.native_shelf)=="table" and current.native_shelf or nil
+        if (tonumber(saved.auth_revision) or 0)>=(tonumber(current.auth_revision) or 0) then
+            self.store:set_deferred("auth",saved)
+        elseif saved_native and (not cur_native or saved_native.accessToken~=cur_native.accessToken) then
+            -- Adopt a worker's successful Native renewal without discarding
+            -- newer Web authentication revisions in the parent process.
+            current.native_shelf=saved_native
+            self.store:set_deferred("auth",current)
+        end
     end
 end
 function M:send()
