@@ -56,15 +56,21 @@ function M.combine(local_rows,cloud)
                     and tonumber(cloud.checked_at)>(tonumber(row.last_attempt_at) or 0)
                 if not vanished then
                     local use_cloud=current and current.content~="" and row.sync_state=="synced"
+                    local cloud_position=use_cloud and current.chapter_uid and current.chapter_uid~=""
+                        and current.range and current.range~=""
+                    local chapter_uid,range,quote,version=row.chapter_uid,row.range_key,row.selected_text,row.book_version
+                    if cloud_position then
+                        local same_position=chapter_uid==current.chapter_uid and range==current.range
+                        chapter_uid,range=current.chapter_uid,current.range
+                        quote=current.quote and current.quote~="" and current.quote or (same_position and quote or nil)
+                        version=current.book_version or (same_position and version or nil)
+                    end
                     local status=row.sync_state
                     if status=="local_only" and current and row.synced_note~=nil
                         and current.content~=row.synced_note and current.content~=row.note then status="conflict" end
                     merged[#merged+1]={review_id=id,local_id=row.local_id,kind="thought",
                         content=use_cloud and current.content or row.note,
-                        chapter_uid=use_cloud and current.chapter_uid or row.chapter_uid,
-                        book_version=(current and current.book_version) or row.book_version,
-                        range=use_cloud and current.range or row.range_key,
-                        quote=use_cloud and current.quote or row.selected_text,
+                        chapter_uid=chapter_uid,book_version=version,range=range,quote=quote,
                         chapter=use_cloud and current.chapter or "",
                         status=status,updated_at=use_cloud and current.updated_at or row.updated_at,
                         source=row,remote=current}

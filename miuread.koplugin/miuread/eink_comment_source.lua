@@ -21,8 +21,12 @@ local function load(store,id,uid)
     return row
 end
 
-function Source.exists(store,id,uid)
-    return load(store,id,uid)~=nil
+local function version_compatible(row,version)
+    return row and (not version or not row.version or tonumber(row.version)==version)
+end
+
+function Source.exists(store,id,uid,version)
+    return version_compatible(load(store,id,uid),version)
 end
 
 local function visual_body(html)
@@ -83,15 +87,18 @@ local function verify(row,file,id,uid)
     return nil,why
 end
 
-function Source.ensure(reader,store,id,uid,file)
+function Source.ensure(reader,store,id,uid,file,expected_version)
     local cached=load(store,id,uid)
-    if cached and verify(cached,file,id,uid) then return true end
-    local raw,kind=reader:eink_comment_source(id,uid)
+    if version_compatible(cached,expected_version) and verify(cached,file,id,uid) then return true end
+    local raw,kind,version,limited=reader:eink_comment_source(id,uid)
+    if expected_version and (limited or tonumber(version)~=expected_version) then
+        return nil,"eink_comment_book_version_unavailable"
+    end
     if (kind~="html" and kind~="text") or type(raw)~="string" or raw==""
         or #raw>LIMIT or not U.is_valid_utf8(raw) then
         return nil,"eink_source_invalid"
     end
-    local row={raw=raw,kind=kind,book_id=tostring(id),uid=tostring(uid)}
+    local row={raw=raw,kind=kind,book_id=tostring(id),uid=tostring(uid),version=tonumber(version)}
     local proved,err=verify(row,file,id,uid)
     if not proved then return nil,err end
     store:book_dir(id)
@@ -107,6 +114,20 @@ function Source.make_map(raw,kind)
     end
     by_unit[units]=#map.runes+1
     return {map=map,by_unit=by_unit}
+end
+
+-- The annotation endpoint supplies the HTML used by the original ranges.
+-- A download/progress XHTML file can render the same text with different tags
+-- and therefore different raw UTF-16 offsets.
+function Source.personal_alignment(store,id,uid,file,version)
+    local row=load(store,id,uid)
+    if not version_compatible(row,version) then return nil,"source_cache_missing" end
+    if row.kind~="html" then return nil,"eink_comment_source_invalid" end
+    local chapter,err=require("miuread.epub_installer").read_chapter_text_by_uid(file,id,uid)
+    if not chapter then return nil,err end
+    local original,rendered=require("miuread.eink_progress_source").align(row.raw,chapter)
+    if not original then return nil,rendered end
+    return {source=original,rendered=rendered,version=tonumber(row.version)}
 end
 
 function Source.for_document(store,id,uid,file)

@@ -96,6 +96,14 @@ local local_copy={kind="thought",present=true,remote_id="r1",local_id="x",sync_s
     note="Old",synced_note="Old",last_attempt_at=15}
 local visible=Personal.combine({local_copy},snapshot)
 assert(#visible==1 and visible[1].content=="Phone")
+local_copy.chapter_uid,local_copy.range_key,local_copy.book_version="1","12-18",20
+local incomplete={review_id="r1",chapter_uid="",range="",book_version=21,content="Updated"}
+local preserved=Personal.combine({local_copy},{rows={incomplete}})[1]
+assert(preserved.content=="Updated" and preserved.chapter_uid=="1" and preserved.range=="12-18"
+    and preserved.book_version==20)
+incomplete.chapter_uid,incomplete.range,incomplete.book_version="2","3-4",nil
+local moved=Personal.combine({local_copy},{rows={incomplete}})[1]
+assert(moved.chapter_uid=="2" and moved.range=="3-4" and moved.book_version==nil)
 local merged=Personal.popup_rows(visible,{{review_id="r1",content="duplicate"},
     {review_id="r2",content="first public"},{review_id="r3",content="second public"}})
 assert(#merged==3 and merged[1].own and merged[2].review_id=="r2" and merged[3].review_id=="r3")
