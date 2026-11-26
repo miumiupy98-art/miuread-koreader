@@ -17123,30 +17123,104 @@ function Plugin:_personal_cloud_change(book_id,note,action,content,on_return)
         end)
 end
 
-function Plugin:_jump_to_cloud_thought(book_id,note)
+function Plugin:_jump_to_cloud_thought(book_id,note,refreshed,source_loaded)
     local current=self:_current_book_record()
-    if not (current and current.book and current.record and note.chapter_uid and note.chapter_uid~=""
-        and note.range and note.range~="" and self:_annotation_current_book_id()==book_id) then
-        self:info("这条想法暂时无法定位到正文")
+    if not (current and current.book and current.record and self:_annotation_current_book_id()==book_id) then
+        return false
+    end
+    local record=current.record
+    local uid=tostring(note.chapter_uid or "")
+    local range=tostring(note.range or "")
+    local version=tonumber(record.progress_source_book_version)
+    local version_matches=version and version>0 and tonumber(note.book_version)==version
+    local document=self.ui and self.ui.document
+    local account=DownloadDatabase.account_key(self.store)
+    local session=self.store:auth().login_session_id
+    local function still_reading()
+        return self.ui and self.ui.document==document and not reader_close_active()
+            and session==self.store:auth().login_session_id and account==DownloadDatabase.account_key(self.store)
+    end
+    local can_refresh=not refreshed and note.review_id and note.review_id~="" and self:is_online()
+    local function refresh_position()
+        local function get_position(api,id,review_id)
+            return require("miuread.annotation_sync").cloud_thought_position(api,id,review_id) or {}
+        end
+        return self:_fetch_eink_display("thought-position:"..note.review_id,"想法位置",get_position,
+            {book_id,note.review_id},function(position)
+                if not still_reading() then return end
+                logger.info("[MiuRead][ThoughtPosition] detail","book=",book_id,
+                    "chapter=",tostring(position.chapter_uid or "-"),"range_present=",tostring(position.range~=nil),
+                    "reported_version=",tostring(position.book_version or "-"),"file_version=",tostring(version or "-"))
+                if not position.range then return self:info("微信读书的想法详情没有返回正文位置") end
+                local updated=U.copy(note)
+                updated.chapter_uid,updated.range=position.chapter_uid,position.range
+                updated.book_version=position.book_version
+                if U.trim(position.quote)~="" then updated.quote=position.quote end
+                self:_jump_to_cloud_thought(book_id,updated,true)
+            end)
+    end
+    if can_refresh and (not version_matches or uid=="" or range=="") then return refresh_position() end
+    if uid=="" or range=="" then
+        self:info("微信读书的想法详情没有返回正文位置")
         return false
     end
     local path=normalized_reader_file(self:_current_document_path())
-    local uid=tostring(note.chapter_uid)
-    HOME_SESSION.personal_thought_jump={book_id=book_id,chapter_uid=uid,range=note.range,
-        account=DownloadDatabase.account_key(self.store),expires=os.time()+45}
-    local chapter=tostring(current.record.chapter_uid or "")
+    local chapter=tostring(record.chapter_uid or "")
     if chapter~="" and chapter~=uid then
+        local jump={book_id=book_id,chapter_uid=uid,range=range,note=note,refreshed=refreshed,
+            account=account,expires=os.time()+45}
+        HOME_SESSION.personal_thought_jump=jump
         local book=current.book
-        return self:_open_online_toc_chapter({path=path,book_id=book_id,current_uid=chapter,
+        local opened=self:_open_online_toc_chapter({path=path,book_id=book_id,current_uid=chapter,
             book={bookId=book_id,title=book.title,author=book.author,version=book.version,cover=book.cover}},uid)
+        if not opened and HOME_SESSION.personal_thought_jump==jump then HOME_SESSION.personal_thought_jump=nil end
+        return opened
     end
-    local bounds=require("miuread.comment_locator").chapterBounds(self.ui,current.record,uid)
-    if bounds and bounds.start and chapter=="" then
-        self:_reader_goto_annotation({pos0=bounds.start})
+    local Locator=require("miuread.comment_locator")
+    local location=self._personal_thought_locations and self._personal_thought_locations[range]
+    if location and (not version_matches or location.chapter_uid~=uid or location.book_id~=book_id) then location=nil end
+    local reason
+    if not location and Locator.uses_eink_ranges(path,record) then
+        local positions
+        positions,reason=Locator.eink_positions(self.store,self.ui,book_id,uid,record,{range},
+            {quotes={[range]=note.quote},verify_quote=not version_matches})
+        location=positions[range]
+        if not location and reason=="source_cache_missing" and not source_loaded and self:is_online() then
+            local auth=U.copy(self.store:auth())
+            local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
+            local context={path=self:_current_document_path(),version=version}
+            return self:_run_interactive_network("thought-source:"..book_id..":"..uid,"thought-source",function()
+                return self:_comment_worker(auth,data_dir,temp_dir,"prepare_thought_position",book_id,uid,context)
+            end,function(reply)
+                if not still_reading() then return end
+                local payload=reply and reply.ok and reply.value
+                if payload and payload.auth_changed then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
+                if payload and payload.request_ok then
+                    self:_jump_to_cloud_thought(book_id,note,refreshed,true)
+                else
+                    logger.warn("[MiuRead][ThoughtPosition] chapter source unavailable","book=",book_id,
+                        "chapter=",uid,"reason=",U.first_line(tostring(payload and payload.error or "-"),100))
+                    self:info("当前章节的原文坐标暂时无法取得")
+                end
+            end,{status_title="想法位置",status_text="正在读取…",timeout=30})
+        end
     end
-    if self:_schedule_personal_thought_overlay(true) then return true end
-    HOME_SESSION.personal_thought_jump=nil
-    self:info("当前文档暂时无法标出这条想法")
+    if location and location.chapter_uid==uid then
+        logger.info("[MiuRead][ThoughtPosition] located","book=",book_id,"chapter=",uid,"detail=",tostring(refreshed==true))
+        if refreshed then
+            local selected=U.copy(note)
+            selected.book_version=version
+            self._selected_cloud_thought={book_id=book_id,account=account,note=selected}
+        end
+        local jumped=self:_reader_goto_annotation(location)
+        if jumped then self:_schedule_personal_thought_overlay(true) end
+        return jumped
+    end
+    if can_refresh then return refresh_position() end
+    logger.info("[MiuRead][ThoughtPosition] unresolved","book=",book_id,"chapter=",uid,
+        "reason=",tostring(reason or "renderer_position_unavailable"),"detail=",tostring(refreshed==true))
+    self:info(reason=="official_range_text_differs" and "这条想法保存的原文范围和当前正文不一致"
+        or "这条想法的正文位置暂时无法确认")
     return false
 end
 
@@ -17161,9 +17235,7 @@ function Plugin:_show_personal_thought(book_id,note,on_return)
     end
     local function jump()
         if item then return self:_reader_goto_annotation(item) end
-        local location=self._personal_thought_locations and self._personal_thought_locations[note.range]
-        if location and location.chapter_uid==note.chapter_uid then return self:_reader_goto_annotation(location) end
-        if note.source and note.source.source_path~="" and U.file_exists(note.source.source_path) then
+        if not ready and note.source and note.source.source_path~="" and U.file_exists(note.source.source_path) then
             return self:_annotation_open_result(note.source,nil,false)
         end
         return self:_jump_to_cloud_thought(book_id,note)
@@ -33043,12 +33115,18 @@ function Plugin:_comment_worker(auth,data_dir,temp_dir,operation,book_id,uid,arg
     end
     local api=Api:new(Http:new(child),child):for_channel("eink")
     local sync=require("miuread.comment_sync"):new(api,child)
-    if operation=="fetch_marks" and type(argument)=="string" then
-        argument={file=argument,reader=Reader:new(Http:new(child),child)}
+    if operation=="fetch_marks" and type(argument)=="table" then
+        argument.reader=Reader:new(Http:new(child),child)
     end
-    local ok,value,err=pcall(sync[operation],sync,book_id,uid,argument,more)
+    local ok,value,err
+    if operation=="prepare_thought_position" then
+        local ensure=require("miuread.eink_comment_source").ensure
+        ok,value,err=pcall(ensure,Reader:new(Http:new(child),child),child,book_id,uid,argument.path,argument.version)
+    else
+        ok,value,err=pcall(sync[operation],sync,book_id,uid,argument,more)
+    end
     local credentials,changed=child:snapshot()
-    return {request_ok=ok and value~=nil,
+    return {request_ok=ok and value~=nil and value~=false,
         range_done=ok and type(value)=="table" and value.known_end==true,
         chapter_partial=ok and type(value)=="table" and value.partial==true,
         error=not ok and tostring(value) or err,auth=credentials,auth_changed=changed}
@@ -33111,7 +33189,7 @@ function Plugin:_cancel_current_comment_marks(reason)
     if active then active.async:cancel(reason or "comment marks cancelled") end
 end
 
-function Plugin:_schedule_current_comment_marks(scope,cached)
+function Plugin:_schedule_current_comment_marks(scope,cached,record)
     if not self:_reader_session_is_weread() or not self:_thoughts_enabled()
         or self._miuread_suspended or HOME_SESSION.suspended then return end
     local document=self.ui and self.ui.document
@@ -33121,12 +33199,18 @@ function Plugin:_schedule_current_comment_marks(scope,cached)
     local active=self._current_comment_marks
     if active and active.key==key and active.document==document then return end
     self:_cancel_current_comment_marks("chapter changed")
+    local path=self:_current_document_path()
+    local native=require("miuread.comment_locator").uses_eink_ranges(path,record)
+    local version=native and tonumber(record.progress_source_book_version)
     if cached and os.time()-(tonumber(cached.updated_at) or 0)<1800 then
-        local missing_source=false
-        for _,row in ipairs(cached.underlines or {}) do
-            if row.markText=="" then missing_source=true;break end
+        local underlines=cached.underlines or {}
+        local needs_source=native and #underlines>0
+        if not native then
+            for _,row in ipairs(underlines) do
+                if row.markText=="" then needs_source=true;break end
+            end
         end
-        if not missing_source or require("miuread.eink_comment_source").exists(self.store,book_id,uid) then return end
+        if not needs_source or require("miuread.eink_comment_source").exists(self.store,book_id,uid,version) then return end
     end
     local last=self._current_comment_marks_last
     if last and last.key==key and last.document==document and os.time()-last.at<120 then return end
@@ -33157,9 +33241,9 @@ function Plugin:_schedule_current_comment_marks(scope,cached)
         self._current_comment_marks_last={key=key,document=document,at=os.time()}
         local auth=U.copy(self.store:auth())
         local data_dir,temp_dir=self.store.data_dir,self.store.temp_dir
-        local path=self:_current_document_path()
+        local source_context={file=path,version=version or nil,native=native}
         local started=worker:run("comment-marks",function()
-            return self:_comment_worker(auth,data_dir,temp_dir,"fetch_marks",book_id,uid,path)
+            return self:_comment_worker(auth,data_dir,temp_dir,"fetch_marks",book_id,uid,source_context)
         end,function(reply)
             if self._current_comment_marks~=runtime then return end
             self._current_comment_marks=nil
@@ -33306,38 +33390,70 @@ function Plugin:_schedule_personal_thought_overlay(force)
         if self.ui~=ui or ui.document~=document or reader_close_active() then return end
         local context=self:_current_book_record()
         if not context or not context.record then return end
-        local groups,by_range={},{}
-        local version=tonumber(context.record.progress_source_book_version)
-        for _,note in ipairs(self:_personal_thought_rows(scope.book_id)) do
+        local groups,by_range,ranges={}, {}, {}
+        local record=context.record
+        local version=tonumber(record.progress_source_book_version)
+        local Locator=require("miuread.comment_locator")
+        local native_epub=Locator.uses_eink_ranges(document.file,record)
+        local function add(note)
             local range=tostring(note.range or "")
-            if range~="" and note.chapter_uid==scope.chapter_uid
-                and (not note.book_version or not version or version<=0 or note.book_version==version) then
-                if not by_range[range] then
-                    groups[#groups+1]={range=range,mark_only=true,personal=true,texts={{abstract=note.quote}}}
-                    by_range[range]={}
+            if range=="" or note.chapter_uid~=scope.chapter_uid
+                or (note.book_version and version and version>0 and tonumber(note.book_version)~=version) then return end
+            if not by_range[range] then
+                ranges[#ranges+1]=range
+                groups[#groups+1]={range=range,mark_only=true,personal=true,texts={{abstract=note.quote}}}
+                by_range[range]={}
+            end
+            by_range[range][#by_range[range]+1]=note
+        end
+        local selected=self._selected_cloud_thought
+        local selected_note=selected and selected.book_id==scope.book_id
+            and selected.account==DownloadDatabase.account_key(self.store) and selected.note
+        for _,note in ipairs(self:_personal_thought_rows(scope.book_id)) do
+            if selected_note and note.review_id==selected_note.review_id then
+                -- Use the resolved location with the current locally merged content.
+                note=U.copy(note)
+                note.chapter_uid,note.range=selected_note.chapter_uid,selected_note.range
+                note.quote,note.book_version=selected_note.quote,selected_note.book_version
+            end
+            add(note)
+        end
+        local jump=HOME_SESSION.personal_thought_jump
+        local records,locations={},{}
+        if #ranges>0 then
+            if native_epub then
+                local needed={}
+                for _,range in ipairs(ranges) do
+                    local prior=self._personal_thought_locations and self._personal_thought_locations[range]
+                    if prior and prior.book_id==scope.book_id and prior.chapter_uid==scope.chapter_uid
+                        and prior.source_version==version then locations[range]=prior
+                    else needed[#needed+1]=range end
                 end
-                by_range[range][#by_range[range]+1]=note
+                if #needed>0 then
+                    local quotes={}
+                    for _,range in ipairs(needed) do quotes[range]=by_range[range][1].quote end
+                    local added=Locator.eink_positions(self.store,ui,scope.book_id,scope.chapter_uid,record,needed,
+                        {quotes=quotes})
+                    for range,row in pairs(added) do locations[range]=row end
+                end
+                for _,range in ipairs(ranges) do
+                    if locations[range] then records[#records+1]=locations[range] end
+                end
+            else
+                records=Locator.resolve(self.store,self.reader,ui,scope.book_id,scope.chapter_uid,record,groups)
             end
         end
-        local records={}
-        if #groups>0 then
-            records=require("miuread.comment_locator").resolve(self.store,self.reader,ui,
-                scope.book_id,scope.chapter_uid,context.record,groups)
-        end
-        local locations={}
         for _,row in ipairs(records) do
             row.personal=by_range[row.range]
             locations[row.range]=row
         end
         self._personal_thought_locations=locations
         if overlay:setRecords(records) then UIManager:setDirty(ui,"ui") end
-        local jump=HOME_SESSION.personal_thought_jump
         if jump and (jump.expires<os.time() or jump.account~=DownloadDatabase.account_key(self.store)) then
             HOME_SESSION.personal_thought_jump=nil
         elseif jump and jump.book_id==scope.book_id and jump.chapter_uid==scope.chapter_uid then
             HOME_SESSION.personal_thought_jump=nil
-            if locations[jump.range] then self:_reader_goto_annotation(locations[jump.range])
-            else self:info("这条想法的正文位置暂时无法确认") end
+            self:_jump_to_cloud_thought(jump.book_id,jump.note,jump.refreshed)
         end
     end
     self._personal_thought_task=task
@@ -33350,7 +33466,25 @@ function Plugin:_thoughts_for_paragraph(book_id,uid,range)
     local a,b=tostring(range or ""):match("^(%d+)%-(%d+)$")
     a,b=tonumber(a),tonumber(b)
     if not a or not b then return result end
-    for _,note in ipairs(self:_personal_thought_rows(book_id)) do
+    local document=self.ui and self.ui.document
+    local context=document and self:_current_book_record()
+    local native=context and require("miuread.comment_locator").uses_eink_ranges(document.file,context.record)
+    local candidates
+    if native then
+        candidates={}
+        for key,location in pairs(self._personal_thought_locations or {}) do
+            if location.book_id==book_id and location.chapter_uid==uid then
+                local x,y=key:match("^(%d+)%-(%d+)$")
+                x,y=tonumber(x),tonumber(y)
+                if x and y and x<b and a<y then
+                    for _,note in ipairs(location.personal or {}) do candidates[#candidates+1]=note end
+                end
+            end
+        end
+    else
+        candidates=self:_personal_thought_rows(book_id)
+    end
+    for _,note in ipairs(candidates) do
         local x,y=tostring(note.range or ""):match("^(%d+)%-(%d+)$")
         x,y=tonumber(x),tonumber(y)
         if note.chapter_uid==uid and x and y and x<b and a<y then result[#result+1]=note end
@@ -33480,7 +33614,7 @@ function Plugin:_refresh_current_comment_overlay(force)
     self._comment_overlay_chapter=key
 
     local cached=self.comment_sync:load_marks(scope.book_id,scope.chapter_uid)
-    self:_schedule_current_comment_marks(scope,cached)
+    self:_schedule_current_comment_marks(scope,cached,context.record)
     local groups=self.comment_sync:load(scope.book_id,scope.chapter_uid) or {}
     local marks=cached and cached.underlines or {}
     local seen={}
@@ -33496,7 +33630,7 @@ function Plugin:_refresh_current_comment_overlay(force)
         return false
     end
 
-    -- Text search is bounded to a few ranges per UI tick on older Kindles.
+    -- Project a few ranges per UI tick on older Kindles.
     -- A chapter or document switch invalidates the entire projection.
     local Locator=require("miuread.comment_locator")
     local ui=self.ui

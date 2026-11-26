@@ -276,13 +276,30 @@ function Source.local_position(reader,record,anchor,allow_fetch)
         safe=true,precise=true,source_xpointer=anchor.xpointer}
 end
 
-function Source.remote_anchor(source,rendered,co)
-    if not co or co<0 or co>source.units or co%1~=0 then return nil end
-    local lo,hi=1,#source.rows
+local function first_row_after(rows,offset)
+    local lo,hi=1,#rows
     while lo<=hi do
         local mid=math.floor((lo+hi)/2)
-        if source.rows[mid].last<=co then lo=mid+1 else hi=mid-1 end
+        if rows[mid].last<=offset then lo=mid+1 else hi=mid-1 end
     end
+    return lo
+end
+
+function Source.annotation_range(map,range)
+    local first,last,point=require("miuread.annotations.range").parse(range)
+    if not first or first<1 or last-1>map.source.units or first%1~=0 or last%1~=0 then return nil end
+    local rows=map.source.rows
+    local start=first_row_after(rows,first-1)
+    if not rows[start] then return nil end
+    local stop=point and start+1 or first_row_after(rows,last-1)
+    if stop<=start or (not point and rows[start].first>=last-1) then return nil end
+    local text,rendered=map.rendered.text,map.rendered.rows
+    return rendered[start].byte-1,rendered[stop] and rendered[stop].byte-1 or #text
+end
+
+function Source.remote_anchor(source,rendered,co)
+    if not co or co<0 or co>source.units or co%1~=0 then return nil end
+    local lo=first_row_after(source.rows,co)
     local rendered_start=rendered.rows[lo]
     if not rendered_start then return nil end
     local first=rendered_start.visible

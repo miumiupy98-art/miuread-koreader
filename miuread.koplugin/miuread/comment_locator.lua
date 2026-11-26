@@ -43,7 +43,7 @@ end
 
 -- A chapter is only trusted if its local chapter_map identity agrees with
 -- the current TOC interval. On unknown or inconsistent mappings, fail closed.
-function Locator.chapterBounds(ui,record,uid)
+function Locator.chapterBounds(ui,record,uid,target)
     local document=ui and ui.document
     if not document then return nil,"no_document" end
     local entry=type(record)=="table" and record or {}
@@ -62,7 +62,7 @@ function Locator.chapterBounds(ui,record,uid)
         if chapter.structural~=true and id~="" then readable[#readable+1]=id end
     end
     if #readable==1 and readable[1]==uid then
-        return {single=true},nil
+        return {single=true,title=map[1] and (map[1].title or map[1].chapterTitle)},nil
     end
     local toc=ui.toc
     if #readable==0 or not toc or type(toc.getTocIndexByPage)~="function" then
@@ -70,14 +70,21 @@ function Locator.chapterBounds(ui,record,uid)
     end
     if type(toc.fillToc)=="function" then pcall(toc.fillToc,toc) end
     if type(toc.toc)~="table" then return nil,"toc_unavailable" end
-    local current_xp=ui.rolling and ui.rolling.xpointer
-    if not valid(document,current_xp) and type(document.getXPointer)=="function" then
-        local ok,xp=pcall(document.getXPointer,document)
-        if ok then current_xp=xp end
+    local index
+    if target then
+        for i,chapter in ipairs(map) do
+            if tostring(chapter.uid or chapter.chapterUid or chapter.chapter_uid or "")==uid then index=i; break end
+        end
+    else
+        local current_xp=ui.rolling and ui.rolling.xpointer
+        if not valid(document,current_xp) and type(document.getXPointer)=="function" then
+            local ok,xp=pcall(document.getXPointer,document)
+            if ok then current_xp=xp end
+        end
+        if not valid(document,current_xp) then return nil,"current_position_unavailable" end
+        local ok,value=pcall(toc.getTocIndexByPage,toc,current_xp)
+        index=ok and tonumber(value) or nil
     end
-    if not valid(document,current_xp) then return nil,"current_position_unavailable" end
-    local ok,index=pcall(toc.getTocIndexByPage,toc,current_xp)
-    index=ok and tonumber(index) or nil
     if not index or index<1 or index>#toc.toc then return nil,"toc_index_unavailable" end
     index=math.floor(index)
     local chapter=map[index]
@@ -98,17 +105,17 @@ function Locator.chapterBounds(ui,record,uid)
     -- Without an end boundary, the final chapter can be safely constrained
     -- only when its chapter identity is last in the local chapter_map.
     if not ending and index~=#map then return nil,"chapter_end_unavailable" end
-    return {start=start,ending=ending},nil
+    return {start=start,ending=ending,title=chapter.title or chapter.chapterTitle},nil
 end
 
-local function in_bounds(document,start,ending,bounds)
+local function in_bounds(document,start,ending,bounds,allow_exclusive_end)
     if bounds.single then return true end
     if type(document.compareXPointers)~="function" then return false end
     local ok1,a=pcall(document.compareXPointers,document,bounds.start,start)
     if not ok1 or a==-1 then return false end
     if bounds.ending then
         local ok2,b=pcall(document.compareXPointers,document,ending,bounds.ending)
-        if not ok2 or b~=1 then return false end
+        if not ok2 or (b~=1 and not (allow_exclusive_end and b==0)) then return false end
     end
     return true
 end
@@ -133,7 +140,7 @@ function Locator.quoteFor(group,underlines,raw_map,index,native_map)
     end
     if group.personal then
         local abstract=group.texts and group.texts[1] and tostring(group.texts[1].abstract or "") or ""
-        if native and from_source~="" then
+        if native_map and from_source~="" then
             if abstract=="" or compact(abstract)==compact(from_source) then return from_source,"source" end
             return "","personal_source_quote_conflict"
         end
@@ -177,6 +184,139 @@ function Locator.find(document,quote,bounds)
     return found
 end
 
+-- Project the verified HTML character offsets onto KOReader's DOM. Page
+-- boundaries narrow the lookup; visible character traversal resolves the
+-- exact XPointer without choosing a match by quotation.
+local function dom_projection(document,bounds,body,compact_text)
+    if not (document.getPageXPointer and document.getPageFromXPointer
+        and document.getPageCount and document.getNextVisibleChar and document.getTextFromXPointers) then
+        return nil
+    end
+    local start=bounds.start or document:getPageXPointer(1)
+    if not valid(document,start) then return nil end
+    local first_page=document:getPageFromXPointer(start)
+    local last_page=bounds.ending and document:getPageFromXPointer(bounds.ending) or document:getPageCount()
+    if not first_page or not last_page or first_page<1 or last_page<first_page then return nil end
+    local title=compact_text(bounds.title)
+    local prefix_cache,points={},{}
+    local function text_between(a,b)
+        if a==b then return "" end
+        local text=document:getTextFromXPointers(a,b,false)
+        if type(text)=="table" then text=text.text or text[1] end
+        return type(text)=="string" and compact_text(text) or nil
+    end
+    local function body_offset(prefix)
+        if not prefix then return nil end
+        if body:sub(1,#prefix)==prefix then return #prefix end
+        if title~="" then
+            if title:sub(1,#prefix)==prefix then return -1 end
+            if prefix:sub(1,#title)==title then
+                local rest=prefix:sub(#title+1)
+                if body:sub(1,#rest)==rest then return #rest end
+            end
+        end
+    end
+    local function at_offset(offset)
+        if points[offset] then return points[offset] end
+        local lo,hi,best=first_page+1,last_page,start
+        while lo<=hi do
+            local page=math.floor((lo+hi)/2)
+            local point=document:getPageXPointer(page)
+            if not valid(document,point) then return nil end
+            local prefix=prefix_cache[point]
+            if prefix==nil then prefix=text_between(start,point);prefix_cache[point]=prefix end
+            local distance=body_offset(prefix)
+            if distance==nil then return nil end
+            if distance<offset then best=point;lo=page+1 else hi=page-1 end
+        end
+        local prefix=prefix_cache[best] or text_between(start,best)
+        if prefix==nil then return nil end
+        local p=best
+        while valid(document,p) do
+            local tail=text_between(best,p)
+            if tail==nil then return nil end
+            local distance=body_offset(prefix..tail)
+            if distance==nil or distance>offset then return nil end
+            if distance==offset then
+                points[offset]=p
+                return p
+            end
+            local next_point=document:getNextVisibleChar(p)
+            if not next_point or next_point==p
+                or not in_bounds(document,next_point,next_point,bounds,offset==#body) then return nil end
+            p=next_point
+        end
+    end
+    return function(first,last)
+        local a,b=at_offset(first),at_offset(last)
+        if not (a and b and in_bounds(document,a,b,bounds,last==#body)) then return nil end
+        local expected=body:sub(first+1,last)
+        local actual=text_between(a,b)
+        if actual==expected then return a,b end
+        -- The generated heading is a reader prefix, outside the source HTML.
+        if first==0 and title~="" and actual==title..expected then
+            local p=a
+            while p and p~=b do
+                local prefix=text_between(a,p)
+                if prefix==title and text_between(p,b)==expected then return p,b end
+                if not prefix or title:sub(1,#prefix)~=prefix then return nil end
+                local next_point=document:getNextVisibleChar(p)
+                if next_point==p then return nil end
+                p=next_point
+            end
+        end
+    end
+end
+
+function Locator.uses_eink_ranges(path,record)
+    return type(record)=="table" and tostring(path or ""):lower():match("%.epub$")~=nil
+        and (record.eink_content_mode=="eink-online" or record.eink_content_mode=="eink-offline")
+end
+
+function Locator.eink_positions(store,ui,book_id,uid,record,ranges,options)
+    local result={}
+    options=options or {}
+    local document=ui and ui.document
+    local path=document and document.file
+    local version=tonumber(record.progress_source_book_version)
+    if not (path and version and version>0) then return result end
+    local bounds,err=Locator.chapterBounds(ui,record,uid,true)
+    if not bounds then return result,err end
+    local positions=require("miuread.eink_progress_source")
+    local aligned,reason=require("miuread.eink_comment_source").personal_alignment(store,book_id,uid,path,version)
+    if not aligned then return result,reason end
+    local ready,project=pcall(dom_projection,document,bounds,aligned.rendered.text,positions.compact_text)
+    if not ready or not project then return result end
+    local spans={}
+    for _,range in ipairs(ranges) do
+        local first,last=positions.annotation_range(aligned,range)
+        if first then spans[#spans+1]={range=range,first=first,last=last}
+        else reason=reason or "official_range_unavailable" end
+    end
+    table.sort(spans,function(a,b) return a.first<b.first end)
+    for _,span in ipairs(spans) do
+        if options.on_group then options.on_group() end
+        local range,first,last=span.range,span.first,span.last
+        local selection=aligned.rendered.text:sub(first+1,last)
+        local expected=options.quotes and options.quotes[range]
+        local match=expected and positions.compact_text(expected)==selection
+        if options.verify_quote and not match then
+            reason=expected and expected~="" and "official_range_text_differs" or "official_range_quote_missing"
+        elseif options.public or aligned.version==version or match then
+            local ok,a,b=pcall(project,first,last)
+            if ok and a and b then
+                result[range]={pos0=a,pos1=b,book_id=book_id,chapter_uid=uid,range=range,
+                    quote=selection,mark_only=true,source_version=version}
+            else
+                reason=reason or "renderer_position_unavailable"
+            end
+        else
+            reason=reason or "source_cache_missing"
+        end
+    end
+    return result,reason
+end
+
 function Locator.resolve(store,reader,ui,book_id,uid,record,groups,marks,on_group)
     local document=ui and ui.document
     local path=document and document.file
@@ -191,6 +331,19 @@ function Locator.resolve(store,reader,ui,book_id,uid,record,groups,marks,on_grou
     end
     local bounds,err=Locator.chapterBounds(ui,record,uid)
     if not bounds then return {},{matched=0,unmatched=#(groups or {}),error=err} end
+    if Locator.uses_eink_ranges(path,record) then
+        local ranges,records={},{}
+        for _,group in ipairs(groups or {}) do
+            local start,_,point=Range.parse(group.range)
+            if start and not point then ranges[#ranges+1]=group.range end
+        end
+        local located,reason=Locator.eink_positions(store,ui,book_id,uid,record,ranges,
+            {public=true,on_group=on_group})
+        for _,range in ipairs(ranges) do
+            if located[range] then records[#records+1]=located[range] end
+        end
+        return records,{matched=#records,unmatched=#ranges-#records,error=reason}
+    end
     local snapshot=ThoughtDatabase.load_checkpoint(store,book_id,uid)
     local underlines=type(snapshot)=="table" and snapshot.underlines or nil
     local underline_index={}

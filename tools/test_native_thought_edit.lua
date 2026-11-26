@@ -5,13 +5,29 @@ package.loaded["libs/libkoreader-lfs"]={}
 package.loaded["miuread.http"]={}
 package.loaded["miuread.annotation_coord"]={}
 package.loaded["miuread.annotations.posmap"]={}
-package.loaded["miuread.annotations.range"]={}
+package.loaded.util={splitToArray=function(text)
+    local parts={}
+    for part in text:gmatch("[^-]+") do parts[#parts+1]=part end
+    return parts
+end}
 package.loaded["miuread.thought_database"]={}
 local DB={}
 package.loaded["miuread.local_annotation_database"]=DB
 package.loaded["miuread.json"]={is_null=function() return false end}
 
 local AnnotationSync=require("miuread.annotation_sync")
+
+local refreshed=AnnotationSync.cloud_thought_position({
+    review_single=function(_,id)
+        assert(id=="official-id")
+        return {review={review={reviewId=id,bookId="book",chapterUid=56,range="9601-9603",bookVersion=17}}}
+    end,
+},"book","official-id")
+assert(refreshed.chapter_uid=="56" and refreshed.range=="9601-9603" and refreshed.book_version==17)
+assert(not AnnotationSync.cloud_thought_position({
+    review_single=function() return {review={reviewId="official-id",bookId="other",chapterUid=56,range="9601-9603"}} end,
+},"book","official-id"))
+
 local store={}
 local row={local_id="local-review",remote_id="cloud-review",chapter_uid="40",note="New text",sync_state="local_only"}
 local review={reviewId=row.remote_id,chapterUid=40,type=1,isPrivate=true,friendship=0,

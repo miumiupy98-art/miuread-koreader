@@ -513,6 +513,21 @@ function AnnotationSync.cloud_thought_snapshot(api,book_id)
     return {rows=rows,present_ids=present_ids,checked_at=checked_at}
 end
 
+function AnnotationSync.cloud_thought_position(api,book_id,review_id)
+    local value=api:review_single(review_id)
+    for _,row in ipairs(collect_records(value)) do
+        if review_remote_id(row)==review_id then
+            local book=scalar(row.bookId or row.book_id or (type(row.book)=="table" and row.book.bookId))
+            local uid=scalar(row.chapterUid or row.chapter_uid or row.chapterId)
+            local range=record_range(row)
+            if (book=="" or book==book_id) and uid~="" and Range.parse(range) then
+                return {chapter_uid=uid,range=range,book_version=positive_version(row.bookVersion or row.book_version),
+                    quote=scalar(row.abs or row.abstract or row.contextAbstract)}
+            end
+        end
+    end
+end
+
 local function editable_review(api,row)
     local value=api:review_single(row.remote_id)
     local target=find_review_match(collect_records(value),nil,nil,row.remote_id)

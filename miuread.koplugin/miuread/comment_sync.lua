@@ -65,16 +65,19 @@ end
 
 function CommentSync:_prepare_native_source(book_id,uid,context,marks)
     if type(context)~="table" or type(context.file)~="string" or not context.reader then return end
-    for _,row in ipairs(marks.underlines or {}) do
-        if row.markText=="" then
-            local Native=require("miuread.eink_comment_source")
-            local ok,ready,reason=pcall(Native.ensure,context.reader,self.store,book_id,uid,context.file)
-            if not (ok and ready) then
-                require("logger").warn("[MiuRead][Comments] native coordinate source unavailable",
-                    U.first_line(tostring(ok and reason or ready),100))
-            end
-            return
+    if #(marks.underlines or {})==0 or not context.file:lower():match("%.epub$") then return end
+    if context.native==false then
+        local needs_source=false
+        for _,row in ipairs(marks.underlines) do
+            if row.markText=="" then needs_source=true;break end
         end
+        if not needs_source then return end
+    end
+    local Native=require("miuread.eink_comment_source")
+    local ok,ready,reason=pcall(Native.ensure,context.reader,self.store,book_id,uid,context.file,context.version)
+    if not (ok and ready) then
+        require("logger").warn("[MiuRead][Comments] native coordinate source unavailable",
+            U.first_line(tostring(ok and reason or ready),100))
     end
 end
 
