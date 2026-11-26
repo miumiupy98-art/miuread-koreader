@@ -48,8 +48,28 @@ function M.snapshot(value)
     return {groups=groups,books=books,assignment=assignment}
 end
 
-function M.change(api,cmd)
-    local before=M.snapshot(api:shelf())
+function M.cached_snapshot(cache)
+    local groups=cache and cache.groups
+    if type(groups)~="table" or groups.authoritative~=true or cache.stream and cache.stream.enabled==true then return nil end
+    local archive,by_id={},{}
+    for _,group in ipairs(groups.list or {}) do
+        local id=number_id(tostring(group.key or ""):match("^id:(%d+)$"))
+        if not id or id==0 then return nil end
+        local row={archiveId=id,name=group.name,bookIds={}}
+        archive[#archive+1]=row
+        by_id[id]=row
+    end
+    for book,relation in pairs(groups.book_groups or {}) do
+        for _,key in ipairs(relation.keys or {}) do
+            local group=by_id[number_id(tostring(key):match("^id:(%d+)$"))]
+            if group then group.bookIds[#group.bookIds+1]=book end
+        end
+    end
+    return M.snapshot({archive=archive,books=cache.raw_books or {}})
+end
+
+function M.change(api,cmd,before)
+    before=before or M.snapshot(api:shelf())
     local action=cmd.action
     local id=number_id(cmd.group)
     local name=U.trim(cmd.name or "")
@@ -73,8 +93,9 @@ function M.change(api,cmd)
     if action=="move" and before.assignment[book]~=false and (before.assignment[book] or 0)==id then return true end
     if action=="rename" and group.name==name then return true end
 
-    local ok,err=pcall(api.write_shelf_group,api,action,id,name,moving and book or nil)
-    if not ok and tostring(err):find("[MiuReadBeforeWrite]",1,true) then error(err,0) end
+    local ok,value=pcall(api.write_shelf_group,api,action,id,name,moving and book or nil)
+    if ok and type(value)=="table" and require("miuread.eink_client").write_succeeded(value) then return true end
+    if not ok and tostring(value):find("[MiuReadBeforeWrite]",1,true) then error(value,0) end
     -- Check the full cloud snapshot after one POST, including a timed-out POST.
     local after=M.snapshot(api:shelf())
     local new_group=after.groups[id]

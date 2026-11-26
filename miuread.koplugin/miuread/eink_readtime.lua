@@ -30,7 +30,6 @@ function M.prepare(native,book_id,rows)
     if native.on_readtime_parameters then native.on_readtime_parameters(parameters) end
     local progress=native:request("GET","/book/getProgress",{bookId=book_id},"reading_time_position_before")
     local before=M.position(progress)
-    if not before then error("reading_time_position_unavailable",0) end
     if native.on_readtime_server_clock then
         native.on_readtime_server_clock(progress.timestamp,config.server_time_max_offset
             or (type(config.config)=="table" and config.config.server_time_max_offset))

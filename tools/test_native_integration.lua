@@ -44,6 +44,7 @@ local flow_vid,request_kind,shelf_failure="test-account","read",false
 local book_format="epub"
 local durations=false
 local response_error
+local annotation_requests=0
 local quote="synthetic anchor sentence"
 local search={result={{chapterUid=7,keywordStart=113,absStart=110,absEnd=170,
     abstract="😀 <em>"..quote.."</em>."}},totalCount=1,hasMore=false}
@@ -145,6 +146,11 @@ local http={
         end
         assert(options.url=="https://i.weread.qq.com/review/add" and options.retries==0)
         assert(options.body:find('"atUserVids":[]',1,true))
+        assert(options.before_dispatch())
+        annotation_requests=annotation_requests+1
+        local failure=response_error
+        response_error=nil
+        if failure then error(failure) end
         return {succ=1}
     end,
 }
@@ -162,7 +168,8 @@ local install_id=current.native_shelf.installId
 assert(install_id==signed.native_shelf.installId)
 local unfinished=Shelf.new(http,store,true)
 shelf_failure=true
-assert(not pcall(unfinished.finish,unfinished,{wx_code="fixture-code"}) and current.login_session_id=="session-1")
+local before_shelf=unfinished:finish({wx_code="fixture-code"})
+assert(before_shelf.native_shelf.accessToken=="fixture-access" and current.login_session_id=="session-1")
 shelf_failure=false
 
 local Api=require("miuread.api")
@@ -268,7 +275,16 @@ assert(native:write_position(pdf).already and post_count==4)
 remote.book.otherType={}
 assert(not pcall(native.pdf_progress,native,"sample"))
 request_kind="review"
+shelf_failure=true
+local before_review=#calls
 assert(native:add_review({bookId="sample",content="fixture",type=1}).succ==1)
+assert(#calls==before_review,"a successful write must not fetch the shelf")
+assert(annotation_requests==1)
+response_error="HTTP 401"
+assert(native:add_review({bookId="sample",content="fixture",type=1}).succ==1 and annotation_requests==3)
+response_error="connection lost"
+assert(not pcall(native.add_review,native,{bookId="sample",content="fixture",type=1}) and annotation_requests==4)
+shelf_failure=false
 assert(calls[1]:find("https://i.weread.qq.com/wxticket",1,true))
 
 book_format="epub"
@@ -327,10 +343,14 @@ local auth_flow=Auth.new_native(http,store,{
 flow_vid="another-synthetic-account"
 auth_flow:start()
 assert(complete=="Fixture" and shown=="https://open.weixin.qq.com/connect/confirm?uuid=fixture-id")
-assert(current.account.vid==flow_vid and current.cookies==nil and current.login_session_id=="session-2")
+assert(current.account.vid==flow_vid and current.cookies==nil and current.login_session_id=="session-3")
 print("Native first login, committed session renewal, no Web fallback, account data, verified UTF-16 position and single native write passed")
 
 local readtime=require("miuread.eink_readtime")
+remote={}
+local time_only=readtime.prepare(native,"sample",seconds)
+assert(time_only.before==nil and time_only.body.books[1].readingTime==19)
+assert(time_only.body.books[1].chapterUid==nil and time_only.body.books[1].chapterOffset==nil)
 assert(readtime.receipt(true,false,"HTTP 429, retry_after=60").state=="pending")
 assert(readtime.receipt(true,false,"HTTP 499").state=="unknown")
 assert(readtime.receipt(true,false,"timeout").state=="unknown")

@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "6.7.0-beta.17",
+    VERSION = "6.7.0-beta.19",
     SCHEMA = 136,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
@@ -210,7 +210,7 @@ local C = {
     -- tap in the top-center band. Short-lived taps carried across the Home ->
     -- Reader transition are consumed before they can become KOReader corner
     -- actions (for example an unintended bookmark).
-    READER_OPEN_GESTURE_GUARD_SECONDS = 0.75,
+    READER_OPEN_GESTURE_GUARD_SECONDS = 0.20,
     READER_TOP_MENU_X_MIN = 0.25,
     READER_TOP_MENU_X_MAX = 0.75,
     READER_TOP_MENU_Y_MAX = 0.10,

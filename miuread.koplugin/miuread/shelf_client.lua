@@ -172,9 +172,6 @@ function Client:finish(data)
     local result=request(self.http,"POST",BASE.."/login",body,M.request_options(),"login",self.store)
     local credential=tokens(result,{deviceId=self.device_id,installId=self.install_id})
     if not self.primary_login and credential.vid~=self.vid then error("扫码账号与觅阅当前账号不同，请使用同一账号授权") end
-    local shelf=request(self.http,"GET",BASE.."/shelf/sync?synckey=0&lectureSynckey=0",nil,
-        M.request_options(credential),"shelf_verify",self.store)
-    if type(shelf.books)~="table" then error("客户端书架验证失败，未保存授权") end
     current=self.store:auth()
     if self.primary_login then
         local info=type(result.user)=="table" and result.user or {}

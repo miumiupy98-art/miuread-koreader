@@ -2303,15 +2303,57 @@ end
 -- progress sync to guess from an empty local map. This reads only ZIP metadata
 -- and the small embedded MiuRead JSON; it never scans chapter bodies or uses the
 -- network.
+-- Restore synchronization metadata only from the identity of this installed book.
+local function restore_eink_identity(record,meta,id)
+    if tostring(meta.book_id or meta.bookId or "")~=id or id==""
+        or record.pending_install==true or record.pending_file then return false end
+    local mode=meta.eink_content_mode
+    if mode~="eink-offline" and mode~="eink-online" then return false end
+    if mode=="eink-online" and (meta.online_expires or meta.online_server_only) then return false end
+    local changed=false
+    local function fill(key,value)
+        if value~=nil and record[key]==nil then record[key]=value; changed=true end
+    end
+    fill("eink_content_mode",mode)
+    fill("access_scope",meta.access_scope)
+    fill("catalog_complete",meta.catalog_complete)
+    fill("catalog_chapter_count",tonumber(meta.catalog_count))
+    fill("local_chapter_count",tonumber(meta.local_chapter_count))
+    fill("readable_chapter_count",tonumber(meta.readable_count))
+    fill("failed_chapter_count",tonumber(meta.failed_count))
+    fill("restricted_chapter_count",tonumber(meta.restricted_count))
+    fill("eink_catalog_complete",meta.catalog_complete)
+    fill("sync_enabled",meta.sync_enabled)
+    fill("read_report_enabled",meta.read_report_enabled)
+    fill("annotation_requested",meta.annotation_requested)
+    fill("progress_source_complete",meta.progress_source_complete)
+    fill("progress_source_chapter_count",tonumber(meta.progress_source_chapter_count))
+    fill("progress_source_cached_count",tonumber(meta.progress_source_cached_count))
+    local version=tonumber(meta.progress_source_book_version)
+    if version and version>0 and (tonumber(record.progress_source_book_version) or 0)<=0 then
+        record.progress_source_book_version=version
+        changed=true
+    end
+    return changed
+end
+
 local function restore_embedded_chapter_map(store,all,book,record,path,kind,forced_uid)
     if type(record)~="table" or type(book)~="table" then return false end
-    if type(record.chapter_map)=="table" and #record.chapter_map>0 then return false end
+    local missing_map=type(record.chapter_map)~="table" or #record.chapter_map==0
+    local recover_identity=record.recovered==true and (record.eink_content_mode==nil
+        or (tonumber(record.progress_source_book_version) or 0)<=0)
+    if not missing_map and not recover_identity then return false end
     if not path or not U.file_exists(path) or not tostring(path):lower():match("%.epub$") then return false end
 
-    local ok_installer,Installer=pcall(require,"miuread.epub_installer")
-    if not ok_installer or type(Installer)~="table" or type(Installer.inspect)~="function" then return false end
-    local ok_meta,meta=pcall(Installer.inspect,path)
-    if not ok_meta or type(meta)~="table" then return false end
+    local meta=store:epub_identity(path,true)
+    if not meta or (missing_map and type(meta.chapters)~="table") then
+        local ok_installer,Installer=pcall(require,"miuread.epub_installer")
+        if not ok_installer or type(Installer)~="table" or type(Installer.inspect)~="function" then return false end
+        local ok
+        ok,meta=pcall(Installer.inspect,path)
+        if not ok then return false end
+    end
+    if type(meta)~="table" then return false end
 
     local book_id=tostring(book.book_id or record.book_id or "")
     local meta_id=tostring(meta.book_id or meta.bookId or "")
@@ -2320,8 +2362,12 @@ local function restore_embedded_chapter_map(store,all,book,record,path,kind,forc
             "record=",book_id,"embedded=",meta_id)
         return false
     end
+    local identity_changed=restore_eink_identity(record,meta,book_id)
     local chapters=type(meta.chapters)=="table" and meta.chapters or {}
-    if #chapters==0 then return false end
+    if not missing_map or #chapters==0 then
+        if identity_changed then store:set("library",all) end
+        return identity_changed
+    end
 
     record.chapter_map=U.copy(chapters)
     record.chapter_count=#chapters
@@ -2418,6 +2464,7 @@ function Store:file_record_from_identity(path,meta,relink)
     local current_size=U.file_size(path)
     local all=self:library()
     local id=tostring(meta.book_id or "")
+    local embedded_id=id
     if id=="" then
         local wanted_title=metadata_key(meta.title)
         local wanted_author=metadata_key(meta.author)
@@ -2518,10 +2565,12 @@ function Store:file_record_from_identity(path,meta,relink)
         all[id]=book
     end
     if record then
+        restore_eink_identity(record,meta,embedded_id)
         if (type(meta.online_expires)=="number" or meta.online_server_only==true) and type(meta.online_login)=="string"
             and self.limited_online_dir and normalize_path(path)==self:limited_online_path(id,uid,meta.document_format) then
             record.online_expires,record.online_login=meta.online_expires,meta.online_login
             record.online_server_only=meta.online_server_only==true or nil
+            record.eink_content_mode=meta.eink_content_mode=="eink-online" and "eink-online" or record.eink_content_mode
         end
         if meta.progress_source_complete~=nil then
             record.progress_source_complete=meta.progress_source_complete==true

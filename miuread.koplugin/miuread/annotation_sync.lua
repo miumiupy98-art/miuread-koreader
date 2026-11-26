@@ -912,15 +912,24 @@ function AnnotationSync:sync_book(book, record, options)
                                 local remote_id = is_review
                                     and find_id(value, {"reviewId", "reviewID"})
                                     or find_id(value, {"bookmarkId", "bookmarkID"})
-                                local confirmed,confirmed_id
-                                local fresh=fetch_cloud_annotations(self.api,book_id,is_review)
-                                if is_review then
-                                    confirmed,confirmed_id=find_review_match(fresh,located.range,row.note,remote_id,row.chapter_uid)
+                                local confirmed_id
+                                local flag
+                                if type(value)=="table" then flag=value.succ end
+                                if remote_id~="" and (flag==nil or annotation_flag(flag)==true) then
+                                    confirmed_id=remote_id
                                 else
-                                    confirmed,confirmed_id=find_bookmark_match(fresh,located.range,expected_type,remote_id,row.chapter_uid)
+                                    local fresh=fetch_cloud_annotations(self.api,book_id,is_review)
+                                    local confirmed,id
+                                    if is_review then
+                                        confirmed,id=find_review_match(fresh,located.range,row.note,remote_id,row.chapter_uid)
+                                    else
+                                        confirmed,id=find_bookmark_match(fresh,located.range,expected_type,remote_id,row.chapter_uid)
+                                    end
+                                    if confirmed and matches_chapter(confirmed,row.chapter_uid) and record_range(confirmed)==located.range then
+                                        confirmed_id=id
+                                    end
                                 end
-                                if not confirmed or not confirmed_id or confirmed_id==""
-                                    or not matches_chapter(confirmed,row.chapter_uid) or record_range(confirmed)~=located.range then
+                                if not confirmed_id or confirmed_id=="" then
                                     remember_error(row, "unknown", "E-Ink 尚未确认批注的位置及编号", "readback", {
                                         range_key=located.range, book_version=write_version or 0,
                                         chapter_uid=row.chapter_uid, chapter_idx=row.chapter_idx,

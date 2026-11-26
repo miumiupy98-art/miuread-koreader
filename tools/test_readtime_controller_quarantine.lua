@@ -77,4 +77,23 @@ do
     end
     assert(found,"controller must log quarantined preflight and never dispatch")
 end
+-- A fresh unresolved position on the same book must not suppress queued time.
+do
+    local row={id="1",book_id="book",book_version=1,start_time=os.time()-61,duration=60}
+    local batch={book_id="book",book_version=1,rows={row},seconds=60,invalid_rows={}}
+    local c,logs=controller(batch)
+    local selected=false
+    c.store.read_persisted=function(_,key)
+        if key=="sessions" then
+            return {book={pending_unresolved_position={captured_at=os.time()}}}
+        end
+        return {account={vid="test-user"},login_session_id="s1"}
+    end
+    c.queue.pending=function(_,_,_,eligible)
+        selected=eligible(row)
+        return selected and batch or {rows={},invalid_rows={}}
+    end
+    c.queue.quarantine_overlap_batch=function() return {rows=0} end
+    assert(c:send()==true and selected,"position recovery must not prevent batch selection")
+end
 print("readtime controller pre-dispatch quarantine and preflight fallback passed")

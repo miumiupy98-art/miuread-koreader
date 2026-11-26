@@ -305,26 +305,16 @@ function M:send()
     if vid=="" or not self:_recover(vid) then return false end
     local summary=self:summary()
     if summary.pending==0 then return false end
-    if summary.blocked then
+    if summary.blocked=="cloud_position_changed" then
+        if self.queue:resume(vid,summary.blocked_book)~=true then return false end
+        self.summary_cache=nil
+    elseif summary.blocked then
         self:log("dispatch","waiting",{reason=summary.blocked}); return false
     end
     if os.time()<(tonumber((summary.control or {}).next_send) or 0) then return false end
     self.channel="eink"
     local now=os.time()
-    local sessions=type(self.store.read_persisted)=="function" and self.store:read_persisted("sessions") or {}
     local batch,err=self.queue:pending(vid,now,function(row)
-        local session=type(sessions)=="table" and sessions[tostring(row.book_id)] or nil
-        if type(session)=="table" and session.progress_submission_phase~="submitted_unverified" then
-            local position=session.pending_progress
-            if type(position)=="table" and position.eink_coordinate==true
-                and tonumber(position.book_version)==tonumber(row.book_version or 0)
-                and (session.progress_upload_state=="pending_send" or session.progress_upload_state=="remote_newer_pending")
-                and session.progress_sync_state~="verification_required"
-                and session.progress_sync_state~="upload_failed" then return false end
-            local anchor=session.pending_unresolved_position or session.pending_progress_coordinate
-            local captured=type(anchor)=="table" and tonumber(anchor.captured_at or anchor.coordinate_captured_at)
-            if captured and now-captured<120 then return false end
-        end
         return row.start_time+row.duration<=now
     end)
     if not batch then self.capture_error=err; return false end
@@ -419,8 +409,9 @@ function M:send()
             return {state="pending",error=reason,dispatched=false,retry_after=limited and limited.wait_seconds}
         end
         self:log("position_before","success",{book_id=batch.book_id,batch_id=id,
-            chapter_uid=prepared.before.chapter_uid,chapter_offset=prepared.before.chapter_offset,
-            cloud_seconds=prepared.before.reading_seconds,hours=#prepared.body.books[1].hours,
+            chapter_uid=prepared.before and prepared.before.chapter_uid,
+            chapter_offset=prepared.before and prepared.before.chapter_offset,
+            cloud_seconds=prepared.before and prepared.before.reading_seconds,hours=#prepared.body.books[1].hours,
             risk=prepared.body.books[1].risk,book_version=prepared.body.books[1].bookVersion,
             book_version_source=batch.rows[1].book_version_source or "legacy_unknown"})
         -- Auth may rotate during read-only preflight. Refuse an account switch.
@@ -435,27 +426,9 @@ function M:send()
             end
         end
         local result=Transport.send(host.http,prepared,claim)
-        -- Commit an explicit receipt before the optional diagnostic readback.
-        -- A slow verification must not turn accepted seconds into retry debt.
         local saved=self.queue:finish(vid,batch,id,result.state,os.time(),result.error)
         result.saved=saved==true
         if not result.saved then result.state="unknown"; result.error="receipt_persist_failed" end
-        if result.state=="confirmed" then
-            local checked,value=pcall(Native.request,Native,"GET","/book/getProgress",{bookId=batch.book_id},"reading_time_position_after")
-            local after=checked and Transport.position(value)
-            if after then
-                local unchanged=after.chapter_uid==prepared.before.chapter_uid and after.chapter_offset==prepared.before.chapter_offset
-                local delta=after.reading_seconds and prepared.before.reading_seconds
-                    and after.reading_seconds-prepared.before.reading_seconds or nil
-                self:log("position_after",unchanged and "success" or "error",{book_id=batch.book_id,batch_id=id,
-                    chapter_uid=after.chapter_uid,chapter_offset=after.chapter_offset,cloud_seconds=after.reading_seconds,
-                    position_unchanged=unchanged,cloud_delta=delta,seconds=batch.seconds})
-                if not unchanged then
-                    self.queue:block(vid,"cloud_position_changed",batch.book_id)
-                    result.blocked="cloud_position_changed"
-                end
-            else self:log("position_after","waiting",{batch_id=id,reason="verification_unavailable"}) end
-        end
         self:log("receipt",result.state,{book_id=batch.book_id,batch_id=id,seconds=batch.seconds,
             rows=#batch.rows,reason=result.error,code=result.code,status=result.status,
             request_dispatched=result.dispatched,local_cooldown=result.local_cooldown,wait_seconds=result.retry_after,

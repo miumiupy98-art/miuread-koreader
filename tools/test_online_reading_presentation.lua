@@ -16,8 +16,12 @@ local function copy(value)
     for k,v in pairs(value) do result[k]=copy(v) end
     return result
 end
+local scheduled
 local env={
     Plugin=plugin,b4_content_only_options=copy,
+    UIManager={scheduleIn=function(_,_,task) scheduled=task end},
+    DownloadAdmission={check=function() return true end},
+    RuntimePressure={memory_snapshot=function() return {} end},
     U={copy=copy,first_line=tostring,file_exists=function() return true end},
     reader_close_active=function() return false end,
     logger={warn=function() end},Http={is_auth_error=function() return false end},
@@ -111,17 +115,20 @@ assert(h.notices[1][1]=="正文加载失败" and h.store:download_state().status
 
 h=host()
 h.download_task.running=true
-assert(not h:download(book,{chapter_uid="7",read_online=true},true))
-assert(h.queue==0 and h.dialogs==0)
+assert(h:download(book,{chapter_uid="7",read_online=true},true))
+assert(h.queue==0 and h.dialogs==0 and h._online_chapter_slot)
+scheduled()
+assert(h._online_chapter_slot)
 h.download_task.running=false
+scheduled()
+assert(h.download_task.running and not h._online_chapter_slot)
+
+h=host()
 assert(h:download(book,{chapter_uid="7"},false))
 assert(not h.download_task.options.prefetch and h.dialogs==1 and h.writes[1]=="active")
 
-local scheduled
-env.UIManager={scheduleIn=function(_,_,task) scheduled=task end}
-env.monotonic_wall_time=function() return 1 end
 h=host()
-h.background_scheduler={active={key="home_cover_render"}}
+h.background_scheduler={active={key="home_stats"},set_foreground_barrier=function() end}
 h._download_resources_ready=function(self)
     if self.background_scheduler.active then return false,"background_busy" end
     return true
@@ -133,6 +140,22 @@ assert(not h.download_task.running)
 h.background_scheduler.active=nil
 scheduled()
 assert(h.download_task.running and not h._online_chapter_slot and h.queue==0)
+
+h=host()
+h.background_scheduler={
+    active={key="home_cover_render",token=1},
+    set_foreground_barrier=function() end,
+    release=function(self,key,token)
+        assert(key=="home_cover_render" and token==1)
+        self.active=nil
+    end,
+}
+h._background_cancel_worker=function(self,key) self.preempted=key end
+h._download_resources_ready=function(self) return not self.background_scheduler.active,"background_busy" end
+assert(h:download(book,{chapter_uid="7",read_online=true},true))
+assert(h.preempted=="home_cover_render")
+scheduled()
+assert(h.download_task.running and not h._online_chapter_slot)
 
 -- Short taps turn comment pages; only an explicit long-press action opens replies.
 local popup={}

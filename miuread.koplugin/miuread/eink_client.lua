@@ -804,39 +804,48 @@ function M:write_position(position,may_dispatch,rows)
         cloud_conflict=conflict and observed.updated_at>0 and captured>0 or false,
         time_receipt=with_time and receipt or nil}
 end
+function M.write_succeeded(value)
+    return type(value)=="table" and (value.succ==true or tonumber(value.succ)==1)
+end
+
 function M:write(path,payload,stage,preflight_marker,empty_list)
-    -- Renew credentials before sending. Never replay a possibly committed POST.
-    local ok,credentials=pcall(self.authorized,self,function(value)
-        local snapshot=self.http:get_json(BASE.."/shelf/sync?synckey=0&lectureSynckey=0",self:options(value,{5,10}))
-        array(snapshot,"books","shelf")
-        return value
-    end,stage)
-    if not ok then
-        if require("miuread.api_transport").control_error(credentials) then error(credentials,0) end
-        error((preflight_marker or "[MiuReadBeforeWrite] ")..tostring(credentials),0)
-    end
-    if self.before_request then self.before_request(stage) end
-    local options=self:options(credentials,{5,15})
-    local session=tostring(self.store:auth().login_session_id or "")
-    options.before_dispatch=function()
-        if type(self.store.read_persisted)~="function" then return true end
-        local current=self.store:read_persisted("auth")
-        local saved=Client.credentials(current or {})
-        return saved~=nil and current.login_session_id==session and saved.vid==credentials.vid
-            and saved.accessToken==credentials.accessToken
-    end
-    local value
-    if empty_list then
+    local auth=self.store:auth() or {}
+    local credentials=Client.credentials(auth)
+    local marker=preflight_marker or "[MiuReadBeforeWrite] "
+    if not credentials then error(marker.."E-Ink 接口需要客户端授权",0) end
+    local session=tostring(auth.login_session_id or "")
+    local function send(current_credentials)
+        if self.before_request then self.before_request(stage) end
+        local options=self:options(current_credentials,{5,15})
+        options.before_dispatch=function()
+            local current
+            if type(self.store.read_persisted)=="function" then current=self.store:read_persisted("auth")
+            else current=self.store:auth() end
+            local saved=Client.credentials(current or {})
+            return saved~=nil and tostring(current.login_session_id or "")==session
+                and saved.vid==current_credentials.vid and saved.accessToken==current_credentials.accessToken
+        end
+        if not empty_list then return self.http:post_json(BASE..path,payload,options) end
         local encoded=require("miuread.json").encode(payload)
         options.url,options.method=BASE..path,"POST"
         local fields=type(empty_list)=="table" and empty_list or {empty_list}
         local arrays={}
         for _,field in ipairs(fields) do arrays[#arrays+1]=',"'..field..'":[]' end
         options.body=encoded:sub(1,-2)..table.concat(arrays)..'}'
-        value=self.http:json(options)
-    else
-        value=self.http:post_json(BASE..path,payload,options)
+        return self.http:json(options)
     end
+    local ok,value=pcall(send,credentials)
+    if not ok then
+        local failure=tostring(value)
+        local status=tonumber(failure:match("HTTP (%d+)"))
+        local code=tonumber(failure:match("error_code=(%-?%d+)"))
+        if status==401 or code==-2011 or code==-2012 or code==-2041 then
+            local renewed,fresh=pcall(Client.refresh,self.http,self.store)
+            if not renewed then error(marker..tostring(fresh),0) end
+            ok,value=pcall(send,fresh)
+        end
+    end
+    if not ok then error(value,0) end
     if type(value)~="table" then error("E-Ink 写入结果无法确认",0) end
     return value
 end

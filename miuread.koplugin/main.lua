@@ -1546,6 +1546,9 @@ function Plugin:_pump_finished_status(force)
                 ok,data=pcall(api.mark_book_finished,api,book_id,finished)
                 if ok then
                     value.finished=FinishedStatus.parse(data,book_id)
+                    if value.finished==nil and require("miuread.eink_client").write_succeeded(data) then
+                        value.finished=finished
+                    end
                 else
                     value.unsent=tostring(data):find("[MiuReadBeforeWrite]",1,true)~=nil
                 end
@@ -8575,8 +8578,10 @@ function Plugin:_home_apply_weread_group(rows,state,home,preferences)
 end
 
 function Plugin:_change_weread_group(command,on_done)
-    local function change(api,value) return require("miuread.shelf_groups").change(api,value) end
-    return self:_fetch_eink_display("shelf-group-write","微信分组",change,{command},function()
+    local service=require("miuread.shelf_groups")
+    local before=service.cached_snapshot(self.store:shelf_cache())
+    local function change(api,value,current) return require("miuread.shelf_groups").change(api,value,current) end
+    return self:_fetch_eink_display("shelf-group-write","微信分组",change,{command,before},function()
         self:toast("微信分组已更新",2)
         self:_home_refresh_remote(true,true)
         if on_done then on_done() end
@@ -23390,7 +23395,7 @@ function Plugin:_download_resources_ready(reason)
 end
 
 function Plugin:_start_next_queued_download()
-    if self._queued_download_launch_pending then return false end
+    if self._queued_download_launch_pending or self._online_chapter_slot then return false end
     if self.download_task and self.download_task:busy() then return false end
     if self._download_runtime then return false end
     local queue=self.store:download_queue()
@@ -23516,30 +23521,51 @@ function Plugin:show_waiting_downloads()
     self:list("等待下载 · 最多一本",items)
 end
 
-function Plugin:_wait_for_online_chapter_slot(book,opt,open_after,done)
+function Plugin:_wait_for_online_chapter_slot(book,opt,open_after,done,reason)
     local context=self:_interactive_network_context()
     local login=tostring((self.store:auth() or {}).login_session_id or "")
-    local request={book_id=tostring(book.bookId or book.book_id or ""),expires=monotonic_wall_time()+8}
+    local request={book_id=tostring(book.bookId or book.book_id or "")}
     self._online_chapter_slot=request
-    self:status_toast("阅读","后台任务结束后将自动继续加载正文",4)
+    if self.background_scheduler then
+        self.background_scheduler:set_foreground_barrier(7,"reading chapter")
+        local active=self.background_scheduler.active
+        if active and active.user_requested~=true and
+            (active.key=="home_cover" or active.key=="home_cover_render" or active.key=="home_metadata") then
+            self:_background_cancel_worker(active.key,"reading chapter")
+            self.background_scheduler:release(active.key,active.token,"reading chapter")
+        end
+    end
+    local runtime=self._download_runtime
+    if runtime and runtime.options.prefetch_hidden==true and runtime.prefetch_required~=true
+        and self.download_task and self.download_task:busy() then
+        self.download_task:cancel()
+    end
+    self:status_toast("阅读","正在打开书",3)
     local function check()
         if self._online_chapter_slot~=request then return end
         if not self:_interactive_network_context_valid(context) or reader_close_active()
             or tostring((self.store:auth() or {}).login_session_id or "")~=login then
             self._online_chapter_slot=nil
+            self:_start_next_queued_download()
             return
         end
-        if not (self.background_scheduler and self.background_scheduler.active) then
-            opt.online_slot_retry=true
-            self:download(book,opt,open_after,done,true)
-        elseif monotonic_wall_time()<request.expires then
-            UIManager:scheduleIn(.35,check)
-        else
+        if self:_network_radio_hint()==false then
             self._online_chapter_slot=nil
-            self:status_toast("正文未开始加载","后台任务仍在运行，请稍后再试",4)
+            if opt.chapter_continuous_open then self:_clear_chapter_advance_wait("offline") end
+            if done then pcall(done,nil,true) end
+            self:status_toast("阅读","联网后可加载本章",3)
+            return
         end
+        if self.background_scheduler then self.background_scheduler:set_foreground_barrier(2,"reading chapter") end
+        local busy=(self.background_scheduler and self.background_scheduler.active)
+            or (self.download_task and self.download_task:busy())
+            or (self.cache_cleanup_task and self.cache_cleanup_task:busy())
+        local admitted=not busy and DownloadAdmission.check(RuntimePressure.memory_snapshot(true),Config)
+        if not admitted then UIManager:scheduleIn(reason=="low_memory" and 2 or .6,check); return end
+        self._online_chapter_slot=nil
+        self:download(book,opt,open_after,done,true)
     end
-    UIManager:scheduleIn(.35,check)
+    UIManager:scheduleIn(.25,check)
     return true
 end
 
@@ -23549,8 +23575,6 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     opt=b4_content_only_options(opt)
     local reading=(opt.chapter_uid~=nil and (opt.read_online==true or opt.chapter_continuous_open==true))
         or (opt.read_online==true and require("miuread.eink_pdf").is_book(b))
-    local slot_retry=opt.online_slot_retry==true
-    opt.online_slot_retry=nil
     local function ensure_login()
         if self:logged_in() then return true end
         if from_queue then return false end
@@ -23595,7 +23619,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         local active=self._download_runtime
         local active_prefetch=active and active.options.prefetch_hidden==true and active.prefetch_required~=true
         if is_prefetch then
-            if reading then self:status_toast("阅读","设备正在处理另一项书籍任务，请稍后再试",3) end
+            if reading then return self:_wait_for_online_chapter_slot(b,opt,open_after,done,"download_busy") end
             return false
         end
         if active_prefetch then
@@ -23618,7 +23642,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         local active=self._download_runtime
         local active_prefetch=active and active.options.prefetch_hidden==true and active.prefetch_required~=true
         if is_prefetch then
-            if reading then self:status_toast("阅读","设备正在处理另一项书籍任务，请稍后再试",3) end
+            if reading then return self:_wait_for_online_chapter_slot(b,opt,open_after,done,"download_busy") end
             return false
         end
         if active_prefetch and self.download_task and self.download_task:busy() then
@@ -23633,7 +23657,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
         return self:_queue_download(b,opt,open_after)
     end
     if self.cache_cleanup_task and self.cache_cleanup_task:busy() then
-        if reading then self:status_toast("阅读","缓存正在清理，请稍后重试",3) end
+        if reading then return self:_wait_for_online_chapter_slot(b,opt,open_after,done,"cleanup") end
         if is_prefetch then return false end
         self:info("缓存正在清理，完成后再开始下载。"); return
     end
@@ -23650,10 +23674,7 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
     -- fork margin or an existing background worker still owns the lease.
     local admitted,wait_reason=self:_download_resources_ready("download")
     if not admitted then
-        if reading and opt.chapter_uid~=nil and wait_reason=="background_busy" and not slot_retry then
-            return self:_wait_for_online_chapter_slot(b,opt,open_after,done)
-        end
-        if reading then self:status_toast("阅读","设备暂时忙，请稍后重试",3) end
+        if reading then return self:_wait_for_online_chapter_slot(b,opt,open_after,done,wait_reason) end
         if is_prefetch then return false end
         local queued=self:_queue_download(b,opt,open_after,{reason=wait_reason})
         if queued then
@@ -23688,6 +23709,9 @@ function Plugin:download(b,opt,open_after,done,start_in_background,from_queue)
             self:_notify_home_data_changed("content")
         end
         if reading then
+            if err=="low_memory" then return self:_wait_for_online_chapter_slot(b,opt,open_after,done,err) end
+            if opt.chapter_continuous_open then self:_clear_chapter_advance_wait("online worker unavailable") end
+            if done then pcall(done,nil,true) end
             self:status_toast("阅读","暂时无法加载正文，请稍后重试",3)
             return false
         end
@@ -29869,7 +29893,7 @@ function Plugin:on_remote_progress(id,localp,remote,automatic,local_position)
                     local resolved_local=type(actual_position)=="table" and U.copy(actual_position) or U.copy(local_position)
                     resolved_local.updated_at=tonumber(resolved_remote and (resolved_remote.updated_at or resolved_remote.updated) or 0) or os.time()
                     self:_save_position_resolution(id,"aligned","remote_position_verified",resolved_local,resolved_remote)
-                    if automatic then self:_open_sync_close("remote position verified",false); self:_finish_auto_position_check(id,"remote verified"); self:_show_position_undo(resolved_local)
+                    if automatic then self:_open_sync_close("remote position verified",false); self:_finish_auto_position_check(id,"remote verified"); self:_show_position_undo(actual_position)
                     else self:_sync_notice("read_ok") end
                 else
                     local failure_kind=tostring(type(failure_meta)=="table" and failure_meta.kind or "unresolved")
@@ -34312,12 +34336,8 @@ function Plugin:onReaderReady()
         open_sync_requested=open_sync_prefs.auto_latest_position~=false and open_sync_prefs.pull_on_open~=false
     end
     if is_weread or self:_reader_panel_active() then
-        local guard_seconds=preserve_session==true and .20 or tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .75
-        if open_sync_requested then
-            guard_seconds=math.max(guard_seconds,(tonumber(Config.OPEN_SYNC_SOFT_TIMEOUT_SECONDS) or 2.5)+.4)
-        end
-        self:_arm_reader_gesture_guard(guard_seconds,
-            continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or (open_sync_requested and "latest position sync" or "reader open")))
+        self:_arm_reader_gesture_guard(tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .20,
+            continuous_switch and "chapter switch" or (preserve_session==true and "reader rebuild" or "reader open"))
     end
     if open_sync_requested then
         local opening_book
