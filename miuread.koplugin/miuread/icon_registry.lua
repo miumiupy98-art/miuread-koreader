@@ -29,6 +29,7 @@ local MAP = {
     ["↻"] = "refresh", refresh = "refresh",
     ["⌕"] = "search", search = "search",
     ["⇩"] = "download", download = "download",
+    ["download-complete"] = "download-complete",
     ["⇧"] = "upload", upload = "upload",
     ["⚙"] = "settings", settings = "settings", ["koreader-settings"] = "settings",
     ["◷"] = "history", history = "history",

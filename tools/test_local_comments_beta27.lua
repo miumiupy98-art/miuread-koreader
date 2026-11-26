@@ -18,9 +18,18 @@ package.preload["miuread.json"]=function()
     return {encode=serialize,decode=function(s) return assert(loadstring("return "..s))() end}
 end
 package.preload["miuread.util"]=function()
-    return {atomic_write=function(path,body)
-        local f=assert(io.open(path,"wb"));assert(f:write(body));f:close();return true
-    end}
+    return {
+        read_file=function(path,binary)
+            local f,err=io.open(path,binary and "rb" or "r")
+            if not f then return nil,err end
+            local data=f:read("*a")
+            f:close()
+            return data
+        end,
+        atomic_write=function(path,body)
+            local f=assert(io.open(path,"wb"));assert(f:write(body));f:close();return true
+        end,
+    }
 end
 package.preload["libs/libkoreader-lfs"]=function()
     return {attributes=function(path)

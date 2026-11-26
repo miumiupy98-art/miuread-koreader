@@ -15,6 +15,7 @@ local Widget = require("ui/widget/widget")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local TransientGuard = require("miuread.transient_guard")
+local DialogTransition = require("miuread.dialog_transition")
 local Skin = require("miuread.reader_skin")
 local Ui = require("miuread.ui_components")
 
@@ -123,6 +124,7 @@ function Dialog:_row_widget(item, width, height)
 
     local tap = TapBox:new{
         dimen = Geom:new{w = width, h = height},
+        enabled = type(item.callback)=="function",
         callback = function() self:_close(item.callback) end,
     }
     tap[1] = layers
@@ -326,13 +328,7 @@ function Dialog:onCloseWidget()
     self.pending_action = nil
     self.closed = true
     if live_dialog == self then live_dialog = nil end
-    if region then UIManager:setDirty(nil, function() return "ui", region end) end
-    if action then
-        UIManager:scheduleIn(.04, function()
-            local ok, err = pcall(action)
-            if not ok then logger.warn("[MiuRead][ReaderTocDialog] action failed", tostring(err)) end
-        end)
-    end
+    DialogTransition.after_close(region,action,"ReaderTocDialog")
 end
 
 local M = {}

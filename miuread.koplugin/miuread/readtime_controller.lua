@@ -253,6 +253,31 @@ function M:adopt_auth(vid)
         self.store:set_deferred("auth",saved)
     end
 end
+-- The progress writer holds our fence while it leases the same book's seconds.
+function M:position_time(sync,position)
+    if self.progress_owner~=sync or not self:enabled() then return end
+    local vid=account(self.store)
+    if vid=="" or not self:_recover(vid) then return end
+    local now=os.time()
+    local summary=self.queue:summary(vid)
+    if not summary or summary.blocked or now<(tonumber((summary.control or {}).next_send) or 0) then return end
+    local batch=self.queue:pending(vid,now,function(row)
+        return tostring(row.book_id)==tostring(position.book_id)
+            and tonumber(row.book_version or 0)==tonumber(position.book_version)
+            and row.start_time+row.duration<=now
+    end)
+    if batch and #batch.rows>0 and #batch.invalid_rows==0 then
+        return {id=tostring(now).."-"..tostring(math.random(100000,999999)),vid=vid,batch=batch}
+    end
+end
+
+function M:finish_position_time(attempt,receipt)
+    local state=receipt and receipt.state or "unknown"
+    local reason=receipt and receipt.error or "worker_failed"
+    if receipt and not receipt.dispatched then return true end
+    return self.queue:finish(attempt.vid,attempt.batch,attempt.id,state,os.time(),reason)
+end
+
 function M:send()
     if not self:enabled() or self.suspended or self.progress_owner or self.worker:busy() or self.worker_unavailable
         or not self.host then return false end
@@ -263,17 +288,11 @@ function M:send()
     if daemon and (daemon.active or daemon.final_flush_pending) then return false end
     if owner_daemon and owner_daemon~=daemon
         and (owner_daemon.active or owner_daemon.final_flush_pending) then return false end
-    local prefs=self.store:preferences().sync or {}
-    local mode=(live_sync and live_sync.reading_time_mode and live_sync:reading_time_mode())
-        or (prefs.time_eink_only==true and "eink" or prefs.time_route_mode or "legacy")
-    local eink_allowed=mode=="eink" or mode=="smart"
     -- A stale Sync.current survives stopped sessions; only live sessions
     -- should hold the read-time outbox. Keep beta.9 worker ownership unchanged.
     local function live_reader(s)
         return s and s.current and s.state~="stopped"
     end
-    if live_sync and live_sync.reading_time_backend=="web" and live_reader(live_sync) then return false end
-    if self.sync and self.sync.reading_time_backend=="web" and live_reader(self.sync) then return false end
     if self.active or live_reader(live_sync) or live_reader(self.sync) then return false end
     if host._reading_end_sync_active or host._reading_end_finalizer_active
         or (self.sync and (self.sync.busy or self.sync.progress_write_fence)) then return false end
@@ -286,14 +305,13 @@ function M:send()
     if vid=="" or not self:_recover(vid) then return false end
     local summary=self:summary()
     if summary.pending==0 then return false end
-    if summary.blocked then
+    if summary.blocked=="cloud_position_changed" then
+        if self.queue:resume(vid,summary.blocked_book)~=true then return false end
+        self.summary_cache=nil
+    elseif summary.blocked then
         self:log("dispatch","waiting",{reason=summary.blocked}); return false
     end
     if os.time()<(tonumber((summary.control or {}).next_send) or 0) then return false end
-    if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink" then
-        self.awaiting_authorization=true
-        return false
-    end
     self.channel="eink"
     local now=os.time()
     local batch,err=self.queue:pending(vid,now,function(row)
@@ -328,8 +346,7 @@ function M:send()
     self:log("preflight","start",{book_id=batch.book_id,batch_id=id,seconds=batch.seconds,rows=#batch.rows})
     local launched=self.worker:run("offline-reading-time",function()
         local function claim()
-            -- Recheck the persisted login immediately before either transport
-            -- enters its write. Switching accounts never redirects a batch.
+            -- Recheck the persisted E-Ink login immediately before dispatch.
             if account(self.store)~=vid then return false end
             for _,row in ipairs(batch.rows) do
                 if row.start_time+row.duration>os.time() then return false end
@@ -392,8 +409,9 @@ function M:send()
             return {state="pending",error=reason,dispatched=false,retry_after=limited and limited.wait_seconds}
         end
         self:log("position_before","success",{book_id=batch.book_id,batch_id=id,
-            chapter_uid=prepared.before.chapter_uid,chapter_offset=prepared.before.chapter_offset,
-            cloud_seconds=prepared.before.reading_seconds,hours=#prepared.body.books[1].hours,
+            chapter_uid=prepared.before and prepared.before.chapter_uid,
+            chapter_offset=prepared.before and prepared.before.chapter_offset,
+            cloud_seconds=prepared.before and prepared.before.reading_seconds,hours=#prepared.body.books[1].hours,
             risk=prepared.body.books[1].risk,book_version=prepared.body.books[1].bookVersion,
             book_version_source=batch.rows[1].book_version_source or "legacy_unknown"})
         -- Auth may rotate during read-only preflight. Refuse an account switch.
@@ -408,27 +426,9 @@ function M:send()
             end
         end
         local result=Transport.send(host.http,prepared,claim)
-        -- Commit an explicit receipt before the optional diagnostic readback.
-        -- A slow verification must not turn accepted seconds into retry debt.
         local saved=self.queue:finish(vid,batch,id,result.state,os.time(),result.error)
         result.saved=saved==true
         if not result.saved then result.state="unknown"; result.error="receipt_persist_failed" end
-        if result.state=="confirmed" then
-            local checked,value=pcall(Native.request,Native,"GET","/book/getProgress",{bookId=batch.book_id},"reading_time_position_after")
-            local after=checked and Transport.position(value)
-            if after then
-                local unchanged=after.chapter_uid==prepared.before.chapter_uid and after.chapter_offset==prepared.before.chapter_offset
-                local delta=after.reading_seconds and prepared.before.reading_seconds
-                    and after.reading_seconds-prepared.before.reading_seconds or nil
-                self:log("position_after",unchanged and "success" or "error",{book_id=batch.book_id,batch_id=id,
-                    chapter_uid=after.chapter_uid,chapter_offset=after.chapter_offset,cloud_seconds=after.reading_seconds,
-                    position_unchanged=unchanged,cloud_delta=delta,seconds=batch.seconds})
-                if not unchanged then
-                    self.queue:block(vid,"cloud_position_changed",batch.book_id)
-                    result.blocked="cloud_position_changed"
-                end
-            else self:log("position_after","waiting",{batch_id=id,reason="verification_unavailable"}) end
-        end
         self:log("receipt",result.state,{book_id=batch.book_id,batch_id=id,seconds=batch.seconds,
             rows=#batch.rows,reason=result.error,code=result.code,status=result.status,
             request_dispatched=result.dispatched,local_cooldown=result.local_cooldown,wait_seconds=result.retry_after,
@@ -490,20 +490,8 @@ function M:summary()
     self.summary_cache,self.summary_account,self.summary_at=value,vid,now
     return value
 end
-function M:unknown()
-    local vid=account(self.store)
-    local groups,err=self.queue:unknown(vid)
-    if groups then for _,group in ipairs(groups) do group.account=vid end end
-    return groups,err
-end
-function M:ignore(group)
-    if self.worker:busy() then return nil,"同步任务忙，请稍后再试" end
-    if group.account and group.account~=account(self.store) then return nil,"账号已切换，请重新打开记录" end
-    local seconds=self.queue:ignore(account(self.store),group)
-    self.summary_cache=nil
-    if seconds==nil then return nil,"本地记录无法保存" end
-    self:log("ignore","success",{seconds=seconds,batch_id=group.id})
-    return seconds
+function M:unverified_history()
+    return self.queue:unverified_history(account(self.store))
 end
 function M:check_and_resume(host,callback)
     self.host=host or self.host

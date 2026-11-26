@@ -9,7 +9,7 @@ local Range = require("miuread.annotations.range")
 local lfs = require("libs/libkoreader-lfs")
 
 local Locator = {}
-Locator.VERSION = "b3-1"
+Locator.VERSION = "b3-3"
 
 local function compact(s)
     s=tostring(s or "")
@@ -113,19 +113,31 @@ local function in_bounds(document,start,ending,bounds)
     return true
 end
 
-function Locator.quoteFor(group,underlines,raw_map)
+function Locator.quoteFor(group,underlines,raw_map,index,native_map)
     local range=tostring(group and group.range or "")
-    local remote
-    for _,row in ipairs(underlines or {}) do
-        if tostring(row.range or row.markRange or row.bookmarkRange or "")==range then
-            remote=row; break
+    local remote=index and index[range]
+    if not index then
+        for _,row in ipairs(underlines or {}) do
+            if tostring(row.range or row.markRange or row.bookmarkRange or "")==range then
+                remote=row; break
+            end
         end
     end
     local from_remote=remote and tostring(remote.markText or remote.bookmarkText or remote.rangeText or "") or ""
     local from_source=""
-    if raw_map then
+    if native_map then
+        from_source=require("miuread.eink_comment_source").quote(native_map,range) or ""
+    elseif raw_map then
         local resolved=Coord.resolveRangeOnMap(raw_map,range)
         if resolved and not resolved.point then from_source=tostring(resolved.text or "") end
+    end
+    if group.personal then
+        local abstract=group.texts and group.texts[1] and tostring(group.texts[1].abstract or "") or ""
+        if native and from_source~="" then
+            if abstract=="" or compact(abstract)==compact(from_source) then return from_source,"source" end
+            return "","personal_source_quote_conflict"
+        end
+        return abstract,"personal_review_abstract"
     end
     -- The server's raw coordinate source wins over an unrelated review abstract.
     if from_source~="" and compact(from_source)~="" then
@@ -165,7 +177,7 @@ function Locator.find(document,quote,bounds)
     return found
 end
 
-function Locator.resolve(store,reader,ui,book_id,uid,record,groups)
+function Locator.resolve(store,reader,ui,book_id,uid,record,groups,marks,on_group)
     local document=ui and ui.document
     local path=document and document.file
     if (not path or path=="") and document and type(document.getFilePath)=="function" then
@@ -181,8 +193,31 @@ function Locator.resolve(store,reader,ui,book_id,uid,record,groups)
     if not bounds then return {},{matched=0,unmatched=#(groups or {}),error=err} end
     local snapshot=ThoughtDatabase.load_checkpoint(store,book_id,uid)
     local underlines=type(snapshot)=="table" and snapshot.underlines or nil
+    local underline_index={}
+    for _,row in ipairs(underlines or {}) do
+        local range=row.range or row.markRange or row.bookmarkRange
+        if range then underline_index[tostring(range)]=row end
+    end
+    for _,row in ipairs(marks or {}) do
+        if row.markText~="" or not underline_index[row.range] then underline_index[row.range]=row end
+    end
     -- Offline only. Missing source is not a reason to trigger a network request.
-    local raw=Source.readCachedChapter(store,book_id,uid)
+    local native
+    for _,group in ipairs(groups or {}) do
+        if group.mark_only then
+            local CommentSource=require("miuread.eink_comment_source")
+            native=CommentSource.for_document(store,book_id,uid,path)
+            local version=type(record)=="table" and tonumber(record.progress_source_book_version)
+            if not native and group.personal and version and version>0 and reader and reader.store then
+                local position_source=require("miuread.eink_progress_source")
+                local aligned=position_source.annotation_alignment(reader,
+                    {book={book_id=book_id},path=path,record=record},uid,version,false)
+                if aligned then native=CommentSource.make_map(aligned.raw,"html") end
+            end
+            break
+        end
+    end
+    local raw=not native and Source.readCachedChapter(store,book_id,uid) or nil
     local raw_map=raw and Coord.build(raw) or nil
     local locations
     if type(record)=="table" and record.local_document==true then
@@ -192,10 +227,11 @@ function Locator.resolve(store,reader,ui,book_id,uid,record,groups)
     end
     local written,records,stats={}, {},{matched=0,unmatched=0}
     for _,group in ipairs(groups or {}) do
+        if on_group then on_group() end
         local range=tostring(group.range or "")
         local _,_,point=Range.parse(range)
-        if range~="" and #(group.texts or {})>0 and point~=true then
-            local quote,origin=Locator.quoteFor(group,underlines,raw_map)
+        if range~="" and (#(group.texts or {})>0 or group.mark_only==true) and point~=true then
+            local quote,origin=Locator.quoteFor(group,nil,raw_map,underline_index,native)
             local key=fingerprint.."|"..signature(compact(quote))
             local previous=locations[range]
             local start,ending,status
@@ -215,7 +251,7 @@ function Locator.resolve(store,reader,ui,book_id,uid,record,groups)
             end
             if start and ending and in_bounds(document,start,ending,bounds) then
                 records[#records+1]={pos0=start,pos1=ending,book_id=book_id,
-                    chapter_uid=uid,range=range,quote=quote}
+                    chapter_uid=uid,range=range,quote=quote,mark_only=group.mark_only==true}
                 stats.matched=stats.matched+1
             else stats.unmatched=stats.unmatched+1 end
         end

@@ -2585,7 +2585,10 @@ function DownloadTask:start(book, options, on_progress, on_done, restart_count)
                 emit{stage = "done", current = 1, total = 1, percent = 1,
                     chapter = clean_book.title or "",
                     message = value and value.record and
-                        (value.record.post_install_web_status=="complete" and "EPUB 已安装，Web 原文缓存完成"
+                        (value.record.document_format=="pdf" and "PDF 原件已保存"
+                        or value.record.document_format=="txt" and "TXT 正文已保存"
+                        or value.record.eink_content_mode and "E-Ink 正文已生成 EPUB"
+                        or (value.record.post_install_web_status=="complete" and "EPUB 已安装，Web 原文缓存完成")
                         or "EPUB 已安装；Web 定位尚未全部通过，可继续处理") or nil,
                     recovery_result = {ok=true,value=payload.value},
                     recovery_saved = recovery_ok==true, recovery_error = recovery_ok and nil or tostring(recovery_error)}

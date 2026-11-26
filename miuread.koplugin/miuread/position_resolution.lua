@@ -54,14 +54,55 @@ local function changed_from_anchor(position, anchor)
     return not M.same_position(position,ap)
 end
 
+function M.current_pending(session)
+    session=type(session)=="table" and session or {}
+    local verified=number(session.progress_verified_sequence,0)
+    local latest=number(session.progress_latest_sequence,0)
+    local epoch=math.max(1,number(session.progress_epoch,1))
+    local selected,sequence=nil,0
+    for _,key in ipairs({"pending_progress","pending_progress_coordinate","pending_unresolved_position"}) do
+        local pending=session[key]
+        if type(pending)=="table" then
+            local seq=number(pending.progress_sequence,0)
+            if seq>verified and seq>=latest and seq>sequence and number(pending.progress_epoch,epoch)==epoch then
+                selected,sequence=pending,seq
+            end
+        end
+    end
+    return selected
+end
+
+function M.pending_cloud_reason(pending,remote,other_device)
+    if not pending or not remote or remote.source~="eink" or uid(remote)=="" or offset(remote)==nil then return nil end
+    local book_version=tonumber(pending.book_version)
+    local remote_version=tonumber(remote.version)
+    if book_version and remote_version and book_version~=remote_version then return nil end
+    if pending.eink_coordinate==true and uid(pending)==uid(remote) and offset(pending)==offset(remote) then
+        return "cloud_matches_saved_position"
+    end
+    local captured=number(pending.captured_at or pending.coordinate_captured_at,0)
+    local updated=number(remote.updated_at or remote.updated,0)
+    if other_device==true and captured>0 and updated>captured then
+        return "newer_cloud_device"
+    end
+end
+
 -- input:
--- local_position, remote_position, verified_anchor,
+-- local_position, remote_position, verified_anchor, pending_position, remote_other_device,
 -- local_seq, verified_seq, local_updated_at, remote_updated_at,
 -- clock_skew_grace (seconds, default 30)
 function M.decide(input)
     input=type(input)=="table" and input or {}
     local lp=type(input.local_position)=="table" and input.local_position or nil
     local rp=type(input.remote_position)=="table" and input.remote_position or nil
+    if type(input.pending_position)=="table" then
+        local reason=M.pending_cloud_reason(input.pending_position,rp,input.remote_other_device)
+        if reason=="cloud_matches_saved_position" and M.same_position(lp,rp) then
+            return {winner="aligned",reason=reason}
+        end
+        if reason then return {winner="remote",reason=reason} end
+        return {winner="local",reason="unconfirmed_local_read_event"}
+    end
     if not lp and rp then return {winner="remote",reason="local_missing"} end
     if lp and not rp then return {winner="local",reason="remote_missing"} end
     if not lp and not rp then return {winner="local",reason="positions_missing"} end
@@ -70,6 +111,9 @@ function M.decide(input)
     local local_seq=number(input.local_seq,0) or 0
     local verified_seq=number(input.verified_seq,0) or 0
     local seq_local_changed=local_seq>verified_seq
+    if seq_local_changed and input.remote_same_device==true then
+        return {winner="local",reason="unsent_position_from_this_device"}
+    end
     local local_anchor_changed=changed_from_anchor(lp,input.verified_anchor)
     local remote_anchor_changed=changed_from_anchor(rp,input.verified_anchor)
     local local_changed=seq_local_changed or local_anchor_changed==true
@@ -129,7 +173,7 @@ local POSITION_SNAPSHOT_FIELDS = {
     "chapter_uid","chapterUid","chapter_idx","chapter_index","chapterIdx",
     "canonical_offset","chapter_offset","offset","chapterOffset","offset_basis","position_basis",
     "native_offset","chapter_word_count","total_word_count","words_before","chapter_percent","chapter_ratio",
-    "summary","safe","precise","standalone","source","selection_reason","conflict",
+    "summary","safe","precise","standalone","source","selection_reason","conflict","app_id","install_id","device_id",
     "updated_at","updated","fetched_at","captured_at","submitted_at","server_updated","saved_at",
     "progress_sequence","progress_epoch","display_progress_quality","display_catalog_source","display_page_token",
     "precision_ms","precision_anchor","precision_anchor_chars","precision_chapter_chars","precision_cache_hit",

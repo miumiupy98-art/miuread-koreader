@@ -30,6 +30,11 @@ function M.request_options(credentials,timeout)
     return {auth=false,redirects=0,retries=0,rate_limit_retries=0,rate_limit_fail_fast=true,
         timeout=timeout or {5,10},headers=M.headers(credentials)}
 end
+local function same_credentials(first,second)
+    return first and second and first.vid==second.vid
+        and first.accessToken==second.accessToken and first.refreshToken==second.refreshToken
+        and first.deviceId==second.deviceId
+end
 local function request(http,method,url,body,opt,stage,store)
     local started=Log.now()
     local ok,value
@@ -77,7 +82,7 @@ local function tokens(data,previous)
     if vid=="" or not nonempty(data.accessToken) or not nonempty(refresh) then
         error("客户端授权未返回完整登录凭证")
     end
-    return {vid=vid,accessToken=data.accessToken,refreshToken=refresh,deviceId=previous.deviceId}
+    return {vid=vid,accessToken=data.accessToken,refreshToken=refresh,deviceId=previous.deviceId,installId=previous.installId}
 end
 
 function M.refresh(http,store)
@@ -92,24 +97,24 @@ function M.refresh(http,store)
     local current=store:auth()
     local vid,session=account(auth)
     local current_vid,current_session=account(current)
-    if current_vid~=vid or current_session~=session
-        or tonumber(current.auth_revision or 0)~=tonumber(auth.auth_revision or 0) then
+    if current_vid~=vid or current_session~=session or not same_credentials(credential,M.credentials(current)) then
         error("登录账号或凭据已变更，已忽略客户端续期")
     end
     current.native_shelf=renewed
-    local saved=store:save_auth(current,{expected_revision=tonumber(auth.auth_revision or 0) or 0})
+    local saved=store:save_auth(current,{expected_revision=tonumber(current.auth_revision or 0) or 0})
     if saved~=true then error("客户端续期凭证未保存，请重试授权") end
     return renewed
 end
 
 local Client={}; Client.__index=Client
-function M.new(http,store)
+function M.new(http,store,primary_login)
     local auth=store:auth()
     local vid,session=account(auth)
-    if vid=="" or session=="" then error("请先登录微信读书，再授权书架管理") end
+    if not primary_login and (vid=="" or session=="") then error("请先登录微信读书，再授权书架管理") end
     local previous=M.credentials(auth)
-    return setmetatable({http=http,store=store,vid=vid,session=session,
-        device_id=previous and previous.deviceId or "eink334691225"..digits(19)},Client)
+    return setmetatable({http=http,store=store,vid=vid,session=session,primary_login=primary_login==true,
+        device_id=previous and previous.deviceId or "eink334691225"..digits(19),
+        install_id=previous and previous.installId or "eink31"..digits(26)},Client)
 end
 function Client:uid()
     local ticket=request(self.http,"GET",BASE.."/wxticket?nonceStr=weread",nil,M.request_options(),"qr_ticket",self.store)
@@ -142,14 +147,16 @@ end
 function Client:validate_commit(auth)
     local current_vid,current_session=account(self.store:auth())
     local vid,session=account(auth)
-    if current_vid~=self.vid or current_session~=self.session or vid~=self.vid or session~=self.session
-        or not M.credentials(auth) then return false,"当前账号已变更，请重新授权书架管理" end
+    local target_valid=self.primary_login and vid~="" and session~="" and session~=self.session
+        or (not self.primary_login and vid==self.vid and session==self.session)
+    if current_vid~=self.vid or current_session~=self.session or not target_valid
+        or not M.credentials(auth) then return false,"账号会话已变更，请重新扫码" end
     return true
 end
 function Client:persisted_matches(expected,persisted)
     local a=M.credentials(expected); local b=M.credentials(persisted)
     if not a or not b then return false,"客户端凭据未保存" end
-    for _,key in ipairs({"vid","accessToken","refreshToken","deviceId"}) do
+    for _,key in ipairs({"vid","accessToken","refreshToken","deviceId","installId"}) do
         if a[key]~=b[key] then return false,"客户端凭据保存不完整" end
     end
     return true
@@ -157,22 +164,25 @@ end
 function Client:finish(data)
     local current=self.store:auth()
     local vid,session=account(current)
-    if vid~=self.vid or session~=self.session then error("当前账号已变更，请重新授权书架管理") end
+    if vid~=self.vid or session~=self.session then error("账号会话已变更，请重新扫码") end
     if not nonempty(data.wx_code) then error("客户端授权码缺失") end
     local body=login_body(self.device_id)
-    body.code=data.wx_code; body.appFirstInstall=1; body.installId="eink31"..digits(26)
+    body.code=data.wx_code; body.appFirstInstall=1; body.installId=self.install_id
     body.isAutoLogout=0; body.isFromQrcode=1
     local result=request(self.http,"POST",BASE.."/login",body,M.request_options(),"login",self.store)
-    local credential=tokens(result,{deviceId=self.device_id})
-    if credential.vid~=self.vid then error("扫码账号与觅阅当前账号不同，请使用同一账号授权") end
-    local shelf=request(self.http,"GET",BASE.."/shelf/sync",nil,M.request_options(credential),"shelf_verify",self.store)
-    if type(shelf.books)~="table" then error("客户端书架验证失败，未保存授权") end
-    -- Merge with the current Web session, allowing ordinary cookie renewal
-    -- during the QR scan without overwriting it with an older snapshot.
+    local credential=tokens(result,{deviceId=self.device_id,installId=self.install_id})
+    if not self.primary_login and credential.vid~=self.vid then error("扫码账号与觅阅当前账号不同，请使用同一账号授权") end
     current=self.store:auth()
+    if self.primary_login then
+        local info=type(result.user)=="table" and result.user or {}
+        local old_name=credential.vid==vid and (current.account or {}).name or nil
+        local name=info.name or result.name or old_name
+        current={login_session_id=self.store:generate_login_session_id(),
+            account={vid=credential.vid,name=nonempty(name) and name or credential.vid,logged_at=os.time()}}
+    end
     current.native_shelf=credential
     local valid,err=self:validate_commit(current)
     if not valid then error(err) end
-    return current,tostring((current.account or {}).name or self.vid)
+    return current,tostring((current.account or {}).name or credential.vid)
 end
 return M

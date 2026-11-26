@@ -48,7 +48,7 @@ end
 function M:invoke(name,native,web,options)
     if self.control_failure then error(self.control_failure,0) end
     options=options or {}
-    local channel=options.web_only and "web" or self.selected
+    local channel=options.force_eink and "eink" or (options.web_only and "web" or self.selected)
     if options.native_only and (channel~="eink" or not native) then
         if options.coordinates then error("[MiuReadCoordinateSource] E-Ink 批注坐标需要同源接口，未发送写入",0) end
         error("E-Ink 来源暂不可用，请重新打开列表后重试",0)

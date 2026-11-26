@@ -193,6 +193,11 @@ Epub.build(
         variant="clean",
         content_type="epub",
         chapters={{uid="c1",index=1,title="Chapter 1",word_count=1200}},
+        eink_content_mode="eink-offline",
+        access_scope="full",
+        catalog_complete=true,
+        annotation_requested=false,
+        progress_source_book_version=37,
         progress_source_complete=true,
         progress_source_chapter_count=1,
     }
@@ -217,6 +222,14 @@ local rec_book,rec_record,rec_kind,rec_source=store:recover_miuread_file(miuread
 assert(rec_book and rec_book.book_id=="3300012345","recover_miuread_file failed on real MiuRead EPUB")
 assert(rec_record and rec_kind=="clean" and rec_source=="embedded_book_id","recover_miuread_file unexpected result")
 assert(popen_calls==0,"recover_miuread_file spawned subprocess on real MiuRead EPUB")
+assert(rec_record.eink_content_mode=="eink-offline" and rec_record.progress_source_book_version==37)
+assert(rec_record.access_scope=="full" and rec_record.annotation_requested==false and rec_record.eink_catalog_complete)
+rec_record.eink_content_mode=nil
+rec_record.progress_source_book_version=nil
+store:save_book(rec_book.book_id,rec_book)
+local _,repaired=store:recover_miuread_file(miuread_epub,true)
+assert(repaired.eink_content_mode=="eink-offline" and repaired.progress_source_book_version==37,
+    "previously recovered records must repair existing metadata in place")
 
 -- Test 2: Ordinary ZIP .epub (without OEBPS/miuread.json or miuread://book/)
 local ordinary_epub=TMP.."/ordinary_book.epub"

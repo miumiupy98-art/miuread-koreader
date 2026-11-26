@@ -1,6 +1,7 @@
 local lfs = require("libs/libkoreader-lfs")
 local U = require("miuread.util")
 local BookIntegrity = require("miuread.book_integrity")
+local logger = require("logger")
 
 local Service = {}
 Service.__index = Service
@@ -53,6 +54,7 @@ local function collect_document(plan, path)
     if path == "" then return end
     add_unique(plan.documents, plan._document_seen, path)
     add_unique(plan.paths, plan._path_seen, path)
+    if plan.download_only then return end
 
     local ok, DocSettings = pcall(require, "docsettings")
     if not ok or not DocSettings then return end
@@ -196,8 +198,8 @@ function Service:summary(book_id)
 
     for uid, row in pairs(book.chapters or {}) do
         local found = false
-        for _, record in pairs(type(row) == "table" and row or {}) do
-            if type(record) == "table" and record.file and exists(record.file) then
+        for kind, record in pairs(type(row) == "table" and row or {}) do
+            if kind~="online" and type(record) == "table" and record.file and exists(record.file) then
                 found = true
                 local size = path_size(record.file)
                 out.chapter_bytes = out.chapter_bytes + size
@@ -227,15 +229,17 @@ local function add_matching_partial_repairs(plan, store, book_id, predicate)
     end
 end
 
-function Service:plan_variant(book_id, kind)
+function Service:plan_variant(book_id, kind, download_only)
     book_id, kind = tostring(book_id or ""), tostring(kind or "")
     local plan = new_plan("variant", book_id)
+    plan.download_only=download_only==true
     plan.kind = kind
     plan.label = self:variant_label(kind)
     local record = self.store:variant(book_id, kind)
     if record then collect_record(plan, record) end
 
     local base_kind = (kind == "notes" or kind == "range_notes" or kind == "preview_notes") and "notes" or "clean"
+    if plan.download_only then return finalize_plan(plan) end
     add_matching_partial_repairs(plan, self.store, book_id, function(repair)
         if tostring(repair.kind or "") ~= base_kind then return false end
         local options = type(repair.options) == "table" and repair.options or {}
@@ -253,12 +257,24 @@ function Service:plan_variant(book_id, kind)
     return finalize_plan(plan)
 end
 
-function Service:plan_chapter(book_id, uid)
+function Service:plan_chapter(book_id, uid, download_only)
     book_id, uid = tostring(book_id or ""), tostring(uid or "")
     local plan = new_plan("chapter", book_id)
     plan.uid = uid
     local book = self.store:book(book_id)
     local row = book and book.chapters and book.chapters[uid]
+    plan.download_only=download_only==true
+    if plan.download_only then
+        plan.kinds={}
+        for kind,record in pairs(type(row)=="table" and row or {}) do
+            if kind~="online" and type(record)=="table"
+                and record.variant~="online" and record.eink_content_mode~="eink-online" then
+                plan.kinds[#plan.kinds+1]=kind
+                collect_record(plan,record)
+            end
+        end
+        return finalize_plan(plan)
+    end
     for _, record in pairs(type(row) == "table" and row or {}) do collect_record(plan, record) end
     if type(self.store.hidden_prefetch_entries) == "function" then
         for _, entry in ipairs(self.store:hidden_prefetch_entries(book_id)) do
@@ -275,6 +291,7 @@ end
 function Service:plan_book(book_id)
     book_id = tostring(book_id or "")
     local plan = new_plan("book", book_id)
+    plan.legacy_reply_ids=require("miuread.review_replies").legacy_ids_for_book(self.store,book_id)
     local book = self.store:book(book_id)
     if book then
         for _, record in pairs(book.variants or {}) do collect_record(plan, record) end
@@ -511,6 +528,13 @@ end
 function Service:commit(plan)
     plan = type(plan) == "table" and plan or {}
     local scope = tostring(plan.scope or "")
+    if plan.download_only then
+        if scope=="variant" then self.store:forget_variant(plan.book_id,plan.kind) end
+        if scope=="chapter" then
+            for _,kind in ipairs(plan.kinds) do self.store:forget_chapter(plan.book_id,plan.uid,kind) end
+        end
+        return
+    end
     remove_koreader_document_refs(plan.documents)
 
     if scope == "variant" then
@@ -529,6 +553,8 @@ function Service:commit(plan)
     elseif scope == "book" then
         repair_store_recent(self, plan, true)
         self.store:forget_book_local_state(plan.book_id)
+        local replies_ok,replies_error=require("miuread.review_replies").prune_legacy(self.store,plan.legacy_reply_ids)
+        if not replies_ok then logger.warn("[MiuRead][Comments] legacy reply cleanup failed",tostring(replies_error)) end
         prune_network_metadata(self.store, plan.book_id, nil)
         for _, path in ipairs(plan.documents or {}) do
             prune_network_metadata(self.store, nil, path)
@@ -607,11 +633,18 @@ function Service:verify(plan)
     if scope == "variant" and self.store:variant(plan.book_id, plan.kind) ~= nil then residual_refs[#residual_refs + 1] = "variant" end
     if scope == "chapter" then
         local book = self.store:book(plan.book_id)
-        if book and book.chapters and book.chapters[tostring(plan.uid or "")] ~= nil then residual_refs[#residual_refs + 1] = "chapter" end
+        local row=book and book.chapters and book.chapters[tostring(plan.uid or "")]
+        if row and plan.download_only then
+            for _,kind in ipairs(plan.kinds) do
+                if row[kind] then residual_refs[#residual_refs+1]="chapter:"..kind end
+            end
+        elseif row then residual_refs[#residual_refs+1]="chapter" end
     end
     if scope == "book" and self.store:book(plan.book_id) ~= nil then residual_refs[#residual_refs + 1] = "library" end
-    local recent_hit, recent_name = store_has_removed_reference(self.store, plan)
-    if recent_hit then residual_refs[#residual_refs + 1] = recent_name end
+    if not plan.download_only then
+        local recent_hit, recent_name = store_has_removed_reference(self.store, plan)
+        if recent_hit then residual_refs[#residual_refs + 1] = recent_name end
+    end
     return {ok = #residual_paths == 0 and #residual_refs == 0, paths = residual_paths, refs = residual_refs}
 end
 

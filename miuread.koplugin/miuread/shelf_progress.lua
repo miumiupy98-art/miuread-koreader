@@ -22,8 +22,8 @@ function M.finished_flag(row)
     if type(row) ~= "table" then return nil end
     local value = row.finishReading
     if value == nil then value = row.finished end
-    if value == nil then return nil end
-    return value == true or tonumber(value) == 1 or value == "true"
+    if value == true or tonumber(value) == 1 or value == "true" then return true end
+    if value == false or tonumber(value) == 0 or value == "false" then return false end
 end
 
 function M.is_finished(row)

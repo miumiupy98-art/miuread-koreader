@@ -110,17 +110,31 @@ function M.hours(rows)
     end)
     return result
 end
-function M.book(credentials,book_id,rows,guest_token,now,random)
-    local hours=M.hours(rows)
-    if #hours==0 or tostring(book_id or "")=="" then error("empty reading-time batch",0) end
+local function duration_fields(rows)
+    local hours=M.hours(rows or {})
     local total,risk,book_version=0,0,nil
-    for _,row in ipairs(rows) do
+    for _,row in ipairs(rows or {}) do
         local version=integer(row.book_version or 0,0,2147483647)
         if book_version~=nil and book_version~=version then error("mixed reading-time book versions",0) end
         book_version=version
         risk=bit.bor(risk,integer(row.risk or 0,0,2147483647))
     end
     for _,hour in ipairs(hours) do total=total+hour.readingTime end
+    return hours,total,risk,book_version
+end
+
+local function sign_book(credentials,body,guest_token)
+    local parts={tostring(credentials.vid),body.deviceId,body.appId,body.bookId,tostring(body.risk),
+        body.recordCreateTimeZone,tostring(body.readingTime),"0"}
+    for _,hour in ipairs(body.hours) do
+        parts[#parts+1]=table.concat({hour.startOfHour,hour.timeZone,hour.readingTime,hour.ttsTime},"_")
+    end
+    body.signature=M.sign({guest_token,tostring(body.random),tostring(body.timestamp),table.concat(parts,"_")})
+end
+
+function M.book(credentials,book_id,rows,guest_token,now,random)
+    local hours,total,risk,book_version=duration_fields(rows)
+    if #hours==0 or tostring(book_id or "")=="" then error("empty reading-time batch",0) end
     local zone=assert(M.time_zone(now),"reading-time zone unavailable")
     -- Match Native's BaseBookReadPostBody, selected after a newer cloud
     -- position is detected. Deliberately omit every chapter/offset coordinate.
@@ -131,11 +145,7 @@ function M.book(credentials,book_id,rows,guest_token,now,random)
         -- JSONField(serialize=false). novelTime is renamed to novalTime above.
         finish=false,risk=risk,readingTime=total,recordCreateTimeZone=zone,
         timestamp=integer(now,1,4102444800),random=integer(random,0,999),hours=hours}
-    local parts={tostring(credentials.vid),body.deviceId,body.appId,body.bookId,tostring(risk),zone,tostring(total),"0"}
-    for _,hour in ipairs(hours) do
-        parts[#parts+1]=table.concat({hour.startOfHour,hour.timeZone,hour.readingTime,hour.ttsTime},"_")
-    end
-    body.signature=M.sign({guest_token,tostring(random),tostring(now),table.concat(parts,"_")})
+    sign_book(credentials,body,guest_token)
     return body
 end
 function M.batch(credentials,book_id,rows,guest_token,config_token,now,random,envelope)
@@ -150,5 +160,42 @@ function M.batch(credentials,book_id,rows,guest_token,config_token,now,random,en
     -- and JSONEncoded omits it; the book and hours retain their own zones.
     return {books={book},timestamp=timestamp,random=outer_random,
         signature=Digest.sha256(string.format("%.0f",timestamp)..config_token..tostring(outer_random))}
+end
+
+function M.position_body(credentials,position,guest_token,now,random,rows)
+    if position.eink_coordinate~=true or type(credentials.installId)~="string" or credentials.installId=="" then
+        error("E-Ink 已验证位置或安装标识不可用",0)
+    end
+    local hours,total,risk,version=duration_fields(rows)
+    local book_version=integer(position.book_version,0,2147483647)
+    if version~=nil and version~=book_version then error("mixed reading-time book versions",0) end
+    local body={
+        bookId=tostring(position.book_id),bookVersion=book_version,hours=hours,
+        deviceId=credentials.deviceId,installId=credentials.installId,appId=credentials.deviceId,
+        chapterUid=integer(position.chapter_uid,0,2147483647),chapterIdx=integer(position.chapter_index,0,2147483647),
+        chapterOffset=integer(position.chapter_offset,0,2147483647),summary=tostring(position.summary or ""),
+        readingTime=total,ttsTime=0,lectureTime=0,lectureTextTime=0,novalTime=0,autoTime=0,isLecture=0,risk=risk,
+        reviewId="",voiceType=-1,chapterProgress=0,wordCount=0,isStoryFeed=0,
+        timestamp=integer(now,1,4102444800),random=integer(random,0,999),
+        recordCreateTimeZone=assert(M.time_zone(now),"reading-time zone unavailable"),
+    }
+    sign_book(credentials,body,guest_token)
+    if position.document_format=="pdf" then
+        local percent=integer(position.progress,0,100)
+        if body.chapterUid~=body.chapterIdx or body.chapterOffset~=0 then error("PDF 页码坐标无效",0) end
+        body.progress,body.currentProgress=percent,percent
+    end
+    return body
+end
+
+function M.position_batch(credentials,position,guest_token,config_token,now,random,outer_random,rows)
+    if type(config_token)~="string" or config_token=="" then error("E-Ink 补报签名配置不可用",0) end
+    local body=M.position_body(credentials,position,guest_token,now,random,rows)
+    body.reviewId,body.voiceType,body.chapterProgress,body.wordCount,body.isStoryFeed=nil,nil,nil,nil,nil
+    body.isResendReadingInfo=1
+    local timestamp=integer(now,1,4102444800)*1000
+    local nonce=integer(outer_random,0,999)
+    return {books={body},timestamp=timestamp,random=nonce,
+        signature=Digest.sha256(string.format("%.0f",timestamp)..config_token..tostring(nonce))}
 end
 return M

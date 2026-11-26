@@ -14,11 +14,17 @@ REQUIRED = {
     "miuread/readtime_clock.lua", "miuread/readtime_metadata.lua",
     "licenses/weread-omni-MIT.txt", "licenses/moon-GPL-3.0.txt",
 }
+RETIRED_REPORTERS = {
+    "miuread/read_report_service.lua",
+    "miuread/legacy_adapter_worker.lua",
+    "miuread/legacy/read_report_worker.lua",
+}
 
 
 def included(path):
     relative = path.relative_to(PLUGIN)
-    return (not set(relative.parts) & {"native", "__MACOSX", "__pycache__"}
+    return (relative.as_posix() not in RETIRED_REPORTERS
+            and not set(relative.parts) & {"native", "__MACOSX", "__pycache__"}
             and path.name not in {".DS_Store", "Thumbs.db", "miuread.lua", "settings.reader.lua", "NON_COMMERCIAL_NOTICE.txt"}
             and path.suffix.lower() not in {".md", ".epub", ".log", ".pyc", ".zip", ".sqlite3", ".db",
                                             ".sqlite3-wal", ".sqlite3-shm", ".db-wal", ".db-shm"})

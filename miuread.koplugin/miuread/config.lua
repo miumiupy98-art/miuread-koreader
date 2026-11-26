@@ -1,6 +1,6 @@
 local C = {
     NAME = "觅阅 · 微信读书助手",
-    VERSION = "6.4.1",
+    VERSION = "6.7.0-beta.19",
     SCHEMA = 136,
     MIN_SUPPORTED_SCHEMA = 113,
     PLUGIN_DIR = "miuread.koplugin",
@@ -8,11 +8,11 @@ local C = {
 
     -- 当前安装包自身仍有 stable/beta 身份；用户选择的 OTA 通道独立保存。
     -- beta.20 起所有实时更新清单都由统一仓库 miuread-koreader 提供。
-    UPDATE_CHANNEL = "stable",
-    UPDATE_CHANNEL_LABEL = "正式通道",
-    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+    UPDATE_CHANNEL = "beta",
+    UPDATE_CHANNEL_LABEL = "内测通道",
+    UPDATE_MANIFEST = "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     UPDATE_MANIFESTS = {
-        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/stable-channel/update.json",
+        "https://github.com/miumiupy98-art/miuread-koreader/releases/download/beta-channel/update-beta.json",
     },
     UPDATE_CHANNELS = {
         stable = {
@@ -85,7 +85,6 @@ local C = {
     CHAPTER_PREFETCH_DELAY = 30,
     -- Hidden next-chapter EPUBs are cache, not formal downloads. Keep them
     -- long enough for a short reading break but prune stale unused entries.
-    CHAPTER_PREFETCH_TTL = 24 * 60 * 60,
     -- Failed automatic cover fetches must not restart on every home gesture.
     -- A manual refresh bypasses the runtime backoff once.
     COVER_RETRY_DELAYS = {30, 120, 600, 1800},
@@ -211,7 +210,7 @@ local C = {
     -- tap in the top-center band. Short-lived taps carried across the Home ->
     -- Reader transition are consumed before they can become KOReader corner
     -- actions (for example an unintended bookmark).
-    READER_OPEN_GESTURE_GUARD_SECONDS = 0.75,
+    READER_OPEN_GESTURE_GUARD_SECONDS = 0.20,
     READER_TOP_MENU_X_MIN = 0.25,
     READER_TOP_MENU_X_MAX = 0.75,
     READER_TOP_MENU_Y_MAX = 0.10,

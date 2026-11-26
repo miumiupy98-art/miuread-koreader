@@ -489,8 +489,9 @@ function NativePopup:_piece_widget(piece, width, metrics, interactive)
     -- A forced height clipped or completely hid author names on later pages on
     -- some Kindle font metrics. Keep the row muted so the comment body remains
     -- the primary reading focus.
+    local comment=self.comments and self.comments[tonumber(piece.comment_index)]
     local can_like = self.online_likes_enabled == true and not piece.continuation
-        and clean(piece.review_id) ~= ""
+        and not (comment and comment.own) and clean(piece.review_id) ~= ""
     if can_like then
         local suffix_text = " · 赞" .. (likes > 0 and (" " .. tostring(likes)) or "")
         local suffix = TextWidget:new{
@@ -1100,6 +1101,7 @@ function NativePopup:_page_indicator_text()
     if self._pagination_complete ~= true then
         return tostring(math.max(1, tonumber(self.page_index) or 1)) .. " / …"
     end
+    if self.on_more_callback and self.page_index>=count then return "更多想法" end
     if count <= 1 then return "" end
     return tostring(clamp(self.page_index, 1, count)) .. " / " .. tostring(count)
 end
@@ -1110,7 +1112,7 @@ function NativePopup:_build_page_indicator(width, metrics, height)
 
     local count = #(self.pages or {})
     local current = clamp(self.page_index, 1, math.max(1, count))
-    local has_next = self._pagination_complete ~= true or current < count
+    local has_next = self._pagination_complete ~= true or current < count or self.on_more_callback~=nil
     local face = make_face(
         self.font_name, math.max(10, math.floor(metrics.meta_size * .92 + .5)), "smallinfofont"
     )
@@ -1208,8 +1210,9 @@ function NativePopup:_handle_action(index,comment)
         local review_id=tostring(comment.review_id or "")
         if review_id~="" then
             local open_replies=self.on_replies_callback
+            local page=self.page_index
             self:_close()
-            UIManager:nextTick(function() open_replies(comment) end)
+            UIManager:nextTick(function() open_replies(comment,page) end)
         end
         return true
     end
@@ -1225,6 +1228,12 @@ end
 function NativePopup:_show_action_menu(comment)
     comment=comment or self:_current_comment()
     if not comment or self.closing then return true end
+    if comment.own and self.on_manage_own_callback then
+        local manage=self.on_manage_own_callback
+        self:_close()
+        UIManager:nextTick(function() manage(comment) end)
+        return true
+    end
     self:_close_action_dialog()
     local texts=self:_action_texts(comment)
     local dialog
@@ -1316,7 +1325,7 @@ function NativePopup:_build(reset_pages, anchor_comment)
             self.pages, self.page_heights = {}, {}
             self._pagination_state = {comment_index = 1, item = nil, remaining_content = nil, continuation = false, done = false}
             self._pagination_complete = false
-            self:_ensure_lazy_page(1)
+            self:_ensure_lazy_page(self.page_index)
             self._layout_cache_hit = false
         end
         self.page_index = clamp(self.page_index, 1, math.max(1, #self.pages))
@@ -1537,7 +1546,18 @@ function NativePopup:_change_page(delta)
         self:_ensure_lazy_page(target)
     end
     local pages = self.pages or {}
-    if target > #pages then return true end
+    if target > #pages then
+        if self.on_more_callback and not self.more_pending then
+            local pending={}
+            self.more_pending=pending
+            local function done()
+                if self.more_pending==pending then self.more_pending=false end
+            end
+            local ok,started=pcall(self.on_more_callback,self.page_index,done)
+            if not ok or started~=true then done() end
+        end
+        return true
+    end
 
     self.page_changing = true
     local previous_index = self.page_index
@@ -1641,6 +1661,13 @@ function NativePopup:onTapPage(_, ges)
             return button:trigger()
         end
     end
+    if self.on_more_callback and self.page_indicator_dimen and not pos:notIntersectWith(self.page_indicator_dimen)
+        and self._pagination_complete and self.page_index>=#(self.pages or {})
+        and pos.x>=self.page_indicator_dimen.x+self.page_indicator_dimen.w*.25 then
+        return self:_change_page(1)
+    end
+    local comment=self:_comment_at_position(pos)
+    if comment and comment.own then return self:_show_action_menu(comment) end
     if pos.x < self.popup_dimen.x + math.floor(self.popup_dimen.w / 2) then
         return self:_change_page(-1)
     end
@@ -1715,6 +1742,9 @@ function NativePopup:_reopen(opts)
     self.on_interact_callback = opts.on_interact
     self.on_like_callback = opts.on_like
     self.on_replies_callback = opts.on_replies
+    self.on_manage_own_callback = opts.on_manage_own
+    self.on_more_callback = opts.on_more
+    self.more_pending = false
     self.on_error_callback = opts.on_error
     self.is_favorite_callback = opts.is_favorite_callback
     self.toggle_favorite_callback = opts.toggle_favorite_callback
@@ -1722,7 +1752,7 @@ function NativePopup:_reopen(opts)
     self.closing = false
     self.paint_failed = false
     self.page_changing = false
-    self.page_index = 1
+    self.page_index = opts.page_index or 1
     self.pages = nil
     self.page_heights = nil
     self._pagination_state = nil
@@ -1753,11 +1783,14 @@ function M.show(opts)
             font_name = opts.font_name,
             width_ratio = opts.width_ratio,
             height_ratio = opts.height_ratio,
+            page_index = opts.page_index or 1,
             online_likes_enabled = opts.online_likes_enabled == true,
             on_close_callback = opts.on_close,
             on_interact_callback = opts.on_interact,
             on_like_callback = opts.on_like,
             on_replies_callback = opts.on_replies,
+            on_manage_own_callback = opts.on_manage_own,
+            on_more_callback = opts.on_more,
             on_error_callback = opts.on_error,
             is_favorite_callback = opts.is_favorite_callback,
             toggle_favorite_callback = opts.toggle_favorite_callback,
@@ -1800,6 +1833,7 @@ function M.cleanup()
         popup.on_interact_callback = nil
         popup.on_like_callback = nil
         popup.on_replies_callback = nil
+        popup.on_more_callback = nil
         popup.on_error_callback = nil
         if popup[1] and type(popup[1].free) == "function" then
             pcall(popup[1].free, popup[1])

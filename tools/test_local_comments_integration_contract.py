@@ -27,7 +27,9 @@ class LocalCommentsContractTest(unittest.TestCase):
         self.assertIn('function Plugin:_show_comment_replies', main)
         self.assertIn('return self:_start_comment_range(target.book', main)
         self.assertIn('comment_sync:load(target.bookId,target.chapterUid)', main)
-        self.assertIn('on_replies=function(comment)', main)
+        self.assertIn('on_replies=function(comment,popup_page)', main)
+        self.assertIn('self:_show_comment_replies(comment,info,back)', main)
+        self.assertIn('Replies.normalize_native(raw,id,context,cursor)', main)
         self.assertIn('公开评论与本地 EPUB 关联', menu)
 
     def test_source_not_rewritten_and_apis_registered(self):
@@ -36,8 +38,13 @@ class LocalCommentsContractTest(unittest.TestCase):
         self.assertIn('record.local_document==true', locator)
         self.assertIn('record.location_get()', locator)
         self.assertIn('record.location_save(written)', locator)
-        self.assertIn('chapter_public_reviews={phase="annotations",web_only=true}', api)
-        self.assertIn('review_comments={phase="annotations",web_only=true}', api)
+        native = (PLUG / 'miuread/eink_client.lua').read_text()
+        self.assertIn('best_bookmarks={phase="annotations"}', api)
+        self.assertIn('review_comments={phase="annotations"}', api)
+        self.assertIn('function M:best_bookmarks(', native)
+        self.assertIn('function M:review_comments(', native)
+        self.assertIn('/book/bestbookmarks', native)
+        self.assertIn('/review/single', native)
 
     def test_beta_ci_runs_local_comments_regressions(self):
         workflow = (ROOT / '.github/workflows/release-beta.yml').read_text(encoding='utf-8')

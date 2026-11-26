@@ -120,9 +120,25 @@ function FinishedStatus.parse(data,id)
         if type(data)~="table" then return nil end
         local book_id = data.bookId or data.book_id
         if book_id~=nil and tostring(book_id)~=tostring(id) then return nil end
-        local index = tonumber(data.finishedBookIndex)
-        if index and index==index and index>=0 and index<math.huge and index%1==0 then return index>0 end
+        if data.finishReading~=nil then return ShelfProgress.finished_flag({finishReading=data.finishReading}) end
         data = data.data or data.result or data.payload
+    end
+end
+
+function FinishedStatus.parse_shelf(data,id)
+    if type(data)~="table" then return nil end
+    local rows=data.books or data.shelf
+    if type(rows)~="table" then return nil end
+    for _,row in ipairs(rows) do
+        if type(row)=="table" then
+            local book=type(row.bookInfo)=="table" and row.bookInfo or (type(row.book)=="table" and row.book or row)
+            local book_id=book.bookId or row.bookId or book.book_id or row.book_id
+            if tostring(book_id or "")==tostring(id) then
+                local finished=ShelfProgress.finished_flag(row)
+                if finished==nil then finished=ShelfProgress.finished_flag(book) end
+                return finished
+            end
+        end
     end
 end
 
@@ -154,7 +170,18 @@ function FinishedStatus:pump(make_request,on_change,apply_auth,force)
     if not worker or not worker:available() or worker:busy() then return false end
     local id,row = self:next_due(force)
     if not row then return false end
-    return self:_run(id,U.copy(row),"read",make_request,on_change,apply_auth)
+    if row.phase~="queued" then
+        return self:_run(id,U.copy(row),"read",make_request,on_change,apply_auth)
+    end
+    -- A possibly dispatched write may only be read back after restart.
+    local writing=U.copy(row)
+    writing.phase,writing.retry_at="verifying",os.time()+60
+    if not self:_save(id,writing) then return false end
+    if self:_run(id,writing,"write",make_request,on_change,apply_auth) then return true end
+    row=U.copy(row)
+    row.retry_at=os.time()+60
+    self:_save(id,row)
+    return false
 end
 
 function FinishedStatus:_run(id,row,mode,make_request,on_change,apply_auth)
@@ -168,6 +195,11 @@ function FinishedStatus:_run(id,row,mode,make_request,on_change,apply_auth)
         end
         local value = result and result.ok==true and result.value or nil
         if type(value)=="table" and apply_auth then apply_auth(value) end
+        current=self:entry(id)
+        if generation~=self.generation or not current or current.sequence~=row.sequence or current.account~=row.account then
+            if on_change then on_change(id,"superseded") end
+            return
+        end
         local finished
         -- False is a valid cancellation result, not a missing response.
         if type(value)=="table" then finished=value.finished end
@@ -180,25 +212,10 @@ function FinishedStatus:_run(id,row,mode,make_request,on_change,apply_auth)
                 if on_change then on_change(id,"verified") end
                 return
             end
-        elseif type(finished)=="boolean" and row.phase=="queued" and mode=="read" then
-            current=U.copy(current)
-            current.phase,current.retry_at = "verifying",os.time()+60
-            -- Commit BEFORE spawning the POST. A crash in either process must
-            -- not turn a possibly successful write into a duplicate request.
-            if self:_save(id,current) then
-                local sent=self:_run(id,current,"write",make_request,on_change,apply_auth)
-                if not sent then
-                    current.phase,current.retry_at="queued",os.time()+60
-                    self:_save(id,current)
-                    if on_change then on_change(id,"queued") end
-                end
-                return
-            end
         end
         current=U.copy(self:entry(id))
-        if current.phase=="queued" then
-            -- A failed preflight or phase flush has not sent a POST.
-            current.retry_at=os.time()+60
+        if mode=="write" and type(value)=="table" and value.unsent==true then
+            current.phase,current.retry_at="queued",os.time()+60
         else
             local attempts=(tonumber(current.readback_attempts) or 0)+1
             current.readback_attempts=attempts

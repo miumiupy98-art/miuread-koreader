@@ -85,6 +85,74 @@ local function collect_css_urls(out, text)
     for ref in text:gmatch("[uU][rR][lL]%s*%(%s*([^%s%)\"']+)%s*%)") do add_reference(out, ref, "css") end
 end
 
+-- Shared E-Ink styles may refer to images from other chapters' body classes.
+-- Only remove a top-level rule when its single body class cannot match.
+function R.prune_online_chapter_style(css,xhtml)
+    css=tostring(css or "")
+    local body=tostring(xhtml or ""):match("<[bB][oO][dD][yY]%s+([^>]*)>") or ""
+    body=" "..body
+    local _,classes=body:match("%s[cC][lL][aA][sS][sS]%s*=%s*(['\"])(.-)%1")
+    classes=classes or body:match("%s[cC][lL][aA][sS][sS]%s*=%s*([^%s'\"]+)")
+    local active={}
+    for class in tostring(classes or ""):gmatch("%S+") do active[class]=true end
+
+    local output,removed={},{}
+    local start,pos,depth,parens=1,1,0,0
+    local selector
+    local function finish(at,drop)
+        local rule=css:sub(start,at)
+        if drop then
+            for key in rule:gmatch("#miuread%-image%-(%d+)#") do removed[key]=(removed[key] or 0)+1 end
+        else
+            output[#output+1]=rule
+        end
+        start=at+1
+    end
+    while pos<=#css do
+        local at=css:find("[\"'\\/;{}()]",pos)
+        if not at then break end
+        local char=css:sub(at,at)
+        pos=at+1
+        if char=="'" or char=='"' then
+            while pos<=#css do
+                local next_char=css:sub(pos,pos)
+                pos=pos+1
+                if next_char==char then break end
+                if next_char=="\\" then pos=pos+1 end
+            end
+        elseif char=="/" and css:sub(pos,pos)=="*" then
+            local last=css:find("*/",pos+1,true)
+            pos=last and (last+2) or (#css+1)
+        elseif char=="\\" then
+            pos=pos+1
+        elseif char=="(" then
+            parens=parens+1
+        elseif char==")" then
+            parens=math.max(0,parens-1)
+        elseif parens==0 then
+            if char=="{" then
+                if depth==0 then selector=trim((css:sub(start,at-1):gsub("/%*.-%*/",""))) end
+                depth=depth+1
+            elseif char=="}" and depth>0 then
+                depth=depth-1
+                if depth==0 then
+                    local class=selector and selector:match("^[bB][oO][dD][yY]%.([%w_%-]+)$")
+                    finish(at,class and not active[class] and css:sub(start,at):lower():find("url%s*%(")~=nil)
+                end
+            elseif char==";" and depth==0 then
+                local statement=trim((css:sub(start,at):gsub("/%*.-%*/","")))
+                local urls={}
+                if statement:lower():match("^@import%s") then collect_css_urls(urls,statement) end
+                local source=urls[1] and urls[1].value:lower():gsub("[?#].*$", "") or ""
+                local basename=source:match("([^/]+)$")
+                finish(at,basename=="fonts.css" or source:match("^data:image/"))
+            end
+        end
+    end
+    output[#output+1]=css:sub(start)
+    return table.concat(output),removed
+end
+
 function R.collect(text, opt)
     local refs = {}
     text = tostring(text or "")
@@ -281,6 +349,32 @@ read_chapter = function(chapter)
     if type(chapter) ~= "table" then return "" end
     if chapter.body_path then return U.read_file(chapter.body_path, true) end
     return tostring(chapter.body or "")
+end
+
+function R.prepare_online_chapter_style(css,chapter,summary,repair)
+    -- The packager wraps the chapter fragment in a body with no class.
+    local cleaned,removed=R.prune_online_chapter_style(css)
+    if not next(removed) then return cleaned,summary,repair end
+
+    local count=0
+    for _,references in pairs(removed) do count=count+references end
+    summary=U.copy(summary or {})
+    for _,field in ipairs({"missing","required_missing","required_discovered","discovered"}) do
+        summary[field]=math.max(0,(tonumber(summary[field]) or 0)-count)
+    end
+    if repair then
+        local body=read_chapter(chapter) or ""
+        local pending={}
+        for _,item in ipairs(repair.items or {}) do
+            local marker="#miuread-image-"..item.key.."#"
+            if not removed[item.key] or cleaned:find(marker,1,true) or body:find(marker,1,true) then
+                pending[#pending+1]=item
+            end
+        end
+        repair=#pending>0 and U.copy(repair) or nil
+        if repair then repair.items=pending end
+    end
+    return cleaned,summary,repair
 end
 
 function R.scan(chapters, css, assets)

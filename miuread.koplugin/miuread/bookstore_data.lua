@@ -118,6 +118,33 @@ function M.shelf_state(data,id,full_shelf)
     if full_shelf then return false end
 end
 
+function M.recent_books(data)
+    if type(data)~="table" or type(data.items)~="table" then
+        error("微信读书最近阅读列表不完整")
+    end
+    -- An empty feed means retain the last accepted list.
+    if next(data.items)==nil then return {unchanged=true,books={}} end
+    if #data.items==0 then error("微信读书最近阅读列表格式无效") end
+    local books,seen={},{}
+    local function flagged(value) return value==true or value=="true" or tonumber(value)==1 end
+    local timestamp=require("miuread.shelf_progress").timestamp
+    for _,entry in ipairs(data.items) do
+        if type(entry)=="table" and type(entry.book)=="table" and not flagged(entry.isTTS)
+            and not flagged(entry.isRecommend) and (tonumber(entry.book.type) or 0)==0 then
+            local book=M.book(entry.book)
+            if book and not seen[book.bookId] then
+                seen[book.bookId]=true
+                book.last_opened=timestamp(entry.readUpdateTime or entry.readTime or entry.updateTime
+                    or entry.book.readUpdateTime or entry.book.lastReadTime)
+                book.cloud_recent_order=#books+1
+                books[#books+1]=book
+                if #books==8 then break end
+            end
+        end
+    end
+    return {books=books}
+end
+
 function M.key(spec)
     return table.concat({tostring(spec.kind),tostring(spec.category_id or spec.book_id or ""),
         tostring(spec.cursor or 0),tostring(spec.session_id or ""),tostring(spec.channel or "")}, ":")

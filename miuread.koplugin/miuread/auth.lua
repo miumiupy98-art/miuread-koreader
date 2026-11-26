@@ -53,6 +53,11 @@ function Auth:new(http,store,host,backend)
         login_fingerprint=nil,
     },self)
 end
+function Auth.new_native(http,store,host)
+    local flow=Auth:new(http,store,host)
+    flow.primary_native_login=true
+    return flow
+end
 local function merge_auth_headers(jar,vid,key)
     return {Accept="application/json, text/plain, */*",Referer=BASE.."/r/weread-skills",Cookie=Cookies.session_header(jar),["X-Vid"]=vid,["X-Skey"]=key}
 end
@@ -82,6 +87,7 @@ function Auth:cancel()
     self:_close_retry_dialog()
     self.jar={}
     self.login_fingerprint=nil
+    self.login_continuation=nil
     self.started=0
     self.poll_failures=0
     self.refresh_count=0
@@ -158,7 +164,8 @@ function Auth:_commit_auth(auth,expected_revision)
         local valid,err=self.backend:validate_commit(auth)
         if not valid then return false,err end
     end
-    local saved,save_error=self.store:save_auth(auth,{expected_revision=expected_revision,replace_login=self.backend==nil})
+    local saved,save_error=self.store:save_auth(auth,{expected_revision=expected_revision,
+        replace_login=self.backend==nil or self.primary_native_login==true})
     if saved~=true then return false,save_error or "settings write failed" end
     local verified,verify_error=self:_persisted_auth_matches(auth)
     if verified~=true then
@@ -170,6 +177,7 @@ end
 
 function Auth:_complete_login(name)
     local completed_name=tostring(name or self.pending_name or "")
+    local continuation=self.login_continuation
     logger.info("[MiuRead][Auth] QR login completed")
     self:cancel()
     if self.host.on_auth_success then
@@ -177,6 +185,7 @@ function Auth:_complete_login(name)
     else
         self.host:info(_("Logged in")..": "..completed_name)
     end
+    if continuation then UIManager:nextTick(continuation) end
 end
 
 function Auth:_abandon_pending_commit()
@@ -439,7 +448,12 @@ function Auth:_stop_if_rate_limited(value)
     return true
 end
 function Auth:_begin(refresh_count)
+    local continuation=self.login_continuation
     self:cancel()
+    self.login_continuation=continuation
+    if self.primary_native_login then
+        self.backend=require("miuread.shelf_client").new(self.http,self.store,true)
+    end
     self.refresh_count=tonumber(refresh_count) or 0
     local gen=self.generation
     self.started=os.time()
@@ -479,7 +493,8 @@ function Auth:_begin(refresh_count)
         self:_schedule(uid,gen,"")
     end)
 end
-function Auth:start()
+function Auth:start(continuation)
+    self.login_continuation=type(continuation)=="function" and continuation or nil
     if not self.backend and self.host._bookstore_shelf_auth then
         self.host._bookstore_shelf_auth:cancel()
         self.host._bookstore_shelf_auth=nil

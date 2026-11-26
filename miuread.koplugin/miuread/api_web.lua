@@ -763,23 +763,6 @@ function Api:review_single(review_id, context)
     return unwrap(data)
 end
 
--- The replies endpoint is distinct from read-only review state/likes.
-function Api:review_comments(review_id,context)
-    local id=tostring(review_id or "")
-    if id=="" then error("reviewId missing") end
-    context=type(context)=="table" and context or {}
-    local url="https://weread.qq.com/web/review/single?reviewId="..Protocol.escape(id)
-        .."&commentsCount=50&commentsDirection=0&likesCount=0&synckey=0"
-    return self:_recover_web_once("review_comments",function()
-        return self.http:get_json(url,{
-            headers=annotation_write_headers(context.bookId or context.bookid,
-                context.chapterUid or context.chapteruid),
-            retries=0,rate_limit_retries=0,timeout={10,18},
-            pacing_scope="annotation-read",shared_pacing=true,min_interval=0.35,
-        })
-    end)
-end
-
 function Api:like_review(review_id, is_unlike, context)
     local id = tostring(review_id or "")
     if id == "" then error("reviewId missing") end
@@ -867,26 +850,6 @@ function Api:_web_readreviews(id,chapter_uid,batch)
         if not ok then propagate_control_error(value) end
     end
     error(last or "web readReviews failed")
-end
-
--- Independent chapter-level public feed for diagnosing/rescuing zero-result
--- range responses. This is *not* an exhaustive replacement for readReviews:
--- the feed normally contains only a subset of public thoughts. Never infer
--- that an empty chapter feed proves there are no public reviews.
-function Api:chapter_public_reviews(id,chapter_uid)
-    local uid=scalar(chapter_uid)
-    if uid==nil or tostring(uid)=="" then error("invalid chapterUid") end
-    local url="https://weread.qq.com/web/review/list?bookId="
-        ..Protocol.escape(tostring(id or ""))
-        .."&chapterUid="..Protocol.escape(uid)
-        .."&listType=8&maxIdx=0&count=100&listMode=3&synckey=0"
-    local options=U.copy(WEB_ANNOTATION_REQUEST_OPTIONS)
-    options.retries=0 -- one bounded supplemental check, not an endless retry
-    options.headers=annotation_headers(id,uid)
-    return self:_recover_web_once("chapter_public_reviews",function()
-        local value=self.http:get_json(url,options)
-        return unwrap(value)
-    end,true)
 end
 
 function Api:_agent_readreviews(id,chapter_uid,batch)
@@ -1090,6 +1053,5 @@ function Api:chapter(book,chapter,format,options)
     return read(self.reader,book,chapter,format,options)
 end
 function Api:report_payload(payload,referer,retries) return self.reader:web_report_payload(payload,referer,retries) end
-function Api:mp_content(id,book_id,options) return self.reader:web_mp_content(id,book_id,options) end
 
 return Api

@@ -140,6 +140,9 @@ load_plugin_methods(ROOT,{
     "_record_recent_read",
     "_abort_rebuild_candidate_on_filemanager",
     "_local_comment_enabled",
+    "_active_reader_body_font_name",
+    "_remember_home_body_font",
+    "_cancel_eink_source_prewarm",
     "onReaderReady",
     "onPageUpdate",
     "onCloseDocument",
@@ -200,6 +203,7 @@ local function new_plugin(opts)
         sync={
             on_page=function() cloud_page_calls=cloud_page_calls+1 end,
             on_reader_ready=function() end,
+            cancel_eink_source_prewarm=function() end,
         },
         _home_enabled=function() return opts.desktop_mode==true end,
         _reader_preferences=function()
@@ -262,6 +266,9 @@ local function new_plugin(opts)
         _schedule_reader_toolbar_prewarm=function() return false end,
         _schedule_chapter_navigation_context=function() end,
         _schedule_chapter_prefetch=function() end,
+        _schedule_online_cache_cleanup=function() end,
+        _install_eink_dictionary_action=function() end,
+        _watch_limited_read=function() end,
         _teardown_thought_tap=function() end,
         _install_comment_overlay=function() overlay_install_calls=overlay_install_calls+1 end,
         _schedule_thought_prewarm=function() end,

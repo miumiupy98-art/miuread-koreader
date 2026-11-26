@@ -13,6 +13,7 @@ local ProgressWidget = require("ui/widget/progresswidget")
 local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local UIManager = require("ui/uimanager")
+local DialogTransition = require("miuread.dialog_transition")
 local logger = require("logger")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
@@ -26,7 +27,7 @@ local DownloadProgress = InputContainer:extend{
     _miuread_transient = true,
     _miuread_modal_surface = true,
     _miuread_download_progress = true,
-    covers_fullscreen = true,
+    covers_fullscreen = false,
     stop_events_propagation = true,
     on_cancel = nil,
     on_pause = nil,
@@ -175,7 +176,8 @@ function DownloadProgress:init()
         fixed_area,
     }
     local center=CenterContainer:new{dimen=self.dimen,self.frame}
-    if self.comment_opaque==true then
+    self.covers_fullscreen=self.comment_opaque==true
+    if self.covers_fullscreen then
         self[1]=OverlapGroup:new{dimen=self.dimen,allow_mirroring=false,
             LineWidget:new{background=Blitbuffer.COLOR_WHITE,
                 dimen=Geom:new{w=Screen:getWidth(),h=Screen:getHeight()}},
@@ -351,9 +353,7 @@ function DownloadProgress:onCloseWidget()
         or (self.frame and self.frame.dimen and self.frame.dimen:copy() or nil)
     -- Force the newly exposed surface to repaint the exact frame area. This is
     -- intentionally stronger than the progress widget's normal fast refresh.
-    if region then
-        UIManager:setDirty(nil, function() return "ui", region end)
-    end
+    if region then UIManager:nextTick(function() DialogTransition.restore(region) end) end
     local callback = self.on_close
     self.on_close = nil
     if callback then
@@ -367,7 +367,7 @@ function DownloadProgress:show()
     self.closed = false
     self._close_notified = false
     self._close_reason = nil
-    UIManager:show(self, "ui")
+    UIManager:show(self)
     return self:is_shown()
 end
 
@@ -377,7 +377,8 @@ function DownloadProgress:close(reason)
         self.closed = true
         return false
     end
-    UIManager:close(self, "ui")
+    local region=self.covers_fullscreen and self.dimen or (self.frame and self.frame.dimen)
+    UIManager:close(self,region and "ui" or nil,region)
     return true
 end
 
@@ -393,8 +394,7 @@ function DownloadProgress.close_orphans(except)
         if widget and widget ~= except and not seen[widget]
             and widget._miuread_download_progress == true and widget_is_shown(widget) then
             seen[widget] = true
-            widget._close_reason = "orphan_replaced"
-            local ok, err = pcall(UIManager.close, UIManager, widget, "ui")
+            local ok, err = pcall(widget.close,widget,"orphan_replaced")
             if ok then
                 closed = closed + 1
             else
