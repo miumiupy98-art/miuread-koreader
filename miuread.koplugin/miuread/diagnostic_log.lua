@@ -8,9 +8,10 @@ local fields={"operation","phase","channel","outcome","reason","elapsed_ms","cod
     "native_annotations","web_annotations","native_translation","web_translation","failure_file","failure_line",
     "book_id","batch_id","source","seconds","rows","source_rows","hours","start_time","end_time",
     "fresh_seconds","carry_seconds","pending_seconds","request_dispatched","dispatch_state_uncertain","protocol_progress",
-    "chapter_uid","chapter_idx","chapter_offset","cloud_seconds","cloud_delta","position_unchanged",
+    "chapter_uid","chapter_idx","chapter_offset","cloud_seconds","cloud_delta","position_unchanged","missing_images",
     "token_source","feature_token_present","feature_token_type","config_token_present",
-    "risk","book_version","book_version_source"}
+    "risk","book_version","book_version_source","archive_name_ambiguous","archive_name_missing",
+    "archive_unavailable","direct_image_failed","image_budget_exhausted","relative_image_unmapped","recovered_images"}
 
 function M.now()
     return ok_socket and type(socket.gettime)=="function" and socket.gettime() or os.time()

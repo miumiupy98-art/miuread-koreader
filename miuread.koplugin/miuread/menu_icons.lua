@@ -2,11 +2,11 @@
 -- Only action/navigation labels get icons; status-only rows stay text-first.
 local M={}
 local EXACT={
-    ["微信书架"]="library",["打开觅阅书架"]="library",["微信读书"]="book",["微信读书书城"]="library",["书城"]="library",
+    ["微信书架"]="library",["打开觅阅书架"]="library",["微信读书"]="book",["微信读书书城"]="library",["书城"]="library",["书源"]="library",["浏览已有书籍"]="library",
     ["搜索书籍"]="search",["搜索扩展"]="search",["公众号"]="newspaper",["公众号阅读"]="newspaper",["本地书库"]="folder",
     ["当前书籍"]="current-book",["目录"]="toc",["书签"]="bookmark",["阅读评论"]="comment",["评论与想法"]="comment",
     ["我的想法"]="thought",["评论显示"]="comment",["评论显示设置"]="comment",["在线评论点赞"]="check",
-    ["同步"]="sync",["同步状态"]="sync",["同步设置"]="settings",["同步与下载"]="sync",["手动同步"]="sync",
+    ["同步"]="sync",["同步状态"]="sync",["同步设置"]="settings",["下载与存储"]="download",["自动同步"]="sync",["手动同步"]="sync",
     ["自动同步设置"]="settings",["重试失败项目"]="refresh",["同步离线待传时间"]="upload",
     ["阅读时长同步"]="history",["启用阅读时长同步"]="power",["同步方式"]="swap",
     ["当前时间通道"]="wifi",["E-Ink 客户端授权"]="shield-check",["E-Ink 授权"]="shield-check",
@@ -23,7 +23,7 @@ local EXACT={
     ["时间与时区"]="history",["锁屏壁纸"]="sleep",["觅阅阅读工具栏"]="tools",
     ["阅读与书库"]="book",["运行与兼容"]="device",["运行模式"]="device",["性能与兼容性"]="tools",
     ["使用提醒"]="info",["恢复全部使用提醒"]="refresh",
-    ["账号"]="user",["账号管理"]="user",["账号状态"]="user",["微信读书账号"]="user",["扫码登录"]="qr-code",
+    ["账号"]="user",["账号管理"]="user",["账号状态"]="user",["扫码登录"]="qr-code",
     ["重新扫码登录"]="qr-code",["退出登录"]="power-off",["基础登录"]="user",
     ["微信分组"]="folder",["接口通道"]="swap",["存储"]="file-manager",["存储管理"]="file-manager",
     ["运行与兼容"]="device",["系统维护"]="repair",["插件设置"]="settings",["觅阅设置"]="settings",

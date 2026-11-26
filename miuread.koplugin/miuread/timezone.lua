@@ -60,6 +60,23 @@ local function days_in_month(year, month)
     return 31
 end
 
+function TimeZone.parse_iso_timestamp(value)
+    if type(value)~="string" then return nil end
+    local y,m,d,h,minute,s,tail=value:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)[T ](%d%d):(%d%d):(%d%d)(.*)$")
+    if not y then return nil end
+    y,m,d,h,minute,s=tonumber(y),tonumber(m),tonumber(d),tonumber(h),tonumber(minute),tonumber(s)
+    if y<2000 or y>2200 or m<1 or m>12 or d<1 or d>days_in_month(y,m)
+        or h>23 or minute>59 or s>59 then return nil end
+    tail=tail:gsub("^%.%d+","")
+    local offset=0
+    if tail~="" and tail~="Z" then
+        local sign,zh,zm=tail:match("^([+-])(%d%d):(%d%d)$")
+        if not sign or tonumber(zh)>23 or tonumber(zm)>59 then return nil end
+        offset=(tonumber(zh)*60+tonumber(zm))*60*(sign=="-" and -1 or 1)
+    end
+    return epoch_utc(y,m,d,h,minute,s)-offset
+end
+
 local function nth_sunday(year, month, n)
     local first = weekday(year, month, 1)
     local first_sunday = 1 + ((7 - first) % 7)

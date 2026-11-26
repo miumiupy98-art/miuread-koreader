@@ -7,17 +7,18 @@ local Api={}; Api.__index=Api
 
 local capabilities={
     shelf={phase="shelf"},shelf_stream={phase="shelf"},book_on_shelf={phase="shelf"},
+    write_shelf_group={phase="shelf",write=true},
     add_to_shelf={phase="shelf",write=true},remove_from_shelf={phase="shelf",write=true},
     book={phase="book"},chapters={phase="catalog"},catalog={phase="catalog"},
-    search={phase="search"},recommend_books={phase="store"},similar_books={phase="store"},
+    search={phase="search"},book_search={phase="search"},recommend_books={phase="store"},similar_books={phase="store"},
     store_categories={phase="store"},category_books={phase="store"},reading_stats={phase="statistics"},
     notebooks={phase="annotations"},bookmark_list={phase="annotations"},review_list_mine={phase="annotations"},
     underlines={phase="annotations"},readreviews={phase="annotations"},review_single={phase="annotations"},
-    -- Web-only, read-only supplemental public thought feed; no mutation.
-    chapter_public_reviews={phase="annotations",web_only=true},
-    review_comments={phase="annotations",web_only=true},
+    best_bookmarks={phase="annotations"},
+    review_comments={phase="annotations"},
     add_bookmark={phase="annotations",write=true,coordinates=true},
     add_review={phase="annotations",write=true,coordinates=true},
+    edit_review={phase="annotations",write=true},
     remove_bookmark={phase="annotations",write=true},remove_review={phase="annotations",write=true},
     like_review={phase="annotations",write=true},
     progress={phase="progress"},web_progress={phase="progress",web_only=true},
@@ -25,7 +26,8 @@ local capabilities={
     book_read_info={phase="progress"},mark_book_finished={phase="progress",write=true},
     translation_member_summary={phase="translation"},toggle_translate={phase="translation"},en_read={phase="translation"},
     chapter={phase="download"},report_payload={phase="reading_report",web_only=true,write=true},
-    mp_content={phase="articles",web_only=true},
+    mp_list={phase="articles"},mp_content={phase="articles"},
+    book_reviews={phase="book"},dictionary={phase="dictionary"},
 }
 
 function Api:new(http,store,reader)
@@ -59,7 +61,9 @@ end
 function Api:_invoke(name,...)
     local policy={}; for key,value in pairs(capabilities[name]) do policy[key]=value end
     if policy.coordinates then
-        if self.coordinate_source=="eink" then policy.native_only=true else policy.web_only=true end
+        if self.coordinate_source~="eink" then
+            error("[MiuReadCoordinateSource] 当前位置尚未验证为 E-Ink 坐标，未发送写入",0)
+        end
     end
     local arguments={n=select("#",...),...}
     if policy.write and type(arguments[1])=="table" then arguments[1]=Web._sanitize(arguments[1]) end
@@ -78,6 +82,7 @@ function Api:_invoke(name,...)
     local native
     if not policy.web_only and type(require("miuread.eink_client")[name])=="function" then
         native=function() return invoke(self:_native(transport)) end
+        policy.native_only,policy.force_eink=true,true
     end
     policy.restart_on_fallback=transport.restart_annotations and policy.phase=="annotations"
     local a,b,c,d=transport:invoke(name,native,function() return invoke(self.web_backend) end,policy)

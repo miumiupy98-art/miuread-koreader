@@ -846,6 +846,7 @@ function Http:_request_once(opt)
     self.last_request_url=current
     local method = opt.method or (opt.body and "POST" or "GET")
     local body = opt.body
+    local max_response_bytes = tonumber(opt.max_response_bytes)
     local auth_snapshot=self.store:auth()
     local request_login_session_id=tostring(auth_snapshot.login_session_id or "")
     local request_auth_revision=math.max(0,tonumber(auth_snapshot.auth_revision or 0) or 0)
@@ -880,6 +881,15 @@ function Http:_request_once(opt)
             socketutil:reset_timeout()
             return nil, nil, nil, current, "HTTP transport unavailable"
         end
+        local tls_ca
+        if opt.require_verified_tls then
+            local ssl_ok,ssl=pcall(require,"ssl")
+            tls_ca=ssl_ok and type(ssl.get_system_ca)=="function" and ssl.get_system_ca() or nil
+            if not ok_https or transport~=https or not tls_ca then
+                socketutil:reset_timeout()
+                return nil,nil,nil,current,"verified HTTPS unavailable"
+            end
+        end
         self:_pace(current, opt)
         if sink_path~="" then
             local parent=sink_path:match("^(.*)/[^/]+$")
@@ -901,6 +911,10 @@ function Http:_request_once(opt)
         local sink=function(chunk,err)
             if callback_error then return nil,callback_error end
             if chunk then
+                if max_response_bytes and #chunk>max_response_bytes-total_bytes then
+                    callback_error="download exceeds configured size limit"
+                    return nil,callback_error
+                end
                 if not first_data_at then first_data_at=clock_now() end
                 total_bytes=total_bytes+#chunk
                 if stream_file then
@@ -936,7 +950,7 @@ function Http:_request_once(opt)
             return 1
         end
         local force_ipv4=self.network_policy and self.network_policy:should_force_ipv4() or false
-        local keepalive=self:_keepalive_begin(current,opt,force_ipv4,sink_path)
+        local keepalive=not tls_ca and self:_keepalive_begin(current,opt,force_ipv4,sink_path) or nil
         local request_url,request_port=current,nil
         if keepalive and keepalive.scheme=="https" then
             -- ssl.https would refuse the create hook, so drive socket.http with
@@ -956,6 +970,8 @@ function Http:_request_once(opt)
                 headers = headers,
                 source = body and ltn12.source.string(body) or nil,
                 sink = sink,
+                verify = tls_ca and "peer" or nil,
+                cafile = tls_ca,
             }, force_ipv4, keepalive)
             if attempt > 1 or (called and tonumber(code)) then break end
             -- A pooled socket the peer closed between requests fails before the

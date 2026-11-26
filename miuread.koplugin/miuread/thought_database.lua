@@ -5,7 +5,7 @@ local lfs = require("libs/libkoreader-lfs")
 
 local ThoughtDatabase = {}
 
-ThoughtDatabase.SCHEMA_VERSION = 4
+ThoughtDatabase.SCHEMA_VERSION = 5
 ThoughtDatabase.FILE_NAME = "thoughts.sqlite3"
 
 local function chapter_key(value)
@@ -86,6 +86,15 @@ local function initialize(conn)
           FROM thought_groups g
          GROUP BY g.chapter_uid;
     ]])
+    conn:exec([[
+        CREATE TABLE IF NOT EXISTS thought_range_pages (
+            chapter_uid TEXT NOT NULL,
+            range_key TEXT NOT NULL,
+            account TEXT NOT NULL,
+            cursor INTEGER NOT NULL,
+            PRIMARY KEY(chapter_uid, range_key, account)
+        );
+    ]])
     -- Preserve legacy migration records: a schema open must never destroy data.
     conn:exec([[INSERT OR IGNORE INTO thought_sync_state(chapter_uid, status, last_success_at)
         SELECT chapter_uid, 'legacy', updated_at FROM thought_chapters;]])
@@ -145,7 +154,7 @@ local function review_fingerprint(item)
         tostring(item.created or 0)}, "\31")
 end
 
-local function merge_chapter(conn, chapter_uid, groups)
+local function merge_chapter(conn, chapter_uid, groups, keep_complete)
     chapter_uid = chapter_key(chapter_uid)
     if chapter_uid == "" then error("章节标识为空") end
     local rows = normalized_groups(groups)
@@ -249,9 +258,10 @@ local function merge_chapter(conn, chapter_uid, groups)
         (chapter_uid, status) VALUES(?, 'legacy')]])
     new_state:bind(chapter_uid):step()
     new_state:close()
-    local state = conn:prepare([[UPDATE thought_sync_state SET status = 'partial',
+    local state = conn:prepare([[UPDATE thought_sync_state
+        SET status = CASE WHEN ? = 1 AND status = 'cached' THEN status ELSE 'partial' END,
         last_attempt_at = ?, last_success_at = ?, last_error = '' WHERE chapter_uid = ?]])
-    state:bind(os.time(), os.time(), chapter_uid):step()
+    state:bind(keep_complete and 1 or 0, os.time(), os.time(), chapter_uid):step()
     state:close()
     return {groups=group_count, comments=comment_count, added=added, previously_known=was_known}
 end
@@ -278,16 +288,72 @@ function ThoughtDatabase.exists(store, book_id)
     return lfs.attributes(database_path(store, book_id), "mode") == "file"
 end
 
-function ThoughtDatabase.save_chapter(store, book_id, chapter_uid, groups)
+function ThoughtDatabase.save_chapter(store, book_id, chapter_uid, groups, keep_complete)
     local conn = open(store, book_id, false)
     local ok, result = xpcall(function()
         return SQLiteStore.transaction(conn, function()
-            return merge_chapter(conn, chapter_uid, groups)
+            return merge_chapter(conn, chapter_uid, groups, keep_complete)
         end)
     end, debug.traceback)
     pcall(conn.close, conn)
     if not ok then return nil, tostring(result) end
     return result
+end
+
+local function cursor_on(conn,uid,range,account)
+    local stmt=conn:prepare([[SELECT cursor FROM thought_range_pages
+        WHERE chapter_uid=? AND range_key=? AND account=? LIMIT 1]])
+    local row=stmt:bind(chapter_key(uid),range,account):step()
+    stmt:close()
+    return row and tonumber(row[1]) or nil
+end
+
+-- nil means no segment-specific request has been made. Zero means the API
+-- confirmed the end, including a segment without displayable reviews.
+function ThoughtDatabase.range_cursor(store,book_id,uid,range,account)
+    if not account or account=="" or not ThoughtDatabase.exists(store,book_id) then return nil end
+    local ok,cursor=pcall(SQLiteStore.with_connection,database_path(store,book_id),true,function(conn)
+        local schema=conn:prepare("SELECT name FROM sqlite_master WHERE name='thought_range_pages' LIMIT 1")
+        local available=schema:step()
+        schema:close()
+        if available then return cursor_on(conn,uid,range,account) end
+    end)
+    return ok and cursor or nil
+end
+
+function ThoughtDatabase.save_range_page(store,book_id,uid,range,account,expected,page)
+    local conn=open(store,book_id,false)
+    local ok,result=xpcall(function()
+        return SQLiteStore.transaction(conn,function()
+            if cursor_on(conn,uid,range,account)~=expected then
+                return false
+            end
+            if #page.texts>0 then merge_chapter(conn,uid,{page},true) end
+            local stmt=conn:prepare([[INSERT OR REPLACE INTO thought_range_pages
+                (chapter_uid,range_key,account,cursor) VALUES(?,?,?,?)]])
+            stmt:bind(chapter_key(uid),range,account,page.cursor):step()
+            stmt:close()
+            return true
+        end)
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if not ok then return nil,tostring(result) end
+    return result
+end
+
+function ThoughtDatabase.match_review_ids(store,book_id,ids)
+    local known={}
+    if #ids==0 or not ThoughtDatabase.exists(store,book_id) then return known end
+    local ok,result=pcall(SQLiteStore.with_connection,database_path(store,book_id),true,function(conn)
+        local match=conn:prepare("SELECT 1 FROM thought_comments WHERE review_id = ? LIMIT 1")
+        for _,id in ipairs(ids) do
+            if match:bind(id):step() then known[id]=true end
+            match:reset()
+        end
+        match:close()
+        return known
+    end)
+    return ok and result or {}
 end
 
 function ThoughtDatabase.sync_state(store, book_id, chapter_uid, with_cursor)

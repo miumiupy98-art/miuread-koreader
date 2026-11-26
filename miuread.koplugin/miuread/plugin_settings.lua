@@ -12,7 +12,6 @@ function M.sync(plugin)
         {text="同步状态",post_text=plugin:_home_sync_status_label(),callback=function() plugin:show_sync_status(false) end},
         {text="手动同步",sub_item_table_func=function() return plugin:sync_now_menu() end},
         {text="重试失败项目",callback=function() plugin:_confirm_sync_retry() end},
-        {text="同步设置",sub_item_table_func=function() return plugin:sync_settings_menu() end},
     }
 end
 
@@ -56,6 +55,7 @@ local function weread_settings(plugin)
     return {
         {text="账号",post_text=plugin:logged_in() and "已登录" or "未登录",sub_item_table_func=function() return plugin:account_menu() end},
         {text="微信分组",post_text=plugin:_shelf_filter_label(),sub_item_table_func=function() return plugin:shelf_filter_settings_menu() end},
+        {text="自动同步",sub_item_table_func=function() return plugin:sync_settings_menu() end},
     }
 end
 
@@ -68,10 +68,8 @@ function M.reading_library(plugin)
     }
 end
 
-function M.sync_download(plugin)
+function M.download_storage(plugin)
     return {
-        {text="接口通道",post_text=require("miuread.api_transport").preference(plugin.store)=="web" and "Web" or "自动",sub_item_table_func=function() return plugin:api_transport_menu() end},
-        {text="同步",sub_item_table_func=function() return plugin:sync_settings_menu() end},
         {text="下载",sub_item_table_func=function() return plugin:download_settings_menu() end},
         {text="存储",sub_item_table_func=function() return plugin:storage_management_menu() end},
     }
@@ -111,7 +109,7 @@ end
 function M.home_interface(plugin)
     return {
         {text="主页",sub_item_table_func=function() return home_page_settings(plugin) end},
-        {text="快捷入口",sub_item_table_func=function() return plugin:home_customization_menu() end},
+        {text="下拉面板",sub_item_table_func=function() return plugin:home_customization_menu() end},
         reader_toolbar_row(plugin),
         {text="字体与显示",sub_item_table_func=function() return display_typography_settings(plugin) end},
         {text="锁屏壁纸",post_text=plugin:_home_lockscreen_style_label(plugin:_home_preferences()),sub_item_table_func=function() return lockscreen_settings(plugin) end},
@@ -184,22 +182,18 @@ function M.system_maintenance(plugin)
             {text="重建书架索引",callback=function() plugin.store:reload();plugin.store:prune_missing_files();plugin:_show_miuread_home_now(false,true,true,"full") end},
             {text="检查下载完整性",callback=function() plugin:scan_downloaded_books_for_integrity_repair() end},
         } end},
-        {text="存储管理",sub_item_table_func=function() return {
-            {text="查看存储占用",callback=function() plugin:show_storage_usage() end},
-            {text="清理可再生缓存",callback=function() plugin:show_download_cleanup_dialog() end},
-        } end},
         {text="高级诊断",sub_item_table_func=function() return {
-            {text="同步诊断",sub_item_table_func=function() return plugin:sync_diagnostics_menu() end},
-            {text="同步状态详情",sub_item_table_func=function() return plugin:sync_diagnostics_status_menu() end},
+            {text="同步状态",callback=function() plugin:show_sync_status(false) end},
+            {text="当前书籍诊断",sub_item_table_func=function() return plugin:sync_diagnostics_status_menu() end},
+            {text="手动同步",sub_item_table_func=function() return plugin:sync_now_menu() end},
         } end},
     }
 end
 
 function M.menu(plugin)
     local rows={
-        {text="微信读书账号",post_text=plugin:_account_status_label(),sub_item_table_func=function() return plugin:account_menu() end},
         {text="阅读与书库",sub_item_table_func=function() return M.reading_library(plugin) end},
-        {text="同步与下载",sub_item_table_func=function() return M.sync_download(plugin) end},
+        {text="下载与存储",sub_item_table_func=function() return M.download_storage(plugin) end},
     }
     if plugin:_home_enabled() then
         rows[#rows+1]={text="首页与界面",sub_item_table_func=function() return M.home_interface(plugin) end}
@@ -224,7 +218,7 @@ local function decorate(items)
     return items
 end
 for _,name in ipairs({"sync","comments","notices","performance","reading_library",
-    "sync_download","home_interface","plugin_interface","runtime_compat",
+    "download_storage","home_interface","plugin_interface","runtime_compat",
     "update_about","plugins_extensions","koreader_tools","system_maintenance","menu"}) do
     local original=M[name]
     if original then M[name]=function(plugin) return decorate(original(plugin)) end end

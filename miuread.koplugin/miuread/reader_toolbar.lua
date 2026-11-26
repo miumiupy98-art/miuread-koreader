@@ -396,10 +396,10 @@ function Toolbar:_inline(action, label, value_widget, suffix)
         logger.warn("[MiuRead][ReaderToolbar] inline action failed", tostring(label or "unknown"), tostring(result))
         return true
     end
-    if result ~= false and value_widget and type(value_widget.setText) == "function" and result ~= nil then
-        value_widget:setText(tostring(result) .. tostring(suffix or ""))
+    if (type(result)=="string" or type(result)=="number") and value_widget then
+        value_widget:setText(tostring(result)..tostring(suffix or ""))
+        UIManager:setDirty(self,function() return "ui",Skin.expand_region(self.panel_dimen) end)
     end
-    UIManager:setDirty(self, function() return "ui", Skin.expand_region(self.panel_dimen, Skin.dp(2, 2, 3)) end)
     return true
 end
 
@@ -412,54 +412,32 @@ end
 
 function Toolbar:_top_status_row(root, header, x, y, width, height)
     header = type(header) == "table" and header or {}
-    local has_bluetooth = header.bluetooth_visible == true
-    local entries, callbacks, holds, ref_keys
-    if has_bluetooth then
-        entries = {
-            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
-            {icon = "bluetooth", label = header.bluetooth_label or "蓝牙", enabled = type(header.bluetooth_callback) == "function", bold = true},
-            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
-            {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
-            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
-            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
-        }
-        callbacks = {
-            function() self:_activate(header.wifi_callback, "Wi-Fi") end,
-            function() self:_activate(header.bluetooth_callback, "蓝牙") end,
-            function() self:_activate(header.sync_callback, "同步") end,
-            nil,nil,
-            function() self:_activate(header.home_callback, "首页") end,
-            function() self:_activate(header.more_callback, "更多") end,
-        }
-        holds = {
-            type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-            type(header.bluetooth_hold_callback) == "function" and function() self:_activate_hold(header.bluetooth_hold_callback, "蓝牙设备") end or nil,
-            nil,nil,nil,nil,nil,
-        }
-        ref_keys = {"wifi","bluetooth","sync","time","battery","home","more"}
-    else
-        entries = {
-            {icon = "wifi", label = header.wifi_label or "Wi-Fi", enabled = type(header.wifi_callback) == "function", alert = header.wifi_alert == true, bold = true, multiline = true},
-            {icon = "sync", label = header.sync_label or "同步", enabled = type(header.sync_callback) == "function", alert = header.sync_alert == true, bold = true},
-            {label = header.time_label or "", enabled = true, text_align = "center", bold = true},
-            {icon = "battery", label = header.battery_label or "", enabled = true, bold = true},
-            {icon = "home", label = header.home_label or "首页", enabled = type(header.home_callback) == "function", bold = true},
-            {icon = "more", label = header.more_label or "更多", enabled = type(header.more_callback) == "function", text_align = "center", bold = true},
-        }
-        callbacks = {
-            function() self:_activate(header.wifi_callback, "Wi-Fi") end,
-            function() self:_activate(header.sync_callback, "同步") end,
-            nil,nil,
-            function() self:_activate(header.home_callback, "首页") end,
-            function() self:_activate(header.more_callback, "更多") end,
-        }
-        holds = {
-            type(header.wifi_hold_callback) == "function" and function() self:_activate_hold(header.wifi_hold_callback, "Wi-Fi 设置") end or nil,
-            nil,nil,nil,nil,nil,
-        }
-        ref_keys = {"wifi","sync","time","battery","home","more"}
+    local entries={}
+    local function add(key, spec, callback, hold)
+        spec.key=key
+        spec.callback=callback and function() self:_activate(callback,spec.label) end or nil
+        spec.hold=hold and function() self:_activate_hold(hold,spec.label) end or nil
+        entries[#entries+1]=spec
     end
+    add("wifi",{icon="wifi",label=header.wifi_label or "Wi-Fi",enabled=type(header.wifi_callback)=="function",
+        alert=header.wifi_alert==true,bold=true,multiline=true},header.wifi_callback,header.wifi_hold_callback)
+    if header.bluetooth_visible then
+        add("bluetooth",{icon="bluetooth",label=header.bluetooth_label or "蓝牙",
+            enabled=type(header.bluetooth_callback)=="function",bold=true},header.bluetooth_callback,header.bluetooth_hold_callback)
+    end
+    if header.sync_alert and type(header.sync_callback)=="function" then
+        add("sync",{icon="sync",label=header.sync_label,enabled=true,alert=true,bold=true},header.sync_callback)
+    end
+    add("time",{label=header.time_label or "",enabled=true,text_align="center",bold=true})
+    add("battery",{icon="battery",label=header.battery_label or "",enabled=true,bold=true})
+    add("home",{icon="home",label=header.home_label or "首页",enabled=type(header.home_callback)=="function",bold=true},header.home_callback)
+    if type(header.download_callback)=="function" then
+        add("download",{icon=header.download_icon or "cloud-download",
+            label=header.download_label or "下载整本",enabled=true,bold=true,multiline=true},
+            header.download_callback)
+    end
+    add("more",{icon="more",label=header.more_label or "更多",enabled=type(header.more_callback)=="function",text_align="center",bold=true},
+        header.more_callback)
     local count = #entries
     local cell_w = math.floor(width / count)
     local used = 0
@@ -467,7 +445,7 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
         local w = index == count and (width - used) or cell_w
         root[#root + 1] = OffsetContainer:new{
             x_off = x + used, y_off = y,
-            status_item(entry, w, height, callbacks[index], holds[index], self, ref_keys[index]),
+            status_item(entry,w,height,entry.callback,entry.hold,self,entry.key),
         }
         used = used + w
     end
@@ -576,6 +554,10 @@ end
 
 function Toolbar:_typeset_row(root, typeset, x, y, width, height)
     typeset = type(typeset) == "table" and typeset or {}
+    if typeset.fixed_actions then
+        return self:_device_row(root,typeset.fixed_actions,x,y,width,height)
+    end
+    self.typeset_dimen=Geom:new{x=x,y=y,w=width,h=height}
     local page_w = math.floor(width * .22)
     local left = width - page_w
     local half = math.floor(left / 2)
@@ -789,6 +771,7 @@ function Toolbar:_signature(opts)
         opts.frontlight and "f1" or "f0",
         opts.warmth and "w1" or "w0",
         (type(opts.header)=="table" and opts.header.bluetooth_visible==true) and "bt1" or "bt0",
+        (type(opts.header)=="table" and opts.header.sync_alert and type(opts.header.sync_callback)=="function") and "s1" or "s0",
         tostring(#(type(opts.actions)=="table" and opts.actions or {})),
         tostring(#(type(opts.device_actions)=="table" and opts.device_actions or {})),
         tostring(Screen:getWidth()),tostring(Screen:getHeight()),
@@ -919,6 +902,13 @@ function M.refreshFrontlight()
         return live_toolbar:refreshFrontlightState()
     end
     return false
+end
+function M.refreshTypography(size,spacing)
+    if not live_toolbar or live_toolbar.closed or not live_toolbar.typeset_dimen then return false end
+    set_ref(live_toolbar._text_refs.font_value,size)
+    set_ref(live_toolbar._text_refs.spacing_value,spacing)
+    UIManager:setDirty(live_toolbar,function() return "ui",Skin.expand_region(live_toolbar.typeset_dimen) end)
+    return true
 end
 function M.invalidate()
     M.close()

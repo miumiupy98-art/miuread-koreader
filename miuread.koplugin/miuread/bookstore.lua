@@ -2,6 +2,7 @@ local U=require("miuread.util")
 local Data=require("miuread.bookstore_data")
 local UIManager=require("ui/uimanager")
 local ShelfView=require("miuread.shelf_view")
+local ReaderList=require("miuread.reader_list_dialog")
 local RawButtonDialog=require("ui/widget/buttondialog")
 local TransientGuard=require("miuread.transient_guard")
 local logger=require("logger")
@@ -56,14 +57,15 @@ local function cache(s,key,value)
     while #s.order>Data.CACHE_LIMIT do s.cache[table.remove(s.order,1)]=nil end
 end
 
-local function request(plugin,key,label,fn,callback,timeout)
-    TransientGuard.close_all()
+local function request(plugin,key,label,fn,callback,timeout,quiet)
+    if not quiet then TransientGuard.close_all() end
     local s=state(plugin)
     s.generation=s.generation+1
     local generation=s.generation
     local auth=U.copy(plugin.store:auth())
     local data_dir,temp_dir=plugin.store.data_dir,plugin.store.temp_dir
     close_loading(s)
+    if not quiet then
     local dialog
     dialog=ButtonDialog:new{
         title=label.."\n\n"..(key:find("^shelf:") and "正在确认微信书架，请稍候。" or "正在后台获取，请稍候。"),title_align="center",
@@ -82,6 +84,7 @@ local function request(plugin,key,label,fn,callback,timeout)
     }
     s.loading=dialog
     UIManager:show(dialog)
+    end
     local api_mode=require("miuread.api_transport").preference(plugin.store)
     local started,err=plugin:_run_interactive_network("bookstore:"..key,label,function()
         local store=plugin:_interactive_child_store(auth,data_dir,temp_dir,api_mode)
@@ -102,7 +105,7 @@ local function request(plugin,key,label,fn,callback,timeout)
         local payload=type(result.value)=="table" and result.value or {}
         if payload.auth_changed then plugin:_apply_interactive_auth{auth=payload.auth,changed=true} end
         callback(payload.request_ok==true,payload.request_ok and payload.value or payload.error)
-    end,{timeout=timeout or 40,on_cancel=function()
+    end,{timeout=timeout or 40,silent=quiet,on_cancel=function()
         if generation~=s.generation then return end
         s.generation=s.generation+1
         close_loading(s)
@@ -126,19 +129,100 @@ local function error_message(plugin,value,label)
     return plugin:_friendly_remote_error(tostring(value or "未知错误"),label)
 end
 
-function M.open(plugin)
-    state(plugin)
+local function discovery(api)
+    local result={}
+    local function fetch(key,callback)
+        local ok,value=pcall(callback)
+        if ok then result[key]=value end
+    end
+    fetch("recommend",function()
+        return Data.page("recommend",api:recommend_books(0,Data.PAGE_SIZE),0,Data.PAGE_SIZE)
+    end)
+    fetch("categories",function() return Data.categories(api:store_categories()) end)
+    local first=result.categories and result.categories.ranks[1]
+    if first then
+        fetch("rank",function()
+            local source=first.channel and api:for_channel(first.channel) or api
+            local spec={kind="category",category_id=first.id,rank=true,title=first.title,channel=first.channel}
+            return {spec=spec,page=Data.page("category",source:category_books(first.id,0,true),0,Data.PAGE_SIZE)}
+        end)
+    end
+    return result
+end
+
+function M.open(plugin,force)
     close_view(plugin)
     if plugin._shelf_view then plugin:_close_current_shelf() end
-    return plugin:list("微信读书 · 书城",{
-        {text="为你推荐",post_text="根据阅读记录发现可能喜欢的书",callback=function()
-            if plugin:require_login() then M.browse(plugin,{kind="recommend",title="为你推荐"}) end
-        end},
-        {text="排行榜",post_text="总榜 · 飙升 · 新书 · 热门",callback=function() M.categories(plugin,true) end},
-        {text="分类浏览",post_text="按主题与子分类浏览",callback=function() M.categories(plugin,false) end},
-        {text="搜索微信读书",post_text="搜索全部图书",callback=function() plugin:search_dialog("搜索微信读书") end},
-        {text="微信书架",post_text="查看已加入的图书",callback=function() plugin:show_shelf(false,false,"account") end},
+    local s=state(plugin)
+    local cached=s.cache.discovery
+    local logged_in=plugin:logged_in()
+    local data=U.copy(cached and cached.value or {})
+    local loading=logged_in and plugin:is_online()
+        and (force==true or not cached or os.time()-cached.at>Data.CACHE_TTL)
+    local rows={}
+    local function close_discovery()
+        if plugin._interactive_network_key=="bookstore:discovery" then
+            plugin:_cancel_interactive_network("source page closed")
+        end
+    end
+    local function back()
+        close_discovery()
+        plugin:show_book_sources()
+    end
+    local function reopen() M.open(plugin) end
+    local function render()
+        for i=#rows,1,-1 do rows[i]=nil end
+        local function section(title,page,spec)
+            local books=page and page.books or {}
+            if #books==0 then return end
+            rows[#rows+1]={text=title,post_text="更多",callback=function() M.browse(plugin,U.copy(spec)) end}
+            for i=1,math.min(#books,3) do
+                local book=books[i]
+                rows[#rows+1]={text=book.title,post_text=book.author,callback=function()
+                    plugin:book_menu(book,reopen)
+                end}
+            end
+        end
+        section("为你推荐",data.recommend,{kind="recommend",title="为你推荐"})
+        if data.rank then section(data.rank.spec.title,data.rank.page,data.rank.spec) end
+        if not logged_in then
+            rows[#rows+1]={text="扫码登录",callback=function() plugin:require_login("浏览微信读书",reopen) end}
+        elseif #rows==0 and loading then
+            rows[1]={text="正在加载书单…",enabled=false}
+        elseif #rows==0 or not data.recommend or not data.rank then
+            rows[#rows+1]={text=plugin:is_online() and "刷新书单" or "联网后刷新书单",callback=function()
+                if plugin:is_online() then M.open(plugin,true) else plugin:toast("请先连接网络",2) end
+            end}
+        end
+    end
+    render()
+    local view=plugin:_show_miuread_menu("微信读书",rows,{
+        page_size=8,on_back=back,actions={
+            {label="搜索",callback=function() plugin:search_dialog("搜索微信读书",reopen) end},
+            {label="榜单",callback=function() M.categories(plugin,true) end},
+            {label="分类",callback=function() M.categories(plugin,false) end},
+        },
+        on_close=close_discovery,
     })
+    if not view or not loading then return view end
+    local started=request(plugin,"discovery","微信读书书单",discovery,function(ok,value)
+        if ok and type(value)=="table" then
+            for key,result in pairs(value) do data[key]=result end
+            if value.categories then cache(s,"categories",value.categories) end
+            if value.rank then cache(s,Data.key(value.rank.spec),value.rank.page) end
+            if value.recommend then cache(s,Data.key{kind="recommend"},value.recommend) end
+            if next(value) then cache(s,"discovery",data) end
+        end
+        loading=false
+        render()
+        ReaderList.refresh(view)
+    end,55,true)
+    if not started then
+        loading=false
+        render()
+        ReaderList.refresh(view)
+    end
+    return view
 end
 
 local function category_rows(plugin,entries)
@@ -168,7 +252,7 @@ function M.categories(plugin,rank,force)
     local function show(data,stale)
         local entries=rank and data.ranks or data.categories
         local rows=category_rows(plugin,entries or {})
-        table.insert(rows,1,{text="返回书城",callback=function() M.open(plugin) end})
+        table.insert(rows,1,{text="返回微信读书",callback=function() M.open(plugin) end})
         rows[#rows+1]={text="刷新分类与榜单",callback=function() M.categories(plugin,rank,true) end}
         if #entries==0 then table.insert(rows,2,{text="暂时没有可用分类",enabled=false}) end
         plugin:list((rank and "排行榜" or "分类浏览")..(stale and " · 缓存" or ""),rows)
@@ -243,7 +327,10 @@ local function show_page(plugin,s,spec,page,cached)
             {id="previous",label="上一页",callback=previous},
             {id="next",label=page.has_more and "下一页" or "已到底",callback=next_page}},
         left_action_label="搜索微信读书",right_action_label="刷新",
-        on_search=function() close_view(plugin); plugin:search_dialog("搜索微信读书") end,
+        on_search=function()
+            close_view(plugin)
+            plugin:search_dialog("搜索微信读书",function() M.browse(plugin,U.copy(spec)) end)
+        end,
         on_refresh=function() M.browse(plugin,U.copy(spec),true) end,
         on_select=select,on_hold=select,
         on_page_changed=function(view_page,first,last,view)
@@ -335,14 +422,14 @@ local function known_membership(plugin,id)
     return false
 end
 
-function M.shelf_action(plugin,book)
+function M.shelf_action(plugin,book,on_verified)
     local id=tostring(book.bookId or book.book_id or "")
     if id=="" then return nil end
     local _,_,entry=pending(plugin,id)
     local present=known_membership(plugin,id)
     return {text=entry and "确认微信书架状态" or (present and "从微信书架移除" or "加入微信书架"),
         callback=function()
-            if present then M.remove_from_shelf(plugin,book) else M.add_to_shelf(plugin,book) end
+            if present then M.remove_from_shelf(plugin,book,on_verified) else M.add_to_shelf(plugin,book,on_verified) end
         end}
 end
 
@@ -365,74 +452,12 @@ local function shelf_error_message(plugin,value,desired)
     return error_message(plugin,value,"书架确认")
 end
 
-local function authorize_shelf(plugin,detail,client_access)
-    local vid,session=identity(plugin)
-    local dialog
-    dialog=ButtonDialog:new{
-        title=(client_access and "E-Ink 客户端授权\n\n请用微信扫码授权与觅阅相同的微信读书账号。智能阅读时间模式下，E-Ink 负责断网时间补传。"
-            or "书架管理需要客户端授权\n\n请使用微信扫描二维码，并选择与觅阅相同的微信读书账号。授权后，再重新选择移除。")
-            ..(detail and ("\n\n接口错误："..shelf_error_summary(detail)) or ""),title_align="center",
-        buttons={{{text="微信扫码授权",callback=function()
-            UIManager:close(dialog)
-            local current_vid,current_session=identity(plugin)
-            if current_vid~=vid or current_session~=session then
-                plugin:info("登录账号已变更，请重新选择书籍操作。")
-                return
-            end
-            if plugin._bookstore_shelf_auth then plugin._bookstore_shelf_auth:cancel() end
-            if plugin.auth_flow then plugin.auth_flow:cancel() end
-            local host={
-                is_online=function() return plugin:is_online() end,
-                online=function(_,label,fn) plugin:online(label,fn) end,
-                toast=function(_,text,duration) plugin:toast(text,duration) end,
-                info=function(_,text) plugin:info(text) end,
-                on_auth_success=function()
-                    if plugin.sync and plugin.sync.offline_time_controller then
-                        plugin.sync:offline_time_controller():authorization_restored(plugin)
-                    end
-                    -- QR login has just verified the new credentials through
-                    -- Native /shelf/sync; reflect that check without claiming
-                    -- any reading-time batch has already been uploaded.
-                    local fresh_auth=plugin.store:auth()
-                    plugin._eink_auth_check_vid=tostring((fresh_auth.account or {}).vid or (fresh_auth.cookies or {}).wr_vid or "")
-                    plugin._eink_auth_check_at=os.time()
-                    plugin._eink_auth_check_ok=true
-                    if plugin._refresh_miuread_menu then plugin:_refresh_miuread_menu() end
-                    plugin:info(client_access and "E-Ink 客户端授权已保存；已安排检查待上传的离线阅读时间。" or "书架管理授权已保存。请重新选择要移除的书籍。")
-                end,
-            }
-            local Client=require("miuread.shelf_client")
-            local Auth=require("miuread.auth")
-            local flow=Auth:new(plugin.http,plugin.store,host,Client.new(plugin.http,plugin.store))
-            plugin._bookstore_shelf_auth=flow
-            flow:start()
-        end},{text="取消",callback=function() UIManager:close(dialog) end}}},
-    }
-    TransientGuard.close_all()
-    UIManager:show(dialog)
-    return true
+local function authorize_shelf(plugin)
+    return plugin:confirm_eink_authorization()
 end
 
-function M.authorize_client(plugin)
+local function change_shelf(plugin,book,desired,confirmed,on_verified)
     if not plugin:require_login() then return false end
-    return authorize_shelf(plugin,nil,true)
-end
-
-local function change_shelf(plugin,book,desired,confirmed)
-    if not plugin:require_login() then return false end
-    local auth=plugin.store:auth()
-    local native_credentials=require("miuread.shelf_client").credentials(auth)
-    local native=require("miuread.api_transport").preference(plugin.store)~="web" and native_credentials
-    -- The membership worker first checks Web state. If the book has already
-    -- been removed remotely, it can confirm without prompting for native
-    -- credentials. Otherwise it requests native authorization before any
-    -- write. Keeping this check in the worker avoids false client scans.
-    if not desired then native=native_credentials end
-    if not native and tostring((auth.cookies or {}).wr_skey or "")=="" then
-        if not desired then return authorize_shelf(plugin) end
-        plugin:info("管理微信书架需要网页登录，请先扫码登录或修复登录。")
-        return false
-    end
     local id=tostring(book.bookId or book.book_id or "")
     if id=="" then return false end
     if plugin._interactive_network_key=="bookstore:shelf:"..id then
@@ -452,7 +477,7 @@ local function change_shelf(plugin,book,desired,confirmed)
                 plugin:info("登录账号已变更，请重新选择书籍操作。")
                 return
             end
-            change_shelf(plugin,target,false,true)
+            change_shelf(plugin,target,false,true,on_verified)
         end)
         return true
     end
@@ -481,7 +506,7 @@ local function change_shelf(plugin,book,desired,confirmed)
             if type(result.present)=="boolean" then cache(s,"shelf:"..id,result.present) end
             if result.stage=="credentials" and (require("miuread.http").is_auth_error(result.error)
                 or tostring(result.error):find("[MiuReadShelfAuthorization]",1,true)) then
-                authorize_shelf(plugin,result.error)
+                authorize_shelf(plugin)
             else
                 plugin:info("未提交"..(desired and "加入" or "移除").."，可稍后重新操作。\n\n"
                     ..shelf_error_message(plugin,result.error,desired))
@@ -510,6 +535,7 @@ local function change_shelf(plugin,book,desired,confirmed)
                     plugin:_reopen_shelf(plugin._last_shelf_mode,plugin._last_shelf_section)
                 end
             end,true,{skip_online_probe=true})
+            if value.state=="verified" and on_verified then on_verified() end
             return
         end
         local message=ok and type(value)=="table" and value.error or value
@@ -521,12 +547,12 @@ local function change_shelf(plugin,book,desired,confirmed)
     return started
 end
 
-function M.add_to_shelf(plugin,book)
-    return change_shelf(plugin,book,true)
+function M.add_to_shelf(plugin,book,on_verified)
+    return change_shelf(plugin,book,true,false,on_verified)
 end
 
-function M.remove_from_shelf(plugin,book)
-    return change_shelf(plugin,book,false)
+function M.remove_from_shelf(plugin,book,on_verified)
+    return change_shelf(plugin,book,false,false,on_verified)
 end
 
 return M

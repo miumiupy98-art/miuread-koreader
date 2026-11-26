@@ -206,15 +206,16 @@ local function book_card(book, width, height, on_select, on_hold)
     layer[#layer + 1] = cover
 
     local status = U.trim(tostring(book.status_text or book.download_status or ""))
-    local downloaded = book.generated == true or book.downloaded == true
+    local offline=book.offline_download
+    local downloaded=offline=="whole" or (offline==nil and (book.generated == true or book.downloaded == true
         or tostring(book.shelf_section or "") == "generated"
         or status == "已生成" or status == "已下载"
-        or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
+        or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))))
     local progress = math.max(0, math.min(100, tonumber(book.progress) or 0))
-    if downloaded then
-        local badge = UiScale.dp(20, 18, 28)
+    if downloaded or offline=="partial" then
+        local badge = offline=="partial" and UiScale.dp(34,29,38) or UiScale.dp(20,18,28)
         local inset = UiScale.dp(3, 2, 5)
-        layer[#layer + 1] = OffsetContainer:new{x_off = inset, y_off = inset, outlined_badge("✓", badge, badge)}
+        layer[#layer + 1] = OffsetContainer:new{x_off = inset, y_off = inset, outlined_badge(offline=="partial" and "部分" or "✓",badge,UiScale.dp(20,18,28))}
     end
     if progress > 0 then
         local text = progress >= 100 and "已读" or tostring(math.floor(progress + .5)) .. "%"

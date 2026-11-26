@@ -363,6 +363,7 @@ function Dialog:_tab_widget(category, width, height, selected)
     local tap = TapBox:new{dimen = Geom:new{w = width, h = height}, callback = function()
         if self.selected_key ~= key then
             self.selected_key = key
+            if self.opts.on_category then self.opts.on_category(key) end
             self.page = 1
             self.expanded_index = nil
             self:_rebuild()
@@ -479,14 +480,35 @@ function Dialog:_build_content()
         return self:_close(self.opts and self.opts.on_close or nil, false)
     end}
     close[1] = Ui.icon("close", side_w, header_h, Skin.dp(20, 17, 27), {face = Skin.face("cfont", 16, 21, 13.5)})
+    local actions=self.opts.actions
+    local more,extra_width
+    if type(actions)=="table" and #actions>0 then
+        extra_width=side_w
+        more=TapBox:new{dimen=Geom:new{w=side_w,h=header_h},callback=function()
+            local buttons={}
+            local dialog
+            for _,action in ipairs(actions) do
+                buttons[#buttons+1]={{text=action.label,callback=function()
+                    UIManager:close(dialog)
+                    self:_close(action.callback)
+                end}}
+            end
+            local ButtonDialog=require("ui/widget/buttondialog")
+            dialog=ButtonDialog:new{title=self.opts.title,buttons=buttons,
+                _miuread_modal_surface=true,_miuread_transient=true}
+            UIManager:show(dialog)
+        end}
+        more[1]=Ui.icon("more",side_w,header_h,Skin.dp(20,17,27),{face=Skin.face("cfont",16,21,13.5)})
+    end
     root[#root + 1] = OffsetContainer:new{
         x_off = panel_x + pad, y_off = y,
         HorizontalGroup:new{
             align = "center",
             back,
-            Ui.textbox(tostring(self.opts.title or "觅阅"), math.max(1, content_w - side_w * 2), header_h,
+            Ui.textbox(tostring(self.opts.title or "觅阅"), math.max(1, content_w - side_w * 2 - (extra_width or 0)), header_h,
                 Skin.face("cfont", 16.0, 20.6, 13.4), {bold = true, alignment = "center", halign = "center"}),
             close,
+            more,
         },
     }
     y = y + header_h
@@ -623,8 +645,8 @@ function M.push(title, items, subtitle)
     end
     return false
 end
-function M.refresh()
-    if live_dialog and not live_dialog.closed then
+function M.refresh(dialog)
+    if live_dialog and (not dialog or dialog==live_dialog) and not live_dialog.closed then
         live_dialog:_rebuild()
         return true
     end

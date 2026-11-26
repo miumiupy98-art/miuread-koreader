@@ -109,6 +109,31 @@ function LocalLibrary.is_resource_path(path)
     return false
 end
 
+function LocalLibrary.validate_root(path)
+    path = LocalLibrary.normalize(path)
+    if path == "" or path == "/" or path:sub(1, 1) ~= "/" then return nil, "路径无效" end
+    if LocalLibrary.is_resource_path(path) then return nil, "请选择书籍目录，系统或插件目录不能用作本地书库" end
+    if lfs.attributes(path, "mode") ~= "directory" then return nil, "文件夹不存在或暂不可访问" end
+    local ok, iter, state = pcall(lfs.dir, path)
+    if not ok or type(iter) ~= "function" then return nil, "无法读取文件夹" end
+    pcall(function() if state and state.close then state:close() end end)
+    return true, path
+end
+
+function LocalLibrary.snapshot_changed(snapshot)
+    if type(snapshot) ~= "table" or snapshot.error or snapshot.partial
+        or type(snapshot.directories) ~= "table" or snapshot.directories[snapshot.path] == nil then
+        return true
+    end
+    for path, old in pairs(snapshot.directories) do
+        local attr = lfs.attributes(path)
+        if not attr or attr.mode ~= "directory" or old ~= (tonumber(attr.modification) or 0) then
+            return true
+        end
+    end
+    return false
+end
+
 -- KOReader owns format support. MiuRead deliberately keeps no extension list.
 function LocalLibrary.is_supported(path)
     local registry_value = document_registry()
@@ -340,6 +365,7 @@ function TreeScan:_open_next()
         local ok, iter, state, var = pcall(lfs.dir, path)
         if ok and iter then
             self.current_path, self.current_iter, self.current_state, self.current_var = path, iter, state, var
+            self.directories[path] = tonumber(lfs.attributes(path, "modification")) or 0
             self.directories_scanned = self.directories_scanned + 1
             return true
         end
@@ -481,6 +507,7 @@ function TreeScan:snapshot()
         direct_count = #self.folders,
         book_count = #self.books,
         directories_scanned = self.directories_scanned,
+        directories = self.directories,
         unreadable_dirs = self.unreadable_dirs,
         partial = #self.unreadable_dirs > 0 and self.error == nil,
         error = self.error,
@@ -500,7 +527,7 @@ function LocalLibrary.new_tree_scan(path, options)
         excluded_paths = type(options.exclude_paths) == "table" and options.exclude_paths or {},
         folders = {}, folder_seen = {}, folder_book_counts = {}, books = {}, direct_books = {}, seen = 0,
         queue = {path}, queue_index = 1,
-        directories_scanned = 0, unreadable_dirs = {},
+        directories_scanned = 0, directories = {}, unreadable_dirs = {},
         truncated = false, done = false, cancelled = false,
     }, TreeScan)
     if path == "" or lfs.attributes(path, "mode") ~= "directory" then

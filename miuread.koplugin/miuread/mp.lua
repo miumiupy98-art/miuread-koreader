@@ -1,5 +1,6 @@
 local Json = require("miuread.json")
 local Codec = require("miuread.codec")
+local Digests = require("miuread.digests")
 local Protocol = require("miuread.protocol")
 local U = require("miuread.util")
 local Http = require("miuread.http")
@@ -14,6 +15,14 @@ local BASE = "https://weread.qq.com"
 local CACHE_SCHEMA = 3
 local LIST_TTL = 6 * 60 * 60
 local ARTICLE_LIMIT = 100
+local FEED_LIMIT = 250
+local FEED_TITLES = {[0]="文章收藏", [1]="微信浮窗文章"}
+local FEED_PREFIX = "MP_WXS_EINK_"
+
+local function account_vid(auth)
+    local vid=tostring((auth.account or {}).vid or "")
+    return vid~="" and vid or tostring((auth.cookies or {}).wr_vid or "")
+end
 
 local ARTICLE_CSS = [[
 html, body {
@@ -121,27 +130,43 @@ local function parse_articles(data)
     return articles
 end
 
-local function extract_mp_body(html)
-    html = tostring(html or "")
-    local body = html:match('<div[^>]*id="js_content"[^>]*>(.-)</div>%s*<script')
-    if not body then
-        body = html:match('class="rich_media_content[^"]*"[^>]*>(.-)</div>%s*<script')
+-- Public originals must contain the WeChat article container. Paid responses
+-- already contain a body fragment supplied by the E-Ink API.
+local function extract_mp_body(html, public_original)
+    if type(html)~="string" or #html>8*1024*1024 then return nil end
+    local body
+    if public_original then
+        local normalized=html:gsub("<[sS][cC][rR][iI][pP][tT][^>]*>.-</[sS][cC][rR][iI][pP][tT]%s*>","")
+            :gsub("<!%-%-.-%-%->","")
+        for tag,last in normalized:gmatch('(<[dD][iI][vV]%s[^>]*>)()') do
+            local _,id=tag:match('%s+id%s*=%s*(["\'])(.-)%1')
+            local _,class=tag:match('%s+class%s*=%s*(["\'])(.-)%1')
+            if id=="js_content" or (class and (" "..class.." "):find(" rich_media_content ",1,true)) then
+                local depth=1
+                for sub_start,closing in normalized:sub(last):gmatch('()<(/?)[dD][iI][vV]%f[%s>][^>]*>') do
+                    depth=depth+(closing=="/" and -1 or 1)
+                    if depth==0 then
+                        body=normalized:sub(last,last+sub_start-2)
+                        break
+                    end
+                end
+                if body then break end
+            end
+        end
+    else
+        body=Codec.body(html)
     end
-    if not body then
-        body = html:match('<div[^>]*id="js_content"[^>]*>(.*)')
+    if not body or body=="" then return nil end
+    for _,tag in ipairs({"script","style","iframe","object","form"}) do
+        body=body:gsub("<"..tag.."%f[%s>][^>]*>.-</"..tag.."%s*>","")
     end
-    if not body or body == "" then
-        local fallback = Codec.body(html)
-        if fallback ~= html or html:match("^%s*<[%a!]") then body = fallback end
-    end
-    if not body or body == "" then return nil end
-    body = body:gsub("<script[%s%S]-</script>", "")
-    body = body:gsub("<style[%s%S]-</style>", "")
-    body = body:gsub("<iframe[%s%S]-</iframe>", "")
-    body = body:gsub(' src=""', '')
-    body = body:gsub(" src=''", "")
-    body = body:gsub("data%-src=", "src=")
-    return body
+    return body:gsub("<[iI][mM][gG]%s[^>]*>",function(tag)
+        local _,lazy=tag:match('%sdata%-src%s*=%s*(["\'])(.-)%1')
+        local _,src=tag:match('%ssrc%s*=%s*(["\'])(.-)%1')
+        src=lazy and lazy~="" and lazy or src
+        if not src or src=="" then return "" end
+        return '<img src="'..src:gsub('"','&quot;')..'"/>'
+    end)
 end
 
 local function strip_mp_reader_font_styles(html)
@@ -241,7 +266,9 @@ end
 function MP:_article_dir(book_id, article_id)
     local root = self:_account_dir(book_id) .. "/articles"
     U.mkdir(root)
-    return root .. "/" .. safe_filename(article_id)
+    local id = self:is_native_feed(book_id)
+        and Digests.sha256(tostring(article_id or "")) or safe_filename(article_id)
+    return root .. "/" .. id
 end
 
 function MP:cached_accounts()
@@ -302,12 +329,92 @@ function MP:accounts(options)
     return self:_save_accounts(accounts)
 end
 
+function MP:is_native_feed(book_id)
+    return tostring(book_id or ""):sub(1,#FEED_PREFIX)==FEED_PREFIX
+end
+
+function MP:native_feed_book(kind)
+    local vid=account_vid(self.store:auth())
+    if not FEED_TITLES[kind] or vid=="" then return nil end
+    return {bookId=FEED_PREFIX..Digests.sha256(vid).."_"..kind,title=FEED_TITLES[kind]}
+end
+
+function MP:native_feed(kind,more)
+    local bucket=self:native_feed_book(kind)
+    if not bucket then error("请先登录微信读书",0) end
+    local vid=account_vid(self.store:auth())
+    local old_rows,_,old=self:cached_articles(bucket.bookId)
+    old=old or {}
+    local cursor=more and tonumber(old.cursor) or nil
+    if more and (old.more~=true or not cursor or cursor<=0) then return old end
+    local payload,show_wechat=self.api:mp_list(kind,cursor,cursor and old.show_wechat or nil)
+    local rows,positions,removed={}, {}, {}
+    local next_cursor,received,recognized=nil,0,false
+    if type(payload.removedKeys)=="table" and not Json.is_null(payload.removedKeys) then
+        recognized=true
+        for _,key in ipairs(payload.removedKeys) do removed[tostring(key)]=true end
+    end
+    if cursor then
+        for _,item in ipairs(old_rows) do
+            if not removed[item.key] then
+                rows[#rows+1]=item
+                positions[item.reviewId]=#rows
+            end
+        end
+    end
+    for _,field in ipairs({"lists","data","updated"}) do
+        local list=payload[field]
+        if list~=nil then
+            recognized=true
+            if Json.is_null(list) then list={} end
+            if type(list)~="table" then error("公众号文章列表格式无效",0) end
+            for _,item in ipairs(list) do
+                local id=type(item)=="table" and scalar(item.reviewId) or ""
+                if id=="" then error("公众号文章缺少编号",0) end
+                local previous=rows[positions[id] or 0] or {}
+                local idx=tonumber(item.idx or previous.idx or 0)
+                if not idx or idx<0 or idx%1~=0 then error("公众号文章排序值无效",0) end
+                received=received+1
+                if idx>0 then next_cursor=math.min(next_cursor or idx,idx) end
+                local row=U.merge(previous,{
+                    idx=idx,reviewId=id,bookId=bucket.bookId,
+                    title=item.title~=nil and scalar(item.title) or previous.title or "文章",
+                    accountName=item.account~=nil and scalar(item.account) or previous.accountName,
+                    key=item.key~=nil and scalar(item.key) or previous.key,
+                })
+                if not removed[row.key] then
+                    if not positions[id] then positions[id]=#rows+1 end
+                    rows[positions[id]]=row
+                end
+            end
+        end
+    end
+    if not recognized then error("未取得公众号文章列表",0) end
+    local order={}
+    for index,item in ipairs(rows) do order[item.reviewId]=index end
+    table.sort(rows,function(a,b)
+        if a.idx~=b.idx then return a.idx>b.idx end
+        return order[a.reviewId]<order[b.reviewId]
+    end)
+    local more_pages=payload.continueFlag==true or tonumber(payload.continueFlag)==1
+        or (payload.continueFlag==nil and received>=50)
+    while #rows>FEED_LIMIT do rows[#rows]=nil end
+    local result={schema=CACHE_SCHEMA,bookId=bucket.bookId,title=bucket.title,articles=rows,updated_at=os.time(),
+        show_wechat=show_wechat,cursor=next_cursor,more=more_pages and next_cursor~=nil
+            and (not cursor or next_cursor<cursor) and #rows<FEED_LIMIT}
+    local persisted=self.store:read_persisted("auth")
+    if not persisted or account_vid(persisted)~=vid then error("账号已切换，请重新打开文章列表",0) end
+    local saved=U.atomic_write(self:_list_path(bucket.bookId),Json.encode(result),true)
+    if not saved then error("公众号文章列表无法保存",0) end
+    return result
+end
+
 function MP:cached_articles(book_id)
     local raw = U.read_file(self:_list_path(book_id), true)
     if not raw then return {}, 0 end
     local ok, value = pcall(Json.decode, raw)
     if not ok or type(value) ~= "table" then return {}, 0 end
-    return type(value.articles) == "table" and value.articles or {}, tonumber(value.updated_at or 0) or 0
+    return type(value.articles) == "table" and value.articles or {}, tonumber(value.updated_at or 0) or 0, value
 end
 
 function MP:list_stale(book_id, ttl)
@@ -389,6 +496,10 @@ function MP:_load_article_record(book_id, article_id)
     if not raw then return nil end
     local ok, record = pcall(Json.decode, raw)
     if not ok or type(record) ~= "table" or record.complete ~= true then return nil end
+    if record.account_scope then
+        local vid=account_vid(self.store:auth())
+        if vid=="" or record.account_scope~=Digests.sha256(vid) then return nil end
+    end
     record.dir = dir
     record.file = dir .. "/article.html"
     record.body_path = dir .. "/body.xhtml"
@@ -415,46 +526,25 @@ function MP:_content_candidates(article)
 end
 
 function MP:_fetch_raw_content(book_id, article)
-    local candidates = self:_content_candidates(article)
+    local candidates=self:_content_candidates(article)
+    if self:is_native_feed(book_id) then candidates={article.reviewId} end
     local last_error
-    local function try_candidates(skip_headers)
-        for _, candidate in ipairs(candidates) do
-            local ok, html = pcall(self.reader.mp_content, self.reader, candidate, book_id, {
-                skip_mp_auth_headers=skip_headers == true,
-            })
-            if ok and trim(html) ~= "" then return html, candidate end
-            last_error = html
-        end
+    for _,id in ipairs(candidates) do
+        local ok,html,public_original=pcall(self.api.mp_content,self.api,id)
+        if ok and type(html)=="string" and trim(html)~="" then return html,id,public_original end
+        last_error=not ok and html or "文章正文为空"
+        if Http.is_auth_error(last_error) or Http.is_rate_limit_error(last_error)
+            or tostring(last_error):find("付费文章",1,true) or tostring(last_error):find("下架",1,true) then break end
     end
-
-    local html, used = try_candidates(false)
-    if html then return html, used end
-
-    local renewed, renew_error = pcall(self.reader.renew, self.reader)
-    logger.warn("[MiuRead][MP] article content credential renewal",
-        "ok=", tostring(renewed), "error=", renewed and "" or tostring(renew_error))
-    if renewed then
-        html, used = try_candidates(true)
-        if html then return html, used end
-    end
-
-    local source_url = tostring(article.sourceUrl or "")
-    if source_url:match("^https?://mp%.weixin%.qq%.com/") then
-        local ok, source_html = pcall(self.http.download, self.http, source_url, {
-            auth=false,
-            headers={Accept="text/html,application/xhtml+xml,*/*", Referer=BASE .. "/"},
-            retries=2,
-        })
-        if ok and trim(source_html) ~= "" then return source_html, "source_url" end
-        last_error = source_html
-    end
-    error(last_error or "文章正文为空")
+    error(last_error or "文章正文为空",0)
 end
 
 local function mp_image_url(src)
-    src = tostring(src or "")
-    if not src:match("mmbiz%.qpic%.cn") and not src:match("mmbiz%.qlogo%.cn") then return nil end
-    return src:match("^//") and ("https:" .. src) or src
+    src=tostring(src or ""):gsub("&amp;","&")
+    if src:sub(1,2)=="//" then src="https:"..src end
+    src=src:gsub("^http://","https://")
+    if not src:match("^https://mmbiz%.qpic%.cn/") and not src:match("^https://mmbiz%.qlogo%.cn/") then return nil end
+    return src
 end
 
 function MP:_localize_images(body, enabled, stage, progress, previous)
@@ -463,7 +553,7 @@ function MP:_localize_images(body, enabled, stage, progress, previous)
     tostring(body or ""):gsub('src=(["\'])(.-)%1', function(_, src)
         if mp_image_url(src) then total = total + 1 end
     end)
-    if total == 0 then return tostring(body or ""), 0, 0, {} end
+    if total == 0 then return strip_mp_images(body), 0, 0, {} end
 
     local image_dir = tostring(stage) .. "/images"
     U.mkdir(image_dir)
@@ -476,11 +566,12 @@ function MP:_localize_images(body, enabled, stage, progress, previous)
             if source~="" and full~="" and U.file_exists(full) then reusable[source]={file=file,full=full,mime=item.mime} end
         end
     end
-    local index, failed = 0, 0
+    local index, failed, requests = 0, 0, 0
+    local started=os.time()
     local cache, sources = {}, {}
     local output = tostring(body or ""):gsub('src=(["\'])(.-)%1', function(quote, src)
         local url = mp_image_url(src)
-        if not url then return "src=" .. quote .. src .. quote end
+        if not url then return 'src=""' end
         index = index + 1
         if progress then progress(index, total, src) end
 
@@ -503,15 +594,20 @@ function MP:_localize_images(body, enabled, stage, progress, previous)
             logger.warn("[MiuRead][MP] cached image reuse failed","index=",tostring(index),"error=",tostring(copy_error))
         end
 
+        if requests>=32 or os.time()-started>=65 then
+            failed=failed+1
+            return 'src=""'
+        end
+        requests=requests+1
         local ok, data = pcall(self.http.download, self.http, url, {
             auth=false,
             headers={Referer=BASE .. "/", Accept="image/avif,image/webp,image/*,*/*"},
-            retries=3, timeout={12,30},
+            redirects=0,retries=1,timeout={4,8},
         })
         if not ok or type(data) ~= "string" or #data == 0 then
             failed = failed + 1
             logger.warn("[MiuRead][MP] article image failed", "index=", tostring(index), "error=", ok and "empty" or tostring(data))
-            return "src=" .. quote .. src .. quote
+            return 'src=""'
         end
 
         local ext, mime = Codec.media(data, url)
@@ -520,7 +616,7 @@ function MP:_localize_images(body, enabled, stage, progress, previous)
             logger.warn("[MiuRead][MP] article asset is not an image", "index=", tostring(index), "mime=", tostring(mime))
             data = nil
             collectgarbage("collect")
-            return "src=" .. quote .. src .. quote
+            return 'src=""'
         end
         local relative_path = "images/" .. string.format("%04d", index) .. tostring(ext or ".bin")
         local wrote, write_error = U.atomic_write(tostring(stage) .. "/" .. relative_path, data, true)
@@ -531,6 +627,7 @@ function MP:_localize_images(body, enabled, stage, progress, previous)
         collectgarbage("collect")
         return "src=" .. quote .. relative_path .. quote
     end)
+    output=output:gsub('<img src=""%s*/?>',"")
     return output, total, failed, sources
 end
 
@@ -542,6 +639,11 @@ function MP:fetch_article(book, article, options)
     local article_id = tostring(article.reviewId or article.originalId or "")
     if not Protocol.is_mp_account(book_id) or article_id == "" then error("公众号文章标识缺失") end
 
+    local auth_vid=account_vid(self.store:auth())
+    local is_feed=self:is_native_feed(book_id)
+    if is_feed and (auth_vid=="" or not book_id:match("^"..FEED_PREFIX..Digests.sha256(auth_vid).."_[01]$")) then
+        error("账号已切换，请重新打开文章列表",0)
+    end
     local cached = self:_load_article_record(book_id, article_id)
     local cached_schema=tonumber(cached and cached.schema or 0) or 0
     local cache_matches=options.images==true
@@ -558,8 +660,8 @@ function MP:fetch_article(book, article, options)
     U.mkdir(stage)
 
     local ok, result = xpcall(function()
-        local html, used_id = self:_fetch_raw_content(book_id, article)
-        local body = extract_mp_body(html)
+        local html, used_id, public_original = self:_fetch_raw_content(book_id, article)
+        local body = extract_mp_body(html, public_original)
         if not body or not has_readable_body(body) then error("文章正文为空或无法识别") end
         body = strip_mp_reader_font_styles(body)
         body = strip_blank_mp_blocks(body)
@@ -582,6 +684,7 @@ function MP:fetch_article(book, article, options)
         if not wrote_body then error("文章正文缓存写入失败：" .. tostring(body_error or "")) end
         local metadata = {
             schema=CACHE_SCHEMA, complete=true, bookId=book_id,
+            account_scope=(is_feed or public_original==false) and Digests.sha256(auth_vid) or nil,
             account_title=tostring(book.title or article.accountName or "公众号"),
             reviewId=article_id, usedReviewId=used_id, title=title,
             createTime=tonumber(article.createTime or 0) or 0,
@@ -596,6 +699,13 @@ function MP:fetch_article(book, article, options)
     end, debug.traceback)
 
     if not ok then U.remove_tree(stage); error(result) end
+    if result.account_scope then
+        local persisted=self.store:read_persisted("auth")
+        if auth_vid=="" or not persisted or account_vid(persisted)~=auth_vid then
+            U.remove_tree(stage)
+            error("账号已切换，请重新打开文章列表",0)
+        end
+    end
     local target = self:_article_dir(book_id, article_id)
     local backup = target .. ".backup-" .. stamp
     U.remove_tree(backup)
@@ -622,6 +732,14 @@ function MP:identify_path(path)
     if not raw then return nil end
     local ok, value = pcall(Json.decode, raw)
     if not ok or type(value) ~= "table" or value.complete ~= true then return nil end
+    local book_id=tostring(value.bookId or "")
+    if value.account_scope or self:is_native_feed(book_id) then
+        local vid=account_vid(self.store:auth())
+        if vid=="" then return nil end
+        local scope=Digests.sha256(vid)
+        if value.account_scope and value.account_scope~=scope then return nil end
+        if self:is_native_feed(book_id) and not book_id:match("^"..FEED_PREFIX..scope.."_[01]$") then return nil end
+    end
     value.file = path
     value.dir = dir
     return value

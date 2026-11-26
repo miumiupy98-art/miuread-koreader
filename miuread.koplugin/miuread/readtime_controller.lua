@@ -246,19 +246,38 @@ function M:adopt_auth(vid)
     local current=self.store:auth()
     local ok,saved=pcall(self.store.read_persisted,self.store,"auth")
     if ok and type(saved)=="table" and auth_account(saved)==vid and auth_account(current)==vid
-        and tostring(saved.login_session_id or "")==tostring(current.login_session_id or "") then
-        local saved_native=type(saved.native_shelf)=="table" and saved.native_shelf or nil
-        local cur_native=type(current.native_shelf)=="table" and current.native_shelf or nil
-        if (tonumber(saved.auth_revision) or 0)>=(tonumber(current.auth_revision) or 0) then
-            self.store:set_deferred("auth",saved)
-        elseif saved_native and (not cur_native or saved_native.accessToken~=cur_native.accessToken) then
-            -- Adopt a worker's successful Native renewal without discarding
-            -- newer Web authentication revisions in the parent process.
-            current.native_shelf=saved_native
-            self.store:set_deferred("auth",current)
-        end
+        and tostring(saved.login_session_id or "")==tostring(current.login_session_id or "")
+        and (tonumber(saved.auth_revision) or 0)>=(tonumber(current.auth_revision) or 0) then
+        -- Adopt a worker's successful Native renewal without reloading or
+        -- overwriting unrelated deferred preferences/navigation in the parent.
+        self.store:set_deferred("auth",saved)
     end
 end
+-- The progress writer holds our fence while it leases the same book's seconds.
+function M:position_time(sync,position)
+    if self.progress_owner~=sync or not self:enabled() then return end
+    local vid=account(self.store)
+    if vid=="" or not self:_recover(vid) then return end
+    local now=os.time()
+    local summary=self.queue:summary(vid)
+    if not summary or summary.blocked or now<(tonumber((summary.control or {}).next_send) or 0) then return end
+    local batch=self.queue:pending(vid,now,function(row)
+        return tostring(row.book_id)==tostring(position.book_id)
+            and tonumber(row.book_version or 0)==tonumber(position.book_version)
+            and row.start_time+row.duration<=now
+    end)
+    if batch and #batch.rows>0 and #batch.invalid_rows==0 then
+        return {id=tostring(now).."-"..tostring(math.random(100000,999999)),vid=vid,batch=batch}
+    end
+end
+
+function M:finish_position_time(attempt,receipt)
+    local state=receipt and receipt.state or "unknown"
+    local reason=receipt and receipt.error or "worker_failed"
+    if receipt and not receipt.dispatched then return true end
+    return self.queue:finish(attempt.vid,attempt.batch,attempt.id,state,os.time(),reason)
+end
+
 function M:send()
     if not self:enabled() or self.suspended or self.progress_owner or self.worker:busy() or self.worker_unavailable
         or not self.host then return false end
@@ -269,17 +288,11 @@ function M:send()
     if daemon and (daemon.active or daemon.final_flush_pending) then return false end
     if owner_daemon and owner_daemon~=daemon
         and (owner_daemon.active or owner_daemon.final_flush_pending) then return false end
-    local prefs=self.store:preferences().sync or {}
-    local mode=(live_sync and live_sync.reading_time_mode and live_sync:reading_time_mode())
-        or (prefs.time_eink_only==true and "eink" or prefs.time_route_mode or "legacy")
-    local eink_allowed=mode=="eink" or mode=="smart"
     -- A stale Sync.current survives stopped sessions; only live sessions
     -- should hold the read-time outbox. Keep beta.9 worker ownership unchanged.
     local function live_reader(s)
         return s and s.current and s.state~="stopped"
     end
-    if live_sync and live_sync.reading_time_backend=="web" and live_reader(live_sync) then return false end
-    if self.sync and self.sync.reading_time_backend=="web" and live_reader(self.sync) then return false end
     if self.active or live_reader(live_sync) or live_reader(self.sync) then return false end
     if host._reading_end_sync_active or host._reading_end_finalizer_active
         or (self.sync and (self.sync.busy or self.sync.progress_write_fence)) then return false end
@@ -296,13 +309,22 @@ function M:send()
         self:log("dispatch","waiting",{reason=summary.blocked}); return false
     end
     if os.time()<(tonumber((summary.control or {}).next_send) or 0) then return false end
-    if not eink_allowed and require("miuread.api_transport").new(self.store).selected~="eink" then
-        self.awaiting_authorization=true
-        return false
-    end
     self.channel="eink"
     local now=os.time()
+    local sessions=type(self.store.read_persisted)=="function" and self.store:read_persisted("sessions") or {}
     local batch,err=self.queue:pending(vid,now,function(row)
+        local session=type(sessions)=="table" and sessions[tostring(row.book_id)] or nil
+        if type(session)=="table" and session.progress_submission_phase~="submitted_unverified" then
+            local position=session.pending_progress
+            if type(position)=="table" and position.eink_coordinate==true
+                and tonumber(position.book_version)==tonumber(row.book_version or 0)
+                and (session.progress_upload_state=="pending_send" or session.progress_upload_state=="remote_newer_pending")
+                and session.progress_sync_state~="verification_required"
+                and session.progress_sync_state~="upload_failed" then return false end
+            local anchor=session.pending_unresolved_position or session.pending_progress_coordinate
+            local captured=type(anchor)=="table" and tonumber(anchor.captured_at or anchor.coordinate_captured_at)
+            if captured and now-captured<120 then return false end
+        end
         return row.start_time+row.duration<=now
     end)
     if not batch then self.capture_error=err; return false end
@@ -334,8 +356,7 @@ function M:send()
     self:log("preflight","start",{book_id=batch.book_id,batch_id=id,seconds=batch.seconds,rows=#batch.rows})
     local launched=self.worker:run("offline-reading-time",function()
         local function claim()
-            -- Recheck the persisted login immediately before either transport
-            -- enters its write. Switching accounts never redirects a batch.
+            -- Recheck the persisted E-Ink login immediately before dispatch.
             if account(self.store)~=vid then return false end
             for _,row in ipairs(batch.rows) do
                 if row.start_time+row.duration>os.time() then return false end
@@ -496,20 +517,8 @@ function M:summary()
     self.summary_cache,self.summary_account,self.summary_at=value,vid,now
     return value
 end
-function M:unknown()
-    local vid=account(self.store)
-    local groups,err=self.queue:unknown(vid)
-    if groups then for _,group in ipairs(groups) do group.account=vid end end
-    return groups,err
-end
-function M:ignore(group)
-    if self.worker:busy() then return nil,"同步任务忙，请稍后再试" end
-    if group.account and group.account~=account(self.store) then return nil,"账号已切换，请重新打开记录" end
-    local seconds=self.queue:ignore(account(self.store),group)
-    self.summary_cache=nil
-    if seconds==nil then return nil,"本地记录无法保存" end
-    self:log("ignore","success",{seconds=seconds,batch_id=group.id})
-    return seconds
+function M:unverified_history()
+    return self.queue:unverified_history(account(self.store))
 end
 function M:check_and_resume(host,callback)
     self.host=host or self.host

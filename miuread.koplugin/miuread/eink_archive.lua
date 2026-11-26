@@ -7,6 +7,7 @@ local Json = require("miuread.json")
 local U = require("miuread.util")
 local M = {}
 local MAX_ENTRY, MAX_ARCHIVE = 8*1024*1024, 32*1024*1024
+M.MAX_ARCHIVE_BYTES=MAX_ARCHIVE
 local function le(s, p, n)
     if p < 1 or p+n-1 > #s then error("E-Ink ZIP 已截断") end
     local value = 0
@@ -119,7 +120,7 @@ local function read_zip(file, password, root, opt)
         elseif name:match("%.x?html?$") or name:match("%.txt$") or (base ~= "" and not base:find(".",1,true)) then
             bodies[#bodies+1] = {entry=entry,text=not name:match("%.x?html?$")}
         elseif name:match("%.css$") then
-            styles[#styles+1] = extract(entry)
+            if not opt.coordinate_only then styles[#styles+1] = extract(entry) end
         elseif opt.images ~= false and name:match("%.png$") then
             images[#images+1] = entry
         elseif opt.images ~= false and (name:match("%.jpe?g$") or name:match("%.gif$") or name:match("%.webp$") or name:match("%.svg$")) then
@@ -167,6 +168,10 @@ local function read_zip(file, password, root, opt)
             if not ordered then error("E-Ink 未返回唯一章节正文") end
         end
     end
+    if opt.coordinate_only then
+        if #ordered~=1 then error("E-Ink 章节源存在多个文件，无法确认偏移") end
+        return extract(ordered[1].entry),ordered[1].text and "text" or "html"
+    end
     local parts,total_body={},0
     for _,body in ipairs(ordered) do
         local data=extract(body.entry)
@@ -185,15 +190,16 @@ local function read_zip(file, password, root, opt)
         if not ok then error("无法保存 E-Ink 章节图片") end
         assets[#assets+1] = {href="images/native-"..i..ext,data_path=path,mime=mime,source=entry.name,_temporary_root=root}
     end
-    return ordered[1].text and Codec.text_xhtml(body) or body, table.concat(styles,"\n"), assets
+    return ordered[1].text and Codec.text_xhtml(body) or body, table.concat(styles,"\n"), assets,
+        #ordered==1 and not ordered[1].text
 end
 
 function M.read(path, envelope, vid, root, opt)
     local password = Crypto.password(envelope,vid)
     local file = assert(io.open(path,"rb"),"无法读取 E-Ink 章节包")
-    local ok,a,b,c = pcall(read_zip,file,password,root,opt or {})
+    local ok,a,b,c,d = pcall(read_zip,file,password,root,opt or {})
     file:close()
     if not ok then error(a,0) end
-    return a,b,c
+    return a,b,c,d
 end
 return M

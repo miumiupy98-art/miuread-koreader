@@ -5,10 +5,8 @@ local FFIUtil = require("ffi/util")
 local Json = require("miuread.json")
 local Config = require("miuread.config")
 local PositionResolution = require("miuread.position_resolution")
-local ReadReportService = require("miuread.read_report_service")
 local Protocol = require("miuread.protocol")
 local Http = require("miuread.http")
-local ReadReportWorker = require("miuread.legacy_adapter_worker")
 local BookIntegrity = require("miuread.book_integrity")
 local PrecisePosition = require("miuread.precise_position")
 local SourcePosition = require("miuread.source_position")
@@ -402,7 +400,7 @@ local function catalog_progress_from_remote(remote, chapters)
 end
 
 function Sync:new(reader, api, store, host, async, identity_async)
-    if api and type(api.for_channel)=="function" then api=api:for_channel("web") end
+    if api and type(api.for_channel)=="function" then api=api:for_channel("eink") end
     local object = setmetatable({
         reader=reader, api=api, store=store, host=host, async=async,
         identity_async=identity_async,
@@ -453,8 +451,9 @@ function Sync:_usable_record(book,record,variant,path)
     local content_type=tostring((type(record)=="table" and record.content_type)
         or (type(book)=="table" and book.content_type) or "")
     local partial_range=type(record)=="table" and record.partial_range==true
+    local verified_pdf=type(record)=="table" and record.document_format=="pdf" and tonumber(record.pdf_book_version)~=nil
     if content_type=="mp_collection" or tostring(variant or "")=="mp_collection"
-        or (type(record)=="table" and record.sync_enabled==false and not partial_range) then return nil end
+        or (type(record)=="table" and record.sync_enabled==false and not partial_range and not verified_pdf) then return nil end
     if type(record)=="table" and tostring(record.preview_mode or "")=="info" then return nil end
     return {book=book,record=record,variant=variant,path=path}
 end
@@ -662,6 +661,23 @@ function Sync:_progress_catalog(record)
     local catalog = record.book and record.book.catalog or {}
     if self:_book_catalog_is_complete(record, catalog) then return catalog, "book_catalog" end
     return {}, "missing"
+end
+
+function Sync:progress_chapter_title(position)
+    if type(position)~="table" then return nil end
+    local uid=tostring(position.chapter_uid or position.chapterUid or "")
+    if uid=="" then return nil end
+    local record=self:record()
+    if not record then return nil end
+    local row=record.record or {}
+    if row.document_format=="pdf" then return nil end
+    local local_chapter=local_chapter_by_uid(row.chapter_map,uid)
+    local title=local_chapter and U.trim(tostring(local_chapter.title or local_chapter.chapterTitle or ""))
+    if title and title~="" then return title end
+    local chapters=self:_progress_catalog(record)
+    local catalog_chapter=local_chapter_by_uid(chapters,uid)
+    title=catalog_chapter and U.trim(tostring(catalog_chapter.title or catalog_chapter.chapterTitle or ""))
+    return title and title~="" and title or nil
 end
 
 function Sync:chapter_catalog_context(record)
@@ -954,7 +970,7 @@ function Sync:_complete_partial_position_progress(record,position,catalog)
     local source_word_offset=math.max(0,math.min(selected_words,math.floor(selected_words*within+0.5)))
     position.progress=U.clamp(((before+source_word_offset)/total)*100,0,100)
     position.display_progress=position.progress
-    position.display_progress_quality="precise_source_mapped"
+    position.display_progress_quality=position.eink_coordinate and "estimated_layout_ratio" or "precise_source_mapped"
     position.chapter_word_count=selected_words
     position.total_word_count=total
     position.words_before=before
@@ -1003,169 +1019,60 @@ function Sync:recover_partial_coordinate(record,coordinate,callback)
     return started~=false
 end
 
-function Sync:_prepare_progress_catalog(callback, options)
-    options=type(options)=="table" and options or {}
-    local detached=options.detached==true
-    local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
-    if not record then return false, "position_context_missing" end
-    local book_id = tostring(record.book and record.book.book_id or "")
-    if book_id == "" then return false, "book_id_missing" end
-    local auth = self.store:auth()
-    local account = type(auth.account) == "table" and auth.account or {}
-    local login_snapshot = tostring(auth.login_session_id or "")
-    local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
-    local vid_snapshot = tostring(account.vid or "")
-    if login_snapshot == "" or vid_snapshot == "" then return false, "authentication_required" end
-
-    local worker
-    if self.identity_async and self.identity_async:available() and not self.identity_async:busy() then
-        worker = self.identity_async
-    elseif self.async and self.async:available() and not self.async:busy() then
-        worker = self.async
-    elseif (self.identity_async and self.identity_async:busy()) or (self.async and self.async:busy()) then
-        return false, "catalog_worker_busy"
-    else
-        return false, "catalog_worker_unavailable"
-    end
-
-    local generation = tonumber(options.record_generation_override or self.record_generation or 0) or 0
-    local path = tostring(record.path or "")
-    local core_hash = self:_core_map_hash(record)
-    local session = self.store:session(book_id) or {}
-    local saved = type(session.legacy_report_context) == "table" and session.legacy_report_context or nil
-    local context_matches = saved ~= nil
-        and tostring(session.report_login_session_id or "") == login_snapshot
-        and (tostring(session.report_core_map_hash or "") == ""
-            or tostring(session.report_core_map_hash or "") == tostring(core_hash or ""))
-    local legacy_book = U.copy(context_matches and saved or {})
-    legacy_book.book_id = book_id
-    legacy_book.title = record.book.title
-    self:_decorate_legacy_context(legacy_book, record)
-
-    -- Even before the full catalog exists, preserve the current local chapter
-    -- identity so the context worker can choose a sensible reader chapter.
-    local ratio_snapshot=tonumber(options.ratio_snapshot)
-    if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() or 0 end
-    local local_guess = map_position((record.record and record.record.chapter_map) or {},
-        ratio_snapshot, {chapter_uid=record.record and record.record.chapter_uid, summary=record.book.title})
-    if type(local_guess) == "table" then
-        legacy_book.local_chapter_uid = local_guess.chapter_uid
-        legacy_book.local_chapter_idx = local_guess.chapter_index
-        legacy_book.local_chapter_offset = local_guess.offset
-        legacy_book.local_native_chapter_offset = false
-        legacy_book.local_chapter_offset_basis = "catalog_word_fallback"
-        local row = local_chapter_by_uid(record.record and record.record.chapter_map or {}, local_guess.chapter_uid)
-        legacy_book.local_chapter_word_count = tonumber(row and (row.word_count or row.wordCount) or 0) or 0
-    end
-
-    local book_title = tostring(record.book.title or "")
-    logger.info("[MiuRead][ProgressMap] catalog prepare started",
-        "book=", book_id, "mode=", self:_record_mode(record),
-        "local_chapters=", tostring(#((record.record and record.record.chapter_map) or {})),
-        "core=", tostring(core_hash):sub(1,12))
-
-    local started, run_error = worker:run("progress_catalog_context", function()
-        return ReadReportWorker.run{
-            book_id = book_id,
-            book_title = book_title,
-            book = legacy_book,
-            core_map_hash = core_hash,
-            progress_ratio = ratio_snapshot,
-            elapsed_seconds = 0,
-            cookies = auth.cookies or {},
-            api_key = auth.api_key or "",
-            wr_ticket = auth.wr_ticket or "",
-            wr_wrpa = auth.wr_wrpa or "",
-            allow_renewal = false,
-            force_context = true,
-            context_only = true,
-        }
-    end, function(result)
-        local current = self:record()
-        local current_auth = self.store:auth()
-        local current_account = type(current_auth.account) == "table" and current_auth.account or {}
-        if not detached and (generation ~= tonumber(self.record_generation or 0)
-            or not current or tostring(current.book and current.book.book_id or "") ~= book_id
-            or tostring(current.path or "") ~= path) then
-            if callback then callback(nil, "stale_catalog_result", {error_kind="context"}) end
+function Sync:_prepare_progress_catalog(callback,options)
+    options=options or {}
+    local record=type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
+    local book_id=tostring(record and record.book and record.book.book_id or "")
+    if book_id=="" then return false,"position_context_missing" end
+    local auth=self.store:auth()
+    local login=tostring(auth.login_session_id or "")
+    if login=="" then return false,"authentication_required" end
+    local worker=self.identity_async
+    if not worker or not worker:available() or worker:busy() then worker=self.async end
+    if not worker or not worker:available() or worker:busy() then return false,"catalog_worker_busy" end
+    local reader=self.reader
+    local started,err=worker:run("eink_progress_catalog",function()
+        local downloader=require("miuread.downloader"):new(reader,nil,nil,reader.store,reader.http)
+        local _,rows=downloader:catalog(book_id,{eink_only=true})
+        return rows
+    end,function(result)
+        local current=self:record()
+        if options.detached~=true and (not current or current.path~=record.path) then
+            if callback then callback(nil,"stale_catalog_result",{error_kind="context"}) end
             return
         end
-        if login_snapshot ~= tostring(current_auth.login_session_id or "")
-            or auth_revision_snapshot~=math.max(0,tonumber(current_auth.auth_revision or 0) or 0)
-            or vid_snapshot ~= tostring(current_account.vid or "") then
-            if callback then callback(nil, "login_changed", {error_kind="authentication"}) end
+        self.store:reload()
+        if tostring(self.store:auth().login_session_id or "")~=login then
+            if callback then callback(nil,"login_changed",{error_kind="authentication"}) end
             return
         end
-        local value = result and result.ok == true and result.value or nil
-        local context = type(value) == "table" and value.legacy_context or nil
-        if type(value) ~= "table" or value.accepted ~= true
-            or type(context) ~= "table" or context.catalog_complete ~= true
-            or type(context.chapters) ~= "table" or #context.chapters == 0 then
-            local err = tostring((type(value)=="table" and value.error) or (result and result.error) or "catalog_context_failed")
-            local kind = tostring(type(value)=="table" and value.error_kind or "context")
-            logger.warn("[MiuRead][ProgressMap] catalog prepare failed", "book=",book_id,
-                "kind=",kind,"reason=",err)
-            if callback then callback(nil, err, {error_kind=kind}) end
+        local rows=result and result.ok and result.value
+        if type(rows)~="table" or #rows==0 then
+            if callback then callback(nil,result and result.error or "E-Ink 目录不可用",{error_kind="context"}) end
             return
         end
-        context.core_map_hash = core_hash
+        if self:_partial_progress_record(record) then self:_persist_confirmed_progress_catalog(record,rows,"eink") end
+        local core_hash=self:_core_map_hash(record)
+        local context={book_id=book_id,chapters=rows,catalog_complete=true,core_map_hash=core_hash,source="eink"}
+        if options.detached~=true or (current and current.book and tostring(current.book.book_id or "")==book_id) then
+            self.daemon_context=U.copy(context)
+        end
+        self.store:save_session(book_id,{legacy_report_context=context,report_login_session_id=login,
+            report_core_map_hash=core_hash,book_core_map_hash=core_hash,last_stage="E-Ink 目录已准备"})
+        if callback then callback(rows,nil,{source="eink"}) end
+    end,45)
+    return started,err
+end
 
-        -- Keep a catalog that has already produced a verified cloud position
-        -- stable for the rest of the verification TTL. A transient Web Reader
-        -- catalog that adds/removes structural chapters must not silently change
-        -- the whole-book percentage basis from e.g. 22 to 23 chapters.
-        local verified_at=tonumber(session.verified_at or 0) or 0
-        local verified_age=os.time()-verified_at
-        local saved_verified=session.remote_verified==true
-            and verified_at>0 and verified_age>=0 and verified_age<=(tonumber(self.verification_ttl) or 14400)
-            and type(saved)=="table" and saved.catalog_complete==true
-            and type(saved.chapters)=="table" and #saved.chapters>0
-        if saved_verified then
-            local saved_hash=BookIntegrity.core_map_hash(book_id,saved.chapters,{})
-            local new_hash=BookIntegrity.core_map_hash(book_id,context.chapters,{})
-            if saved_hash~="" and new_hash~="" and saved_hash~=new_hash then
-                logger.warn("[MiuRead][ProgressMap] catalog drift ignored during verified session",
-                    "book=",book_id,"kept=",tostring(#saved.chapters),
-                    "new=",tostring(#context.chapters))
-                context=U.copy(saved)
-                context.core_map_hash=core_hash
-            end
-        end
-
-        if value.cookies_changed or value.wr_ticket_changed or value.wr_wrpa_changed then
-            local latest_auth = self.store:auth()
-            if value.cookies_changed and type(value.cookies)=="table" then latest_auth.cookies = U.copy(value.cookies) end
-            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket or "" end
-            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa or "" end
-            local saved_auth,save_error=self.store:save_auth(latest_auth,{expected_revision=auth_revision_snapshot})
-            if saved_auth~=true then
-                logger.warn("[MiuRead][ProgressMap] stale worker credential update ignored",U.first_line(save_error or "",120))
-            end
-        end
-        if self:_partial_progress_record(record) then
-            local persisted,persist_error=self:_persist_confirmed_progress_catalog(record,context.chapters,"context_only")
-            if not persisted then
-                logger.warn("[MiuRead][ProgressCatalog] confirmed catalog not persisted",
-                    "book=",book_id,"reason=",tostring(persist_error or "unknown"))
-            end
-        end
-        local current_after=self:record()
-        if not detached or (current_after and tostring(current_after.book and current_after.book.book_id or "")==book_id) then
-            self.daemon_context = U.copy(context)
-        end
-        self.store:save_session(book_id,{
-            legacy_report_context=U.copy(context),
-            report_login_session_id=login_snapshot,
-            report_core_map_hash=core_hash,
-            book_core_map_hash=core_hash,
-            last_stage="完整章节信息已准备",
-        })
-        logger.info("[MiuRead][ProgressMap] catalog ready", "book=",book_id,
-            "chapters=",tostring(#context.chapters),"source=context_only")
-        if callback then callback(context.chapters, nil, {source="context_only"}) end
-    end, 55)
-    if not started then return false, run_error end
-    return true
+function Sync:pdf_position(record)
+    local ui=self.host and self.host.ui
+    local doc=ui and ui.document
+    if not record.record or record.record.document_format~="pdf" or not doc
+        or type(doc.getPageCount)~="function" then return nil end
+    local ok,total=pcall(doc.getPageCount,doc)
+    local page=self.host:_reader_current_page()
+    if not ok or not page then return nil end
+    return require("miuread.eink_pdf").capture(record,page,total)
 end
 
 function Sync:resolve_local_progress(callback, options)
@@ -1173,6 +1080,11 @@ function Sync:resolve_local_progress(callback, options)
     local detached=options.detached==true
     local record = type(options.record_snapshot)=="table" and U.copy(options.record_snapshot) or self:record()
     if not record then return false, "position_context_missing" end
+    if (record.record or {}).document_format=="pdf" then
+        local position=self:pdf_position(record)
+        if position then callback(position); return true end
+        return false,"pdf_local_page_unavailable"
+    end
     local book_id = tostring(record.book and record.book.book_id or "")
     local generation = tonumber(options.record_generation_override or self.record_generation or 0) or 0
     local path = tostring(record.path or "")
@@ -1397,50 +1309,57 @@ function Sync:resolve_local_progress(callback, options)
     return true
 end
 
--- 6.5.0-beta.8: current-chapter Web source prewarm, strictly worker-only.
--- This does not read or write progress; it only prepares a verified source
--- for the existing native Web co mapper. A busy worker is a harmless retry.
-function Sync:prepare_current_web_source(callback)
-    callback=type(callback)=="function" and callback or function() end
+function Sync:prepare_current_eink_source()
+    if self.suspended or self.quiescing or self.auth_transitioning or self:progress_mode()=="manual" then return false end
+    if self.async and self.async:busy() then return false,"source_worker_busy" end
     local record=self:record()
-    local ui=self.host and self.host.ui or nil
-    if not record or not ui or not ui.document then return false,"position_context_missing" end
-    if not self.async or not self.async:available() then return false,"source_worker_unavailable" end
-    if self.async:busy() then return false,"source_worker_busy" end
-    local anchor,anchor_error=PrecisePosition.capture(ui,record,self:_precision_catalog(record))
-    if not anchor then return false,anchor_error or "source_anchor_unavailable" end
-    local uid=tostring(anchor.chapter_uid or "")
-    local book_id=tostring(record.book and (record.book.book_id or record.book.bookId) or "")
-    if uid=="" or book_id=="" then return false,"chapter_identity_missing" end
-    local generation=tonumber(self.record_generation or 0) or 0
-    local path=tostring(record.path or "")
-    local record_snapshot={book=U.copy(record.book or {}),record=U.copy(record.record or {}),
-        variant=record.variant,path=record.path}
-    local reader=self.reader
-    return self.async:run("web_source_preparation",function()
-        local prepared,why=SourcePosition.ensureWebChapterSource(reader,record_snapshot,anchor)
-        return {prepared=prepared,error=why}
+    local row=record and record.record or {}
+    if row.online_expires or row.online_server_only then return false end
+    local position=record and self:local_position()
+    local uid=position and position.chapter_uid
+    if not uid then return false end
+    local source=require("miuread.eink_progress_source")
+    if source.has_cache(self.store,record,uid)~=false then return false end
+    local id=tostring(record.book.book_id)
+    local login=tostring(self.store:auth().login_session_id or "")
+    local target=table.concat({login,id,tostring(row.progress_source_book_version),tostring(uid)},"/")
+    local now=os.time()
+    if self.source_prewarm_target==target and now-(self.source_prewarm_at or 0)<60 then return false end
+    if not self.source_prewarm_worker then
+        self.source_prewarm_worker=require("miuread.async"):new(self.store,{poll_interval=.35,disable_fallback=true})
+    end
+    local worker=self.source_prewarm_worker
+    if worker:busy() then return false,"source_worker_busy" end
+    if not worker:available() then return false end
+    local reader,snapshot=self.reader,{path=record.path,book={book_id=id},record={
+        file=row.file,eink_content_mode=row.eink_content_mode,
+        progress_source_book_version=row.progress_source_book_version,
+    }}
+    local started=worker:run("eink-progress-source-prewarm",function()
+        local ok,err=source.prepare(reader,snapshot,uid)
+        return {prewarmed=ok,error=err}
     end,function(result)
-        local current=self:record()
-        if generation~=tonumber(self.record_generation or 0) or not current
-            or tostring(current.book and current.book.book_id or "")~=book_id
-            or tostring(current.path or "")~=path then
-            callback(false,"stale_reading_session",uid)
-            return
+        if login~=tostring(self.store:auth().login_session_id or "") then return end
+        if result and result.ok and result.value and result.value.prewarmed then
+            logger.info("[MiuRead][ProgressSource] E-Ink chapter cache warmed","book=",id,"chapter=",tostring(uid))
         end
-        local payload=result and result.ok==true and type(result.value)=="table" and result.value or nil
-        local prepared=payload and payload.prepared or nil
-        if type(prepared)=="table" and prepared.ready==true then
-            logger.info("[MiuRead][WebSourcePrewarm] ready", "book=",book_id,
-                "chapter=",uid,"cache=",tostring(prepared.cache_hit==true))
-            callback(true,nil,uid)
-        else
-            local why=tostring(payload and payload.error or (result and result.error) or "prewarm_failed")
-            logger.warn("[MiuRead][WebSourcePrewarm] unavailable", "book=",book_id,
-                "chapter=",uid,"reason=",why)
-            callback(false,why,uid)
-        end
-    end,tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
+    end,20)
+    if started then self.source_prewarm_target,self.source_prewarm_at=target,now end
+    return started
+end
+
+function Sync:cancel_eink_source_prewarm(reason)
+    if self.source_prewarm_worker then self.source_prewarm_worker:cancel(reason) end
+end
+
+local function native_source_position(reader,record,anchor,allow_fetch)
+    if (record.record or {}).document_format=="txt" then
+        return require("miuread.eink_text_progress").local_position(record,anchor)
+    end
+    local value,err=require("miuread.eink_progress_source").local_position(reader,record,anchor,allow_fetch)
+    if value or not allow_fetch then return value,err end
+    local native=require("miuread.eink_client").new(reader.http,reader.store)
+    return require("miuread.eink_coordinates").position(native,record,anchor,anchor.display_progress)
 end
 
 function Sync:_source_position_async(callback, options)
@@ -1466,6 +1385,16 @@ function Sync:_source_position_async(callback, options)
     local ratio_snapshot=tonumber(options.ratio_snapshot)
     if ratio_snapshot==nil then ratio_snapshot=self:local_ratio() end
     local reader = self.reader
+    local login_snapshot=tostring(self.store:auth().login_session_id or "")
+    anchor.captured_at=anchor.captured_at or os.time()
+    if ratio_snapshot~=nil then
+        local local_position=self:position(record,ratio_snapshot)
+        if local_position and tostring(local_position.chapter_uid)==tostring(anchor.chapter_uid) then
+            anchor.display_progress=local_position.progress
+            anchor.chapter_ratio=local_position.chapter_ratio
+        end
+        if anchor.standalone then anchor.chapter_ratio=anchor.chapter_ratio or ratio_snapshot end
+    end
     local source_cache_only=options.cache_only==true
     -- Detached close/suspend resolvers never start a fresh chapter network fetch.
     -- Their immutable anchor is retained as pending state and can be retried after
@@ -1534,12 +1463,18 @@ function Sync:_source_position_async(callback, options)
     local function local_failure_allows_network(detail)
         detail=tostring(detail or "")
         return detail=="source_cache_missing" or detail=="coord_cache_missing"
+            or detail=="eink_progress_format_unavailable"
             or detail=="not_found" or detail=="ambiguous"
             or detail:find("^source_cache_anchor_mismatch",1,false)~=nil
             or detail:find("^source_map_build_failed",1,false)~=nil
     end
 
     local function consume_success(value)
+        self.store:reload()
+        if login_snapshot=="" or tostring(self.store:auth().login_session_id or "")~=login_snapshot then
+            if callback then callback(nil,"login_changed",{error_kind="authentication"}) end
+            return
+        end
         if not still_current() then
             if callback then callback(nil, "stale_position_result") end
             return
@@ -1547,7 +1482,7 @@ function Sync:_source_position_async(callback, options)
         local current=self:record()
         local mapping_record=detached and record_snapshot or current
         local adjusted = self:_prefer_inverse_cloud_mapping(mapping_record, value, ratio_snapshot)
-        adjusted.captured_at = os.time()
+        adjusted.captured_at = tonumber(anchor.captured_at) or os.time()
         if adjusted.mapping_recovered==true then
             logger.info("[MiuRead][ProgressSource] neighbour chapter mapping recovered",
                 "book=",book_id,
@@ -1603,7 +1538,13 @@ function Sync:_source_position_async(callback, options)
         if self.async:busy() then return false,"source_worker_busy" end
         priority_begin()
         local started,run_error=self.async:run("progress_source_position_local", function()
-            local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=true})
+            local cached=(reader.store:session(book_id) or {}).pending_progress
+            local value=type(cached)=="table" and cached.eink_coordinate==true
+                and tostring(cached.book_id)==book_id and tostring(cached.chapter_uid)==tostring(anchor.chapter_uid)
+                and tostring(cached.chapter_index)==tostring(anchor.chapter_index)
+                and cached.source_xpointer==anchor.xpointer and cached.book_version==anchor.book_version and cached or nil
+            local source_error
+            if not value then value,source_error=native_source_position(reader,record_snapshot,anchor,false) end
             return {position=value,error=source_error}
         end,function(result) on_phase_result("local",result) end,
             tonumber(Config.PROGRESS_SOURCE_LOCAL_TIMEOUT_SECONDS) or 10)
@@ -1614,7 +1555,7 @@ function Sync:_source_position_async(callback, options)
     launch_network=function()
         if self.async:busy() then return false,"source_worker_busy" end
         return self.async:run("progress_source_position_network", function()
-            local value,source_error=SourcePosition.locate(reader, record_snapshot, anchor,{cache_only=false,force_refresh=true,force_refresh_uid=tostring(anchor.chapter_uid or "")})
+            local value,source_error=native_source_position(reader,record_snapshot,anchor,true)
             return {position=value,error=source_error}
         end,function(result) on_phase_result("network",result) end,
             tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
@@ -1662,10 +1603,16 @@ function Sync:resolve_saved_progress_anchor(anchor, record_snapshot, callback, o
     local ratio_snapshot=tonumber(options.ratio_snapshot)
     local reader=self.reader
     local allow_network=options.allow_network~=false
+    local login_snapshot=tostring(self.store:auth().login_session_id or "")
 
     local function finish_success(value,phase)
+        self.store:reload()
+        if login_snapshot=="" or tostring(self.store:auth().login_session_id or "")~=login_snapshot then
+            callback(nil,"login_changed",{error_kind="authentication"})
+            return
+        end
         local adjusted=self:_prefer_inverse_cloud_mapping(record_snapshot,value,ratio_snapshot)
-        adjusted.captured_at=os.time()
+        adjusted.captured_at=tonumber(anchor.captured_at) or tonumber(adjusted.captured_at) or os.time()
         adjusted.recovered_from_saved_anchor=true
         logger.info("[MiuRead][ProgressRecoveryCapsule] source recovered",
             "book=",book_id,"phase=",phase,
@@ -1684,7 +1631,7 @@ function Sync:resolve_saved_progress_anchor(anchor, record_snapshot, callback, o
     local function network_retryable(detail)
         detail=tostring(detail or "")
         return detail=="not_found" or detail=="ambiguous" or detail=="coord_cache_missing"
-            or detail=="source_cache_missing"
+            or detail=="source_cache_missing" or detail=="eink_progress_format_unavailable"
             or detail:find("^source_cache_anchor_mismatch",1,false)~=nil
             or detail:find("^source_map_build_failed",1,false)~=nil
     end
@@ -1707,7 +1654,7 @@ function Sync:resolve_saved_progress_anchor(anchor, record_snapshot, callback, o
     end
     local function launch_local()
         return self.async:run("progress_saved_anchor_local",function()
-            local value,err=SourcePosition.locate(reader,record_snapshot,anchor,{cache_only=true})
+            local value,err=native_source_position(reader,record_snapshot,anchor,false)
             return {position=value,error=err}
         end,function(result) on_result("local",result) end,
             tonumber(Config.PROGRESS_SOURCE_LOCAL_TIMEOUT_SECONDS) or 10)
@@ -1715,8 +1662,7 @@ function Sync:resolve_saved_progress_anchor(anchor, record_snapshot, callback, o
     launch_network=function()
         if self.async:busy() then return false,"source_worker_busy" end
         return self.async:run("progress_saved_anchor_network",function()
-            local value,err=SourcePosition.locate(reader,record_snapshot,anchor,{
-                cache_only=false,force_refresh=true,force_refresh_uid=tostring(anchor.chapter_uid or "")})
+            local value,err=native_source_position(reader,record_snapshot,anchor,true)
             return {position=value,error=err}
         end,function(result) on_result("network",result) end,
             tonumber(Config.PROGRESS_SOURCE_NETWORK_TIMEOUT_SECONDS) or 40)
@@ -1837,31 +1783,42 @@ end
 -- authoritative and runs first. This helper is called only after precise
 -- post-jump verification proves that GotoPercent landed in a different chapter.
 -- It never marks a position verified: the caller must resolve chapter/co again.
-function Sync:resolve_remote_progress(remote, callback)
+function Sync:resolve_remote_progress(remote,callback)
     callback=type(callback)=="function" and callback or function() end
-    -- beta.6: never send the runtime remote graph through async JSON IPC.
-    -- `remote.sources.*` may point back to the selected object and forms a cycle.
-    remote=type(remote)=="table" and PositionResolution.snapshot(remote) or nil
     local record=self:record()
-    if not remote or not record then callback(nil,"remote_position_context_missing"); return false end
-    local map=select(1,self:_progress_catalog(record))
-    local catalog=type(map)=="table" and U.copy(map) or {}
-    if #catalog==0 then callback(nil,"remote_catalog_missing"); return false end
-    local record_snapshot={book=U.copy(record.book or {}),record=U.copy(record.record or {}),variant=record.variant,path=record.path}
-    local reader_snapshot=self.reader
-    local started,err=self.async:run("remote_position_resolve",function()
-        local value,why=SourcePosition.remoteProgress(reader_snapshot,record_snapshot,remote,catalog)
-        return {value=value,error=why}
-    end,function(result)
-        if not result or result.ok~=true or type(result.value)~="table" then
-            callback(nil,result and result.error or "remote_position_resolve_failed")
-            return
+    if type(remote)~="table" or remote.source~="eink" or not record then
+        callback(nil,"eink_remote_position_unavailable")
+        return false
+    end
+    if (record.record or {}).document_format=="pdf" then callback(remote); return true end
+    local quote,uid=remote.summary,tostring(remote.chapter_uid or "")
+    if uid=="" or not self.async
+        or not self.async:available() or self.async:busy() then
+        callback(U.copy(remote),nil)
+        return true
+    end
+    local book_id=tostring(record.book and record.book.book_id or "")
+    local path=record.path
+    local snapshot=U.copy(remote)
+    local record_snapshot=U.copy(record)
+    local started=self.async:run("eink_remote_position_text",function()
+        if (record_snapshot.record or {}).document_format=="txt" then
+            return require("miuread.eink_text_progress").remote_position(record_snapshot,snapshot) or snapshot
         end
-        local payload=result.value
-        callback(type(payload.value)=="table" and payload.value or nil,payload.error)
-    end,70)
-    if started==false then callback(nil,err or "remote_position_resolve_busy") end
-    return started~=false
+        local resolved=require("miuread.eink_progress_source").remote_position(self.reader,record_snapshot,snapshot)
+        if resolved then return resolved end
+        if type(quote)~="string" or #quote<12 then return snapshot end
+        local native=require("miuread.eink_client").new(self.reader.http,self.store)
+        local offset=require("miuread.eink_coordinates").lookup(native,book_id,uid,quote)
+        if offset~=nil and offset==tonumber(snapshot.offset) then snapshot.search_anchor_text=quote end
+        return snapshot
+    end,function(result)
+        local current=self:record()
+        if not current or current.path~=path then callback(nil,"stale_position_result");return end
+        callback(result and result.ok and type(result.value)=="table" and result.value or snapshot,nil)
+    end,20)
+    if not started then callback(snapshot,nil) end
+    return true
 end
 
 local function remote_xpointer_cache_key(sync,remote)
@@ -2002,7 +1959,7 @@ function Sync:text_anchor_rescue(remote,options)
         return false,"text_anchor_hits_outside_chapter"
     end
     local chosen=candidates[1]
-    if #candidates>1 and page_start and page_end and tonumber(remote.chapter_ratio) then
+    if #candidates>1 and not remote.eink_source_anchor and page_start and page_end and tonumber(remote.chapter_ratio) then
         local target=page_start+U.clamp(tonumber(remote.chapter_ratio) or 0,0,1)*math.max(1,page_end-page_start)
         local best=math.huge
         for _,candidate in ipairs(candidates) do
@@ -2100,7 +2057,9 @@ function Sync:chapter_anchor_rescue(remote)
     end
 
     local method
-    if target_page and self:jump_page(target_page) then
+    if remote.eink_chapter_start==true and start_xp and self:jump_xpointer(start_xp) then
+        method = "chapter_start_xpointer"
+    elseif target_page and self:jump_page(target_page) then
         method = "chapter_page_ratio"
     elseif start_xp and self:jump_xpointer(start_xp) then
         method = "chapter_start_xpointer"
@@ -2137,7 +2096,30 @@ function Sync:jump_remote(remote)
     remote = remote or {}
     local record = self:record()
     if not record then return false, "未识别到当前觅阅书籍" end
+    if (record.record or {}).document_format=="pdf" then
+        local page=tonumber(remote.chapter_uid)
+        local doc=self.host.ui.document
+        if remote.document_format~="pdf" or not page or page<0 or page>=doc:getPageCount()
+            or tonumber(remote.version)~=tonumber(record.record.pdf_book_version) then return false,"PDF 页码或版本无法确认" end
+        return self:jump_page(page+1)
+    end
+    if (record.record or {}).document_format=="txt" then
+        local doc=self.host.ui.document
+        if remote.eink_txt_anchor==true and type(doc.findAllText)=="function" then
+            local ok,hits=pcall(doc.findAllText,doc,remote.search_anchor_text,true,3,40,false)
+            if ok and type(hits)=="table" and #hits==1 and self:jump_xpointer(hits[1].start) then return true end
+        end
+        return false,"TXT 云端正文位置无法唯一定位"
+    end
     local mode, standalone_uid = self:_record_mode(record)
+    if remote.eink_chapter_start==true and mode=="full" then
+        local anchored=self:chapter_anchor_rescue(remote)
+        if anchored then return true end
+    end
+    if remote.eink_source_anchor==true and (mode=="full" or standalone_uid==tostring(remote.chapter_uid or "")) then
+        local anchored=self:text_anchor_rescue(remote,{skip_cache=true})
+        if anchored then return true end
+    end
     local row=type(record.record)=="table" and record.record or {}
     local partial_range=row.partial_range==true
     local ok, err
@@ -2473,7 +2455,6 @@ function Sync:remote(book_id, callback, options)
         self.state = "fetching_remote"
         self.last_stage = "读取云端进度"
     end
-    local threshold=tonumber(self.store:preferences().sync.threshold) or 2
     local auth_snapshot=self.store:auth()
     local account_snapshot=type(auth_snapshot.account)=="table" and auth_snapshot.account or {}
     local login_snapshot=tostring(auth_snapshot.login_session_id or "")
@@ -2487,37 +2468,25 @@ function Sync:remote(book_id, callback, options)
     else
         catalog_snapshot=U.copy(self:_remote_catalog(book_id))
     end
-    local resolve_native_progress=options.raw_coordinate~=true
-    local record_snapshot=source_record and {
-        book=U.copy(source_record.book or {}),
-        record=U.copy(source_record.record or {}),
-        variant=source_record.variant,
-        path=source_record.path,
-    } or nil
-    local reader_snapshot=self.reader
     local ok, err = self.async:run("remote_progress", function()
-        local out
-        if options.web_only==true then
-            out={web=self.api:web_progress(book_id)}
-        else
-            out=self.api:progress_sources(book_id)
+        local native=require("miuread.eink_client")
+        if source_record and (source_record.record or {}).document_format=="pdf" then
+            return native.new(self.reader.http,self.store):pdf_progress(book_id)
         end
-
-        local function normalize_native(value,source)
-            local progress=sourced_progress(value,book_id,source)
-            if not progress then return nil end
-            if resolve_native_progress and record_snapshot and tonumber(progress.offset)~=nil
-                and tostring(progress.chapter_uid or "")~="" and #catalog_snapshot>0 then
-                local exact,why=SourcePosition.remoteProgress(
-                    reader_snapshot,record_snapshot,progress,catalog_snapshot)
-                if exact then return exact end
-                progress.native_resolve_error=tostring(why or "remote_native_resolve_failed")
-            end
-            return catalog_progress_from_remote(progress,catalog_snapshot)
+        local response=self.api:progress(book_id)
+        local position=native.progress_position(response,book_id)
+        local display=sourced_progress(response,book_id,"eink")
+        if native.progress_is_empty(response,book_id) then
+            return {source="eink",percent=0,updated_at=0,fetched_at=os.time(),empty=true}
         end
-        out.agent_progress=normalize_native(out.agent,"agent_gateway")
-        out.web_progress=normalize_native(out.web,"web_cookie")
-        return out
+        if not position then return display end
+        position.source="eink"
+        position.position_basis="eink_utf16"
+        position.fetched_at=os.time()
+        position.percent=position.percent or (display and display.percent)
+        catalog_progress_from_remote(position,catalog_snapshot)
+        position.position_basis,position.offset_basis="eink_utf16","eink_utf16"
+        return position
     end, function(result)
         local now_record=self:record()
         if not detached and (generation_snapshot~=tonumber(self.record_generation or 0)
@@ -2548,93 +2517,21 @@ function Sync:remote(book_id, callback, options)
             callback(nil, remote_error)
             return
         end
-        local value=result.value
-        local web=value.web_progress or self:_normalize_remote_progress(
-            sourced_progress(value.web,book_id,"web_cookie"),book_id)
-        local agent=value.agent_progress or self:_normalize_remote_progress(
-            sourced_progress(value.agent,book_id,"agent_gateway"),book_id)
-        -- Log only non-secret wire coordinates. This distinguishes a true
-        -- Web co=0 from an Agent/Web source disagreement after a POST.
-        logger.info("[MiuRead][ProgressWireReadback]",
-            "book=",tostring(book_id),
-            "web_uid=",tostring(web and web.chapter_uid or "-"),
-            "web_co=",tostring(web and web.offset or "-"),
-            "web_basis=",tostring(web and web.position_basis or "-"),
-            "agent_uid=",tostring(agent and agent.chapter_uid or "-"),
-            "agent_co=",tostring(agent and agent.offset or "-"),
-            "agent_basis=",tostring(agent and agent.position_basis or "-"))
-        if options.verify_only==true then
-            -- Reconcile a Web write with the Web response alone; no session
-            -- baseline change, no flash write and no Agent-only acceptance.
-            if web then callback(web,nil)
-            else callback(nil,tostring(value.web_error or "web_progress_unavailable")) end
-            return
-        end
-        local remote=choose_remote_progress(web,agent,threshold)
-        if not remote then
-            local remote_error=tostring(value.web_error or value.agent_error or "remote progress unavailable")
-            if not detached then self.last_error=remote_error end
-            if Http.is_auth_error(remote_error) and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,"progress",remote_error)
-            end
-            callback(nil,remote_error)
-            return
-        end
+        local remote=result.value
+        if options.verify_only==true then callback(remote,nil); return end
         if not detached then self.last_error=nil end
-        -- Agent fallback can resolve overall progress even when Web Cookie
-        -- GET failed. Never clear Web-channel authentication health on Agent
-        -- success alone.
-        if web then
-            if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"progress") end
-        elseif Http.is_auth_error(value.web_error or "") and self.host.on_auth_required then
-            pcall(self.host.on_auth_required,self.host,"progress",value.web_error)
-        end
+        if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"progress") end
         local remote_snapshot=strip_progress_sources(remote)
         local session_before=self.store:session(book_id) or {}
         local position_state=type(session_before.position_state)=="table" and U.copy(session_before.position_state) or {version=1}
-        position_state.version=1
         position_state.remote_position=U.copy(remote_snapshot)
-        position_state.remote_position.updated_at=tonumber(remote_snapshot.updated_at or remote_snapshot.updated or 0) or 0
-        position_state.remote_position.fetched_at=os.time()
         self.store:save_session(book_id,{
-            remote=remote_snapshot,
-            remote_sources={web=strip_progress_sources(web),agent=strip_progress_sources(agent)},
-            remote_checked_at=os.time(),
-            remote_web_error=value.web_error,
-            remote_agent_error=value.agent_error,
-            position_state=position_state,
+            remote=remote_snapshot,remote_sources={eink=remote_snapshot},remote_checked_at=os.time(),
+            position_state=position_state,remote_web_error=false,remote_agent_error=false,
         })
-        -- beta.15: every authoritative server observation refreshes the wire
-        -- echo anchor immediately, even when a local pending progress item exists
-        -- or this call deliberately disables canonical CloudAnchor updates.
-        -- The time-reporting wire tuple must originate from the actual Web
-        -- response, not from the newer-source reconciliation winner (which
-        -- may be Agent). Store it even if the progress resolver chose Agent.
-        if web and tostring(web.source or "")=="web_cookie" then
-            self:set_remote_wire_anchor(book_id,web,"remote_observed_wire",true)
-        end
-        if not remote.conflict and options.update_cloud_anchor~=false then
-            local current_session=self.store:session(book_id) or {}
-            local has_pending=type(current_session.pending_progress)=="table"
-            if not has_pending or options.replace_pending_anchor==true then
-                self:set_cloud_anchor(book_id,remote,"remote_observed",true)
-            else
-                logger.info("[MiuRead][CloudAnchor] remote observation retained as readback only",
-                    "book=",tostring(book_id),"pending=true")
-            end
-        end
-        if remote.conflict then
-            logger.warn("[MiuRead][Sync] cloud progress source conflict",
-                "book=",tostring(book_id),
-                "web=",tostring(web and web.percent or "-"),
-                "agent=",tostring(agent and agent.percent or "-"))
-        else
-            logger.info("[MiuRead][Sync] remote progress", "book=", tostring(book_id),
-                "percent=", tostring(remote.percent), "raw_percent=",tostring(remote.raw_percent or "-"),
-                "basis=",tostring(remote.position_basis or "raw_percent"),
-                "source=",tostring(remote.source or "-"),
-                "chapter=", tostring(remote.chapter_uid or "-"),
-                "offset=", tostring(remote.offset or "-"), "updated=", tostring(remote.updated_at or "-"))
+        if options.update_cloud_anchor~=false and (type(session_before.pending_progress)~="table"
+            or options.replace_pending_anchor==true) then
+            self:set_cloud_anchor(book_id,remote,"eink_observed",true)
         end
         callback(remote,nil)
     end, 42)
@@ -2754,32 +2651,29 @@ function Sync:_save_local_snapshot(book_id,position)
     self.store:save_session(book_id,{local_position_snapshot=snapshot,position_state=position_state})
 end
 
-function Sync:_recover_auth_once(channel,error,on_done,force)
+function Sync:_recover_auth_once(channel,reason,on_done,force)
     local now=os.time()
-    if self.auth_recovery_busy or (not force and now-(tonumber(self.auth_recovery_at) or 0)<60) then
-        if on_done then on_done(false,"登录恢复正在进行或刚刚尝试过") end
+    if self.auth_recovery_busy or not self.async or not self.async:available() or self.async:busy()
+        or (not force and now-(tonumber(self.auth_recovery_at) or 0)<60) then
+        if on_done then on_done(false,"登录检查任务正在运行或刚刚尝试过") end
         return false
     end
-    self.auth_recovery_busy=true
-    self.auth_recovery_at=now
-    UIManager:scheduleIn(.1,function()
-        local called,renewed,detail=pcall(self.reader._recover_login_session,self.reader)
+    local login=self.store:auth().login_session_id
+    self.auth_recovery_busy,self.auth_recovery_at=true,now
+    local started,err=self.async:run("eink_session_check",function()
+        local native=require("miuread.eink_client").new(self.reader.http,self.store)
+        native:shelf()
+        return true
+    end,function(result)
         self.auth_recovery_busy=false
-        local success=called and renewed==true
-        if success then
-            if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,channel) end
-            logger.info("[MiuRead][Sync] parent login recovery succeeded","channel=",tostring(channel))
-        else
-            local reason=called and detail or renewed
-            logger.warn("[MiuRead][Sync] parent login recovery failed","channel=",tostring(channel),
-                "error=",U.first_line(reason or error,180))
-            if not force and self.host.on_auth_required then
-                pcall(self.host.on_auth_required,self.host,channel,reason or error)
-            end
-        end
-        if on_done then on_done(success,detail) end
-    end)
-    return true
+        self.store:reload()
+        local success=result and result.ok and result.value==true and login==self.store:auth().login_session_id
+        local failure=not success and (result and result.error or reason) or nil
+        if success and self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,channel) end
+        if on_done then on_done(success==true,failure) end
+    end,25)
+    if not started then self.auth_recovery_busy=false end
+    return started,err
 end
 
 function Sync:_prepare_context(record, ratio, session, force)
@@ -2959,734 +2853,33 @@ function Sync:_mark_repair_required(book_id, kind, err, suppress_prompt)
 end
 
 function Sync:repair_current(callback)
-    local record=self:record()
-    if not record then if callback then callback(false,"未识别当前觅阅书籍") end; return false end
-    local book_id=tostring(record.book.book_id or "")
-    if book_id=="" then if callback then callback(false,"当前书籍 ID 无效") end; return false end
-    local core_hash=self:_core_map_hash(record)
-    if core_hash=="" then if callback then callback(false,"当前书籍章节映射不完整") end; return false end
-
-    -- Automatic repair, manual repair and repeated taps must share one job.
-    -- Starting a second transaction used to leave an old verification callback
-    -- alive after the first repair had already succeeded.
-    if self.repair_busy==true then
-        if tostring(self.repair_book_id or "")==book_id then
-            logger.info("[MiuRead][SyncRepair] duplicate repair ignored","book=",book_id)
-            if callback then callback(false,"检查与修复正在进行",nil,{error_kind="busy",already_running=true}) end
-            return true
-        end
-        logger.info("[MiuRead][SyncRepair] repair busy for another book",
-            "active=",tostring(self.repair_book_id or "-"),"requested=",book_id)
-        if callback then callback(false,"上一项检查与修复正在结束") end
-        return false
-    end
-    self.repair_busy=true
-    self.repair_book_id=book_id
-    self.repair_generation=(tonumber(self.repair_generation) or 0)+1
-    local generation=self.repair_generation
-
-    local function active()
-        return self.repair_busy==true
-            and tostring(self.repair_book_id or "")==book_id
-            and generation==tonumber(self.repair_generation or 0)
-    end
-    local function release()
-        if generation==tonumber(self.repair_generation or 0) then
-            self.repair_busy=false
-            self.repair_book_id=nil
-        end
-    end
-
-    local daemon=self.daemon
-    if daemon and daemon.active then
-        daemon.active=false
-        self:_write_daemon_control(false,true)
-        self.next_due=0
-    end
-
-    local session=self.store:session(book_id) or {}
-    local prior_kind=tostring(session.sync_repair_kind or self.last_error_kind or "")
-    local prior_error=tostring(session.sync_repair_error or session.last_error or self.last_error or "")
-    self.store:save_session(book_id,{
-        last_stage="正在检查登录与当前书籍同步状态",
-        book_core_map_hash=core_hash,
-    })
-    self.state="repairing"
-    self.failure_notified=false
-
-    local finished=false
-    local function cancel(result,value)
-        if finished or not active() then return end
-        finished=true
-        release()
-        self.state="waiting"
-        logger.info("[MiuRead][SyncRepair] cancelled","book=",book_id,"reason=",tostring(result or "cancelled"))
-        if callback then callback(false,tostring(result or "检查与修复已取消"),nil,value or {error_kind="cancelled"}) end
-    end
-    local function fail(result,value)
-        if finished or not active() then return end
-        finished=true
-        release()
-        local err=tostring(result or "阅读同步修复失败")
-        local kind=(value and value.error_kind) or nil
-        if Http.is_auth_error(err) then kind="authentication" end
-        kind=self:_normalize_report_error_kind(kind or (err:lower():find("chapter",1,true) and "context" or "server"),err)
-        local repair_required=self:_mark_repair_required(book_id,kind,err,true)==true
-        self.state=repair_required and "repair_required" or "waiting"
-        if callback then callback(false,err,nil,value) end
-    end
-
-    local function commit(result,position,value,remote)
-        if finished or not active() then return end
-        local auth=self.store:auth()
-        local login=tostring(auth.login_session_id or "")
-        local candidate=value and value.legacy_context
-        if type(candidate)~="table" or tostring(candidate.book_id or candidate.bookId or "")~=book_id then
-            fail("修复结果缺少当前书籍的有效同步上下文",{error_kind="context"})
-            return
-        end
-        candidate.core_map_hash=core_hash
-        finished=true
-        release()
-        self.store:save_session(book_id,{
-            legacy_report_context=U.copy(candidate),
-            report_login_session_id=login,
-            report_core_map_hash=core_hash,
-            book_core_map_hash=core_hash,
-            sync_repair_required=false,
-            sync_repair_kind=nil,
-            sync_repair_error=nil,
-            sync_repair_at=nil,
-            consecutive_failures=0,
-            consecutive_unconfirmed=0,
-            report_context_failures=0,
-            report_recovery_state=false,
-            report_state="ok",
-            last_error=false,
-            sync_repaired_at=os.time(),
-            last_stage="阅读同步已修复并通过云端回读确认",
-            pending_report_seconds=0,
-            progress_upload_state="verified",
-            progress_upload_verified_at=os.time(),
-        })
-        self.last_error=nil
-        self.last_error_kind=nil
-        self.consecutive_failures=0
-        self.failure_notified=false
-        self:mark_verified(book_id,"repair_cloud_verified",position and position.progress,remote and remote.percent,position)
-        self.state="waiting"
-        if self.store:preferences().sync.time_enabled==true and not self.suspended then
-            UIManager:scheduleIn(1,function()
-                local current=self:record()
-                if current and tostring(current.book and current.book.book_id or "")==book_id then
-                    self:start("manual_repair_success")
-                end
-            end)
-        end
-        logger.info("[MiuRead][SyncRepair] cloud verification accepted",
-            "book=",book_id,
-            "chapter=",tostring(position and position.chapter_uid or "-"),
-            "progress=",tostring(position and position.progress or "-"))
-        if callback then callback(true,result,position,value) end
-    end
-
-    local function verify(result,position,value,attempt)
-        if not active() then return end
-        attempt=tonumber(attempt) or 1
-        self.store:save_session(book_id,{last_stage="正在回读微信读书云端位置确认修复结果"})
-        UIManager:scheduleIn(attempt==1 and 1.4 or 2.4,function()
-            if finished or not active() then return end
-            local current=self:record()
-            if not current or tostring(current.book.book_id or "")~=book_id then
-                cancel("书籍已切换，已取消旧书同步修复",{error_kind="cancelled"})
-                return
-            end
-            self:remote(book_id,function(remote,remote_error)
-                if finished or not active() then return end
-                local matched,reason=positions_match(position,remote,self.store:preferences().sync.threshold)
-                if matched then
-                    commit(result,position,value,remote)
-                elseif attempt<2 and remote then
-                    logger.info("[MiuRead][SyncRepair] cloud verification pending",
-                        "book=",book_id,"reason=",tostring(reason))
-                    verify(result,position,value,attempt+1)
-                else
-                    local detail=remote_error or reason or "云端位置未更新"
-                    logger.warn("[MiuRead][SyncRepair] cloud verification failed",
-                        "book=",book_id,"reason=",tostring(detail),
-                        "submitted_uid=",tostring(position and position.chapter_uid or "-"),
-                        "remote_uid=",tostring(remote and remote.chapter_uid or "-"),
-                        "submitted_progress=",tostring(position and position.progress or "-"),
-                        "remote_progress=",tostring(remote and remote.percent or "-"))
-                    fail("微信读书已接收请求，但云端位置未与当前书籍一致",{error_kind="context"})
-                end
-            end,{force=true})
-        end)
-    end
-
-    local function run_upload(force_context,label)
-        if not active() then return false end
-        logger.info("[MiuRead][SyncRepair] "..tostring(label or "testing context"),
-            "book=",book_id,"core=",core_hash:sub(1,12))
-        self.store:save_session(book_id,{last_stage=force_context and "正在重新建立当前书籍章节同步信息" or "正在验证原有章节同步信息"})
-        if force_context then
-            self.daemon_context=nil
-            if daemon and daemon.paths and daemon.paths.context then os.remove(daemon.paths.context) end
-        end
-        local started=self:upload(0,function(ok,result,position,value)
-            if not active() then return end
-            if ok then
-                verify(result,position,value,1)
-                return
-            end
-            local err=tostring(result or "")
-            local kind=tostring((value and value.error_kind) or "")
-            if not force_context and kind~="authentication" and not Http.is_auth_error(err) then
-                run_upload(true,"rebuilding current book context")
-            else
-                fail(result,value)
-            end
-        end,{silent=true,progress_only=true,force_context=force_context,repair=true,transactional_context=true})
-        if not started then fail("暂时无法启动阅读同步修复",{error_kind="context"}) end
-        return started
-    end
-
-    local saved_context=type(session.legacy_report_context)=="table" and session.legacy_report_context or nil
-    local auth=self.store:auth()
-    local can_preserve=type(saved_context)=="table"
-        and tostring(saved_context.book_id or saved_context.bookId or "")==book_id
-        and tostring(session.report_login_session_id or "")==tostring(auth.login_session_id or "")
-        and tostring(session.report_core_map_hash or "")~=""
-        and tostring(session.report_core_map_hash or "")==core_hash
-
-    local function after_auth()
-        if not active() then return end
-        if can_preserve then
-            run_upload(false,"testing preserved context")
-        else
-            run_upload(true,"rebuilding current book context")
-        end
-    end
-
-    local needs_auth_check=prior_kind=="authentication" or prior_kind=="context" or Http.is_auth_error(prior_error)
-    if needs_auth_check then
-        logger.info("[MiuRead][SyncRepair] explicit login renewal requested","book=",book_id,
-            "previous_kind=",prior_kind~="" and prior_kind or "unknown")
-        self.store:save_session(book_id,{last_stage="正在验证微信读书登录状态"})
-        local started=self:_recover_auth_once("read_report",prior_error,function(recovered,detail)
-            if not active() then return end
-            if recovered then after_auth()
-            else fail(tostring(detail or "微信读书登录验证失败"),{error_kind="authentication"}) end
-        end,true)
-        if not started then fail("登录状态正在处理 请稍后再试",{error_kind="authentication"}) end
-        return started
-    end
-
-    after_auth()
-    return true
-end
-
-function Sync:upload(elapsed, callback, options)
-    options = options or {}
-    if self:web_readtime_disabled() and ((tonumber(elapsed) or 0)>0
-        or options.time_only==true or options.report_mode=="reading_time_compat") then
-        if callback then callback(false,"仅 E-Ink 模式禁止 Web 阅读时长上传") end
-        return false
-    end
-    local record = type(options.record_override)=="table" and U.copy(options.record_override) or self:record()
-    if not record then if callback then callback(false, "未识别到 MiuRead 生成的当前书籍") end; return false end
-    if self.progress_hold and not options.progress_only and options.reading_time_retry~=true then
-        if callback then callback(false, "阅读位置尚未确认") end
-        return false
-    end
-    if self.busy then if callback then callback(false, "同步任务忙") end; return false end
-
-    local book_id = tostring(record.book.book_id)
-    local generation_snapshot=tonumber(options.record_generation_override or self.record_generation or 0) or 0
-    local path_snapshot=tostring(record.path or "")
-    local core_hash=self:_core_map_hash(record)
-    local session = self.store:session(book_id) or {}
-    -- beta.17: a reading-time context repair flag must not veto a valid,
-    -- independent Kindle progress-only upload. The worker still validates its
-    -- own current credentials, native chapter and payload before dispatch.
-    if session.sync_repair_required==true and options.repair~=true and options.progress_only~=true
-        and not options.reading_time_retry then
-        local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
-        if repair_kind~="context" then
-            self:_clear_noncontext_repair_flag(book_id,session,"upload_reclassified")
-            session=self.store:session(book_id) or session
-        else
-            self.last_error=tostring(session.sync_repair_error or "当前书籍需要修复同步")
-            self.last_error_kind="context"
-            if callback then callback(false,self.last_error) end
-            return false
-        end
-    end
-    local auth = self.store:auth()
-    local account=type(auth.account)=="table" and auth.account or {}
-    local login_snapshot=tostring(auth.login_session_id or "")
-    local auth_revision_snapshot=math.max(0,tonumber(auth.auth_revision or 0) or 0)
-    local vid_snapshot=tostring(account.vid or "")
-    if login_snapshot=="" or vid_snapshot=="" then
-        if callback then callback(false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码") end
-        return false
-    end
-    local ratio = type(options.position_override)=="table" and tonumber(options.position_override.progress)
-        and U.clamp((tonumber(options.position_override.progress) or 0)/100,0,1)
-        or self:local_ratio() or 0
-    local auth_channel=options.progress_only and "progress" or "read_report"
-    local chapters = (record.record and record.record.chapter_map) or record.book.catalog or {}
-    -- Keep the old worker's own field names and cached context isolated from
-    -- MiuRead's newer protocol model. On first use it refreshes the reader page,
-    -- catalog and reporting context through the isolated compatibility worker.
-    local saved_context=type(session.legacy_report_context)=="table" and session.legacy_report_context or nil
-    local context_matches=tostring(session.report_login_session_id or "")==login_snapshot
-        and tostring(session.report_core_map_hash or "")~=""
-        and tostring(session.report_core_map_hash or "")==tostring(core_hash or "")
-        and type(saved_context)=="table"
-        and tostring(saved_context.book_id or saved_context.bookId or "")==book_id
-        and (tostring(saved_context.core_map_hash or "")==""
-            or tostring(saved_context.core_map_hash or "")==tostring(core_hash or ""))
-    local legacy_book = U.copy(context_matches and saved_context or {})
-    legacy_book.book_id = book_id
-    legacy_book.title = record.book.title
-    self:_decorate_legacy_context(legacy_book, record)
-    local position_snapshot=type(options.position_override)=="table" and U.copy(options.position_override)
-        or self:_position_for_report(ratio,options.precise_position==true or options.progress_only==true)
-    if not options.reading_time_retry then self:_save_local_snapshot(book_id,position_snapshot) end
-    if type(position_snapshot)~="table" or position_snapshot.safe~=true or position_snapshot.progress==nil
-        or tostring(position_snapshot.chapter_uid or "")=="" then
-        local mapping_error=type(position_snapshot)=="table" and position_snapshot.mapping_error or "position_unavailable"
-        local message="当前书籍无法可靠换算微信读书整书进度"
-            ..(mapping_error and ("（"..tostring(mapping_error).."）") or "")
-        self.last_error=message
-        self.last_error_kind="context"
-        if callback then callback(false,message,position_snapshot,{error_kind="context"}) end
-        return false
-    end
-    legacy_book.local_chapter_uid=position_snapshot.chapter_uid
-    legacy_book.local_chapter_idx=position_snapshot.chapter_index or position_snapshot.chapter_idx
-    legacy_book.local_chapter_offset=position_snapshot.offset or position_snapshot.chapter_offset
-    legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
-    legacy_book.local_native_chapter_offset=position_snapshot.native_offset == true
-    legacy_book.local_chapter_offset_basis=position_snapshot.offset_basis or position_snapshot.position_basis
-    legacy_book.progress=position_snapshot.progress
-    legacy_book.core_map_hash=core_hash
-    local report_ratio=report_ratio_from_position(position_snapshot)
-
-    self.busy, self.state, self.last_attempt = true, options.progress_only and "progress_uploading" or "uploading", os.time()
-    self.last_stage = options.progress_only and "主动提交阅读进度" or "调用兼容阅读时间上传链路"
-    local ok, err = self.async:run("legacy_read_report", function()
-        return ReadReportWorker.run{
-            book_id = book_id,
-            book_title = record.book.title,
-            book = legacy_book,
-            core_map_hash = core_hash,
-            progress_ratio = report_ratio,
-            elapsed_seconds = elapsed or 0,
-            web_time_disabled = self:web_readtime_disabled(),
-            cookies = auth.cookies or {},
-            api_key = auth.api_key or "",
-            wr_ticket = auth.wr_ticket or "",
-            wr_wrpa = auth.wr_wrpa or "",
-            allow_renewal = false,
-            force_context = options.force_context == true,
-            time_only = options.time_only == true,
-            report_mode = options.report_mode,
-            reading_time_session_id = options.reading_time_session_id,
-            cloud_anchor = type(options.cloud_anchor)=="table" and U.copy(options.cloud_anchor) or nil,
-        }
-    end, function(result)
-        self.busy = false
-        local current_record=self:record()
-        local same_book=current_record
-            and tostring(current_record.book.book_id or "")==book_id
-            and tostring(current_record.path or "")==path_snapshot
-        local generation_changed=generation_snapshot~=tonumber(self.record_generation or 0)
-        local allow_same_book_generation=options.allow_same_book_generation_change==true and same_book
-        local allow_detached_result=options.allow_book_switch_result==true
-        local detached_result=allow_detached_result and (not same_book or generation_changed)
-        local previous_state,previous_last_stage=self.state,self.last_stage
-        local previous_last_error,previous_last_error_kind=self.last_error,self.last_error_kind
-        local previous_failures,previous_failure_notified=self.consecutive_failures,self.failure_notified
-        local previous_last_path,previous_response=self.last_path,self.last_response_summary
-        local previous_http_code,previous_http_length=self.last_http_code,self.last_http_length
-        local function restore_detached_state()
-            if not detached_result then return end
-            self.state=previous_state
-            self.last_stage=previous_last_stage
-            self.last_error=previous_last_error
-            self.last_error_kind=previous_last_error_kind
-            self.consecutive_failures=previous_failures
-            self.failure_notified=previous_failure_notified
-            self.last_path=previous_last_path
-            self.last_response_summary=previous_response
-            self.last_http_code=previous_http_code
-            self.last_http_length=previous_http_length
-        end
-        local function emit_callback(...)
-            restore_detached_state()
-            if callback then callback(...) end
-        end
-        if not detached_result then self.state = self.progress_hold and "verification_required" or "waiting" end
-        if (not same_book or (generation_changed and not allow_same_book_generation)) and not allow_detached_result then
-            logger.warn("[MiuRead][ReadReport] stale book worker result ignored",
-                "book=",book_id,"generation=",tostring(generation_snapshot))
-            emit_callback(false,"书籍已切换，本次旧同步结果已忽略",nil,
-                {error_kind="context",request_dispatched=true,dispatch_state_uncertain=true})
-            return
-        end
-        if allow_detached_result and (not same_book or generation_changed) then
-            logger.info("[MiuRead][ReadingEnd] detached upload result retained",
-                "book=",book_id,"generation=",tostring(generation_snapshot),
-                "current_generation=",tostring(self.record_generation or 0))
-        elseif generation_changed and allow_same_book_generation then
-            logger.info("[MiuRead][ReadingEnd] same-book generation advanced; final result retained",
-                "book=",book_id,"from=",tostring(generation_snapshot),
-                "to=",tostring(self.record_generation or 0))
-        end
-        self.store:reload()
-        local current_auth=self.store:auth()
-        local current_account=type(current_auth.account)=="table" and current_auth.account or {}
-        if login_snapshot~=tostring(current_auth.login_session_id or "")
-            or auth_revision_snapshot~=math.max(0,tonumber(current_auth.auth_revision or 0) or 0)
-            or vid_snapshot~=tostring(current_account.vid or "") then
-            logger.warn("[MiuRead][ReadReport] stale worker result ignored")
-            emit_callback(false,"登录状态已变化",nil,
-                {error_kind="authentication",request_dispatched=true,dispatch_state_uncertain=true})
-            return
-        end
-        if not result.ok or type(result.value) ~= "table" then
-            self.last_error = result.error or "阅读同步工作器无结果"
-            self.last_stage = "同步工作器失败"
-            local kind=Http.is_auth_error(self.last_error) and "authentication"
-                or ((Http.is_network_error and Http.is_network_error(self.last_error)) and "transport" or "context")
-            logger.warn("[MiuRead][ReadReport] worker failed", tostring(self.last_error))
-            if not options.reading_time_retry then
-                self:_record_report_issue(book_id,kind,self.last_error,{
-                    force_repair_required=options.repair==true,
-                    suppress_prompt=options.repair==true,
-                })
-            end
-            emit_callback(false, self.last_error,nil,
-                {error_kind=kind,request_dispatched=true,dispatch_state_uncertain=true})
-            return
-        end
-
-        local value = result.value
-        local legacy_context = value.legacy_context or legacy_book
-        local position = value.position or self:position(record, ratio, chapters)
-        if value.cookies_changed or value.wr_ticket_changed or value.wr_wrpa_changed then
-            local latest_auth = self.store:auth()
-            if value.cookies_changed and type(value.cookies)=="table" then latest_auth.cookies = U.copy(value.cookies) end
-            if value.wr_ticket_changed then latest_auth.wr_ticket = value.wr_ticket or "" end
-            if value.wr_wrpa_changed then latest_auth.wr_wrpa = value.wr_wrpa or "" end
-            local saved_auth,save_error=self.store:save_auth(latest_auth,{expected_revision=auth_revision_snapshot})
-            if saved_auth~=true then
-                logger.warn("[MiuRead][ReadReport] stale worker credential update ignored",U.first_line(save_error or "",120))
-            end
-        end
-        local attempts_count = #(value.attempts or {})
-        local public = value.payload_public or {}
-        -- The values below are from the actual signed Web POST payload, not
-        -- the in-memory local snapshot. Exclude cookies, token and signature.
-        logger.info("[MiuRead][ReadReportWire]",
-            "book=",book_id,
-            "mode=",tostring(public.report_mode or "-"),
-            "uid=",tostring(public.report_chapter_uid or "-"),
-            "ci=",tostring(public.ci or "-"),
-            "co=",tostring(public.co or "-"),
-            "pr=",tostring(public.pr or "-"),
-            "rt=",tostring(public.rt or "-"),
-            "source=",tostring(public.position_source or "-"),
-            "result=",tostring(value.accepted==true and "accepted" or "not_accepted"))
-        self.last_path = value.path
-        self.last_response_summary = value.response_summary or value.error
-        self.last_http_code = value.meta and value.meta.code or nil
-        self.last_http_length = value.meta and value.meta.length or nil
-        self.last_stage = value.accepted and "兼容上传链路已确认"
-            or (tostring(value.path or ""):find("context", 1, true) and "兼容上传上下文失败"
-            or "兼容上传链路被服务端拒绝")
-
-        local diagnostic_patch={
-            last_attempt=self.last_attempt,
-            last_path=value.path,
-            last_attempts=attempts_count,
-            last_stage=self.last_stage,
-            last_response_summary=self.last_response_summary,
-            last_http_code=self.last_http_code,
-            last_http_length=self.last_http_length,
-            last_payload_public=public,
-        }
-        if options.transactional_context~=true and value.accepted==true then
-            diagnostic_patch.legacy_report_context=legacy_context
-            diagnostic_patch.report_login_session_id=login_snapshot
-            diagnostic_patch.report_core_map_hash=core_hash
-        end
-        self.store:save_session(book_id,diagnostic_patch)
-
-        if value.uncertain==true or tostring(value.error_kind or "")=="unconfirmed" then
-            local target_label=options.progress_only and "阅读进度" or "阅读时长"
-            local message="微信读书未明确确认本次"..target_label.."（"..tostring(value.error or "无明确回执").."）"
-            self.last_response_summary=value.response_summary or value.error
-            if not options.reading_time_retry then self:_record_report_issue(book_id,"unconfirmed",message) end
-            self.store:save_session(book_id,{
-                last_response_summary=self.last_response_summary,
-                last_http_code=self.last_http_code,
-                last_http_length=self.last_http_length,
-                last_payload_public=public,
-                progress_upload_state=options.progress_only and "unconfirmed" or nil,
-            })
-            logger.warn("[MiuRead][ReadReport] unconfirmed",
-                "book=",book_id,"target=",target_label,
-                "ci=",tostring(public.ci or "-"),"co=",tostring(public.co or "-"),
-                "pr=",tostring(public.pr or "-"),"summary=",tostring(self.last_response_summary or "-"))
-            -- A progress-only request can be safely checked by reading cloud
-            -- position. A reading-time interval must not be replayed because it
-            -- may already have been accepted server-side.
-            if options.progress_only then emit_callback(true,value.response or {},position,value)
-            else emit_callback(false,message,position,value) end
-            return
-        end
-
-        if not value.accepted then
-            local rejected_auth=tostring(value.error_kind or "")=="authentication" or Http.is_auth_error(value.error)
-            local target_label=options.progress_only and "阅读进度" or "阅读时长"
-            self.last_error = "微信读书未确认接收"..target_label.."（" .. tostring(value.error or "unknown") .. "）"
-            self.last_error_kind=rejected_auth and "authentication" or self:_normalize_report_error_kind(value.error_kind,value.error)
-            self.store:save_session(book_id, {
-                last_error=self.last_error,
-                last_response_summary=self.last_response_summary,
-                last_http_code=self.last_http_code,
-                last_http_length=self.last_http_length,
-                last_payload_public=public,
-            })
-            logger.warn("[MiuRead][ReadReport] rejected", self.last_error,
-                "attempts=", tostring(attempts_count),
-                "ci=", tostring(public.ci or "-"),
-                "co=", tostring(public.co or "-"),
-                "pr=", tostring(public.pr or "-"),
-                "token_source=", tostring(public.token_source or "-"),
-                "pc_source=", tostring(public.pc_source or "-"),
-                "fields_complete=", tostring(public.payload_fields_complete == true),
-                "position_source=", tostring(public.position_source or "-"),
-                "report_uid=", tostring(public.report_chapter_uid or "-"),
-                "report_idx=", tostring(public.report_chapter_idx or "-"),
-                "local_uid=", tostring(public.local_chapter_uid or "-"),
-                "local_idx=", tostring(public.local_chapter_idx or "-"),
-                "remote_uid=", tostring(public.remote_chapter_uid or "-"),
-                "remote_idx=", tostring(public.remote_chapter_idx or "-"))
-            if not options.reading_time_retry then
-                self:_record_report_issue(book_id,self.last_error_kind,self.last_error,{
-                    force_repair_required=options.repair==true,
-                    suppress_prompt=options.repair==true,
-                })
-            end
-            emit_callback(false, self.last_error, position, value)
-            return
-        end
-
-        local response = value.response or {}
-        local completed_at=os.time()
-        self.last_error = nil
-        self.consecutive_failures = 0
-        if self.host.on_auth_channel_ok then pcall(self.host.on_auth_channel_ok,self.host,"read_report") end
-        self.failure_notified = false
-        local patch={
-            local_percent=not options.reading_time_retry and position.progress or nil,
-            pending=nil,
-            synckey=response_synckey(response) or legacy_context.synckey or session.synckey,
-            last_error=false,
-            consecutive_failures=0,
-            consecutive_unconfirmed=0,
-            report_recovery_state=false,
-            last_path=value.path,
-            last_attempts=attempts_count,
-            last_response_summary=self.last_response_summary,
-            last_http_code=self.last_http_code,
-            last_http_length=self.last_http_length,
-            last_payload_public=public,
-            book_core_map_hash=core_hash,
-        }
-        if options.transactional_context~=true then
-            patch.legacy_report_context=legacy_context
-            patch.report_login_session_id=login_snapshot
-            patch.report_core_map_hash=core_hash
-            patch.sync_repair_required=false
-            patch.sync_repair_kind=nil
-            patch.sync_repair_error=nil
-            patch.sync_repair_at=nil
-            patch.report_context_failures=0
-            patch.report_state="ok"
-        end
-        if options.progress_only then
-            patch.progress_upload_at=completed_at
-            patch.progress_upload_percent=position.progress
-            patch.progress_upload_state="submitted"
-            self.last_stage="阅读进度已提交，等待云端确认"
-            logger.info("[MiuRead][Progress] submit accepted",
-                "book=",tostring(book_id),"progress=",tostring(position.progress),
-                "path=",tostring(value.path),"attempts=",tostring(attempts_count))
-        else
-            self.session_uploads = self.session_uploads + 1
-            self.last_upload = completed_at
-            patch.last_upload=self.last_upload
-            logger.info("[MiuRead][ReadReport] success", "count=", tostring(self.session_uploads),
-                "book=", tostring(book_id), "elapsed=", tostring(elapsed or 0),
-                "progress=", tostring(position.progress), "path=", tostring(value.path),
-                "attempts=", tostring(attempts_count))
-        end
-        self.store:save_session(book_id,patch)
-        if not options.progress_only and not self.first_success_notified and not options.silent then
-            self.first_success_notified = true
-            if self.host.on_read_report_success then pcall(self.host.on_read_report_success, self.host, value.path) end
-        end
-        emit_callback(true, response, position, value)
-    end, 95)
-
-    if not ok then
-        self.busy = false
-        self.last_error = err
-        if callback then callback(false, err) end
-        return false
-    end
-    return true
-end
-
-function Sync:retry_safe_reading_time(book_id,record_override,position_override,callback)
     callback=type(callback)=="function" and callback or function() end
-    -- Older settings may still contain legacy SAFE time debt after OTA.
-    -- Never replay it in the 6.2 best-effort mode; this does not affect the
-    -- independent pending progress recovery system.
-    if Config.READ_TIME_BEST_EFFORT==true then
-        callback(true,"历史阅读时间补报已关闭","best_effort_disabled")
-        return true
-    end
-    book_id=tostring(book_id or "")
-    if type(record_override)~="table" or not record_override.book
-        or book_id=="" or tostring(record_override.book.book_id or record_override.book.bookId or "")~=book_id then
-        callback(false,"缺少本地书籍同步上下文","context"); return false
-    end
-    local position=type(position_override)=="table" and U.copy(position_override) or nil
-    if not position or position.safe~=true or tonumber(position.progress)==nil
-        or tostring(position.chapter_uid or position.chapterUid or "")=="" then
-        callback(false,"缺少安全的位置锚点，不能重传阅读时间","context"); return false
-    end
-    record_override=U.copy(record_override)
-    record_override.book.book_id=book_id
-    local core_hash=self:_core_map_hash(record_override)
-    local identity=self:_readtime_recovery_identity(book_id,core_hash)
-    local maximum=math.max(10,tonumber(Config.READ_REPORT_MAX_ELAPSED_SECONDS) or 60)
-    local accepted_seconds=0
-    local function same_login()
-        return self:_readtime_recovery_matches(identity,self:_readtime_recovery_identity(book_id,core_hash))
-    end
-    local function reading_active()
-        return (self.daemon and (self.daemon.active or self.daemon.final_flush_pending))
-            or (self.host and type(self.host._active_reader_ui)=="function" and self.host:_active_reader_ui())
-    end
-    local function save_remaining(seconds)
-        -- This journal is authoritative on restart. A settings-only fallback
-        -- could leave an older, larger journal balance eligible for replay.
-        if self:_write_readtime_recovery(book_id,seconds,core_hash)~=true then return false end
-        self.store:save_session(book_id,{pending_report_seconds=seconds,pending_report_safe=seconds>0},false)
-        return true
-    end
-    local function send_next()
-        if not same_login() then callback(false,"登录状态已变化","authentication"); return false end
-        local remaining,found,journal_error=self:_load_readtime_recovery(book_id,core_hash)
-        if not found or journal_error then
-            callback(false,"无法确认待报时长属于当前账号和书籍","context")
-            return false
+    local record=self:record()
+    local id=tostring(record and record.book and record.book.book_id or "")
+    if id=="" or self.repair_busy then return false end
+    self.repair_busy,self.repair_book_id=true,id
+    local function finish(ok,detail)
+        self.repair_busy,self.repair_book_id=false,nil
+        if ok then
+            self.store:save_session(id,{sync_repair_required=false,sync_repair_kind=false,sync_repair_error=false})
+            self:wake_offline_reading_time()
         end
-        if remaining<=0 then
-            if accepted_seconds==0 then callback(true,"没有可安全重试的阅读时间","empty"); return true end
-            self.store:save_session(book_id,{
-                report_state="ok",last_error=false,last_error_kind=false,
-                last_unconfirmed=false,last_unconfirmed_at=false,
-                last_report_reason="safe_retry_all_batches_accepted",last_upload=os.time(),
-                last_elapsed=accepted_seconds,
-            })
-            callback(true,"微信读书已确认接收待报时长","accepted")
-            return true
-        end
-        if reading_active() or self.busy then
-            callback(false,"阅读或同步正在进行；剩余时长已保留","busy")
-            return false
-        end
-        local anchor=self:remote_wire_anchor(book_id)
-        local age=anchor and (os.time()-(tonumber(anchor.fetched_at) or 0)) or math.huge
-        local from_web=anchor and (anchor.source=="web_cookie" or anchor.source=="web"
-            or anchor.source=="web_progress" or anchor.source=="web_cookie_progress")
-        if not from_web or age<0 or age>(tonumber(Config.READ_TIME_WIRE_MAX_AGE_SECONDS) or 600) then
-            callback(false,"没有近期已验证的 Web 原始位置；请先打开本书恢复 Web 位置","context")
-            return false
-        end
-        anchor.book_id=book_id
-        local chunk=math.min(maximum,remaining)
-        local reserved=remaining-chunk
-        if not save_remaining(reserved) then
-            callback(false,"无法保存待报时长，本批未发送","storage")
-            return false
-        end
-        self.readtime_retry_sequence=(self.readtime_retry_sequence or 0)+1
-        local started,synchronous_result,completed
-        local function on_result(ok,result,uploaded_position,value)
-            if started==nil then synchronous_result={ok,result,uploaded_position,value}; return end
-            if completed then return end
-            completed=true
-            if not same_login() then callback(false,"登录状态已变化","authentication"); return end
-            value=type(value)=="table" and value or {}
-            local meta=type(value.meta)=="table" and value.meta or {}
-            local kind=tostring(value.error_kind or "")
-            if ok==true then
-                accepted_seconds=accepted_seconds+chunk
-                logger.info("[MiuRead][ReadingTimeRetry] batch accepted",
-                    "book=",book_id,"seconds=",tostring(chunk),"remaining=",tostring(reserved))
-                UIManager:scheduleIn(.15,send_next)
-                return
-            end
-            local unsent=not started or ((value.request_dispatched==false or meta.request_dispatched==false)
-                and value.request_dispatched~=true and meta.request_dispatched~=true
-                and value.dispatch_state_uncertain~=true and value.uncertain~=true)
-            if unsent then
-                local current,still_found,read_error=self:_load_readtime_recovery(book_id,core_hash)
-                if reading_active() or not still_found or read_error or current~=reserved or not save_remaining(remaining) then
-                    callback(false,"本批未发送，但待报记录已变化或无法恢复","storage")
-                    return
-                end
-                callback(false,tostring(result or value.error or "阅读时间同步失败"),kind~="" and kind or "failed")
-            else
-                self.store:save_session(book_id,{
-                    report_state="unconfirmed",
-                    last_unconfirmed=tostring(result or value.response_summary or "请求已发出但结果不明确"),
-                    last_unconfirmed_at=os.time(),
-                    last_report_reason="safe_retry_chunk_unconfirmed",
-                })
-                logger.warn("[MiuRead][ReadingTimeRetry] uncertain chunk excluded from replay",
-                    "book=",book_id,"attempted=",tostring(chunk),"safe_remaining=",tostring(reserved))
-                callback(false,"本次请求的结果不确定；未尝试的剩余时长已安全保留","unconfirmed")
-            end
-        end
-        started=self:upload(chunk,on_result,{
-            silent=true,
-            reading_time_retry=true,
-            transactional_context=true,
-            time_only=true,
-            report_mode="reading_time_compat",
-            reading_time_session_id=tostring(self.controller_token)..":safe_retry:"..tostring(self.readtime_retry_sequence),
-            cloud_anchor=anchor,
-            position_override=position,
-            record_override=record_override,
-            allow_same_book_generation_change=true,
-            allow_book_switch_result=true,
-        })
-        started=started==true
-        if synchronous_result then on_result(unpack(synchronous_result,1,4))
-        elseif not started then on_result(false,"阅读时间同步任务暂时不可用") end
-        return started
+        callback(ok,detail)
     end
-    return send_next()
+    local started=self:_prepare_progress_catalog(function(rows,detail)
+        if not rows then finish(false,detail); return end
+        self:remote(id,function(remote,err)
+            if not remote then finish(false,err); return end
+            finish(true,remote)
+        end,{force=true})
+    end)
+    if not started then self.repair_busy,self.repair_book_id=false,nil end
+    return started
+end
+
+function Sync:upload(_,callback)
+    if callback then callback(false,"旧 Web 阅读上报已停用",nil,{request_dispatched=false}) end
+    return false
 end
 
 function Sync:begin_progress_write(reason, callback,reading_time_granted)
@@ -3811,137 +3004,108 @@ function Sync:end_progress_write(reason)
     return had_fence or had_priority
 end
 
-function Sync:upload_progress(callback, options)
-    options = options or {}
+function Sync:upload_progress(callback,options)
+    options=options or {}
     callback=type(callback)=="function" and callback or function() end
-    self.state = "progress_locating"
-    self.last_stage = "正在定位当前阅读位置"
-    local detached=options.detached==true or options.reading_end==true
-    local progress_record=type(options.record_override)=="table" and options.record_override or self:record()
-    local progress_book_id=progress_record and progress_record.book and tostring(progress_record.book.book_id or "") or ""
-
-    local function do_upload()
-        local inner_callback=function(ok,result,position,value)
-            -- Progress-only HTTP 200 without succ is intentionally returned as
-            -- ok=true so readback can decide. Once that exact write has left the
-            -- client, freeze reading-time reports to the same immutable position
-            -- before releasing the shared writer fence.
-            if ok==true and progress_book_id~="" then
-                local anchor_position=type(position)=="table" and position or options.position_override
-                if type(anchor_position)=="table" then
-                    self:set_cloud_anchor(progress_book_id,anchor_position,"progress_submitted",true)
-                end
-            end
-            self:end_progress_write(ok==true and "progress_submitted" or "progress_submit_failed")
-            callback(ok,result,position,value)
-        end
-        if type(options.position_override) == "table" then
-            return self:upload(0,inner_callback,{
-                silent=true,progress_only=true,transactional_context=true,
-                position_override=options.position_override,
-                record_override=options.record_override,
-                record_generation_override=options.record_generation_override,
-                allow_same_book_generation_change=detached,
-                allow_book_switch_result=detached,
-            })
-        end
-        local started, resolve_error = self:resolve_local_progress(function(position, err, meta)
-            if not position then
-                self:end_progress_write("position_unavailable")
-                callback(false,err,nil,{error_kind=meta and meta.error_kind or "position",request_dispatched=false})
-                return
-            end
-            local ok=self:upload(0,inner_callback,{
-                silent=true,progress_only=true,transactional_context=true,
-                position_override=position,
-                allow_same_book_generation_change=detached,
-                allow_book_switch_result=detached,
-            })
-            if not ok then self:end_progress_write("upload_not_started") end
-        end,{
-            precise=true,prepare_catalog=true,require_cloud_coordinate=true,on_stage=options.on_stage,
-        })
-        if not started then
-            self:end_progress_write("resolver_not_started")
-            callback(false,resolve_error,nil,{error_kind="busy",request_dispatched=false})
+    local record=options.record_override or self:record()
+    local book_id=tostring(record and record.book and record.book.book_id or "")
+    local login=tostring(self.store:auth().login_session_id or "")
+    local function failed(reason,kind)
+        self:end_progress_write(reason)
+        callback(false,reason,nil,{error_kind=kind,request_dispatched=false})
+    end
+    local function send(position)
+        if book_id=="" or type(position)~="table" or position.eink_coordinate~=true
+            or tostring(position.book_id or "")~=book_id then
+            failed("当前位置尚未通过 E-Ink 原文校验","position")
             return false
         end
-        return true
+        if not self.async or not self.async:available() or self.async:busy() then
+            failed("progress_worker_busy","busy")
+            return false
+        end
+        local snapshot=U.copy(position)
+        local time=self.offline_time
+        local lease=time and time:position_time(self,snapshot)
+        local started,err=self.async:run("eink_progress_write",function()
+            local native=require("miuread.eink_client").new(self.reader.http,self.store)
+            local attempted=false
+            if lease then
+                native.on_readtime_server_clock=function(stamp,limit)
+                    local result,clock_error=time.queue:server_clock(lease.vid,stamp,limit,os.time())
+                    if not result then error(clock_error or "reading_time_clock_unavailable",0) end
+                end
+            end
+            local ok,receipt=pcall(native.write_position,native,snapshot,function(with_time)
+                local live=self.store:read_persisted("auth")
+                if not live or tostring(live.login_session_id or "")~=login then return false end
+                local sequence=tonumber(snapshot.progress_sequence or 0) or 0
+                if sequence>0 then
+                    local sessions=self.store:read_persisted("sessions")
+                    local row=type(sessions)=="table" and sessions[book_id] or {}
+                    if (tonumber(row.progress_epoch) or 1)~=(tonumber(snapshot.progress_epoch) or 1)
+                        or (tonumber(row.progress_latest_sequence) or 0)~=sequence
+                        or (tonumber(row.progress_verified_sequence) or 0)>=sequence then return false end
+                end
+                if with_time and (not lease or time.queue:claim(lease.vid,lease.batch,lease.id)~=true) then return false end
+                attempted=true
+                return true
+            end,lease and lease.batch.rows)
+            if lease then
+                local value=ok and receipt.time_receipt
+                if value or attempted then time:finish_position_time(lease,value) end
+            end
+            if ok then return receipt end
+            return {error=tostring(receipt),error_kind=Http.is_auth_error(receipt) and "authentication" or "position",
+                request_dispatched=attempted}
+        end,function(result)
+            if lease then
+                if not (result and result.ok) then time:finish_position_time(lease) end
+                time.summary_cache=nil
+                local receipt=result and result.ok and type(result.value)=="table" and result.value.time_receipt
+                if receipt and receipt.dispatched then
+                    time:log("complete",receipt.state,{book_id=book_id,batch_id=lease.id,
+                        seconds=lease.batch.seconds,reason=receipt.error})
+                end
+            end
+            self:end_progress_write("eink_progress_write_finished")
+            self.store:reload()
+            if tostring(self.store:auth().login_session_id or "")~=login then
+                callback(false,"account_changed",nil,{error_kind="authentication",request_dispatched=false})
+                return
+            end
+            local receipt=result and result.ok and result.value
+            if type(receipt)~="table" then
+                callback(false,(result and result.error) or "E-Ink 写入状态不明",snapshot,{request_dispatched=true})
+                return
+            end
+            logger.info("[MiuRead][ProgressWrite]","book=",book_id,
+                "seq=",tostring(snapshot.progress_sequence or "-"),
+                "route=",tostring(receipt.progress_route or "-"),
+                "accepted=",tostring(receipt.accepted==true),"sent=",tostring(receipt.request_dispatched==true),
+                "already=",tostring(receipt.already==true),"other_device=",tostring(receipt.cloud_conflict==true),
+                "seconds=",tostring(lease and lease.batch.seconds or 0),
+                "time_result=",tostring(receipt.time_receipt and receipt.time_receipt.state or "-"))
+            callback(receipt.accepted==true,receipt.error or receipt,snapshot,receipt)
+        end,55)
+        if not started then failed(err or "progress_worker_busy","busy") end
+        return started
     end
-
-    local fence_started=self:begin_progress_write("progress_write",function(ok)
-        if not ok then callback(false,"progress_writer_busy",nil,{error_kind="busy",request_dispatched=false}); return end
-        local started=do_upload()
-        if started==false then self:end_progress_write("upload_not_started") end
-    end)
-    return fence_started~=false
+    return self:begin_progress_write("eink_progress_write",function(ok)
+        if not ok then failed("progress_writer_busy","busy"); return end
+        if type(options.position_override)=="table" then send(options.position_override); return end
+        local started,err=self:resolve_local_progress(function(position,reason)
+            if not position then failed(reason or "eink_position_unavailable","position"); return end
+            send(position)
+        end,{precise=true,prepare_catalog=true,require_cloud_coordinate=true,on_stage=options.on_stage})
+        if not started then failed(err or "eink_position_unavailable","position") end
+    end)~=false
 end
 
 function Sync:_notify_failure()
     local record=self:record()
     local book_id=record and record.book and record.book.book_id
     if book_id then self:_mark_repair_required(book_id,self.last_error_kind or "server",self.last_error) end
-end
-
-function Sync:test_upload(callback)
-    if self:web_readtime_disabled() then
-        if callback then callback(false,"仅 E-Ink 模式禁止 Web 30 秒测试；请使用阅读时长菜单中的立即同步") end
-        return false
-    end
-    local record=self:record()
-    if not record then if callback then callback(false,"未识别到 MiuRead 生成的当前书籍") end; return false end
-    if not self:_read_report_allowed(record) then
-        if callback then callback(false,"当前文件未启用阅读时间同步") end
-        return false
-    end
-    if self.busy or (self.async and self.async:busy()) then
-        if callback then callback(false,"同步任务忙") end
-        return false
-    end
-    local auth=self.store:auth()
-    local account=type(auth.account)=="table" and auth.account or {}
-    if tostring(auth.login_session_id or "")=="" or tostring(account.vid or "")=="" then
-        if callback then callback(false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码") end
-        return false
-    end
-    local book_id=tostring(record.book.book_id or "")
-    local core_hash=self:_core_map_hash(record)
-    local legacy_book={book_id=book_id,title=record.book.title,core_map_hash=core_hash}
-    local restart=self.daemon and self.daemon.active==true
-    if restart then self:_stop_daemon("manual_time_only_test",true,0) end
-    self.busy=true
-    self.state="uploading"
-    self.last_stage="测试纯阅读时间上传"
-    local started,err=self.async:run("time_only_read_report_test",function()
-        return ReadReportWorker.run{
-            book_id=book_id,book_title=record.book.title,book=legacy_book,
-            core_map_hash=core_hash,progress_ratio=nil,elapsed_seconds=30,time_only=true,
-            report_mode="reading_time_compat",
-            web_time_disabled=self:web_readtime_disabled(),
-            cookies=auth.cookies or {},api_key=auth.api_key or "",
-            wr_ticket=auth.wr_ticket or "",wr_wrpa=auth.wr_wrpa or "",
-            allow_renewal=false,force_context=false,
-        }
-    end,function(result)
-        self.busy=false
-        self.state="waiting"
-        local value=result and result.ok==true and result.value or nil
-        local ok=value and value.accepted==true or false
-        if restart and self.store:preferences().sync.time_enabled and not self.suspended then
-            self:start("manual_time_only_test_finished")
-        end
-        if callback then
-            if ok then callback(true,value.response or {},nil,value)
-            else callback(false,(value and value.error) or (result and result.error) or "纯阅读时间上传失败",nil,value) end
-        end
-    end,95)
-    if not started then
-        self.busy=false
-        if restart and self.store:preferences().sync.time_enabled and not self.suspended then self:start("manual_time_only_test_failed") end
-        if callback then callback(false,err or "无法启动纯阅读时间测试") end
-        return false
-    end
-    return true
 end
 
 function Sync:compare(local_percent, remote)
@@ -4048,33 +3212,35 @@ local function acquire_lock_dir(path)
 end
 
 function Sync:_retire_legacy_daemon()
-    -- Stop workers created by every earlier service layout before starting the
-    -- current one. Their job files contain credential snapshots; leaving an old
-    -- worker alive across OTA would defeat the auth-revision barrier.
+    -- Retire all former Web workers, including the most recent service layout.
+    -- Inactive legacy control files must never recreate a reporting worker.
     local base = self.store.temp_dir .. "/readtime-service"
     local retired={}
     local suffixes={""}
-    for version=1,READ_REPORT_SERVICE_VERSION-1 do suffixes[#suffixes+1]="-v"..tostring(version) end
+    for version=1,READ_REPORT_SERVICE_VERSION do suffixes[#suffixes+1]="-v"..tostring(version) end
     for _, suffix in ipairs(suffixes) do
         local prefix=base..suffix
         local owner_path=prefix..".owner.json"
-        retired[#retired+1]={
-            job=prefix..".job.json",control=prefix..".control.json",status=prefix..".status.json",
-            context=prefix..".context.json",heartbeat=prefix..".heartbeat",
-            stop=prefix..".stop",owner=owner_path,lock=prefix..".lock",
-        }
-        local generation=2147483000
-        U.atomic_write(prefix..".job.json",Json.encode({
-            generation=generation,controller_token="retired",book_id="",book={},auth={},interval=Config.READ_INTERVAL,
-        }),true)
-        U.atomic_write(prefix..".control.json",Json.encode({
-            active=false,generation=generation,controller_token="retired",updated_at=os.time(),
-        }),true)
-        U.atomic_write(prefix..".stop", "1", true)
-        -- Status/context may contain old cookies or report tokens. They are not
-        -- needed once the worker has been retired, so remove them immediately.
-        os.remove(prefix..".status.json")
-        os.remove(prefix..".context.json")
+        if U.file_exists(owner_path) or U.file_exists(prefix..".job.json")
+            or U.file_exists(prefix..".control.json") or U.file_exists(prefix..".heartbeat") then
+            retired[#retired+1]={
+                job=prefix..".job.json",control=prefix..".control.json",status=prefix..".status.json",
+                context=prefix..".context.json",heartbeat=prefix..".heartbeat",
+                stop=prefix..".stop",owner=owner_path,lock=prefix..".lock",
+            }
+            local generation=2147483000
+            U.atomic_write(prefix..".job.json",Json.encode({
+                generation=generation,controller_token="retired",book_id="",book={},auth={},interval=Config.READ_INTERVAL,
+            }),true)
+            U.atomic_write(prefix..".control.json",Json.encode({
+                active=false,generation=generation,controller_token="retired",updated_at=os.time(),
+            }),true)
+            U.atomic_write(prefix..".stop", "1", true)
+            -- Status/context may contain old cookies or report tokens. They are not
+            -- needed once the worker has been retired, so remove them immediately.
+            os.remove(prefix..".status.json")
+            os.remove(prefix..".context.json")
+        end
     end
     local function purge()
         for _,paths in ipairs(retired) do
@@ -4235,76 +3401,7 @@ function Sync:_attach_existing_daemon(paths, owner)
 end
 
 function Sync:_ensure_daemon()
-    if self.daemon and process_alive(self.daemon.pid) then
-        local healthy,reason=self:_daemon_health(self.daemon)
-        if healthy then return true end
-        self:_restart_unhealthy_daemon(reason)
-        return false,"后台阅读时间服务正在恢复"
-    end
-    if self.daemon then self:_cleanup_daemon_files(self.daemon); self.daemon=nil end
-    if type(FFIUtil.runInSubProcess) ~= "function" then
-        self.last_error = "当前 KOReader 不支持后台阅读时间服务"
-        return false, self.last_error
-    end
-
-    local paths = self:_daemon_paths()
-    local owner = read_json_file(paths.owner)
-    if self:_attach_existing_daemon(paths, owner) then return true end
-
-    -- Remove stale ownership before acquiring the lifetime lock.
-    os.remove(paths.owner)
-    remove_lock_dir(paths.lock)
-    if not acquire_lock_dir(paths.lock) then
-        owner = read_json_file(paths.owner)
-        if self:_attach_existing_daemon(paths, owner) then return true end
-        self.last_error = "后台阅读时间服务正在启动"
-        return false, self.last_error
-    end
-
-    U.atomic_write(paths.control, Json.encode({active=false,generation=0,controller_token="",updated_at=os.time()}), true)
-    os.remove(paths.stop)
-    os.remove(paths.heartbeat)
-    local service_job = {
-        parent_pid = current_pid(),
-        service_version = READ_REPORT_SERVICE_VERSION,
-        data_dir = self.store.data_dir,
-        poll_interval = 1,
-        job_path = paths.job,
-        control_path = paths.control,
-        status_path = paths.status,
-        context_path = paths.context,
-        heartbeat_path = paths.heartbeat,
-        stop_path = paths.stop,
-        owner_path = paths.owner,
-        lock_path = paths.lock,
-        reader_busy_path = "/tmp/miuread-reader-busy.until",
-    }
-    local child = function()
-        -- A forked long-lived worker must not retain KOReader listeners such as
-        -- HTTP Inspector :8080. Open its own sockets only after this boundary.
-        SubprocessHygiene.close_inherited_sockets()
-        return ReadReportService.run(service_job)
-    end
-    local ok, pid, err = pcall(FFIUtil.runInSubProcess, child, false, false)
-    if not ok or not pid then
-        os.remove(paths.owner)
-        remove_lock_dir(paths.lock)
-        self.last_error = tostring(err or pid or "无法启动后台阅读时间服务")
-        return false, self.last_error
-    end
-    U.atomic_write(paths.owner, Json.encode({
-        pid=pid, parent_pid=current_pid(), started_at=os.time(),
-        service_version=READ_REPORT_SERVICE_VERSION,
-    }), true)
-    self.daemon = {
-        pid=pid, paths=paths, active=false, generation=0,
-        book_id=nil, interval=Config.READ_INTERVAL, reason="prestarted", is_child=true,
-        service_version=READ_REPORT_SERVICE_VERSION,
-    }
-    self.daemon_status_stamp = nil
-    self:_schedule_daemon_poll(10)
-    logger.info("[MiuRead][ReadReport] lightweight service started", "pid=", tostring(pid))
-    return true
+    return false,"旧 Web 阅读上报已停用"
 end
 
 function Sync:progress_mode()
@@ -4322,6 +3419,7 @@ function Sync:periodic_progress_enabled()
 end
 
 function Sync:_write_daemon_control(active, immediate, extra)
+    if active==true then return false end
     local daemon = self.daemon
     if not daemon and not self:_ensure_daemon() then return false end
     daemon = self.daemon
@@ -5160,191 +4258,8 @@ function Sync:_ensure_reading_time_ids(new_session,new_segment)
     return self.reading_time_session_id,self.reading_time_segment_id
 end
 
-function Sync:_start_daemon(reason)
-    if self:web_readtime_disabled() then
-        self.state="paused"
-        self.last_stage="仅 E-Ink 模式已禁止 Web 时间服务"
-        return false,"仅 E-Ink 模式禁止 Web 阅读时间服务"
-    end
-    local record = self:record()
-    if not record then
-        self.state = "stopped"
-        return false, "未识别到 MiuRead 书籍"
-    end
-    if not self:_read_report_allowed(record) then
-        self.state = "stopped"
-        self.last_stage = "当前文件未启用阅读时间同步"
-        return false, "当前文件未启用阅读时间同步"
-    end
-    -- A session has exactly one clock owner. Keep the upstream Web service
-    -- unchanged; only Native sessions use the historical statistics outbox.
-    if self.reading_time_backend=="eink" then
-        local controller=self:offline_time_controller()
-        if self.suspended or not controller:enabled() then return false end
-        return controller:start(self,record)
-    end
-    local book_id = tostring(record.book.book_id or "")
-    local core_hash=self:_core_map_hash(record)
-    local time_only=not self:periodic_progress_enabled()
-    -- beta.8 daemon jobs are permanently time-only. Exact position work is
-    -- owned by manual and end-of-reading submissions.
-    local position_snapshot=nil
-    if core_hash=="" then
-        self.state="stopped"
-        return false,"当前书籍章节信息不可用"
-    end
-    local ok, err = self:_ensure_daemon()
-    if not ok then self.state="stopped"; return false, err end
-
-    local daemon = self.daemon
-    local prefs = self.store:preferences().sync
-    local interval = math.max(10, tonumber(prefs.interval) or tonumber(Config.READ_INTERVAL) or 60)
-    local first_delay = math.max(10, math.min(interval,
-        tonumber(Config.READ_FIRST_DELAY) or tonumber(FIRST_REPORT_DELAY) or 15))
-    local session = self.store:session(book_id) or {}
-    if not time_only and session.sync_repair_required==true then
-        local repair_kind=self:_normalize_report_error_kind(session.sync_repair_kind,session.sync_repair_error)
-        if repair_kind~="context" then
-            self:_clear_noncontext_repair_flag(book_id,session,"daemon_start_reclassified")
-            session=self.store:session(book_id) or session
-        else
-            self.state="repair_required"
-            self.last_error=tostring(session.sync_repair_error or "当前书籍需要修复同步")
-            self.last_error_kind="context"
-            return false,"当前书籍需要修复同步"
-        end
-    end
-    local auth = self.store:auth()
-    local current_account=type(auth.account)=="table" and auth.account or {}
-    local login_session_id=tostring(auth.login_session_id or "")
-    local auth_revision=math.max(0,tonumber(auth.web_auth_revision or auth.auth_revision or 0) or 0)
-    local account_vid=tostring(current_account.vid or "")
-    if login_session_id=="" or account_vid=="" then
-        self.state="stopped"
-        return false,"当前登录记录不完整，请先在账号状态中重新检查；仍无法恢复时再重新扫码"
-    end
-    self.pending_report_status_at=os.time()
-    -- beta.18: restore only a journal entry with a matching account/book/core.
-    -- A legacy session setting without an authoritative journal is NOT safe
-    -- replay evidence. The service carries only provably pre-dispatch seconds.
-    local carry_elapsed=0
-    if Config.READ_TIME_BEST_EFFORT~=true then
-        local restored,found=self:_load_readtime_recovery(book_id,core_hash)
-        if found then carry_elapsed=math.max(0,tonumber(restored) or 0) end
-    end
-    self.pending_report_elapsed=carry_elapsed
-    local existing_job=read_json_file(daemon.paths.job) or {}
-    local same_account=tostring(existing_job.login_session_id or "")==login_session_id
-        and math.max(0,tonumber(existing_job.auth_revision or 0) or 0)==auth_revision
-        and tostring(existing_job.account_vid or "")==account_vid
-    local same_document=tostring(existing_job.book_path or "")==tostring(record.path or "")
-    local same_core=tostring(existing_job.core_map_hash or "")==core_hash
-    if daemon.active and tostring(daemon.book_id or "")==book_id and same_account and same_document and same_core
-        and process_alive(daemon.pid) then
-        daemon.reason=reason
-        daemon.core_map_hash=core_hash
-        daemon.record_generation=tonumber(self.record_generation or 0) or 0
-        daemon.reading_time_session_id=tostring(self.reading_time_session_id or daemon.reading_time_session_id or "")
-        daemon.reading_time_segment_id=tostring(self.reading_time_segment_id or daemon.reading_time_segment_id or "")
-        self.state="waiting"
-        self.last_stage="轻量后台服务运行中"
-        if position_snapshot then self:_save_local_snapshot(book_id,position_snapshot) end
-        self:_write_daemon_control(true,true,{_time_only=true})
-        self:_schedule_daemon_poll(5)
-        logger.info("[MiuRead][ReadReport] duplicate activation ignored",
-            "pid=",tostring(daemon.pid),"book=",book_id,"reason=",tostring(reason or "start"))
-        return true
-    end
-    local context_matches=tostring(session.report_login_session_id or "")==login_session_id
-        and tostring(session.report_core_map_hash or "")==core_hash
-    local legacy_book = time_only and {} or U.copy((context_matches and self.daemon_context)
-        or (context_matches and type(session.legacy_report_context) == "table" and session.legacy_report_context)
-        or {})
-    legacy_book.book_id = book_id
-    legacy_book.title = record.book.title
-    if not time_only then self:_decorate_legacy_context(legacy_book, record) end
-    if position_snapshot then
-        legacy_book.local_chapter_uid=position_snapshot.chapter_uid
-        legacy_book.local_chapter_idx=position_snapshot.chapter_index
-        legacy_book.local_chapter_offset=position_snapshot.chapter_offset or position_snapshot.offset
-        legacy_book.local_chapter_word_count=position_snapshot.chapter_word_count
-        legacy_book.local_native_chapter_offset=position_snapshot.native_offset == true
-        legacy_book.local_chapter_offset_basis=position_snapshot.offset_basis or position_snapshot.position_basis
-        legacy_book.progress=position_snapshot.progress
-        self:_save_local_snapshot(book_id,position_snapshot)
-    end
-    legacy_book.core_map_hash=core_hash
-
-    local existing_control = read_json_file(daemon.paths.control) or {}
-    local existing_status = read_json_file(daemon.paths.status) or {}
-    self.daemon_generation = math.max(
-        tonumber(self.daemon_generation or 0) or 0,
-        tonumber(existing_control.generation or 0) or 0,
-        tonumber(existing_status.generation or 0) or 0
-    ) + 1
-    daemon.generation = self.daemon_generation
-    daemon.identity_stale=false
-    daemon.stale_identity_count=0
-    daemon.stale_identity_fingerprint=nil
-    daemon.active = true
-    self.precise_due_refreshed = 0
-    daemon.book_id = book_id
-    daemon.final_book_id = nil
-    daemon.final_flush_pending = false
-    daemon.interval = interval
-    daemon.reason = reason
-    daemon.login_session_id = login_session_id
-    daemon.auth_revision = auth_revision
-    daemon.account_vid = account_vid
-    daemon.core_map_hash=core_hash
-    daemon.record_generation=tonumber(self.record_generation or 0) or 0
-    daemon.reading_time_session_id=tostring(self.reading_time_session_id or "")
-    daemon.reading_time_segment_id=tostring(self.reading_time_segment_id or "")
-    if not time_only then self.daemon_context=U.copy(legacy_book) end
-
-    local job = {
-        generation = daemon.generation,
-        controller_token = self.controller_token,
-        login_session_id = login_session_id,
-        auth_revision = auth_revision,
-        account_vid = account_vid,
-        book_id = book_id,
-        core_map_hash = core_hash,
-        record_generation = daemon.record_generation,
-        reading_time_session_id = tostring(self.reading_time_session_id or ""),
-        reading_time_segment_id = tostring(self.reading_time_segment_id or ""),
-        book_title = record.book.title,
-        book_path = record.path,
-        book = legacy_book,
-        time_only = time_only,
-        report_mode = time_only and "reading_time_compat" or "progress",
-        carry_elapsed = carry_elapsed,
-        auth = {
-            cookies = auth.cookies or {},
-            api_key = auth.api_key or "",
-            wr_ticket = auth.wr_ticket or "",
-            wr_wrpa = auth.wr_wrpa or "",
-            login_session_id = login_session_id,
-            auth_revision = auth_revision,
-            account = U.copy(auth.account or {}),
-        },
-        interval = interval,
-        first_delay = first_delay,
-        idle_timeout = tonumber(prefs.idle_timeout) or 600,
-    }
-    U.atomic_write(daemon.paths.job, Json.encode(job), true)
-    self.daemon_status_stamp = nil
-    self.daemon_last_persist = os.time()
-    self.state = "waiting"
-    self.next_due = os.time() + first_delay
-    self.last_stage = "阅读时间后台服务运行中，首次约"..tostring(first_delay).."秒后上传"
-    self:_write_daemon_control(true, true, {_time_only=true})
-    self:_schedule_daemon_poll(5)
-    logger.info("[MiuRead][ReadReport] service activated",
-        "pid=", tostring(daemon.pid), "book=", book_id,
-        "core=",core_hash:sub(1,12),"first_delay=", tostring(first_delay),
-        "interval=", tostring(interval), "reason=", tostring(reason or "start"))
-    return true
+function Sync:_start_daemon()
+    return false,"旧 Web 阅读上报已停用"
 end
 
 function Sync:_park_daemon_for_suspend(reason,preserve_final_flush)
@@ -5574,141 +4489,10 @@ end
 -- Reading time has an independent opt-in route. The precise position API
 -- stays on Web, with rt=0, regardless of this flag.
 function Sync:reading_time_mode()
-    local prefs=self.store:preferences().sync or {}
-    if prefs.time_eink_only==true or prefs.time_route_mode=="eink" then return "eink" end
-    if prefs.time_route_mode=="smart" then return "smart" end
-    return "legacy"
+    return "eink"
 end
 
 function Sync:web_readtime_disabled()
-    local mode=self:reading_time_mode()
-    return mode=="eink" or (mode=="smart" and self.reading_time_backend=="eink")
-end
-
--- Smart mode moves ownership of *new* seconds only. Existing Web requests
--- are never transferred to the E-Ink ledger or replayed after interruption.
--- Recheck a transient Web failure at a low rate while E-Ink owns NEW time.
--- Confirmed authentication failures require QR login, not periodic GET spam.
-function Sync:_schedule_smart_web_reprobe()
-    if self._smart_web_reprobe_task or self._smart_web_unavailable_reason~="context" then return end
-    if self:reading_time_mode()~="smart" then return end
-    local task
-    task=function()
-        if self._smart_web_reprobe_task~=task then return end
-        self._smart_web_reprobe_task=nil
-        if self._smart_web_unavailable_reason~="context" or self.reading_time_backend~="eink"
-            or self.suspended or not self.current or self:reading_time_mode()~="smart" then return end
-        if not (self.host and type(self.host.is_online)=="function" and self.host:is_online()) then
-            self:_schedule_smart_web_reprobe()
-            return
-        end
-        local book_id=tostring(self.current.book and self.current.book.book_id or "")
-        self:_recover_web_time_anchor(book_id,"smart_reprobe",function(ok,err)
-            if ok and self.reading_time_backend=="eink" then
-                self._smart_web_unavailable=false
-                self._smart_web_unavailable_reason=nil
-                self:switch_smart_time_backend(true,"web_recovered")
-            elseif self.reading_time_backend=="eink" then
-                if Http.is_auth_error(err or "") then
-                    self._smart_web_unavailable_reason="authentication"
-                else
-                    self:_schedule_smart_web_reprobe()
-                end
-            end
-        end)
-    end
-    self._smart_web_reprobe_task=task
-    UIManager:scheduleIn(120,task)
-end
-
-function Sync:switch_smart_time_backend(online,reason)
-    if self:reading_time_mode()~="smart" or (self.store:preferences().sync or {}).time_enabled~=true
-        or self.suspended or self.quiescing
-        or self.reading_end_finalized or not self.current
-        or not (self.host and self.host.ui and self.host.ui.document) then return false end
-    local target=(online and self._smart_web_unavailable~=true) and "web" or "eink"
-    if target=="web" and self._smart_handoff then
-        -- Reconnect happened before the old Web writer acknowledged stop.
-        -- Defer re-start until that same barrier completes; starting a new
-        -- Web clock now could overlap the in-flight old request.
-        self._smart_handoff.reconnect_requested=true
-        return true
-    end
-    if self.reading_time_backend==target then return true end
-    if self.reading_time_backend~="web" and self.reading_time_backend~="eink" then return false end
-    local previous=self.reading_time_backend
-    if previous=="web" then
-        -- Stop Web without a closing tail. The service acknowledges the
-        -- writer barrier *after* its last dispatched request has returned.
-        -- No E-Ink clock can start for this interval before that receipt.
-        if self._smart_handoff then return true end
-        local active_worker=self.daemon and (self.daemon.active or self.daemon.final_flush_pending)
-        local seq=self:_stop_daemon("smart_offline:"..tostring(reason),true,0)
-        local handoff={target="eink",record=self.current,reason=reason}
-        self._smart_handoff=handoff
-        local function after_stop(ack)
-            if self._smart_handoff~=handoff then return end
-            self._smart_handoff=nil
-            if not ack then
-                self.last_stage="Web 计时服务尚未确认停止，离线接管待确认"
-                logger.warn("[MiuRead][ReadTimeRoute] Web stop not acknowledged; refusing clock overlap")
-                if self.host and self.host.on_readtime_route_change then
-                    self.host:on_readtime_route_change("unavailable",previous,self.last_stage)
-                end
-                return
-            end
-            if self.current~=handoff.record or self:reading_time_mode()~="smart" then return end
-            if self._smart_web_unavailable~=true and
-                (handoff.reconnect_requested or (self.host and type(self.host.is_online)=="function" and self.host:is_online())) then
-                -- The old request has finished. Now a fresh Web clock can be
-                -- started without accidentally double-submitting its tail.
-                self:start("smart_online_restored_during_handoff")
-                return
-            end
-            self.reading_time_backend="eink"
-            local controller=self:offline_time_controller()
-            if controller.task then UIManager:unschedule(controller.task);controller.task=nil end
-            local ok,err=self:start("smart_network_offline")
-            if not ok then
-                self.last_stage=err or "E-Ink 本地记录不可用"
-                if self.host and self.host.on_readtime_route_change then
-                    self.host:on_readtime_route_change("unavailable",previous,self.last_stage)
-                end
-                return
-            end
-            if self._smart_web_unavailable_reason=="context" then
-                self:_schedule_smart_web_reprobe()
-            end
-            logger.info("[MiuRead][ReadTimeRoute] smart switch", "from=",previous,
-                "to=eink", "reason=",tostring(reason))
-            if self.host and self.host.on_readtime_route_change then
-                self.host:on_readtime_route_change("eink",previous,reason)
-            end
-        end
-        if active_worker and seq then self:wait_writer_barrier(seq,after_stop,12)
-        else after_stop(true) end
-        return true
-    else
-        -- Persist the final Native interval BEFORE starting a new Web clock.
-        local controller=self:offline_time_controller()
-        if controller.active and not controller:collect(true) then
-            self.last_stage="E-Ink 时间结算失败，暂不切换 Web"
-            return false,self.last_stage
-        end
-        controller:stop(self,"smart_network_online",false)
-        self.reading_time_backend="web"
-        local ok,err=self:start("smart_network_online")
-        if not ok then
-            -- Roll back to Native rather than leave subsequent seconds ownerless.
-            self.reading_time_backend="eink"
-            controller:start(self,self.current)
-            self.last_stage=err or "Web 时间服务启动失败"
-            return false,err
-        end
-    end
-    logger.info("[MiuRead][ReadTimeRoute] smart switch",
-        "from=",previous,"to=",target,"reason=",tostring(reason))
-    if self.host.on_readtime_route_change then self.host:on_readtime_route_change(target,previous,reason) end
     return true
 end
 
@@ -5776,74 +4560,17 @@ function Sync:start(reason)
             "book=",tostring(record.book and record.book.book_id or ""))
         return false,"当前文件未启用阅读时间同步"
     end
-    if self.reading_time_backend=="eink_restart_required" then
-        self.state="paused"
-        self.last_stage="时间通道已切换，请重新打开当前书籍"
-        return false,self.last_stage
+    if self.suspended then return false,"设备已休眠" end
+    if self.daemon and (self.daemon.active or self.daemon.final_flush_pending) then
+        self:_stop_daemon("eink_clock_only",true,0)
+        return false,"正在关闭旧阅读时钟，请重新打开书籍"
     end
-    local mode=self:reading_time_mode()
-    if mode=="smart" and not self.reading_time_backend then
-        local online=self.host and type(self.host.is_online)=="function" and self.host:is_online()
-        self.reading_time_backend=online and "web" or "eink"
-    end
-    if mode=="smart" and self.reading_time_backend=="web"
-        and self.host and type(self.host.is_online)=="function" and not self.host:is_online() then
-        return self:switch_smart_time_backend(false,"start_network_offline")
-    end
-    if mode=="eink" then
-        -- A Web-clock session from before the switch is never migrated to
-        -- Native midway through a book; that could count the same seconds twice.
-        if self.reading_time_backend=="web" then
-            self.state="paused"
-            self.last_stage="请重新打开书籍后开始仅 E-Ink 计时"
-            return false,self.last_stage
-        end
-        self.reading_time_backend="eink"
-    elseif not self.reading_time_backend then
-        self.reading_time_backend=require("miuread.api_transport").new(self.store).selected
-    end
-    if self.reading_time_backend=="eink" then
-        -- Each segment has one clock owner; smart mode may change it only
-        -- after closing the preceding owner's interval. Auth/settings
-        -- changes cannot count an existing Native interval again through Web.
-        if self.suspended then return false,"设备已休眠" end
-        if self.daemon and self.daemon.active then self:_stop_daemon("statistics_time_mode",true,0) end
-        local ok,err=self:offline_time_controller():start(self,record)
-        self.state=ok and "waiting" or "paused"
-        self.last_stage=ok and "本地记录阅读时长，联网后补传" or err
-        self.last_error=nil
-        if ok and mode=="smart" and self._smart_initial_notice_session~=self.reading_time_session_id then
-            self._smart_initial_notice_session=self.reading_time_session_id
-            if self.host and self.host.on_readtime_route_change then
-                self.host:on_readtime_route_change("eink",nil,"reader_open_offline")
-            end
-        end
-        return ok,err
-    end
-    if enabled and self:periodic_progress_enabled() and not self:is_verified(record.book.book_id) then
-        self.progress_hold = true
-        self.state = "verification_required"
-        self.last_stage = "等待确认本机与云端阅读位置"
-        logger.info("[MiuRead][ReadReport] start deferred", "reason=", tostring(reason),
-            "book=", tostring(record.book.book_id), "progress=unverified")
-        return false, "阅读位置尚未确认"
-    end
-    self.progress_hold = false
-    self.state = enabled and "waiting" or "stopped"
-    self.last_stage = enabled and "准备后台阅读时间工作器" or "阅读时间同步已关闭"
-    logger.info("[MiuRead][ReadReport] start requested", "reason=", tostring(reason),
-        "enabled=", tostring(enabled), "mode=long_lived_worker")
-    if enabled and not self.suspended then
-        local ok,err=self:_start_daemon(reason)
-        if ok and mode=="smart" and self._smart_initial_notice_session~=self.reading_time_session_id then
-            self._smart_initial_notice_session=self.reading_time_session_id
-            if self.host and self.host.on_readtime_route_change then
-                self.host:on_readtime_route_change("web",nil,"reader_open_online")
-            end
-        end
-        return ok,err
-    end
-    return enabled
+    self.reading_time_backend="eink"
+    local ok,err=self:offline_time_controller():start(self,record)
+    self.state=ok and "waiting" or "paused"
+    self.last_stage=ok and "正在记录 E-Ink 阅读时长" or err
+    self.last_error=nil
+    return ok,err
 end
 
 -- A menu mode change must never cancel the independent precision-progress
@@ -6261,13 +4988,6 @@ function Sync:on_resume(_slept)
     -- Otherwise the finalizer's ownership token becomes stale before it can
     -- retire the *old* writer, leaving that process behind on a fast wake.
     self:_ensure_reading_time_ids(false,true)
-    if self:reading_time_mode()=="smart" and self.current then
-        local online=self.host and type(self.host.is_online)=="function" and self.host:is_online()
-        local target=online and "web" or "eink"
-        if self.reading_time_backend~=target then
-            if self:switch_smart_time_backend(online,"resume") then return end
-        end
-    end
     self:start("resume")
 end
 
@@ -6338,6 +5058,7 @@ function Sync:on_close(options)
                 pending={
                     percent=position and position.progress or nil,
                     chapter_percent=position and position.chapter_percent or math.floor((self:local_ratio() or 0) * 100 + .5),
+                    chapter_ratio=position and position.chapter_ratio or nil,
                     chapter_uid=position and position.chapter_uid or nil,
                     saved_at=now, reason="close",
                 },
@@ -6501,34 +5222,8 @@ function Sync:on_auth_restored()
     self.consecutive_failures=0
     self.failure_notified=false
     self.busy=false
-    self.daemon_context=nil
-    self.store:ensure_login_session_id()
-    local record=self:record()
-    if not record or self.suspended then return false end
-    if self.store:preferences().sync.time_enabled~=true then return false end
-    self.state="waiting"
-    self.last_stage="登录已恢复，正在重新读取 Web 位置"
-    if self:reading_time_mode()=="eink" then return self:start("auth_restored") == true end
-    -- A new credential must not reuse a previous credential's Web time wire.
-    self._time_wire_refresh_at=0
-    local book_id=tostring(record.book.book_id or "")
-    return self:_recover_web_time_anchor(book_id,"auth_restored",function(ok,err)
-        if not self.current or tostring(self.current.book and self.current.book.book_id or "")~=book_id then return end
-        if ok then
-            self._smart_web_unavailable=false
-            if self:reading_time_mode()=="smart" and self.reading_time_backend=="eink" then
-                self:switch_smart_time_backend(true,"auth_restored")
-            else
-                self:start("auth_restored_web_ready")
-            end
-        else
-            self.last_stage="Web 登录已恢复，但位置尚不可用："..tostring(err or "未知错误")
-            if self:reading_time_mode()=="smart" then
-                self._smart_web_unavailable=true
-                self:switch_smart_time_backend(false,"auth_web_position_unavailable")
-            end
-        end
-    end)==true
+    if self.suspended or self.store:preferences().sync.time_enabled~=true then return false end
+    return self:start("eink_auth_restored")==true
 end
 
 function Sync:status_label()

@@ -2,6 +2,7 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local Geometry = require("miuread.modal_geometry")
 local Geom = require("ui/geometry")
+local Screen = require("device").screen
 
 local M = {generation = 0}
 
@@ -15,7 +16,7 @@ end
 -- CURRENT stack on the next turn.  "all" requests layout paint, whereas
 -- nil requests waveform only and may leave an old frame behind.
 function M.restore(region, mode)
-    local safe = Geometry.rect(region, 3)
+    local safe = Geometry.rect(region, 3, Screen:getWidth(), Screen:getHeight())
     if safe then
         UIManager:setDirty("all", mode or "ui", Geom:new(safe))
     end
@@ -28,10 +29,12 @@ local function current_modal_frame()
     for i = #stack, 1, -1 do
         local window = stack[i]
         local widget = window and window.widget
-        if widget and widget._miuread_modal_surface == true then
-            local rect = widget.bubble_dimen or widget.popup_dimen
-                or widget.frame_dimen or widget.panel_dimen
-            if rect then return Geometry.rect(rect, 3) end
+        if widget and not widget.invisible and not widget.toast
+            and (widget._miuread_modal_surface==true or widget.modal==true) then
+            local rect=widget.bubble_dimen or widget.popup_dimen or widget.frame_dimen or widget.panel_dimen
+                or (widget.frame and widget.frame.dimen) or (widget.movable and widget.movable.dimen)
+            rect=Geometry.rect(rect,0)
+            if rect then return rect end
         end
     end
     return nil
@@ -39,7 +42,7 @@ end
 
 function M.after_close(region, action, label)
     local token = M.cancel_pending()
-    local old = Geometry.rect(region, 3)
+    local old = Geometry.rect(region, 0)
     UIManager:nextTick(function()
         -- Never run a stale action after a newer explicit navigation.
         -- A newer modal may have superseded the pending action, but its
@@ -60,7 +63,12 @@ function M.after_close(region, action, label)
             -- complete frame. Repaint the OLD footprint on the current stack
             -- even if the action opened another dialog (and changed token).
             UIManager:nextTick(function()
-                M.restore(Geometry.union(old, current_modal_frame()))
+                -- Native dialogs often only know their frame origin after paint.
+                UIManager:setDirty("all",function()
+                    local region=Geometry.rect(Geometry.union(old,current_modal_frame()),3,
+                        Screen:getWidth(),Screen:getHeight())
+                    if region then return "ui",Geom:new(region) end
+                end)
             end)
         end)
     end)

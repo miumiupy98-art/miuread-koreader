@@ -35,14 +35,9 @@ local function show_variant(plugin, book_id, variant)
             callback = function() plugin:choose_download_mode(book, {annotations = false}, false) end,
         }
     end
-    -- Legacy variants remain manageable but deletion is an explicit
-    -- advanced action, distinct from the full-book cleanup operation.
     items[#items + 1] = {
-        text = "高级文件管理",sub_item_table_func=function() return {
-            {text="仅删除"..label,callback=function()
-                plugin:_confirm_delete_variant(book_id,kind,book.title or book_id)
-            end},
-        } end,
+        text="删除下载",
+        callback=function() plugin:_confirm_delete_variant(book_id,kind,book.title or book_id) end,
     }
     return plugin:list(label .. " · " .. human_size(variant.size), items)
 end
@@ -88,7 +83,11 @@ function M.open_generated(plugin, book_ref)
         }
     end
     items[#items + 1] = {
-        text = "删除书籍（清理本机全部关联数据）",
+        text="清理在线阅读缓存",
+        callback=function() plugin:_show_online_cache_management(book_id) end,
+    }
+    items[#items + 1] = {
+        text = "清除本书全部本机数据",
         separator = true,
         callback = function() plugin:_confirm_delete_book_downloads(book_id, stored.title or book_id) end,
     }

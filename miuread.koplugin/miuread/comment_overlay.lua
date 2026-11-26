@@ -1,4 +1,5 @@
 -- B3: paints cached comment anchors after the reader text, never into EPUB.
+local Range=require("miuread.annotations.range")
 local M={}; M.__index=M
 
 function M:new()
@@ -6,12 +7,30 @@ function M:new()
 end
 
 function M:setRecords(rows)
-    self.records=type(rows)=="table" and rows or {}
-    self:invalidate()
+    rows=type(rows)=="table" and rows or {}
+    local changed=#rows~=#self.records
+    if not changed then
+        for i,row in ipairs(rows) do
+            local old=self.records[i]
+            if row.book_id~=old.book_id or row.chapter_uid~=old.chapter_uid or row.range~=old.range
+                or row.pos0~=old.pos0 or row.pos1~=old.pos1 or row.quote~=old.quote then
+                changed=true
+                break
+            end
+        end
+    end
+    if changed then
+        self.records=rows
+        self:invalidate()
+    end
+    return changed
 end
 function M:setEnabled(value)
-    self.enabled=value==true
-    self:invalidate()
+    value=value==true
+    if self.enabled~=value then
+        self.enabled=value
+        self:invalidate()
+    end
 end
 function M:invalidate()
     self.visible={}
@@ -25,6 +44,21 @@ local function intersects(a,b)
     return a.x<b.x+b.w and a.x+a.w>b.x and a.y<b.y+b.h and a.y+a.h>b.y
 end
 
+local function geometry(ui,screen)
+    local doc=ui.document
+    local size=ui.view and ui.view.dimen or ui.dimen
+    local viewport={x=size and size.x or 0,y=size and size.y or 0,
+        w=size and size.w or screen:getWidth(),h=size and size.h or screen:getHeight()}
+    local view=ui.view
+    if view and view.footer_visible and view.footer and type(view.footer.getHeight)=="function" then
+        viewport.h=math.max(1,viewport.h-view.footer:getHeight())
+    end
+    local top=type(doc.getCurrentPos)=="function" and tonumber(doc:getCurrentPos()) or nil
+    local page=type(doc.getCurrentPage)=="function" and doc:getCurrentPage() or 0
+    local key=table.concat({top or "",page or "",viewport.x,viewport.y,viewport.w,viewport.h},":")
+    return viewport,top,key
+end
+
 function M:paintTo(bb)
     self.visible={}
     if not self.enabled or #self.records==0 then return end
@@ -35,12 +69,11 @@ function M:paintTo(bb)
     local screen=require("device").screen
     local ink=BB.Color8(0x80)
     local px=math.max(1,screen:scaleBySize(1))
-    local viewport=self.ui.dimen or {x=0,y=0,w=screen:getWidth(),h=screen:getHeight()}
-    local top=type(doc.getCurrentPos)=="function" and tonumber(doc:getCurrentPos()) or nil
+    local viewport,top,view_key=geometry(self.ui,screen)
     local count=type(doc.getVisiblePageCount)=="function" and
         tonumber(doc:getVisiblePageCount()) or 1
     local bottom=top and top+viewport.h*math.max(1,count or 1) or nil
-    local key=tostring(self.generation or 0)..":"..tostring(top or "")..":"..tostring(viewport.w)
+    local key=tostring(self.generation or 0)..":"..view_key
     if self._last_visible_key~=key then
         local entries={}
         for _,record in ipairs(self.records) do
@@ -68,21 +101,25 @@ function M:paintTo(bb)
         self._last_visible=entries
         self._last_visible_key=key
     end
-    self.visible=self._last_visible
-    for _,entry in ipairs(self.visible) do
+    self.visible={}
+    self._painted_view_key=view_key
+    for _,entry in ipairs(self._last_visible) do
         local rect=entry.rect
         -- Screen boxes can straddle the reader viewport. Never draw a mark
         -- into the toolbar, margins outside the viewport, or negative pixels.
         local left=math.max(0,viewport.x,rect.x)
         local right=math.min(screen:getWidth(),viewport.x+viewport.w,rect.x+rect.w)
-        local y=rect.y+rect.h-px
-        local top=math.max(0,viewport.y)
-        local bottom=math.min(screen:getHeight(),viewport.y+viewport.h)
-        if left<right and y>=top and y+px<=bottom then
+        local viewport_top=math.max(0,viewport.y)
+        local viewport_bottom=math.min(screen:getHeight(),viewport.y+viewport.h)
+        local line_bottom=rect.y+rect.h
+        local y=math.min(line_bottom+2*px,viewport_bottom-px)
+        if left<right and rect.y<viewport_bottom and y>=viewport_top and line_bottom>=viewport_top then
             for x=left,right-1,7*px do
                 local width=math.min(4*px,right-x)
                 if width>0 then bb:paintRect(x,y,width,px,ink) end
             end
+            self.visible[#self.visible+1]={record=entry.record,left=left,right=right,
+                top=math.max(rect.y,viewport_top),bottom=y+px,mark_y=y,text_bottom=math.min(line_bottom,viewport_bottom)}
         end
     end
 end
@@ -91,11 +128,21 @@ function M:hitTest(pos)
     if not self.enabled or type(pos)~="table" then return nil end
     local x,y=tonumber(pos.x),tonumber(pos.y)
     if not x or not y then return nil end
-    for i=#self.visible,1,-1 do
-        local item=self.visible[i];local r=item.rect
-        if x>=r.x-2 and x<=r.x+r.w+2 and y>=r.y-2 and y<=r.y+r.h+2 then
-            return item.record
+    if #self.visible==0 or not (self.ui and self.ui.document) then return nil end
+    local screen=require("device").screen
+    local _,_,key=geometry(self.ui,screen)
+    if key~=self._painted_view_key then return nil end
+    local best,distance,span,bounds
+    for _,item in ipairs(self.visible) do
+        if x>=item.left-2 and x<=item.right+2 and y>=item.top and y<=item.bottom+2 then
+            local range_start,range_stop=Range.parse(item.record.range)
+            local width=range_start and range_stop and range_stop-range_start or item.right-item.left
+            local delta=math.abs(y-item.mark_y)
+            if not best or delta<distance or (delta==distance and width<span) then
+                best,distance,span,bounds=item.record,delta,width,item
+            end
         end
     end
+    return best,bounds
 end
 return M

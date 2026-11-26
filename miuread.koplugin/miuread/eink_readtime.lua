@@ -52,6 +52,10 @@ function M.send(http,prepared,before_dispatch)
         return dispatched
     end
     local ok,value=pcall(http.post_json,http,BASE.."/book/batchUploadProgress",prepared.body,options)
+    return M.receipt(dispatched,ok,value)
+end
+
+function M.receipt(dispatched,ok,value)
     if dispatched and ok and type(value)=="table" and (value.succ==true or tonumber(value.succ)==1) then
         return {state="confirmed",dispatched=true}
     end
@@ -59,18 +63,22 @@ function M.send(http,prepared,before_dispatch)
     -- state; neither restarting nor reconnecting may replay these seconds.
     local text=not ok and tostring(value) or ""
     local limited=not ok and Http.rate_limit_details(value)
-    local is_auth=not ok and Http.is_auth_error(value)
     local code=type(value)=="table" and tonumber(value.errCode or value.errcode)
         or tonumber(text:match("error_code=(%-?%d+)"))
-    -- Authentication errors reject the request before write commitment; keep them
-    -- pending so they can be retried once authorization is renewed.
-    local state=(dispatched and not is_auth) and "unknown" or "pending"
-    return {state=state,dispatched=dispatched,error=limited and "rate_limited"
+    local status=tonumber(text:match("HTTP (%d+)"))
+    -- An explicit authorization rejection is retryable after renewal. A
+    -- dropped connection or ambiguous response may already have committed.
+    local rejected_auth=not limited and (status==401 or code==-2011 or code==-2012 or code==-2041)
+    -- A returned HTTP 429 explicitly rejected the request. A timeout or an
+    -- ambiguous status such as 499 still cannot be replayed safely.
+    local rejected_rate_limit=status==429
+    return {state=dispatched and not rejected_auth and not rejected_rate_limit and "unknown" or "pending",
+        dispatched=dispatched,error=limited and "rate_limited"
         or (not dispatched and "claim_failed")
-        or (is_auth and "authentication")
+        or ((rejected_auth or (not ok and Http.is_auth_error(value))) and "authentication")
         or (ok and "unconfirmed_response" or "request_failed"),
-        retry_after=limited and limited.wait_seconds,
+        retry_after=(limited and limited.wait_seconds) or (status==429 and tonumber(text:match("retry_after=(%d+)"))),
         local_cooldown=limited and limited.local_cooldown,
-        code=limited and limited.code or code,status=tonumber(text:match("HTTP (%d+)"))}
+        code=limited and limited.code or code,status=status}
 end
 return M

@@ -32,9 +32,9 @@ local function now()
     return os.time()
 end
 
-local function propagate_control_error(value)
+local function propagate_download_stop(value)
     local text=tostring(value or "")
-    if Http.is_rate_limit_error(value) or text:find("__MIUREAD_HIBERNATE__",1,true)
+    if text:find("__MIUREAD_HIBERNATE__",1,true)
         or text:lower():find("download cancelled",1,true) then error(value,0) end
 end
 
@@ -74,6 +74,8 @@ local function normalized_book(value)
         author = tostring(source.author or value.author or ""),
         cover = source.cover or source.coverUrl or value.cover,
         category = source.category or value.category,
+        format = source.format or value.format,
+        type = source.type or source.book_type or value.type or value.book_type,
         version = tonumber(source.version or source.bookVersion or source.book_version
             or value.version or value.bookVersion or value.book_version),
     }
@@ -349,7 +351,7 @@ local function namespace_assets(body, style, assets, uid)
         local item = U.copy(asset)
         local old = tostring(item.href or "")
         local base = old:match("([^/]+)$") or ("asset-" .. tostring(index) .. ".bin")
-        local new = "images/" .. prefix .. "-" .. tostring(index) .. "-" .. U.id_name(base)
+        local new = item.eink_shared and old or ("images/" .. prefix .. "-" .. tostring(index) .. "-" .. U.id_name(base))
         if old ~= "" and old ~= new then
             body = body:gsub(pattern_escape("../" .. old), "../" .. new)
             body = body:gsub(pattern_escape(old), new)
@@ -388,6 +390,7 @@ local function option_key(opt)
         opt.images == false and "no-images" or "images",
         opt.chapter_uid and ("chapter-" .. U.id_name(opt.chapter_uid))
             or ((opt.range_start_index and opt.range_end_index) and "range" or "book"),
+        opt.eink_content_mode,
     }, "-")
 end
 
@@ -422,6 +425,8 @@ local function chapter_paths(cache, uid)
         base = dir .. "/base.xhtml",
         coord = dir .. "/coord.xhtml",
         final = dir .. "/final.xhtml",
+        text = dir .. "/chapter.txt",
+        base_css = dir .. "/base.css",
         css = dir .. "/style.css",
         asset_dir = dir .. "/assets",
     }
@@ -434,7 +439,9 @@ local function cache_save(cache)
 end
 
 local function cache_root(store,book,opt)
-    return store:book_dir(book.bookId).."/.miuread-partial-"..option_key(opt)
+    local bucket=opt.limited_online and store.limited_online_dir.."/"..U.id_name(book.bookId)
+        or store:book_dir(book.bookId)
+    return bucket.."/.miuread-partial-"..option_key(opt)
 end
 local function cache_new(store, book, opt, selected, format)
     local root = cache_root(store,book,opt)
@@ -446,6 +453,8 @@ local function cache_new(store, book, opt, selected, format)
         and tostring(manifest.book_id or "") == tostring(book.bookId)
         and tostring(manifest.option_key or "") == option_key(opt)
         and tostring(manifest.format or "") == tostring(format)
+        and (not opt.eink_content_mode or (manifest.content_account == opt.eink_content_account
+            and manifest.content_version == opt.eink_content_version))
     if not valid then
         U.remove_tree(root)
         U.mkdir(root .. "/chapters")
@@ -461,6 +470,8 @@ local function cache_new(store, book, opt, selected, format)
             option_key = option_key(opt),
             signature = signature,
             format = format,
+            content_account = opt.eink_content_account,
+            content_version = opt.eink_content_version,
             title_transform_version = inherited_title_version or TITLE_TRANSFORM_VERSION,
             image_transform_version = IMAGE_TRANSFORM_VERSION,
             repair_options = {
@@ -628,7 +639,12 @@ local function cache_save_assets(cache, uid, assets)
         if temporary_root~="" then temporary_roots[temporary_root]=true end
         local file = paths.asset_dir .. "/" .. string.format("%04d.bin", index)
         local ok, err
-        if tostring(asset.data_path or "")~="" then
+        local shared_prefix=cache.root.."/shared-eink-images/"
+        if asset.eink_shared==true and tostring(asset.data_path):sub(1,#shared_prefix)==shared_prefix then
+            file=asset.data_path
+            ok=(U.file_size(file) or 0)>0
+            if not ok then err="共享图片文件缺失或为空" end
+        elseif tostring(asset.data_path or "")~="" then
             local stage=file..".stream-"..tostring(os.time()).."-"..tostring(math.random(1000,9999))
             os.remove(stage)
             ok,err=U.copy_file_stream(asset.data_path,stage,tonumber(Config.DOWNLOAD_STREAM_CHUNK_BYTES) or 128*1024)
@@ -644,7 +660,13 @@ local function cache_save_assets(cache, uid, assets)
             cleanup_temporary_roots()
             error("无法保存章节图片断点：" .. tostring(err))
         end
+        local size=U.file_size(file)
+        if not size or size<=0 then
+            cleanup_temporary_roots()
+            error("章节图片断点为空")
+        end
         meta[#meta + 1] = {
+            size = size,
             href = asset.href,
             mime = asset.mime,
             source = asset.source,
@@ -665,7 +687,10 @@ local function cache_load_assets(cache, entry)
     local assets = {}
     for _, item in ipairs(meta) do
         local file=absolute(cache.root,item.file)
-        if U.file_size(file)==nil then return nil,"章节图片断点缺失" end
+        local size=U.file_size(file)
+        if not size or size<=0 or (item.size and size~=item.size) then
+            return nil,"章节图片断点缺失或不完整"
+        end
         assets[#assets + 1] = {href=item.href, mime=item.mime, source=item.source, data_path=file}
     end
     return assets
@@ -682,7 +707,11 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
         ok, err = U.atomic_write(paths.coord, coord_body, true)
         if not ok then error("无法保存章节坐标原文：" .. tostring(err)) end
     end
-    ok, err = U.atomic_write(paths.css, style or "", true)
+    if state and state.native_text then
+        ok, err = U.atomic_write(paths.text,state.native_text,true)
+        if not ok then error("无法保存 TXT 章节断点：" .. tostring(err)) end
+    end
+    ok, err = U.atomic_write(paths.base_css, style or "", true)
     if not ok then error("无法保存章节样式断点：" .. tostring(err)) end
     cache_save_assets(cache, uid, assets)
     local entry = cache.manifest.chapters[uid] or {}
@@ -694,14 +723,18 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
     entry.content_done = true
     entry.complete = false
     entry.base_file = relative(cache.root, paths.base)
+    entry.text_file = state and state.native_text and relative(cache.root,paths.text) or nil
     entry.coord_file = (type(coord_body) == "string" and coord_body ~= "") and relative(cache.root, paths.coord) or nil
-    entry.css_file = relative(cache.root, paths.css)
+    entry.base_css_file = relative(cache.root, paths.base_css)
+    entry.css_file = nil
+    entry.final_file = nil
     entry.content_format = state and state.content_format
     entry.source_channel = state and state.source_channel or "web"
     entry.coordinate_source_authoritative = not (state and state.coordinate_source_authoritative==false)
     entry.structural = state and state.structural == true or false
     entry.image_only = state and state.image_only == true or false
     entry.image_summary = state and state.image_summary or nil
+    entry.image_repair = state and state.image_repair or nil
     entry.image_transform_version = IMAGE_TRANSFORM_VERSION
     entry.content_transform_version = CONTENT_TRANSFORM_VERSION
     entry.title_transform_version = tonumber(entry.title_transform_version
@@ -729,9 +762,9 @@ end
 local function cache_load_base(cache, entry)
     if not entry or not entry.content_done then return nil, "正文断点不存在" end
     local body = U.read_file(absolute(cache.root, entry.base_file), true)
-    local style = U.read_file(absolute(cache.root, entry.css_file), true)
+    local style = U.read_file(absolute(cache.root, entry.base_css_file or entry.css_file), true)
     local assets, asset_error = cache_load_assets(cache, entry)
-    if body == nil or style == nil or not assets then return nil, asset_error or "正文断点文件缺失" end
+    if not body or body=="" or style==nil or not assets then return nil,asset_error or "正文断点文件缺失" end
     local coord_body
     if tostring(entry.coord_file or "") ~= "" then
         coord_body = U.read_file(absolute(cache.root, entry.coord_file), true)
@@ -755,6 +788,7 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     ok, err = U.atomic_write(paths.css, style or "", true)
     if not ok then error("无法保存完成章节样式：" .. tostring(err)) end
     entry.final_file = relative(cache.root, paths.final)
+    entry.css_file = relative(cache.root, paths.css)
     entry.complete = true
     entry.error = nil
     entry.underlines = annotation and (annotation.underline_count or 0) or 0
@@ -779,26 +813,12 @@ local function cache_save_final(cache, chapter, body, annotation, style, footnot
     return entry
 end
 
-local function cache_load_asset_sources(cache, entry)
-    local meta = DownloadDatabase.load_assets(cache.root, entry.uid)
-    if type(meta) ~= "table" then return nil, "图片断点清单缺失" end
-    local assets = {}
-    for _, item in ipairs(meta) do
-        local file = absolute(cache.root, item.file)
-        if U.file_size(file) == nil then return nil, "章节图片断点缺失" end
-        assets[#assets + 1] = {
-            href=item.href, mime=item.mime, source=item.source, data_path=file,
-        }
-    end
-    return assets
-end
-
 local function cache_load_final_source(cache, entry)
     if not entry or not entry.complete then return nil, "完成断点不存在" end
     local body_path = absolute(cache.root, entry.final_file)
-    if U.file_size(body_path) == nil then return nil, "完成章节正文断点缺失" end
+    if (U.file_size(body_path) or 0)<=0 then return nil, "完成章节正文断点缺失" end
     local style = U.read_file(absolute(cache.root, entry.css_file), true)
-    local assets, asset_error = cache_load_asset_sources(cache, entry)
+    local assets, asset_error = cache_load_assets(cache, entry)
     if style == nil or not assets then return nil, asset_error or "完成断点文件缺失" end
     return body_path, style, assets
 end
@@ -893,14 +913,22 @@ end
 
 function Downloader:catalog(id, request_options)
     request_options = type(request_options) == "table" and request_options or {}
-    local catalog = self._download_api and self._download_api:catalog(id,request_options)
-        or self.reader:catalog(id, request_options)
+    local catalog
+    if self._download_api then
+        catalog=self._download_api:catalog(id,request_options)
+    elseif request_options.eink_only then
+        catalog=require("miuread.download_transport").new(self.reader):native():catalog(id)
+    else
+        catalog=self.reader:catalog(id,request_options)
+    end
     local source = flattened_catalog(catalog.updated or catalog.chapterInfos or catalog.chapters or {})
     -- chapterInfos does not reliably expose the book format. Use the reader
     -- page context when available; on failure keep the source titles unchanged.
     local book_format=tostring((catalog.book or {}).format or catalog.format or ""):lower()
     local ok_state, state = true,{book={format=book_format}}
-    if book_format=="" then
+    if book_format=="" and (request_options.eink_only or (self._download_transport and self._download_transport.eink_only)) then
+        error("E-Ink 未返回可验证的书籍格式",0)
+    elseif book_format=="" then
         ok_state,state=pcall(self.reader.chapter_state,self.reader,id,nil,request_options.keepalive)
     end
     if not ok_state and Http.is_rate_limit_error(state) then error(state,0) end
@@ -921,6 +949,7 @@ function Downloader:catalog(id, request_options)
             and not self.reader._is_unavailable_chapter(chapter)
         if allowed and (uid=="" or not seen_toc[uid]) then
             local title=tostring(chapter.title or ""):match("^%s*(.-)%s*$") or ""
+            if title=="" and uid~="" then title="第 "..tostring(#out+1).." 节" end
             if title~="" and (uid~="" or chapter._miuread_toc_level~=nil
                 or chapter._miuread_has_children) then
                 toc_rows[#toc_rows+1]={
@@ -1037,11 +1066,20 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     local suffix = kind == "notes" and "划线与想法版" or "纯净版"
     local standalone = opt.chapter_uid ~= nil
     local hidden_prefetch = standalone and opt.prefetch_hidden == true
-    local dir = hidden_prefetch and self.store:prefetch_root(book.bookId) or self.store:epub_root()
+    local online_chapter = standalone and not hidden_prefetch and opt.eink_content_mode=="eink-online"
+    local plain_text=opt.output_format=="txt"
+    local extension=plain_text and ".txt" or ".epub"
+    local format_label=plain_text and "TXT" or "EPUB"
+    if online_chapter and not opt.generate_translation_uid and #chapters==1 then
+        css,opt.image_summary,opt.image_repair=ResourceRefs.prepare_online_chapter_style(
+            css,chapters[1],opt.image_summary,opt.image_repair)
+    end
+    local internal = hidden_prefetch or online_chapter
+    local dir = internal and self.store:prefetch_root(book.bookId) or self.store:epub_root()
     local partial_range = not standalone and opt.range_start_index ~= nil and opt.range_end_index ~= nil
     local access_scope=tostring(opt.access_scope or "full")
-    local storage_kind=partial_range and ("range_"..kind)
-        or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind)
+    local storage_kind=online_chapter and "online" or (partial_range and ("range_"..kind)
+        or ((access_scope=="preview" and not standalone) and ("preview_"..kind) or kind))
     local existing_record
     if standalone then
         existing_record=hidden_prefetch and self.store:hidden_prefetch_record(book.bookId,opt.chapter_uid,storage_kind)
@@ -1059,19 +1097,28 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     -- B4: newly generated clean books have no redundant edition suffix.
     -- The already-installed clean record below retains its exact former path.
     local edition_suffix=kind=="notes" and (" ["..suffix.."]") or ""
-    local formal_filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name..edition_suffix..".epub"
-    local filename=hidden_prefetch and (U.id_name(opt.chapter_uid).."-"..storage_kind..".epub") or formal_filename
-    local path=hidden_prefetch and self.store:hidden_prefetch_path(book.bookId,opt.chapter_uid,storage_kind) or self.store:epub_path(filename)
+    local formal_filename=U.safe_name(book.title,"book")..preview_name..range_name..chapter_name..edition_suffix..extension
+    local filename=internal and (U.id_name(opt.chapter_uid).."-"..storage_kind..extension) or formal_filename
+    local path=opt.limited_online and self.store:limited_online_path(book.bookId,opt.chapter_uid,opt.output_format)
+        or (internal and self.store:hidden_prefetch_path(book.bookId,opt.chapter_uid,storage_kind,opt.output_format) or self.store:epub_path(filename))
+    if opt.limited_online then
+        if not path or (not opt.online_server_only and (tonumber(opt.online_expires) or 0)<=os.time()) then
+            error("限时在线阅读权益已到期",0)
+        end
+        dir=path:match("^(.*)/[^/]+$")
+    end
     -- Keep the exact path of an existing variant. KOReader sidecar notes are
     -- associated with the document path, so a title or filename change must not
     -- silently create a second EPUB and leave the old .sdr behind.
     local recorded_path=type(existing_record)=="table" and tostring(existing_record.file or "") or ""
-    if recorded_path~="" then
+    if recorded_path:sub(-#extension):lower()==extension and not opt.limited_online and not existing_record.online_expires and not existing_record.online_server_only then
         path=recorded_path
         filename=recorded_path:match("([^/]+)$") or filename
+    else
+        recorded_path=""
     end
-    if U.file_exists(path) and not hidden_prefetch then
-        local identity=type(self.store.epub_identity)=="function" and self.store:epub_identity(path) or nil
+    if U.file_exists(path) and not internal then
+        local identity=not plain_text and type(self.store.epub_identity)=="function" and self.store:epub_identity(path) or nil
         local same_identity=type(identity)=="table"
             and tostring(identity.book_id or "")==tostring(book.bookId)
             and (tostring(identity.variant or "")=="" or tostring(identity.variant)==storage_kind)
@@ -1081,8 +1128,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         end
         if not same_identity and recorded_path=="" then
             local collision_id=standalone and (tostring(book.bookId).."-"..tostring(opt.chapter_uid)) or tostring(book.bookId)
-            local stem=filename:gsub("%.epub$","")
-            filename=stem.." ["..U.id_name(collision_id):sub(-12).."].epub"
+            local stem=filename:sub(1,-#extension-1)
+            filename=stem.." ["..U.id_name(collision_id):sub(-12).."]"..extension
             path=self.store:epub_path(filename)
         end
     end
@@ -1111,7 +1158,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
 
     local estimate=1024*1024
     for _,chapter in ipairs(chapters) do
-        estimate=estimate+(chapter.body_path and (U.file_size(chapter.body_path) or 0) or #tostring(chapter.body or ""))
+        local source=plain_text and chapter.text_path or chapter.body_path
+        estimate=estimate+(source and (U.file_size(source) or 0) or #tostring(chapter.body or ""))
     end
     for _,asset in ipairs(assets) do
         estimate=estimate+(asset.data_path and (U.file_size(asset.data_path) or 0) or #tostring(asset.data or ""))
@@ -1161,7 +1209,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     opt.image_summary.assets=#assets
 
     local stamp=tostring(opt.download_run_id or os.time()):gsub("[^%w%-]","-")
-    local temp_path=path:gsub("%.epub$","")..".miuread-new-"..stamp..".epub"
+    local temp_path=path:sub(1,-#extension-1)..".miuread-new-"..stamp..extension
     os.remove(temp_path)
     collectgarbage("collect")
     logger.info("[MiuRead][Download] low-memory EPUB package started",
@@ -1220,7 +1268,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     end
     -- Check the very first package step, even for books with <16 callbacks.
     package_guard(true)
-    local built,build_error=pcall(Epub.build,temp_path,book,chapters,css,assets,cover,{
+    local metadata={
         schema=8,book_id=book.bookId,title=book.title,author=book.author,
         variant=storage_kind,base_variant=kind,standalone=standalone,chapter_uid=opt.chapter_uid,
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
@@ -1228,6 +1276,10 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         range_end_title=opt.range_end_title,content_type="book",
         sync_enabled=true,progress_sync_enabled=true,read_report_enabled=true,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
+        eink_content_mode=opt.eink_content_mode,
+        online_expires=opt.online_expires,
+        online_server_only=opt.online_server_only,
+        online_login=opt.limited_online and tostring((self.store:auth() or {}).login_session_id or "") or nil,
         progress_source_complete=opt.progress_source_complete==true,
         progress_source_chapter_count=tonumber(opt.progress_source_chapter_count) or 0,
         progress_source_cached_count=tonumber(opt.progress_source_cached_count) or 0,
@@ -1251,18 +1303,30 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         content_transform_version=CONTENT_TRANSFORM_VERSION,
         internal_links={links=link_stats.links or 0,rewritten=link_stats.rewritten or 0,
             unresolved=link_stats.unresolved or 0,critical=link_stats.unresolved_critical or 0},
-    },package_progress,opt.toc_catalog)
-    if not built then os.remove(temp_path); error(build_error) end
+    }
+    local built,build_result
+    if plain_text then
+        if progress then progress("package",1,1,book.title,{message="正在保存 TXT",activity="txt_write"}) end
+        built,build_result=pcall(require("miuread.eink_text").build,temp_path,chapters,map,function()
+            ensure_not_cancelled()
+            package_guard()
+        end)
+    else
+        built,build_result=pcall(Epub.build,temp_path,book,chapters,css,assets,cover,metadata,package_progress,opt.toc_catalog)
+    end
+    if not built then os.remove(temp_path); error(build_result) end
     local boundary_ok,boundary_error=pcall(package_guard,true)
     if not boundary_ok then os.remove(temp_path); error(boundary_error,0) end
     ensure_not_cancelled()
     if type(progress)=="function" then
         progress("package",1,1,book.title,{
-            message="正在验证 EPUB",activity="epub_validate",processed=1,process_total=1,package_fraction=0.90,
+            message="正在验证 "..format_label,activity="epub_validate",processed=1,process_total=1,package_fraction=0.90,
         })
     end
     local validation_options={book_id=book.bookId,variant=storage_kind,chapters=map,previous_chapters=previous_chapters,
-        image_summary=U.copy(opt.image_summary or {})}
+        image_summary=U.copy(opt.image_summary or {}),
+        allow_deferred_online_images=online_chapter and not opt.generate_translation_uid,
+        document_format=opt.output_format,text_size=plain_text and build_result or nil}
     local validation_last_report_at=0
     validation_options.on_progress=function(detail)
         ensure_not_cancelled()
@@ -1361,7 +1425,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         "memory_kb=",tostring(math.floor(collectgarbage("count"))))
     if type(progress)=="function" then
         progress("package",1,1,book.title,{
-            message="正在安装 EPUB",activity="epub_install",processed=1,process_total=1,package_fraction=0.97,
+            message="正在安装 "..format_label,activity="epub_install",processed=1,process_total=1,package_fraction=0.97,
         })
     end
 
@@ -1373,7 +1437,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     local pending_path
     ensure_not_cancelled()
     if defer_install then
-        pending_path=path:gsub("%.epub$","")..".miuread-pending-"..stamp..".epub"
+        pending_path=path:sub(1,-#extension-1)..".miuread-pending-"..stamp..extension
         local staged,stage_mode_or_error=EpubInstaller.stage(temp_path,pending_path,validation_options)
         if not staged then os.remove(temp_path); error("无法暂存当前正在阅读书籍的新版本："..tostring(stage_mode_or_error)) end
         local old_pending=type(existing_record)=="table" and tostring(existing_record.pending_file or "") or ""
@@ -1389,6 +1453,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         file=path, directory=dir, variant=storage_kind, base_variant=kind, downloaded_at=now,
         content_type="book",
+        document_format=plain_text and "txt" or nil,text_size=plain_text and build_result or nil,
         sync_enabled=true,
         progress_sync_enabled=true,
         read_report_enabled=true,
@@ -1406,6 +1471,10 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         access_scope=access_scope,
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         chapter_map=map,failures=U.copy(failures or {}),complete=true,
+        eink_content_mode=opt.eink_content_mode,
+        online_expires=opt.online_expires,
+        online_server_only=opt.online_server_only,
+        online_login=opt.limited_online and tostring((self.store:auth() or {}).login_session_id or "") or nil,
         progress_source_complete=opt.progress_source_complete==true,
         progress_source_chapter_count=tonumber(opt.progress_source_chapter_count) or 0,
         progress_source_cached_count=tonumber(opt.progress_source_cached_count) or 0,
@@ -1428,6 +1497,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         annotation_account_key=opt.annotations and annotation_account_key or nil,
         core_map_hash=core_map_hash,
         image_count=#assets,image_summary=U.copy(opt.image_summary or {}),
+        image_repair=online_chapter and not opt.limited_online and opt.image_repair or nil,
         image_transform_version=IMAGE_TRANSFORM_VERSION,
         content_transform_version=CONTENT_TRANSFORM_VERSION,
         prefetch_hidden=hidden_prefetch or nil,
@@ -1451,9 +1521,10 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
     self.store:save_book(book.bookId, {
         book_id=book.bookId, title=book.title, author=book.author, cover=book.cover,
         version=tonumber(book.version),
-        directory=hidden_prefetch and self.store:epub_root() or dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
+        directory=internal and self.store:epub_root() or dir, updated_at=now, catalog=(type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map),
         catalog_chapter_count=tonumber(opt.catalog_chapter_count) or 0,
         catalog_complete=opt.catalog_complete==true,
+        eink_catalog_complete=opt.catalog_complete==true and opt.eink_content_mode~=nil,
         core_catalog_hash=BookIntegrity.core_map_hash(book.bookId,
             type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,{}),
         content_type="book",
@@ -1515,6 +1586,66 @@ local function append_entry(chapters, assets, css_list, css_seen, entry, body_so
     chapters[#chapters + 1] = chapter
 end
 
+function Downloader:_download_pdf(book,opt,progress,checkpoint,native)
+    if opt.annotations then error("PDF 暂不支持下载公开想法，请下载 PDF 原件",0) end
+    if opt.chapter_uid or opt.range_start_index or opt.range_end_index or opt.generate_translation_uid then
+        error("PDF 原件按整份文件下载",0)
+    end
+    local online=opt.read_online==true
+    local kind=online and "online" or "clean"
+    local id=U.id_name(book.bookId)
+    local dir=online and self.store:prefetch_root(book.bookId) or self.store:epub_root()
+    local title=U.safe_name(book.title,id)
+    if #title>180 then title=id end
+    local target=dir..(online and "/document-online.pdf" or "/"..title.." ["..id.."].pdf")
+    local prior=self.store:variant(book.bookId,kind)
+    if prior and prior.document_format=="pdf" and prior.file and U.file_exists(prior.file) then target=prior.file end
+    if U.file_exists(target) and (not prior or prior.file~=target or prior.document_format~="pdf") then
+        error("已有同名 PDF，原文件已保留",0)
+    end
+    local stamp=U.id_name(opt.download_run_id or (tostring(os.time()).."-"..tostring(math.random(1000,9999))))
+    local stage=self.store.temp_dir.."/"..id.."-"..stamp..".pdf.part"
+    local function check(stage_name)
+        if opt.cancelled and opt.cancelled() then error("download cancelled",0) end
+        checkpoint(stage_name)
+    end
+    local function publish_pdf()
+        check("catalog")
+        progress("content",0,1,book.title,{message="正在获取 PDF 原件"})
+        local _,version=native:download_pdf(book.bookId,stage,function(size)
+            check("network")
+            progress("content",0,1,book.title,{message="正在获取 PDF 原件",
+                activity="transport_download",transfer_bytes=size})
+        end)
+        local size=U.file_size(stage)
+        local options={document_format="pdf",document_size=size}
+        check("package")
+        progress("package",0,1,book.title,{message="正在验证 PDF 原件"})
+        local pending
+        local ok,why
+        if U.file_exists(target) and opt.active_document_path==target then
+            pending=target..".miuread-pending-"..stamp..".pdf"
+            ok,why=EpubInstaller.stage(stage,pending,options)
+        else
+            ok,why=EpubInstaller.install(stage,target,options)
+        end
+        if not ok then error("无法安装 PDF 原件："..tostring(why),0) end
+        return {book_id=book.bookId,title=book.title,author=book.author,cover=book.cover,
+            file=target,directory=dir,document_format="pdf",file_size=size,
+            pdf_book_version=version,
+            content_type="book",variant=kind,base_variant="clean",downloaded_at=os.time(),
+            pdf_login_session=online and self.store:auth().login_session_id or nil,
+            eink_content_mode=opt.eink_content_mode,complete=true,pending_file=pending,
+            pending_install=pending~=nil,expected_chapter_count=0,chapter_count=0,
+            sync_enabled=false,progress_sync_enabled=false,read_report_enabled=false}
+    end
+    local ok,record=pcall(publish_pdf)
+    os.remove(stage)
+    if not ok then error(record,0) end
+    self.store:save_variant(book.bookId,kind,record)
+    return record
+end
+
 function Downloader:_book_once(input, opt, progress)
     opt = opt or {}
     progress = progress or function() end
@@ -1523,10 +1654,17 @@ function Downloader:_book_once(input, opt, progress)
     local http_at_start = type(self.http) == "table" and self.http.stats_snapshot
         and self.http:stats_snapshot() or nil
     local chapters_fetched, chapters_from_checkpoint = 0, 0
-    local transport = require("miuread.download_transport").new(self.reader,opt)
+    local DownloadTransport=require("miuread.download_transport")
+    local transport=DownloadTransport.new(self.reader,opt)
+    opt.eink_content_mode=transport.content_mode
+    local foreground_online=opt.eink_content_mode=="eink-online" and opt.read_online==true
+        and opt.chapter_uid~=nil and opt.prefetch_hidden~=true
+    opt.limited_online,opt.online_expires,opt.online_server_only=nil,nil,nil
+    if transport.eink_only then
+        opt.eink_content_account=DownloadDatabase.account_key(self.store)
+    end
     self._download_transport=transport
     self._download_api=transport:service(self.api)
-    local run_annotations=self.annotations and setmetatable({api=self._download_api},{__index=self.annotations}) or nil
     local function respect_reader_priority(stage)
         local pause_logged=false
         local function worker_paused()
@@ -1561,6 +1699,11 @@ function Downloader:_book_once(input, opt, progress)
             logger.info("[MiuRead][Download] worker resumed",tostring(stage or "work"))
         end
         check_hibernate()
+
+        -- An explicit chapter open owns the foreground. Honor actual pause,
+        -- cancel and hibernate signals above; the soft reading/desktop yield
+        -- is for background work and would make the current tap wait for itself.
+        if foreground_online then return end
 
         local heavy_stage = stage=="package" or stage=="transform"
             or stage=="annotation_batch" or stage=="annotation_apply"
@@ -1615,11 +1758,14 @@ function Downloader:_book_once(input, opt, progress)
     transport.checkpoint=respect_reader_priority
     local book = normalized_book(input)
     if book.bookId == "" then error("bookId missing") end
+    if transport.eink_only and require("miuread.eink_pdf").is_book(book) then
+        return self:_download_pdf(book,opt,progress,respect_reader_priority,transport:native())
+    end
     -- Hibernate/restart after EPUB installation must NOT rebuild or replace
     -- the same book again. Resume only the persisted coordinate phase when
     -- its task id, EPUB identity, size and account still match.
     local PostInstall=require("miuread.post_install_web")
-    local previous=PostInstall.resume(self.store,book,opt)
+    local previous=not transport.eink_only and PostInstall.resume(self.store,book,opt)
     if previous then
         logger.info("[MiuRead][PostInstallWeb] resume installed EPUB without packaging",
             "book=",tostring(book.bookId),"task=",tostring(opt.download_run_id))
@@ -1695,7 +1841,7 @@ function Downloader:_book_once(input, opt, progress)
                 end
                 return catalog,all
             end
-            if not Http.is_network_error(catalog) then error(catalog) end
+            if foreground_online or not Http.is_network_error(catalog) then error(catalog,0) end
             catalog_wait_progress("网络连接中断，下载断点已保留，等待网络恢复")
             while true do
                 if opt.cancelled and opt.cancelled() then error("download cancelled") end
@@ -1725,6 +1871,15 @@ function Downloader:_book_once(input, opt, progress)
         end
     end
     local catalog, all = fetch_catalog_with_recovery()
+    if transport.eink_only then
+        if require("miuread.eink_pdf").is_book(catalog.book or catalog) then
+            return self:_download_pdf(book,opt,progress,respect_reader_priority,transport:native())
+        end
+        local catalog_book=catalog.book or {}
+        local catalog_version=catalog_book.version or catalog_book.bookVersion
+        book.version=tonumber(catalog_version) or book.version
+        opt.eink_content_version=tostring(catalog.synckey or "")..":"..tostring(catalog_version or "")
+    end
     -- Navigation metadata is ephemeral; it is not part of the cached chapter
     -- payload, library chapter_map, progress core hash, or EPUB miuread.json.
     opt.toc_catalog=catalog._miuread_toc_entries
@@ -1738,6 +1893,8 @@ function Downloader:_book_once(input, opt, progress)
             structural=chapter.structural==true,
             toc_level=catalog_level(chapter),
             toc_parent_uid=catalog_parent_uid(chapter),
+            structural_heading=type(self.reader._is_structure_chapter)=="function"
+                and self.reader._is_structure_chapter(chapter)==true,
         }
     end
     opt.full_catalog_map=full_catalog_map
@@ -1761,6 +1918,20 @@ function Downloader:_book_once(input, opt, progress)
     expected = #selected
     local format = catalog.format == "txt" and "txt" or "epub"
     transport:configure(catalog.format)
+    opt.output_format=transport.eink_only and format=="txt" and not opt.annotations
+        and not opt.generate_translation_uid and "txt" or nil
+    if opt.eink_content_mode=="eink-online" and opt.chapter_uid and not opt.prefetch_hidden then
+        local grant,reason=transport:native():online_chapter_access(book,opt.chapter_uid)
+        if not grant then error(reason or "微信读书未确认本章在线阅读权限",0) end
+        if grant.expires or grant.server_confirmation then
+            if not self.store:limited_online_path(book.bookId,opt.chapter_uid,opt.output_format) then
+                error("当前设备无法创建限时在线阅读的临时文件",0)
+            end
+            opt.limited_online,opt.online_expires,opt.online_server_only=true,grant.expires,grant.session_only or nil
+            self._limited_cache_root=cache_root(self.store,book,opt)
+            U.remove_tree(self._limited_cache_root)
+        end
+    end
     local cache = cache_new(self.store, book, opt, selected, format)
     transport:restore(cache.manifest.download_transport)
     transport.on_fallback=function()
@@ -1786,12 +1957,19 @@ function Downloader:_book_once(input, opt, progress)
     local failure_map, restricted_map = {}, {}
     local network_failure_streak=0
     local requested_annotations=opt.annotations==true
+    local run_annotations
+    if requested_annotations then
+        -- A stop from an optional comment endpoint must not latch onto the
+        --正文 route. Both routes still share the underlying HTTP limits.
+        local thoughts_route=DownloadTransport.new(self.reader,opt)
+        thoughts_route.checkpoint=respect_reader_priority
+        run_annotations=setmetatable({api=thoughts_route:service(self.api)},{__index=self.annotations})
+    end
     opt.download_run_id=tostring(opt.download_run_id or (os.time().."-"..math.random(100000,999999)))
     local annotation_account_key=DownloadDatabase.account_key(self.store)
     local annotation_suspended=false
     local annotation_error_kind=nil
     local annotation_error_map={}
-    local annotation_recovery_attempted=false
     local function chapter_uid(chapter)
         return tostring(chapter and (chapter.chapterUid or chapter.uid) or "")
     end
@@ -1804,12 +1982,13 @@ function Downloader:_book_once(input, opt, progress)
         annotation_error_kind=annotation_error_kind or (annotation and annotation.error_kind) or "incomplete"
     end
 
-    local function fetch_annotation(chapter,report_progress,native_source)
+    local function fetch_annotation(chapter,report_progress)
         local uid=chapter_uid(chapter)
-        local source_key=annotation_account_key..(native_source and ":eink" or "")
+        local source_key=annotation_account_key..":eink"
         local previous=DownloadDatabase.load_annotation_data(cache.root,uid,source_key,run_annotations)
         if annotation_suspended then
-            local cached=previous or self.annotations:from_cache({book_id=book.bookId,chapter_uid=uid})
+            local cached=previous or {book_id=tostring(book.bookId),chapter_uid=uid,
+                underlines={},review_map={},review_groups={},underline_count=0,thought_count=0}
             cached.complete=false
             cached.review_complete=false
             cached.error_kind=annotation_error_kind or "deferred"
@@ -1847,59 +2026,18 @@ function Downloader:_book_once(input, opt, progress)
                     -- thoughts even if the underline-popularity list is empty.
                     probe_empty_underlines=true})
             if type(fetched)=="table" then
-                for _,message in ipairs(fetched.errors or {}) do propagate_control_error(message) end
-                if fetched.rate_limited==true then error("[MiuReadRateLimit]",0) end
+                for _,message in ipairs(fetched.errors or {}) do propagate_download_stop(message) end
             end
             return fetched
         end
 
         local ok,current=pcall(fetch_once)
-        if not ok then propagate_control_error(current) end
-        if native_source and transport.selected=="web" then return nil,"transport_changed" end
+        if not ok then propagate_download_stop(current) end
         if not ok or type(current)~="table" then
             current={book_id=tostring(book.bookId),chapter_uid=uid,underlines={},review_map={},review_groups={},
                 underline_count=0,thought_count=0,thought_entry_count=0,underline_request_ok=false,
                 review_complete=false,complete=false,error_kind="server",errors={tostring(current)}}
         end
-        if native_source and current.complete~=true then
-            local message=table.concat(current.errors or {},"; ")
-            transport:use_web(message~="" and message or "E-Ink 想法响应不完整")
-            return nil,"transport_changed"
-        end
-        if not native_source and (current.auth_required==true or current.forbidden==true) and not annotation_recovery_attempted
-            and self.reader and type(self.reader._recover_login_session)=="function" then
-            annotation_recovery_attempted=true
-            local recovered,recover_error=self.reader:_recover_login_session()
-            if not recovered then propagate_control_error(recover_error) end
-            logger.info("[MiuRead][Download] annotation login renewal attempted",
-                "renewed=",tostring(recovered),"book=",tostring(book.bookId),
-                "error=",recovered and "" or tostring(recover_error))
-            if recovered then
-                local retry_ok,retry_annotation=pcall(fetch_once)
-                if retry_ok and type(retry_annotation)=="table" then
-                    current=retry_annotation
-                    if current.complete==true or (current.auth_required~=true and current.forbidden~=true) then
-                        logger.info("[MiuRead][Download] annotation access restored after renewal",
-                            "book=",tostring(book.bookId),"chapter=",uid)
-                    else
-                        logger.warn("[MiuRead][Download] annotation access still unavailable after renewal",
-                            "book=",tostring(book.bookId),"chapter=",uid,
-                            "kind=",tostring(current.error_kind or "incomplete"))
-                    end
-                else
-                    propagate_control_error(retry_annotation)
-                    current.errors=current.errors or {}
-                    current.errors[#current.errors+1]=tostring(retry_annotation)
-                    logger.warn("[MiuRead][Download] annotation endpoint retry failed after renewal",
-                        "book=",tostring(book.bookId),"chapter=",uid,
-                        "error=",tostring(retry_annotation))
-                end
-            else
-                current.errors=current.errors or {}
-                current.errors[#current.errors+1]="自动续期失败："..tostring(recover_error)
-            end
-        end
-
         local merged
         if current==previous then
             merged=current
@@ -1910,10 +2048,6 @@ function Downloader:_book_once(input, opt, progress)
         local saved,save_error=DownloadDatabase.save_annotation_data(cache.root,uid,source_key,run_annotations,merged)
         if not saved then error("无法保存批注断点："..tostring(save_error)) end
 
-        if current.auth_required==true then
-            error(table.concat(current.errors or {},"; ")~="" and table.concat(current.errors or {},"; ")
-                or "登录凭证仍不可用 [MiuReadAuth]")
-        end
         if current.forbidden==true then
             annotation_suspended=true
             annotation_error_kind="forbidden"
@@ -2112,6 +2246,10 @@ function Downloader:_book_once(input, opt, progress)
         end
         local uid = tostring(chapter.chapterUid or chapter.uid)
         local entry = cache.manifest.chapters[uid]
+        if entry and transport.eink_only and entry.source_channel~="eink" then
+            cache_reset_entry(cache,uid)
+            entry=nil
+        end
         local body, style, new_assets, coord_body
 
         local refresh_translation=translation_generation and translation_generation.should_refresh(opt.translation_refresh_versions,uid) or false
@@ -2152,6 +2290,11 @@ function Downloader:_book_once(input, opt, progress)
             })
         end
 
+        if entry and entry.content_done and opt.output_format=="txt"
+            and (not entry.text_file or (U.file_size(absolute(cache.root,entry.text_file)) or 0)<=0) then
+            cache_reset_entry(cache,uid)
+            entry=nil
+        end
         if entry and tonumber(entry.content_transform_version or LEGACY_CONTENT_TRANSFORM_VERSION)<CONTENT_TRANSFORM_VERSION then
             logger.info("[MiuRead][Download] refreshing legacy chapter body checkpoint",
                 "chapter=",uid,"old_version=",tostring(entry.content_transform_version or LEGACY_CONTENT_TRANSFORM_VERSION),
@@ -2235,17 +2378,12 @@ function Downloader:_book_once(input, opt, progress)
                 cached_style="完成章节结构无效："..tostring(validation_error)
             end
             logger.warn("[MiuRead][Download] completed checkpoint invalid", "chapter=", uid, "error=", tostring(cached_style))
-            cache_reset_entry(cache, uid)
-            entry = nil
+            -- A failed final XHTML or stylesheet can be rebuilt from its base
+            -- checkpoint. Only the base validation below can require a refetch.
+            entry.complete=false
+            cache_save(cache)
         end
 
-        -- Completed chapters above remain stable. A pending chapter's body
-        -- must match the API route that will supply its annotation coordinates.
-        if entry and entry.content_done and requested_annotations
-            and (entry.source_channel or "web")~=transport.selected then
-            cache_reset_entry(cache,uid)
-            entry=nil
-        end
         if entry and entry.content_done then
             body, style, new_assets, coord_body = cache_load_base(cache, entry)
             if body and cached_translation and not translation_generation.content_ready(body) then
@@ -2266,6 +2404,7 @@ function Downloader:_book_once(input, opt, progress)
             chapters_fetched = chapters_fetched + 1
             progress("content", index, expected, chapter.title)
             local last_activity_at,last_activity_bytes=0,0
+            local last_activity_group
             local function chapter_activity(kind,detail)
                 detail=type(detail)=="table" and detail or {}
                 local now=os.time()
@@ -2273,7 +2412,11 @@ function Downloader:_book_once(input, opt, progress)
                 local heartbeat_seconds=math.max(1,tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_SECONDS) or 3)
                 local heartbeat_bytes=math.max(64*1024,tonumber(Config.DOWNLOAD_TRANSFER_HEARTBEAT_BYTES) or 512*1024)
                 local transport_activity=kind=="transport_download"
-                if not transport_activity and now-last_activity_at<heartbeat_seconds and bytes-last_activity_bytes<heartbeat_bytes then return end
+                local group=kind:find("image",1,true) and "images" or "content"
+                if not transport_activity and group==last_activity_group
+                    and now-last_activity_at<heartbeat_seconds and bytes-last_activity_bytes<heartbeat_bytes then return end
+                if group~=last_activity_group then last_activity_bytes=0 end
+                last_activity_group=group
                 last_activity_at=now
                 last_activity_bytes=math.max(last_activity_bytes,bytes)
                 local channel=detail.channel=="eink" and "E-Ink" or "Web"
@@ -2285,6 +2428,12 @@ function Downloader:_book_once(input, opt, progress)
             local read_options={
                 web_catalog_version=catalog.synckey,
                 images=opt.images,
+                read_online=opt.eink_content_mode=="eink-online",
+                shared_image_root=opt.eink_content_mode=="eink-offline" and not opt.chapter_uid
+                    and cache.root.."/shared-eink-images" or nil,
+                image_repair_requested=opt.prefetch_hidden~=true,
+                limited_online=opt.limited_online==true,
+                online_server_only=opt.online_server_only==true,
                 translation=refresh_translation or cached_translation,
                 require_translation=refresh_translation or cached_translation or uid==tostring(opt.generate_translation_uid or ""),
                 activity=chapter_activity,
@@ -2305,10 +2454,16 @@ function Downloader:_book_once(input, opt, progress)
             local ok, downloaded, downloaded_style, downloaded_assets, state = pcall(read_chapter)
             cache.manifest.download_transport=transport:resume_state()
             if not ok then
-                if tostring(downloaded):find("[MiuReadTranslationContentPending]",1,true) then error(downloaded) end
+                local reason=tostring(downloaded)
+                if reason:find("__MIUREAD_HIBERNATE__",1,true)
+                    or reason:lower():find("download cancelled",1,true) then error(downloaded,0) end
+                if reason:find("[MiuReadTranslationContentPending]",1,true) then error(downloaded) end
                 if Http.is_rate_limit_error(downloaded) then error(downloaded) end
                 if Http.is_auth_error(downloaded) then error(downloaded) end
                 if Http.is_network_error(downloaded) then
+                    if opt.eink_content_mode=="eink-online" and not opt.prefetch_hidden then
+                        return mark_failure(chapter,downloaded)
+                    end
                     network_failure_streak=network_failure_streak+1
                     mark_failure(chapter,downloaded)
                     local threshold=math.max(1,tonumber(Config.DOWNLOAD_NETWORK_FAILURE_BREAKER) or 1)
@@ -2329,7 +2484,19 @@ function Downloader:_book_once(input, opt, progress)
                 end
                 return mark_failure(chapter, downloaded)
             end
+            if transport.eink_only and (not state or state.source_channel~="eink") then
+                return mark_failure(chapter,"E-Ink 未能验证正文来源")
+            end
             network_failure_streak=0
+            if opt.limited_online then
+                local expires=state and tonumber(state.online_expires)
+                if expires and expires>os.time() then
+                    opt.online_expires=math.min(opt.online_expires or expires,expires)
+                    opt.online_server_only=nil
+                elseif not (opt.online_server_only and state.online_server_only==true) then
+                    return mark_failure(chapter,"微信读书未确认本章限时在线授权")
+                end
+            end
             if state then
                 local discovered_version = tonumber(state.book_version
                     or (type(state.book)=="table" and
@@ -2345,8 +2512,11 @@ function Downloader:_book_once(input, opt, progress)
             -- ranges are interpreted only against this immutable chapter body.
             coord_body = type(state) == "table" and tostring(state.coord_html or "") or ""
             if coord_body == "" then coord_body = AnnotationCoord.fromDownloadedXhtml(downloaded) end
-            local cached_source, cache_error
-            if type(state)=="table" and state.coordinate_source_authoritative==false then
+            local cached_source, cache_error, native_source_cached
+            if type(state)=="table" and state.native_progress_raw and transport.eink_only then
+                native_source_cached,cache_error=require("miuread.eink_progress_source").seed(
+                    self.store,book.bookId,uid,state.book_version,state.native_progress_raw)
+            elseif type(state)=="table" and state.coordinate_source_authoritative==false then
                 cache_error="native_source_requires_web_verification"
             else
                 cached_source, cache_error = SourcePosition.cacheChapter(
@@ -2370,7 +2540,7 @@ function Downloader:_book_once(input, opt, progress)
                 done=cached_source==true, version=tonumber(book.version) or 0,
                 error=cached_source==true and nil or tostring(cache_error or "source_cache_write_failed"),
             }
-            if not cached_source then
+            if not cached_source and not native_source_cached then
                 logger.warn("[MiuRead][ProgressSource] download cache seed failed",
                     "book=",tostring(book.bookId),"chapter=",uid,"reason=",tostring(cache_error or "unknown"))
             end
@@ -2397,13 +2567,18 @@ function Downloader:_book_once(input, opt, progress)
         local annotation
         if requested_annotations then
             progress("underlines",index,expected,chapter.title)
-            local changed
-            annotation,changed=fetch_annotation(chapter,function(stage,current_index,total)
+            annotation=fetch_annotation(chapter,function(stage,current_index,total)
                 progress(stage,index,expected,chapter.title,{batch=current_index,batches=total})
-            end,entry.source_channel=="eink")
-            if changed then
-                cache_reset_entry(cache,uid)
-                return process_one(chapter,index,retry_round)
+            end)
+            respect_reader_priority("annotation_apply")
+            progress("annotation_apply",index,expected,chapter.title,{message="正在定位划线与想法"})
+            local extra_css,apply_stats
+            body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body,{native_source=true})
+            if tonumber(apply_stats and apply_stats.dropped or 0)>0 then
+                annotation.complete=false
+                annotation.error_kind=annotation.error_kind or "alignment"
+                annotation.errors=annotation.errors or {}
+                annotation.errors[#annotation.errors+1]="E-Ink 批注位置未能验证"
             end
             local pending=annotation.complete~=true
             entry.annotation_done=not pending
@@ -2419,15 +2594,6 @@ function Downloader:_book_once(input, opt, progress)
                     "kind=",tostring(annotation.error_kind or "incomplete"))
             else
                 annotation_error_map[uid]=nil
-            end
-            local extra_css,apply_stats
-            respect_reader_priority("annotation_apply")
-            progress("annotation_apply",index,expected,chapter.title,{message="正在定位划线与想法"})
-            body,extra_css,apply_stats=self.annotations:apply(body,annotation,coord_body,{native_source=entry.source_channel=="eink"})
-            if entry.source_channel=="eink" and tonumber(apply_stats and apply_stats.dropped or 0)>0 then
-                transport:use_web("E-Ink 批注位置未能验证")
-                cache_reset_entry(cache,uid)
-                return process_one(chapter,index,retry_round)
             end
             entry.annotation_fallback=tonumber(apply_stats and apply_stats.fallback or 0) or 0
             entry.annotation_official=tonumber(apply_stats and apply_stats.official or 0) or 0
@@ -2452,7 +2618,8 @@ function Downloader:_book_once(input, opt, progress)
 
     -- Retry only unresolved items. Successful checkpoints are never fetched
     -- again, and a later success removes the earlier failure state.
-    for retry_round = 1, 2 do
+    local retry_limit=opt.eink_content_mode=="eink-online" and not opt.prefetch_hidden and 1 or 2
+    for retry_round = 1, retry_limit do
         local pending = {}
         for index,chapter in ipairs(selected) do
             local uid=tostring(chapter.chapterUid or chapter.uid)
@@ -2488,6 +2655,9 @@ function Downloader:_book_once(input, opt, progress)
             elseif final_path then
                 append_entry(rebuilt_chapters, rebuilt_assets, rebuilt_css_list, rebuilt_css_seen,
                     entry, {path=final_path}, final_style, final_assets, index, chapter)
+                if opt.output_format=="txt" then
+                    rebuilt_chapters[#rebuilt_chapters].text_path=absolute(cache.root,entry.text_file)
+                end
                 local chapter_images=type(entry.image_summary)=="table" and entry.image_summary or {}
                 rebuilt_images.chapters=rebuilt_images.chapters+1
                 for _,key in ipairs({
@@ -2498,7 +2668,9 @@ function Downloader:_book_once(input, opt, progress)
                     rebuilt_images[key]=rebuilt_images[key]+(tonumber(chapter_images[key]) or 0)
                 end
                 if opt.annotations then
-                    rebuilt_annotations.chapters_ok = rebuilt_annotations.chapters_ok + 1
+                    if entry.annotation_done==true then
+                        rebuilt_annotations.chapters_ok=rebuilt_annotations.chapters_ok+1
+                    end
                     rebuilt_annotations.underlines = rebuilt_annotations.underlines + (tonumber(entry.underlines) or 0)
                     rebuilt_annotations.thoughts = rebuilt_annotations.thoughts + (tonumber(entry.thoughts) or 0)
                     rebuilt_annotations.fallbacks = rebuilt_annotations.fallbacks + (tonumber(entry.annotation_fallback) or 0)
@@ -2658,6 +2830,10 @@ function Downloader:_book_once(input, opt, progress)
     opt.annotation_errors=U.copy(annotation_errors)
     image_summary.assets=#assets
     opt.image_summary=image_summary
+    if opt.eink_content_mode=="eink-online" and opt.chapter_uid and not opt.limited_online then
+        local entry=cache.manifest.chapters[tostring(opt.chapter_uid)]
+        opt.image_repair=entry and entry.image_repair or nil
+    end
 
     local restricted_count=0
     for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
@@ -2667,7 +2843,11 @@ function Downloader:_book_once(input, opt, progress)
     local guard_uid=chapters[#chapters] and chapters[#chapters].uid or nil
     local preview_mode="complete"
 
-    if not preview then
+    if opt.eink_content_mode=="eink-online" and opt.chapter_uid and #failures>0 then
+        error(failures[1].error,0)
+    elseif transport.eink_only and #failures>0 then
+        error(failure_message(failures, accessible_expected, #chapters, true))
+    elseif not preview then
         if #chapters ~= accessible_expected or #failures > 0 then
             error(failure_message(failures, accessible_expected, #chapters, true))
         end
@@ -2720,12 +2900,27 @@ function Downloader:_book_once(input, opt, progress)
             or ("正在生成官方试读版 · "..tostring(readable_count).."/"..tostring(expected).." 章"))) or nil,
     })
 
+    -- The shelf already owns covers. The internal one-chapter EPUB can be
+    -- opened as soon as its正文 and resources are ready.
+    local chapter_cache=opt.eink_content_mode=="eink-online" and opt.chapter_uid~=nil
+    if opt.annotation_pending and existing_download_record
+        and existing_download_record.annotation_pending~=true
+        and existing_download_record.file and U.file_exists(existing_download_record.file) then
+        cache.manifest.annotation_pending=true
+        cache.manifest.annotation_error_kind=opt.annotation_error_kind
+        cache.manifest.annotation_errors=U.copy(opt.annotation_errors or {})
+        cache_save(cache)
+        local existing=U.copy(existing_download_record)
+        existing.kept_existing=true
+        return existing
+    end
+    local cover=self:_cover(book,not chapter_cache)
     local record = self:_save(book, chapters, assets, table.concat(css_list, "\n"),
-        self:_cover(book, true), opt, failures, session, progress)
+        cover, opt, failures, session, progress)
     -- The EPUB has already been installed and safely committed by _save.
     -- Continue Web-source fill IN THIS SAME CHILD WORKER before returning.
     -- Web failures are per-chapter results, not EPUB-installation failures.
-    if record.pending_install~=true and opt.prefetch_hidden~=true
+    if not transport.eink_only and record.pending_install~=true and opt.prefetch_hidden~=true
         and record.access_scope=="full" and record.partial_range~=true
         and opt.chapter_uid==nil and opt.generate_translation_uid==nil then
         local Post=require("miuread.post_install_web")
@@ -2794,11 +2989,16 @@ function Downloader:book(input, opt, progress)
         self._download_transport=nil
     end
     self._download_api=nil
+    if self._limited_cache_root then
+        U.remove_tree(self._limited_cache_root)
+        self._limited_cache_root=nil
+    end
     if self.reader and self.reader._eink_client then
         self.reader._eink_client.before_request=nil
         self.reader._eink_client.keepalive=nil
         self.reader._eink_client=nil
         self.reader._eink_styles=nil
+        self.reader._eink_shared_images=nil
     end
     if self.reader and type(self.reader.cleanup_transient_images)=="function" then
         pcall(self.reader.cleanup_transient_images,self.reader)

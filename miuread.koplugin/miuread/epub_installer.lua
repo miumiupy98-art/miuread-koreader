@@ -60,16 +60,20 @@ local function directory(path)
     return entries,size
 end
 
+local function entry_offset(file,entry)
+    file:seek("set",entry.offset)
+    local header=file:read(30)
+    if not header or #header~=30 or header:sub(1,4)~="PK\003\004" then return nil,"EPUB 本地条目损坏" end
+    return entry.offset+30+le16(header,27)+le16(header,29)
+end
+
 local function read_entry(path,entry)
     if not entry or entry.method~=0 then return nil,"EPUB 元数据条目不是未压缩格式" end
     local file,err=io.open(path,"rb")
     if not file then return nil,err end
-    file:seek("set",entry.offset)
-    local header=file:read(30)
-    if not header or #header~=30 or header:sub(1,4)~="PK\003\004" then file:close(); return nil,"EPUB 本地条目损坏" end
-    local name_length=le16(header,27) or 0
-    local extra_length=le16(header,29) or 0
-    file:seek("cur",name_length+extra_length)
+    local offset,offset_error=entry_offset(file,entry)
+    if not offset then file:close(); return nil,offset_error end
+    file:seek("set",offset)
     local data=file:read(entry.uncompressed)
     file:close()
     if not data or #data~=entry.uncompressed then return nil,"EPUB 元数据读取不完整" end
@@ -136,7 +140,7 @@ local function image_signature_ok(mime,data)
     return mime:match("^image/")~=nil and #data>0
 end
 
-local function validate_resources(path,entries,opt)
+local function validate_resources(path,entries,opt,allow_deferred_images)
     local opf,opf_error=read_entry(path,entries["OEBPS/package.opf"])
     if not opf then return nil,opf_error end
     local manifest={}
@@ -209,7 +213,7 @@ local function validate_resources(path,entries,opt)
     if missing==nil then missing=tonumber(summary.missing or 0) or 0 end
     if external>0 then return nil,"EPUB 正文仍包含网络图片引用；"..table.concat(broken,"；") end
     if #broken>0 then return nil,"EPUB 图片引用或文件无效；"..table.concat(broken,"；") end
-    if missing>0 then return nil,"EPUB 仍有 "..tostring(missing).." 个必需正文图片资源缺失" end
+    if missing>0 and not allow_deferred_images then return nil,"EPUB 仍有 "..tostring(missing).." 个必需正文图片资源缺失" end
     -- Zero final image references is valid for text-only books and for books
     -- whose optional footnote/decorative image markers were converted to text.
     -- The downloader prunes orphan assets before building the OPF; validation
@@ -260,6 +264,80 @@ function Installer.inspect(path)
     return meta,entries
 end
 
+-- Update only marked image references. Stream every unchanged member from the
+-- existing plugin-generated EPUB, preserving spine, paths and text nodes.
+function Installer.repair_online_images(path,output,opt)
+    local meta,entries=Installer.inspect(path)
+    if not meta then return nil,entries end
+    if meta.variant~="online" or meta._chapter_count~=1 or tostring(meta.book_id)~=tostring(opt.book_id)
+        or tostring(((meta.chapters or {})[1] or {}).uid)~=tostring(opt.uid) or not opt.task_id or meta.task_id~=opt.task_id then
+        return nil,"source_changed"
+    end
+    local used, replaced, edited={},{},{}
+    for _,name in ipairs({"OEBPS/text/chapter-0001.xhtml","OEBPS/style.css"}) do
+        if entries[name].uncompressed>4*1024*1024 then return nil,"chapter_markup_too_large" end
+        local raw,err=read_entry(path,entries[name])
+        if not raw then return nil,err end
+        local prefix=name:match("/text/") and "../" or ""
+        edited[name]=raw:gsub(opt.marker_pattern,function(key)
+            local asset=opt.assets[key]
+            if not asset then return nil end
+            used[key]=asset
+            replaced[key]=(replaced[key] or 0)+1
+            return prefix..asset.href
+        end)
+    end
+    if next(used)==nil then return nil,"no_marked_images" end
+    local output_entries,manifest={},{}
+    local recovered_count=0
+    for key,asset in pairs(used) do
+        local name="OEBPS/"..asset.href
+        if entries[name] or not asset.href:match("^images/eink%-repair%-%d+%.[a-z0-9]+$")
+            or not tostring(asset.mime):match("^image/[a-z0-9.+%-]+$") then return nil,"image_entry_collision" end
+        manifest[#manifest+1]='<item id="eink-repair-'..key..'" href="'..asset.href..'" media-type="'..asset.mime..'"/>'
+        output_entries[#output_entries+1]={name=name,source={path=asset.data_path}}
+        recovered_count=recovered_count+replaced[key]
+    end
+    table.sort(manifest)
+    local opf,err=read_entry(path,entries["OEBPS/package.opf"])
+    if not opf then return nil,err end
+    local updated,manifest_count=opf:gsub("</manifest>",table.concat(manifest).."</manifest>",1)
+    if manifest_count~=1 then return nil,"manifest_missing" end
+    edited["OEBPS/package.opf"]=updated
+    local images=meta.images or {}
+    images.required_missing=math.max(0,(tonumber(images.required_missing) or 0)-recovered_count)
+    images.missing=math.max(0,(tonumber(images.missing) or 0)-recovered_count)
+    images.required_localized=(tonumber(images.required_localized) or 0)+recovered_count
+    images.localized=(tonumber(images.localized) or 0)+recovered_count
+    images.assets=(tonumber(images.assets) or 0)+#manifest
+    images.final_referenced=(tonumber(images.final_referenced) or 0)+#manifest
+    meta.images=images
+    meta._chapter_count,meta._file_size=nil,nil
+    edited["OEBPS/miuread.json"]=Json.encode(meta)
+    local file,open_error=io.open(path,"rb")
+    if not file then return nil,open_error end
+    for name,entry in pairs(entries) do
+        local source=edited[name]
+        if not source then
+            local offset=entry_offset(file,entry)
+            if not offset or entry.method~=0 then file:close(); return nil,"invalid_source_entry" end
+            source={path=path,offset=offset,length=entry.uncompressed}
+        end
+        output_entries[#output_entries+1]={name=name,source=source}
+    end
+    file:close()
+    table.sort(output_entries,function(a,b)
+        if a.name=="mimetype" then return b.name~="mimetype" end
+        if b.name=="mimetype" then return false end
+        return a.name<b.name
+    end)
+    require("miuread.epub")._stream_zip(output,output_entries)
+    local valid,validation=Installer.validate(output,{book_id=opt.book_id,variant="online",chapters=meta.chapters})
+    if not valid then os.remove(output); return nil,validation end
+    images.final_referenced=validation._image_references
+    return {remaining=images.required_missing,images=images,used=replaced}
+end
+
 -- Public bounded one-chapter extractor for pre-existing generated MiuRead
 -- EPUBs. No write path, no extraction of the whole archive.
 function Installer.read_chapter_text(path,index,meta,entries)
@@ -278,9 +356,23 @@ function Installer.read_chapter_text(path,index,meta,entries)
     return html,(meta.chapters or {})[index] or {}
 end
 
--- Read generated chapter text one chapter at a time. Translation display
--- inspection must not extract images, rewrite the archive or retain a whole
--- book in memory. Older MiuRead EPUBs use the same stored ZIP entry format.
+-- Resolve a chapter by its source UID, then use the bounded EPUB reader.
+function Installer.read_chapter_text_by_uid(path,book_id,uid)
+    local meta,entries=Installer.inspect(path)
+    if not meta then return nil,entries end
+    if tostring(meta.book_id or "")~=tostring(book_id) then return nil,"epub_book_mismatch" end
+    local selected
+    for index,chapter in ipairs(meta.chapters or {}) do
+        if tostring(chapter.uid or chapter.chapter_uid or "")==tostring(uid) then
+            if selected then return nil,"epub_chapter_repeated" end
+            selected=index
+        end
+    end
+    if not selected then return nil,"epub_chapter_unavailable" end
+    local html,_,err=Installer.read_chapter_text(path,selected,meta,entries)
+    return html,err
+end
+
 function Installer.visit_chapter_text(path, callback)
     local meta, entries = Installer.inspect(path)
     if not meta then return nil, entries end
@@ -307,6 +399,14 @@ end
 
 function Installer.validate(path,opt)
     opt=opt or {}
+    if opt.document_format=="pdf" then return require("miuread.eink_pdf").validate(path,opt) end
+    if opt.document_format=="txt" then
+        local valid,meta=require("miuread.eink_text").validate(path,opt)
+        if not valid then return nil,meta end
+        local same,missing=contains_all(meta.chapters or {},opt.previous_chapters or {})
+        if not same then return nil,"新 TXT 缺少旧版本章节："..tostring(missing) end
+        return true,meta
+    end
     local meta,entries=Installer.inspect(path)
     if not meta then return nil,entries end
     if opt.book_id and tostring(meta.book_id or "")~=tostring(opt.book_id) then return nil,"EPUB 书籍身份不一致" end
@@ -327,7 +427,9 @@ function Installer.validate(path,opt)
         local ok,missing=contains_all(type(meta.chapters)=="table" and meta.chapters or {},previous)
         if not ok then return nil,"新 EPUB 缺少旧版本章节："..tostring(missing) end
     end
-    local resource_stats,resource_error=validate_resources(path,entries,opt)
+    local allow_deferred_images=opt.allow_deferred_online_images==true and opt.variant=="online"
+        and meta.variant=="online" and meta._chapter_count==1
+    local resource_stats,resource_error=validate_resources(path,entries,opt,allow_deferred_images)
     if not resource_stats then return nil,resource_error end
     meta._image_references=resource_stats.references
     meta._image_assets=resource_stats.assets
@@ -360,11 +462,16 @@ local function backup_candidates(target)
     return out
 end
 
-local function recover_backup(target)
+local function recover_backup(target,opt)
     if U.file_exists(target) then return true end
     for _,candidate in ipairs(backup_candidates(target)) do
-        local valid=Installer.inspect(candidate.path)
-        if type(valid)=="table" then
+        local valid
+        if opt and (opt.document_format=="txt" or opt.document_format=="pdf") then
+            local recovery_options=U.copy(opt)
+            recovery_options.document_size=nil
+            valid=Installer.validate(candidate.path,recovery_options)
+        else valid=Installer.inspect(candidate.path) end
+        if valid then
             local restored=os.rename(candidate.path,target)
             if restored then return true end
         end
@@ -378,11 +485,11 @@ end
 
 function Installer.install(source,target,opt)
     opt=opt or {}
-    recover_backup(target)
+    recover_backup(target,opt)
     local valid,meta=Installer.validate(source,opt)
     if not valid then return nil,meta end
     local previous=opt.previous_chapters
-    if U.file_exists(target) then
+    if U.file_exists(target) and opt.document_format~="pdf" then
         local old_meta=Installer.inspect(target)
         if type(old_meta)=="table" and tostring(old_meta.book_id or "")~=tostring(meta.book_id or "") then
             return nil,"目标文件属于另一部书"
@@ -401,7 +508,7 @@ function Installer.install(source,target,opt)
     if U.file_exists(target) then
         backup=unique_backup(target)
         local ok,err=os.rename(target,backup)
-        if not ok then return nil,"无法保护原 EPUB："..tostring(err) end
+        if not ok then return nil,"无法保护原文件："..tostring(err) end
     end
     local installed,mode_or_error=U.move_file_safe(source,target,function(candidate)
         return Installer.validate(candidate,opt)

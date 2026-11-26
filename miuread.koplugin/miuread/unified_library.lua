@@ -265,8 +265,8 @@ local function fanqie_rows()
             local complete, cached_count, total = fanqie_cache_state(download_dir, book)
             if complete then local_count = local_count + 1 end
             -- Logged-in users see their cached remote shelf. After explicit
-            -- logout, only fully cached books remain in “本机”; the old remote
-            -- shelf itself is no longer treated as current account data.
+            -- logout, only fully cached books remain under FanQie. The old
+            -- remote shelf is no longer treated as current account data.
             if logged_in or complete then
                 local row = decorate(book, {
                     source="fanqie", source_id=book.book_id or book.bookId,
@@ -291,6 +291,8 @@ local function fanqie_rows()
 end
 
 local function zlibrary_download_dir()
+    local built_in=require("miuread.zlibrary_source").directory()
+    if lfs.attributes(built_in,"mode")=="directory" then return norm_path(built_in) end
     -- Only classify a directory as Z-Library when the plugin has an explicit
     -- download-directory setting. Its built-in fallback may be KOReader's home
     -- directory; treating that fallback as Z-Library would mislabel unrelated
@@ -385,15 +387,47 @@ local function zlibrary_scan_rows(dir)
     return copies, truncated
 end
 
-local function external_rows()
+local function external_rows(downloads)
     local fanqie, fanqie_state = fanqie_rows()
     local zdir = zlibrary_download_dir()
     local zrows, ztruncated = zlibrary_scan_rows(zdir)
+    local source=require("miuread.zlibrary_source")
+    local built_in=norm_path(source.directory())
+    local identified={}
+    local legacy=downloads==nil and {} or nil
+    for _,row in ipairs(zrows) do
+        if zdir~=built_in then
+            identified[row.file]=row
+        elseif legacy and row.file:match(" %[%d+%]%.[^/]+$") then
+            identified[row.file]=row
+            legacy[row.file]={size=row.size,modified_at=row.modified_at}
+        end
+    end
+    for path, entry in pairs(type(downloads)=="table" and downloads or {}) do
+        if type(entry)=="table" then
+            local book=LocalLibrary.book_from_path(path,{include_cover=false})
+            if book and book.size==entry.size and book.modified_at==entry.modified_at then
+                book.source="zlibrary"
+                identified[path]=decorate(book,{source="zlibrary",local_available=true})
+            else
+                identified[path]=nil
+            end
+        end
+    end
+    zrows={}
+    for _,row in pairs(identified) do zrows[#zrows+1]=row end
+    -- Defer legacy detection if the built-in directory is present but unreadable
+    -- or the scan reached its safety limit. Retry at the next refresh.
+    if legacy and zdir==built_in and (ztruncated or not pcall(function()
+        local _,state=lfs.dir(zdir)
+        if state and state.close then state:close() end
+    end)) then legacy=nil end
     local zinstalled=zdir~="" or PluginLoader:getPluginInstance("zlibrary")~=nil
         or user_plugin_installed("zlibrary.koplugin")
     return {fanqie=fanqie, zlibrary=zrows}, {
         fanqie=fanqie_state,
-        zlibrary={installed=zinstalled, download_dir=zdir, count=#zrows, truncated=ztruncated},
+        zlibrary={installed=zinstalled, download_dir=zdir, count=#zrows, truncated=ztruncated,
+            legacy_downloads=legacy},
     }
 end
 
@@ -405,9 +439,8 @@ function M.build(opts)
 
     local weread_state=tostring(opts.weread_state or "")
     -- An explicit logout must not resurrect a stale remote WeRead shelf from
-    -- a settings/cache recovery. Local generated files are still kept in the
-    -- device view below, but their old remote-shelf flag is not trusted while
-    -- logged out. Auth-expired/recovering sessions may retain cached rows with
+    -- a settings/cache recovery. Downloaded titles stay available in their
+    -- source view, but their old remote-shelf flag is not trusted while logged out. Auth-expired/recovering sessions may retain cached rows with
     -- an explicit source-state label so the user can re-authenticate.
     if weread_state~="logged_out" then
         for _, row in ipairs(type(opts.account) == "table" and opts.account or {}) do
@@ -446,15 +479,33 @@ function M.build(opts)
         end
     end
 
-    local externals, external_state = external_rows()
-    local zdir = norm_path(external_state.zlibrary and external_state.zlibrary.download_dir or "")
+    local externals, external_state = external_rows(opts.zlibrary_downloads)
+    local path_sources={}
+    local fanqie_dirs={}
+    local function remember_paths(rows,source)
+        for _,row in ipairs(type(rows)=="table" and rows or {}) do
+            local path=norm_path(row.file or row.local_path)
+            if path~="" then path_sources[path]=source end
+        end
+    end
+    remember_paths(externals.zlibrary,"zlibrary")
+    remember_paths(externals.fanqie,"fanqie")
+    remember_paths(opts.mp_articles,"wechat_mp")
+    if weread_state~="logged_out" then remember_paths(opts.account,"weread") end
+    remember_paths(opts.generated,"weread")
+    for _,row in ipairs(externals.fanqie or {}) do
+        local path=norm_path(row.fanqie_cache_dir)
+        if path~="" then fanqie_dirs[path]=true end
+    end
+    local files={paths=path_sources,fanqie_dirs=fanqie_dirs}
     for _, row in ipairs(type(opts.local_rows) == "table" and opts.local_rows or {}) do
         if not (row.local_folder == true or row.kind == "folder") then
             local path = norm_path(row.file or row.local_path)
-            local source = row.unified_source or (zdir ~= "" and path_within(path, zdir) and "zlibrary" or "local")
-            local item = decorate(row, {source=source, in_shelf=false, local_available=true})
-            item.in_shelf = is_member(item, membership)
-            put(map, order, item)
+            local source=M.managed_source(files,path)
+            if not source or source=="zlibrary" then
+                local item=decorate(row,{source=source or "local",in_shelf=false,local_available=true})
+                put(map,order,item)
+            end
         end
     end
 
@@ -463,8 +514,10 @@ function M.build(opts)
     -- outside MiuRead's ordinary local-library root. Duplicate file paths merge
     -- back into the same unified record.
     for _, row in ipairs(externals.zlibrary or {}) do
-        row.in_shelf = is_member(row, membership)
-        put(map, order, row)
+        if M.managed_source(files,norm_path(row.file or row.local_path))=="zlibrary" then
+            row.in_shelf = is_member(row, membership)
+            put(map, order, row)
+        end
     end
 
     for _, row in ipairs(type(opts.mp_articles) == "table" and opts.mp_articles or {}) do
@@ -527,33 +580,93 @@ function M.build(opts)
 
     local shelf, device, recent = {}, {}, {}
     local zlibrary_count = 0
+    local indexed_paths={}
     for _, item in ipairs(all) do
-        if item.in_shelf == true then shelf[#shelf + 1] = item end
-        if item.local_available == true then
-            device[#device + 1] = item
-            if canonical_source(item) == "zlibrary" then zlibrary_count = zlibrary_count + 1 end
+        local path=norm_path(item.file or item.local_path)
+        if path~="" then indexed_paths[path]=true end
+        local source=canonical_source(item)
+        if source=="local" then
+            if item.local_available then device[#device+1]=item end
+        elseif item.in_shelf or item.local_available then
+            shelf[#shelf+1]=item
+            if source=="zlibrary" then zlibrary_count=zlibrary_count+1 end
         end
-        if (tonumber(item.last_opened) or 0) > 0 then recent[#recent + 1] = item end
+        if (tonumber(item.last_opened) or 0)>0 then recent[#recent+1]=item end
+    end
+    -- The configured local directory can omit legitimate KOReader history.
+    -- Keep those files in local recents without adding them to the library.
+    for _,row in ipairs(type(opts.recent_local)=="table" and opts.recent_local or {}) do
+        local path=norm_path(row.file or row.local_path)
+        if path~="" and not indexed_paths[path] and not M.managed_source(files,path) and recent_by_file[path] then
+            recent[#recent+1]=decorate(row,{source="local",local_available=true,last_opened=recent_by_file[path]})
+            indexed_paths[path]=true
+        end
     end
     if external_state.zlibrary then external_state.zlibrary.count = zlibrary_count end
-    table.sort(recent, function(a,b) return (tonumber(a.last_opened) or 0) > (tonumber(b.last_opened) or 0) end)
+
+    -- Cloud history augments this view only. A book outside the shelf remains
+    -- outside the shelf, and the local continue-reading card keeps its own data.
+    local recent_by_key={}
+    for index,row in ipairs(recent) do recent_by_key[row.unified_key]=index end
+    for _,remote in ipairs(type(opts.recent_weread)=="table" and opts.recent_weread or {}) do
+        local row=decorate(remote,{source="weread",in_shelf=false,local_available=false})
+        local key=row.unified_key
+        if map[key] then
+            local existing=map[key]
+            local merged=merge_prefer(existing,row)
+            merged.cloud_recent_order=row.cloud_recent_order
+            row=merged
+        end
+        local index=recent_by_key[key]
+        if index then recent[index]=row
+        else
+            recent[#recent+1]=row
+            recent_by_key[key]=#recent
+        end
+    end
+    table.sort(recent,function(a,b)
+        local at,bt=last_opened(a),last_opened(b)
+        if at~=bt then return at>bt end
+        return (tonumber(a.cloud_recent_order) or math.huge)<(tonumber(b.cloud_recent_order) or math.huge)
+    end)
 
     return {
         all=all,
         shelf=shelf,
         device=device,
         recent=recent,
+        files=files,
         external_state=external_state,
     }
 end
 
 local SOURCE_LABELS = {
     all="全部来源", weread="微信读书", fanqie="番茄小说", zlibrary="Z-Library",
-    ["local"]="本地书", wechat_mp="公众号",
+    ["local"]="本地导入", wechat_mp="公众号",
 }
 local TYPE_LABELS = {all="全部内容", book="书籍", article="文章"}
 local LOCAL_LABELS = {all="全部", available="本机已有", remote="尚未下载"}
 local SORT_LABELS = {cloud="云端顺序", recent="最近阅读", added="最近加入", title="书名", author="作者"}
+
+function M.managed_source(files,path)
+    if not files or path=="" then return nil end
+    local source=files.paths[path]
+    if source then return source end
+    if files.fanqie_dirs[path] then return "fanqie" end
+    local dir=path:match("^(.*)/[^/]+$")
+    while dir and dir~="" do
+        if files.fanqie_dirs[dir] then return "fanqie" end
+        dir=dir:match("^(.*)/[^/]+$")
+    end
+end
+
+function M.section_source(section,source)
+    if section=="device" then return "local" end
+    if section=="recent" and (source==nil or source=="all") then return "all" end
+    if source=="weread" or source=="wechat_mp" or source=="fanqie" or source=="zlibrary"
+        or (section=="recent" and source=="local") then return source end
+    return "weread"
+end
 
 function M.source_labels() return SOURCE_LABELS end
 function M.type_labels() return TYPE_LABELS end
@@ -625,6 +738,10 @@ function M.apply(rows, state, mode)
         end
         local av,bv=tonumber(a.last_opened) or 0,tonumber(b.last_opened) or 0
         if av~=bv then return av>bv end
+        if mode=="recent" then
+            local ar,br=tonumber(a.cloud_recent_order) or math.huge,tonumber(b.cloud_recent_order) or math.huge
+            if ar~=br then return ar<br end
+        end
         local aa,ba=tonumber(a.added_at) or 0,tonumber(b.added_at) or 0
         if aa~=ba then return aa>ba end
         return trim(a.title):lower()<trim(b.title):lower()

@@ -114,6 +114,7 @@ local function review_texts(group,yield_check)
             -- Agent and Web may wrap the actual text at different review
             -- depths. Never interpret a nested table as literal comment text.
             local r = page
+            local author = type(rawget(page, "author"))=="table" and rawget(page, "author") or {}
             local review_id = scalar_str(rawget(page, "reviewId") or rawget(page, "id"))
             for _ = 1, 3 do
                 if scalar_str(rawget(r, "content") or rawget(r, "text"))~="" then break end
@@ -122,20 +123,21 @@ local function review_texts(group,yield_check)
                 if review_id == "" then
                     review_id = scalar_str(rawget(nested, "reviewId") or rawget(nested, "id"))
                 end
+                if type(rawget(nested, "author"))=="table" then author=rawget(nested, "author") end
                 r = nested
             end
             local content = scalar_str(rawget(r, "content") or rawget(r, "text"))
             if content == "" then return nil end
-            local author = type(rawget(r, "author")) == "table" and rawget(r, "author") or {}
             local author_name = scalar_str(rawget(author, "nick") or rawget(author, "name") or rawget(r, "authorName"))
             local key = review_id
             if key == "" then key = content .. "\0" .. author_name end
             return {
                 key = key,
                 content = content,
-                abstract = scalar_str(rawget(r, "abstract") or rawget(r, "contextAbstract") or rawget(r, "markText")),
+                abstract = scalar_str(rawget(r, "abstract") or rawget(r, "abs") or rawget(r, "contextAbstract") or rawget(r, "markText")),
                 created = tonumber(rawget(r, "createTime") or rawget(r, "createdAt") or 0) or 0,
                 author = author_name,
+                author_vid = scalar_str(rawget(author,"vid") or rawget(author,"userVid") or rawget(r,"userVid")),
                 likes = tonumber(rawget(page, "likesCount") or rawget(r, "likesCount") or 0) or 0,
                 review_id = review_id,
             }
@@ -153,6 +155,54 @@ end
 
 function Annotations:new(api) return setmetatable({api = api}, self) end
 
+function Annotations:fetch_range(book_id,uid,range,viewer,cursor)
+    local first,last,point=Range.parse(range)
+    if not first or not last or last<=first or point then return nil,"想法范围无效" end
+    local request={range=range,count=5}
+    if cursor and cursor>0 then request.maxIdx=cursor else request.synckey=0 end
+    local batch={request}
+    local ok,payload,_,kind=call_with_retry("readreviews",function()
+        return self.api:readreviews(book_id,uid,batch)
+    end)
+    if not ok then return nil,payload,kind end
+    if (payload.bookId~=nil and tostring(payload.bookId)~=tostring(book_id))
+        or (payload.chapterUid~=nil and tostring(payload.chapterUid)~=tostring(uid))
+        or type(payload.reviews)~="table" then
+        return nil,"想法响应与当前段落不匹配"
+    end
+    local reviews,seen={},{}
+    local ignored,matched,next_cursor=false,false,0
+    for _,group in ipairs(payload.reviews) do
+        if range_key(group)==range then
+            if matched then return nil,"想法响应包含重复段落" end
+            matched=true
+            if group.hasMore==true or tonumber(group.hasMore)==1 then
+                next_cursor=tonumber(group.maxIdx)
+                if not next_cursor or next_cursor<1 or next_cursor%1~=0
+                    or next_cursor>2147483647 or next_cursor<=(cursor or 0) then
+                    return nil,"想法分页位置无效"
+                end
+            end
+            local items,invalid=review_texts(group)
+            ignored=ignored or invalid>0
+            for _,row in ipairs(items) do
+                local key=row.review_id~="" and row.review_id or (row.author.."\0"..row.content)
+                local own=viewer and viewer~="" and viewer==row.author_vid
+                if not own and not seen[key] then
+                    reviews[#reviews+1]=row
+                    seen[key]=true
+                end
+            end
+        else
+            ignored=true
+        end
+    end
+    if (ignored and #reviews==0) or (cursor and cursor>0 and not matched) then
+        return nil,"本次未取得可显示的想法"
+    end
+    return {range=range,texts=reviews,cursor=next_cursor}
+end
+
 function Annotations:fetch_chapter(book_id, uid, progress, options)
     options=type(options)=="table" and options or {}
     local previous=type(options.previous)=="table" and options.previous or nil
@@ -166,7 +216,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
 
     local result={book_id=str(book_id),chapter_uid=str(uid),underlines={},review_map={},review_groups={},
         underline_count=0,thought_count=0,thought_entry_count=0,errors={},underline_request_ok=false,
-        underlines_partial=false,completed_ranges={},pending_ranges={},review_complete=false,complete=false}
+        underlines_partial=false,discovery_limited=false,completed_ranges={},pending_ranges={},review_complete=false,complete=false}
 
     local reuse_pending=previous and options.force_refresh~=true and previous.underline_request_ok==true
         and previous.underlines_partial~=true and #(previous.underlines or {})>0
@@ -174,6 +224,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     if reuse_pending then
         result.underlines=previous.underlines
         result.underline_count=#result.underlines
+        result.discovery_limited=previous.discovery_limited==true
         result.underline_request_ok=true
         progress("underlines",result.underline_count,result.underline_count,"继续未完成的想法")
     else
@@ -211,78 +262,26 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         local key=range_key(row)
         if key~="" and not active_seen[key] then active_seen[key]=true; active_ranges[#active_ranges+1]=key end
     end
-    if #active_ranges==0 then
-        -- A successful, empty /book/underlines reply is not proof that the
-        -- chapter has no public thoughts. This is particularly relevant to
-        -- user-imported books, where public thoughts may exist without
-        -- underline popularity ranges. Probe the bounded chapter feed only
-        -- for user-requested notes/comment work, never ordinary reading.
-        if options.probe_empty_underlines==true
-            and type(self.api.chapter_public_reviews)=="function" then
-            progress("thoughts",0,1,"检查章节公开想法")
-            local ok,feed=pcall(self.api.chapter_public_reviews,self.api,book_id,uid)
-            result.public_feed_probed=true
-            if ok and type(feed)=="table" then
-                local rows=array_from(feed,{"reviews","updated","list"})
-                if #rows==0 and type(feed.data)=="table" then
-                    rows=array_from(feed.data,{"reviews","updated","list"})
-                end
-                local grouped,order={},{}
-                for _,row in ipairs(rows) do
-                    if type(row)=="table" then
-                        local nested=type(row.review)=="table" and row.review or row
-                        local key=range_key(nested)
-                        if key=="" then key=range_key(row) end
-                        if key~="" then
-                            local feed_group=(type(row.pageReviews)=="table"
-                                or type(row.reviews)=="table" or type(row.updated)=="table")
-                                and row or {pageReviews={row}}
-                            local texts=review_texts(feed_group)
-                            if #texts>0 then
-                                if not grouped[key] then
-                                    grouped[key]={range=key,texts={},seen={}}
-                                    order[#order+1]=key
-                                end
-                                local group=grouped[key]
-                                for _,item in ipairs(texts) do
-                                    local id=tostring(item.review_id or "")
-                                    if id=="" then id=tostring(item.content or "").."\0"..tostring(item.author or "") end
-                                    if not group.seen[id] then
-                                        group.seen[id]=true
-                                        group.texts[#group.texts+1]=item
-                                        result.thought_entry_count=result.thought_entry_count+1
-                                    end
-                                end
-                            end
-                        end
+    if #active_ranges==0 and options.probe_empty_underlines==true then
+        -- Best bookmarks supply a bounded set of source ranges. The actual
+        -- replies to each range are still retrieved by the E-Ink read RPC.
+        result.discovery_limited=true
+        if type(self.api.best_bookmarks)=="function" then
+            progress("thoughts",0,1,"查找本章热门划线")
+            local ok,marks=pcall(self.api.best_bookmarks,self.api,book_id)
+            if ok and type(marks)=="table" then
+                for _,row in ipairs(marks.rows or {}) do
+                    if row.chapter_uid==result.chapter_uid and not active_seen[row.range] then
+                        active_seen[row.range]=true
+                        active_ranges[#active_ranges+1]=row.range
+                        result.underlines[#result.underlines+1]={range=row.range,markText=row.text}
                     end
                 end
-                table.sort(order)
-                for _,key in ipairs(order) do
-                    local group=grouped[key]
-                    result.underlines[#result.underlines+1]={range=key}
-                    result.review_map[key]=group.texts
-                    result.review_groups[#result.review_groups+1]={range=key,texts=group.texts}
-                end
                 result.underline_count=#result.underlines
-                result.thought_count=#result.review_groups
-                result.public_feed_found=result.thought_entry_count
-                logger.info("[MiuRead][Comments] no-underline chapter feed",
-                    "book=",result.book_id,"chapter=",result.chapter_uid,
-                    "feed_rows=",#rows,"thoughts=",result.thought_entry_count)
             else
-                -- The supplemental feed is optional. A failed probe must not
-                -- fail a valid text download or overwrite existing thoughts.
-                result.public_feed_error=ok and "invalid_response" or U.first_line(tostring(feed),100)
-                logger.warn("[MiuRead][Comments] no-underline chapter feed unavailable",
-                    "book=",result.book_id,"chapter=",result.chapter_uid,
-                    "reason=",result.public_feed_error)
+                result.errors[#result.errors+1]=U.first_line(tostring(marks),120)
             end
-            progress("thoughts",1,1,"章节公开想法检查完成")
         end
-        result.review_complete=true
-        result.complete=result.underline_request_ok and result.underlines_partial~=true
-        return result
     end
 
     local target_ranges={}
@@ -296,11 +295,16 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
     end
     if #target_ranges==0 then
         result.review_complete=true
-        result.complete=result.underline_request_ok and result.underlines_partial~=true
+        result.complete=result.underline_request_ok and result.underlines_partial~=true and not result.discovery_limited
         return result
     end
 
     local batches=self.api:review_batches(target_ranges,30)
+    if result.discovery_limited then
+        for _,batch in ipairs(batches) do
+            for _,item in ipairs(batch) do item.count=5; item.maxIdx=nil end
+        end
+    end
     local completed,pending={},{}
     local review_map={}
     local group_count,entry_count,invalid_review_count=0,0,0
@@ -359,7 +363,7 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         table.sort(result.completed_ranges)
         table.sort(result.pending_ranges)
         result.review_complete=#result.pending_ranges==0
-        result.complete=result.underline_request_ok and result.underlines_partial~=true and result.review_complete
+        result.complete=result.underline_request_ok and result.underlines_partial~=true and not result.discovery_limited and result.review_complete
         result.invalid_review_count=invalid_review_count
     end
     local function save_checkpoint()
@@ -467,76 +471,6 @@ function Annotations:fetch_chapter(book_id, uid, progress, options)
         progress("thoughts",index,#batches,"")
         local _,stop=fetch_adaptive(batch,"thoughts batch "..tostring(index),0)
         if stop then break end
-    end
-
-    -- An independent Web chapter feed can reveal public thoughts even when
-    -- every underline-range response was empty. Use it only as a bounded
-    -- *positive evidence* source. An empty feed cannot prove no comments.
-    -- This path is read-only: it does not modify the EPUB.
-    if entry_count==0 and #active_ranges>0 and type(self.api.chapter_public_reviews)=="function" then
-        local feed_ok,feed=pcall(self.api.chapter_public_reviews,self.api,book_id,uid)
-        if feed_ok and type(feed)=="table" then
-            local feed_rows=array_from(feed,{"reviews","updated","list"})
-            if #feed_rows==0 and type(feed.data)=="table" then
-                feed_rows=array_from(feed.data,{"reviews","updated","list"})
-            end
-            local found,invalid_feed={},0
-            for _,row in ipairs(feed_rows) do
-                if type(row)=="table" then
-                    local nested=type(row.review)=="table" and row.review or row
-                    local key=range_key(nested)
-                    if key=="" then key=range_key(row) end
-                    if key~="" then
-                        found[key]=found[key] or {}
-                        found[key][#found[key]+1]=row
-                    else
-                        invalid_feed=invalid_feed+1
-                    end
-                else
-                    invalid_feed=invalid_feed+1
-                end
-            end
-            local recovered=0
-            for key,entries in pairs(found) do
-                local texts=review_texts({pageReviews=entries})
-                if #texts>0 then
-                    if not active_seen[key] then
-                        -- A thought range can be absent from underline listings;
-                        -- retain it as a separately located public-thought anchor.
-                        active_seen[key]=true
-                        result.underlines[#result.underlines+1]={range=key}
-                    end
-                    if not review_map[key] then review_map[key]={};group_count=group_count+1 end
-                    local already={}
-                    for _,item in ipairs(review_map[key]) do
-                        already[tostring(item.review_id or item.content or "")]=true
-                    end
-                    for _,item in ipairs(texts) do
-                        local unique=tostring(item.review_id or item.content or "")
-                        if not already[unique] then
-                            already[unique]=true
-                            review_map[key][#review_map[key]+1]=item
-                            entry_count=entry_count+1
-                            recovered=recovered+1
-                        end
-                    end
-                end
-            end
-            logger.info("[MiuRead][Comments] chapter public feed", "book=",result.book_id,
-                "chapter=",result.chapter_uid,"rows=",#feed_rows,
-                "recovered=",recovered,"missing_range=",invalid_feed)
-            if recovered>0 then
-                -- The chapter feed is a limited discovery source: some other
-                -- range reviews may still be missing. Do not claim full sync.
-                -- A positive chapter feed is useful supplemental content.
-                -- It does not invalidate already completed normal batches.
-            end
-        else
-            local reason=feed_ok and "invalid_response" or tostring(feed)
-            logger.warn("[MiuRead][Comments] chapter public feed unavailable",
-                "book=",result.book_id,"chapter=",result.chapter_uid,
-                "reason=",U.first_line(reason,100))
-        end
     end
 
     rebuild_state()
@@ -1070,7 +1004,8 @@ function Annotations:to_cache(data)
         schema=1,book_id=str(data.book_id),chapter_uid=str(data.chapter_uid),underlines=underlines,
         review_groups=cached_groups(data.review_groups),completed_ranges=data.completed_ranges or {},
         pending_ranges=data.pending_ranges or {},underline_request_ok=data.underline_request_ok==true,
-        underlines_partial=data.underlines_partial==true,review_complete=data.review_complete==true,
+        underlines_partial=data.underlines_partial==true,discovery_limited=data.discovery_limited==true,
+        review_complete=data.review_complete==true,
         complete=data.complete==true,error_kind=data.error_kind,
     }
 end
@@ -1089,7 +1024,8 @@ function Annotations:from_cache(value)
         review_map=map,review_groups=groups,underline_count=#underlines,thought_count=group_count,
         thought_entry_count=entry_count,errors={},completed_ranges=value.completed_ranges or {},
         pending_ranges=value.pending_ranges or {},underline_request_ok=value.underline_request_ok==true,
-        underlines_partial=value.underlines_partial==true,review_complete=value.review_complete==true,
+        underlines_partial=value.underlines_partial==true,discovery_limited=value.discovery_limited==true,
+        review_complete=value.review_complete==true,
         complete=value.complete==true,error_kind=value.error_kind,
         cached=true}
 end
@@ -1191,7 +1127,7 @@ function Annotations:merge(previous,current)
     end
     current.underline_count=#(current.underlines or {})
     current.review_complete=#(current.pending_ranges or {})==0
-    current.complete=current.underline_request_ok and current.underlines_partial~=true and current.review_complete
+    current.complete=current.underline_request_ok and current.underlines_partial~=true and not current.discovery_limited and current.review_complete
     return current
 end
 

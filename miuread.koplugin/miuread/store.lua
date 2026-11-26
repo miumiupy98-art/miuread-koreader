@@ -39,7 +39,7 @@ local defaults={
              annotations={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
              read_report={state="unknown",checked_at=0,error="",code="",failures=0,retry_at=0},
          }}},
- preferences={api_transport="auto",images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={},archive_keys={}},shelf_group_hint={accounts={}},home_ui={enabled=false,layout_version=24,layout_style="desk",header_visible=true,header_items={title=true,account=true,wifi=true,bluetooth=true,sync=true,battery=true,tools=true},show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",lockscreen_provider="native",lockscreen_pending_provider="",lockscreen_dash_source="",lockscreen_native_snapshot={},page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="all",kind="all",locality="all",sort="cloud"},device={source="all",kind="all",locality="all",sort="recent"}},weread_group="all",action_items={refresh=true,search=false,downloads=true,sync=true,sleep=true,miuread_settings=true,all_books=false,history=false,file_manager=false,screenshot=false,extensions=false},action_order={"refresh","bookstore","search","downloads","sync","sleep","miuread_settings","all_books","history","file_manager","screenshot","extensions"},action_layout_version=7,panel_items={wifi=true,bluetooth=false,rotate=true,mp=true,screenshot=false,full_refresh=true,downloads=false,sync=false,miuread_settings=false,koreader_settings=true,koreader_file_manager=false,return_koreader=true,quit=false,restart=true,sleep=true,reboot=false,poweroff=false},panel_order={"wifi","bluetooth","rotate","mp","screenshot","full_refresh","downloads","sync","miuread_settings","koreader_settings","koreader_file_manager","return_koreader","quit","restart","sleep","reboot","poweroff"},panel_layout_version=7,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=11,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true,sync=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought","sync"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,online_likes=false,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,time_eink_only=false,time_route_mode="legacy",progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,auto_latest_position=true,fast_local_fallback=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
+ preferences={api_transport="auto",images=true,mp_images=false,shelf_covers=true,download_keep_awake=true,download_notice_enabled=false,download_complete_notice=true,download_reader_warning=true,download_reader_policy="ask",chapter_prefetch_enabled=true,chapter_continuous_enabled=true,download_dir="",shelf_section="account",account_shelf_kind="books",shelf_filter={enabled=false,archives={},archive_keys={}},shelf_group_hint={accounts={}},home_ui={enabled=false,layout_version=24,layout_style="desk",header_visible=true,header_items={title=true,account=true,wifi=true,bluetooth=true,battery=true,tools=true},show_weread_stats=true,show_local_stats=true,display_size="standard",ui_font_mode="default",ui_font_face="",local_entry_root="",local_entry_version=1,local_browse_version=3,lockscreen_style="frame",lockscreen_last_native_style="frame",lockscreen_provider="native",lockscreen_pending_provider="",lockscreen_dash_source="",lockscreen_native_snapshot={},page_by_section={},source_order={"shelf","device","recent"},visible_sections={shelf=true,device=true,recent=true},library_layout_version=1,library_membership={},library_filters={shelf={source="weread",kind="all",locality="all",sort="cloud"},device={source="local",kind="all",locality="all",sort="recent"},recent={source="weread",kind="all",locality="all",sort="recent"}},weread_group="all",panel_items={wifi=true,full_refresh=true,sleep=true,return_koreader=true,power=true,bluetooth=false,rotate=false,screenshot=false},panel_order={"wifi","full_refresh","sleep","return_koreader","power","bluetooth","rotate","screenshot"},panel_layout_version=9,more_expanded=false,network_metadata_user_set=false,network_metadata=true},reader_ui={enabled=true,plugin_mode_enabled=false,show_title=false,show_status=false,show_recent=false,recent_actions={},edge_guard_enabled=true,edge_guard_percent=15,quick_layout_version=12,quick_items={toc=true,progress=true,search=true,back=true,font=true,spacing=true,page=true,comments=true,bookmark=true,highlight=true,thought=true},quick_order={"toc","progress","search","back","font","spacing","page","comments","bookmark","highlight","thought"}},notices={reader_download=true,low_battery=true,low_storage=true,full_refresh=true,lockscreen=true,mode_switch=true,mode_environment=true},mode_intro={pending_mode="plugin",pending_reason="first_install",last_confirmed_mode="",confirmed_at=0},memory_mode={enabled=false,previous_known=false,previous_ratio=false},performance_mode={enabled=false,auto_detect=true,last_prompt_at=0,reminders_disabled=false},time_display={mode="device",zone="Asia/Shanghai",offset_minutes=480},thoughts={enabled=true,online_likes=false,font_size=22,font_face="",follow_body_font=false,width_ratio=0.90,height_ratio=0.55,display_mode="native_compact_rounded"},annotation_sync={enabled=false,review_visibility="private",highlight_style=1,highlight_color=0,close_upload_enabled=true},update={manifest=Config.UPDATE_MANIFEST,auto_check=true,interval=Config.AUTO_UPDATE_INTERVAL,last_attempt_at=0,last_success_at=0,last_prompted_version="",restart_mode="ask"},sync={time_enabled=true,time_eink_only=false,time_route_mode="legacy",progress_enabled=true,progress_mode="close",success_notice_enabled=false,error_notice_enabled=true,manual_only=false,auto_upload=false,pull_on_open=true,auto_latest_position=true,fast_local_fallback=true,check_resume=false,require_verified=false,interval=Config.READ_INTERVAL,idle_timeout=Config.IDLE_TIMEOUT,threshold=Config.REMOTE_THRESHOLD,resume_after=300}},
  library={},sessions={},shelf_cache={raw_books={},raw_mp={},books={},mp={},groups={updated_at=0,authoritative=false,list={},book_groups={}},effective_scope={mode="all",fingerprint="all",updated_at=0},updated_at=0,stream={enabled=false,ids={},hydrated_ids={},total=0,source="",updated_at=0}},cover_index={},cover_guard={active=false,started_at=0,stage="",version=""},update_state={},
  pending_installs={},last_cleanup_result={},read_report_consumed={},recent_reads={version=1,items={}},
  prefetch_cache={},finished_status={},
@@ -537,6 +537,7 @@ function Store:new(options)
         temp_dir=data.."/temp",
         updates_dir=data.."/updates",
         prefetch_dir=data.."/prefetch",
+        limited_online_dir=data:match("^/mnt/us/") and "/tmp/miuread-limited-online" or nil,
         settings_path=settings_path,
         settings_backup_path=settings_backup_path,
         download_database_path=DownloadDatabase.runtime_path(data),
@@ -1161,7 +1162,7 @@ function Store:migrate()
             local current=self:preferences()
             current.home_ui=type(current.home_ui)=="table" and current.home_ui or {}
             local home=current.home_ui
-            local map={account="shelf",generated="device",["local"]="device",mp="shelf"}
+            local map={account="shelf",generated="shelf",["local"]="device",mp="shelf"}
             home.active_section=map[home.active_section] or home.active_section
             if home.active_section~="shelf" and home.active_section~="device" and home.active_section~="recent" then
                 home.active_section="shelf"
@@ -1589,7 +1590,7 @@ local function same_login_cookies(a,b)
 end
 local function same_native_shelf_credentials(a,b)
     a=type(a)=="table" and a or {}; b=type(b)=="table" and b or {}
-    for _,key in ipairs({"vid","accessToken","refreshToken","deviceId"}) do
+    for _,key in ipairs({"vid","accessToken","refreshToken","deviceId","installId"}) do
         if tostring(a[key] or "")~=tostring(b[key] or "") then return false end
     end
     return true
@@ -1705,9 +1706,15 @@ function Store:prefetch_root(id)
     if id==nil then return self.prefetch_dir end
     local path=self:prefetch_book_path(id); U.mkdir(path); return path
 end
-function Store:hidden_prefetch_path(id,uid,kind)
+function Store:hidden_prefetch_path(id,uid,kind,format)
     local dir=self:prefetch_root(id)
-    return dir.."/"..U.id_name(uid).."-"..U.safe_name(kind or "clean","clean")..".epub"
+    return dir.."/"..U.id_name(uid).."-"..U.safe_name(kind or "clean","clean")..(format=="txt" and ".txt" or ".epub")
+end
+function Store:limited_online_path(id,uid,format)
+    if not self.limited_online_dir then return nil end
+    local book=U.id_name(id)
+    if book=="." or book==".." then return nil end
+    return self.limited_online_dir.."/"..book.."/"..U.id_name(uid).."-online"..(format=="txt" and ".txt" or ".epub")
 end
 function Store:book_cache_path(id) return self.cache_books_dir.."/"..U.id_name(id) end
 function Store:mp_account_dir(id)
@@ -1895,18 +1902,11 @@ function Store:save_hidden_prefetch(id,uid,kind,record)
     local book_id,chapter_uid,variant=tostring(id),tostring(uid),tostring(kind)
     if book_id=="" or chapter_uid=="" or variant=="" or type(record)~="table" then return nil,"invalid prefetch record" end
     local all=self:get("prefetch_cache",{})
-    local old=type(all[book_id])=="table" and all[book_id] or {}
-    -- One passive next-chapter artifact per book. This bounds storage and also
-    -- prevents two automatic generations from racing after a chapter switch.
-    for old_uid,row in pairs(old) do
-        for old_kind,old_record in pairs(type(row)=="table" and row or {}) do
-            if old_uid~=chapter_uid or old_kind~=variant then
-                local old_file=type(old_record)=="table" and tostring(old_record.file or "") or ""
-                if old_file~="" and U.file_exists(old_file) then U.remove_tree(old_file) end
-            end
-        end
-    end
-    all[book_id]={[chapter_uid]={[variant]=U.copy(record)}}
+    local book=type(all[book_id])=="table" and all[book_id] or {}
+    local row=type(book[chapter_uid])=="table" and book[chapter_uid] or {}
+    row[variant]=U.copy(record)
+    book[chapter_uid]=row
+    all[book_id]=book
     return self:set("prefetch_cache",all)
 end
 function Store:forget_hidden_prefetch(id,uid,kind,remove_file)
@@ -1942,17 +1942,13 @@ function Store:hidden_prefetch_entries(id)
     end
     return out
 end
-function Store:prune_hidden_prefetch(ttl)
-    ttl=math.max(60,tonumber(ttl) or tonumber(Config.CHAPTER_PREFETCH_TTL) or 86400)
-    local now=os.time(); local all=self:get("prefetch_cache",{}); local changed=false; local removed=0
+function Store:prune_hidden_prefetch()
+    local all=self:get("prefetch_cache",{}); local changed=false; local removed=0
     for book_id,book in pairs(all) do
         for uid,row in pairs(type(book)=="table" and book or {}) do
             for kind,record in pairs(type(row)=="table" and row or {}) do
                 local file=type(record)=="table" and tostring(record.file or "") or ""
-                local created=tonumber(type(record)=="table" and (record.prefetch_at or record.downloaded_at) or 0) or 0
-                local stale=created>0 and now-created>ttl
-                if file=="" or not U.file_exists(file) or stale then
-                    if stale and file~="" and U.file_exists(file) then U.remove_tree(file) end
+                if file=="" or not U.file_exists(file) then
                     row[kind]=nil; removed=removed+1; changed=true
                 end
             end
@@ -2451,6 +2447,11 @@ function Store:file_record_from_identity(path,meta,relink)
     end
     local chapters=type(meta.chapters)=="table" and meta.chapters or {}
     local standalone=meta.standalone==true
+    if standalone and self.prefetch_dir
+        and normalize_path(path):sub(1,#self.prefetch_dir+1)==self.prefetch_dir.."/"
+        and path:match("%-online%.epub$") then
+        kind="online"
+    end
     local uid=tostring(meta.chapter_uid or ((chapters[1] and (chapters[1].uid or chapters[1].chapter_uid)) or ""))
     local book=all[id]
     if kind=="" and book then
@@ -2517,6 +2518,11 @@ function Store:file_record_from_identity(path,meta,relink)
         all[id]=book
     end
     if record then
+        if (type(meta.online_expires)=="number" or meta.online_server_only==true) and type(meta.online_login)=="string"
+            and self.limited_online_dir and normalize_path(path)==self:limited_online_path(id,uid,meta.document_format) then
+            record.online_expires,record.online_login=meta.online_expires,meta.online_login
+            record.online_server_only=meta.online_server_only==true or nil
+        end
         if meta.progress_source_complete~=nil then
             record.progress_source_complete=meta.progress_source_complete==true
         end
@@ -2947,11 +2953,13 @@ local function progress_session_sequence(row)
     row=type(row)=="table" and row or {}
     local pending=type(row.pending_progress)=="table" and row.pending_progress or {}
     local coordinate=type(row.pending_progress_coordinate)=="table" and row.pending_progress_coordinate or {}
+    local unresolved=type(row.pending_unresolved_position)=="table" and row.pending_unresolved_position or {}
     return math.max(
         tonumber(row.progress_latest_sequence or 0) or 0,
         tonumber(row.progress_verified_sequence or 0) or 0,
         tonumber(pending.progress_sequence or 0) or 0,
-        tonumber(coordinate.progress_sequence or 0) or 0
+        tonumber(coordinate.progress_sequence or 0) or 0,
+        tonumber(unresolved.progress_sequence or 0) or 0
     )
 end
 
@@ -2970,15 +2978,18 @@ end
 
 local function progress_session_rank(row)
     row=type(row)=="table" and row or {}
-    local pending=type(row.pending_progress)=="table" and row.pending_progress or nil
-    local pending_seq=pending and (tonumber(pending.progress_sequence or 0) or 0) or 0
-    local verified_seq=tonumber(row.progress_verified_sequence or 0) or 0
-    -- For the same sequence, a verified state is terminal and must always beat
-    -- an older Home copy that still says pending/uploading, even if that stale
-    -- copy happened to save another preference a few seconds later.
-    if verified_seq>0 and verified_seq>=pending_seq then return 3 end
-    if pending_seq>verified_seq then return 2 end
-    return 1
+    local latest=progress_session_sequence(row)
+    if latest==0 then return 0 end
+    -- A receipt for the preceding reading event cannot outrank recovery of
+    -- the current one. Rank only records belonging to this sequence.
+    if tonumber(row.progress_verified_sequence)==latest then return 4 end
+    local pending=row.pending_progress
+    if type(pending)=="table" and tonumber(pending.progress_sequence)==latest then return 3 end
+    local coordinate=row.pending_progress_coordinate
+    if type(coordinate)=="table" and tonumber(coordinate.progress_sequence)==latest then return 2 end
+    local unresolved=row.pending_unresolved_position
+    if type(unresolved)=="table" and tonumber(unresolved.progress_sequence)==latest then return 1 end
+    return 0
 end
 
 local function merge_newer_progress_sessions(memory_sessions,disk_sessions)

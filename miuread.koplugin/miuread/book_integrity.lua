@@ -193,7 +193,9 @@ end
 local function partial_manifest_pending(manifest, has_record)
     if type(manifest)~="table" then return false end
     if manifest.final_repair_required==true then return true end
-    if DownloadResult.annotation_pending(manifest) then return true end
+    -- Native download checkpoints can retain optional public thoughts without
+    -- making the finished book a repair task.
+    if manifest.content_account==nil and DownloadResult.annotation_pending(manifest) then return true end
     for _,entry in pairs(type(manifest.chapters)=="table" and manifest.chapters or {}) do
         if type(entry)=="table" and (entry.complete~=true or tostring(entry.error or "")~="") then return true end
     end
@@ -358,7 +360,20 @@ function M.inspect(store,book_id,record)
         out.error="已下载文件不存在"
         return out
     end
-    local meta,inspect_error=EpubInstaller.inspect(file)
+    if record.document_format=="pdf" then
+        local valid,value=EpubInstaller.validate(file,{document_format="pdf",document_size=record.file_size})
+        out.file_ok=valid==true
+        if not valid then out.repair_kind,out.error="content",value end
+        return out
+    end
+    local meta,inspect_error
+    if record.document_format=="txt" then
+        local valid,value=EpubInstaller.validate(file,{book_id=book_id,variant=record.variant,
+            document_format="txt",text_size=record.text_size,chapters=record.chapter_map})
+        if valid then meta=value else inspect_error=value end
+    else
+        meta,inspect_error=EpubInstaller.inspect(file)
+    end
     if not meta then
         out.repair_kind="content"
         out.error=tostring(inspect_error or "EPUB 完整性检查失败")

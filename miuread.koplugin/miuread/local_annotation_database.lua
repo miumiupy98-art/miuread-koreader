@@ -5,7 +5,7 @@ local logger = require("logger")
 
 local LocalAnnotationDatabase = {}
 
-LocalAnnotationDatabase.SCHEMA_VERSION = 6
+LocalAnnotationDatabase.SCHEMA_VERSION = 7
 LocalAnnotationDatabase.FILE_NAME = "local_annotations.sqlite3"
 
 local function database_path(store, book_id)
@@ -50,6 +50,7 @@ local function initialize(conn)
             coord_source TEXT NOT NULL DEFAULT '',
             coord_verify TEXT NOT NULL DEFAULT '',
             sync_kind TEXT NOT NULL DEFAULT '',
+            synced_note TEXT,
             created_at INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL DEFAULT 0
         );
@@ -70,7 +71,12 @@ local function initialize(conn)
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN coord_verify TEXT NOT NULL DEFAULT '';")
     safe_alter(conn, "ALTER TABLE local_annotations ADD COLUMN sync_kind TEXT NOT NULL DEFAULT '';")
 
-    if previous < LocalAnnotationDatabase.SCHEMA_VERSION then
+    if previous < 7 then
+        safe_alter(conn,"ALTER TABLE local_annotations ADD COLUMN synced_note TEXT;")
+        conn:exec([[UPDATE local_annotations SET synced_note=note
+            WHERE sync_state='synced' AND (kind='thought' OR sync_kind='thought');]])
+    end
+    if previous < 6 then
         -- Re-evaluate old local-only failures once after upgrading. This lets a
         -- newer locator recover beta-era bookmark/highlight failures, but once
         -- the current version has tried them they stay actionable instead of
@@ -100,7 +106,16 @@ end
 
 local function open(store, book_id, read_only)
     local conn = SQLiteStore.open(database_path(store, book_id), read_only == true)
-    if read_only ~= true then initialize(conn) end
+    if read_only==true then
+        local version=tonumber(SQLiteStore.get_text(conn,"local_annotation_schema_version")) or 0
+        if version<LocalAnnotationDatabase.SCHEMA_VERSION then
+            conn:close()
+            conn=SQLiteStore.open(database_path(store,book_id),false)
+            initialize(conn)
+        end
+    else
+        initialize(conn)
+    end
     return conn
 end
 
@@ -147,6 +162,11 @@ local function stable_id(book_id, item, kind)
             .. "\31" .. scalar(item.note)
     end
     return "miu:" .. Digests.md5(base):lower()
+end
+
+function LocalAnnotationDatabase.annotation_id(book_id, item)
+    local kind=LocalAnnotationDatabase.annotation_kind(item)
+    if kind then return stable_id(book_id,item,kind) end
 end
 
 local function compact(book_id, item, source_path, resolver)
@@ -209,9 +229,11 @@ function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_pa
         return SQLiteStore.transaction(conn, function()
             local now = os.time()
             local mark_missing = conn:prepare([[
-                UPDATE local_annotations SET present = 0, updated_at = ? WHERE book_id = ?
+                UPDATE local_annotations SET present = 0, updated_at = ?
+                 WHERE book_id = ? AND source_path = ? AND present = 1
             ]])
-            mark_missing:bind(now, book_id):step()
+            -- Other chapter documents and the whole-book file have their own sidecars.
+            mark_missing:bind(now, book_id, tostring(source_path or "")):step()
             mark_missing:close()
 
             local insert = conn:prepare([[
@@ -230,6 +252,9 @@ function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_pa
                        context_before = CASE WHEN ? <> '' THEN ? ELSE context_before END,
                        context_after = CASE WHEN ? <> '' THEN ? ELSE context_after END,
                        anchor_text = CASE WHEN ? <> '' THEN ? ELSE anchor_text END,
+                       sync_state = CASE WHEN sync_state = 'synced' AND remote_id <> ''
+                           AND (sync_kind = 'thought' OR (sync_kind = '' AND kind = 'thought'))
+                           AND ? = 'thought' AND note <> ? THEN 'local_only' ELSE sync_state END,
                        note = ?, datetime = ?, drawer = ?, source_path = ?,
                        chapter_uid = CASE WHEN ? <> '' THEN ? ELSE chapter_uid END,
                        chapter_idx = COALESCE(?, chapter_idx),
@@ -256,7 +281,7 @@ function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_pa
                         row.context_before, row.context_before,
                         row.context_after, row.context_after,
                         row.anchor_text, row.anchor_text,
-                        row.note, row.datetime, row.drawer, row.source_path,
+                        row.kind, row.note, row.note, row.datetime, row.drawer, row.source_path,
                         row.chapter_uid, row.chapter_uid, row.chapter_idx,
                         now, row.local_id
                     ):step()
@@ -279,7 +304,8 @@ function LocalAnnotationDatabase.snapshot(store, book_id, annotations, source_pa
                 UPDATE local_annotations
                    SET sync_state = 'delete_pending'
                  WHERE present = 0
-                   AND sync_state IN ('synced','unknown','delete_unknown');
+                   AND (sync_state IN ('synced','unknown','delete_unknown')
+                        OR (sync_state = 'local_only' AND remote_id <> ''));
             ]])
             return {count=count, updated_at=now}
         end)
@@ -295,7 +321,7 @@ local SELECT_COLUMNS = [[
     datetime, drawer, source_path, present, sync_state, range_key,
     remote_id, chapter_uid, chapter_idx, book_version, last_stage, last_error,
     last_attempt_at, coord_version, coord_source, coord_verify, created_at, updated_at,
-    sync_kind
+    sync_kind, synced_note
 ]]
 
 local function row_from_sql(row)
@@ -315,7 +341,7 @@ local function row_from_sql(row)
         last_error=tostring(row[25] or ""), last_attempt_at=tonumber(row[26] or 0) or 0,
         coord_version=tonumber(row[27] or 0) or 0, coord_source=tostring(row[28] or ""),
         coord_verify=tostring(row[29] or ""), created_at=tonumber(row[30] or 0) or 0,
-        updated_at=tonumber(row[31] or 0) or 0, sync_kind=tostring(row[32] or ""),
+        updated_at=tonumber(row[31] or 0) or 0, sync_kind=tostring(row[32] or ""), synced_note=row[33],
     }
 end
 
@@ -340,6 +366,30 @@ function LocalAnnotationDatabase.list(store, book_id, limit)
     pcall(conn.close, conn)
     if not ok then return nil, tostring(err) end
     return out
+end
+
+function LocalAnnotationDatabase.thoughts(store,book_id)
+    if not LocalAnnotationDatabase.exists(store,book_id) then return {} end
+    local conn=open(store,book_id,true)
+    local ok,rows=xpcall(function()
+        local out={}
+        local statement=conn:prepare("SELECT "..SELECT_COLUMNS..[[
+            FROM local_annotations WHERE book_id=? AND (kind='thought' OR sync_kind='thought')
+              AND (present=1 OR sync_state IN ('delete_pending','delete_unknown'))
+            ORDER BY present ASC, updated_at DESC
+        ]])
+        statement:bind(tostring(book_id or ""))
+        while true do
+            local row=statement:step()
+            if not row then break end
+            out[#out+1]=row_from_sql(row)
+        end
+        statement:close()
+        return out
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    if ok then return rows end
+    return nil,rows
 end
 
 function LocalAnnotationDatabase.pending(store, book_id, limit, options)
@@ -376,7 +426,9 @@ local function update_state(store, book_id, local_id, state, fields)
     local ok, err = xpcall(function()
         local statement = conn:prepare([[
             UPDATE local_annotations
-               SET sync_state = ?, range_key = CASE WHEN ? IS NULL THEN range_key ELSE ? END,
+               SET sync_state = ?,
+                   synced_note=CASE WHEN ?='synced' AND (kind='thought' OR sync_kind='thought') THEN note ELSE synced_note END,
+                   range_key = CASE WHEN ? IS NULL THEN range_key ELSE ? END,
                    remote_id = CASE WHEN ? IS NULL THEN remote_id ELSE ? END,
                    book_version = CASE WHEN ? IS NULL THEN book_version ELSE ? END,
                    chapter_uid = CASE WHEN ? IS NULL THEN chapter_uid ELSE ? END,
@@ -397,7 +449,7 @@ local function update_state(store, book_id, local_id, state, fields)
         local coord_verify = fields.coord_verify
         local now = os.time()
         statement:bind(
-            tostring(state or "local_only"),
+            tostring(state or "local_only"), tostring(state or ""),
             range, range, remote, remote,
             version, version,
             chapter_uid, chapter_uid,
@@ -430,6 +482,61 @@ function LocalAnnotationDatabase.mark_state(store, book_id, local_id, state, fie
     return update_state(store, book_id, local_id, state, fields)
 end
 
+function LocalAnnotationDatabase.apply_phone_thought(store,book_id,row,content)
+    local conn=open(store,book_id,false)
+    local ok,changed=xpcall(function()
+        local statement=conn:prepare([[
+            UPDATE local_annotations
+               SET note=COALESCE(?,note), synced_note=COALESCE(?,synced_note),
+                   present=CASE WHEN ? IS NULL THEN 0 ELSE present END,
+                   sync_state=CASE WHEN ? IS NULL THEN 'cloud_removed' ELSE sync_state END
+             WHERE local_id=? AND remote_id=? AND note=? AND kind='thought' AND present=1 AND sync_state='synced'
+        ]])
+        statement:bind(content,content,content,content,row.local_id,row.remote_id,row.note):step()
+        statement:close()
+        local changes=conn:prepare("SELECT changes()")
+        local count=changes:step()
+        changes:close()
+        return count and tonumber(count[1])==1
+    end,debug.traceback)
+    pcall(conn.close,conn)
+    return ok and changed==true
+end
+
+function LocalAnnotationDatabase.begin_thought_edit(store,book_id,row)
+    return SQLiteStore.with_connection(database_path(store,book_id),false,function(conn)
+        local statement=conn:prepare([[
+            UPDATE local_annotations
+               SET sync_state='unknown', last_stage='eink_edit', last_error='', last_attempt_at=?
+             WHERE local_id=? AND present=1 AND sync_state='local_only' AND remote_id=? AND note=?
+        ]])
+        statement:bind(os.time(),row.local_id,row.remote_id,row.note):step()
+        statement:close()
+        local changes=conn:prepare("SELECT changes()")
+        local count=changes:step()
+        changes:close()
+        return count and tonumber(count[1])==1
+    end)
+end
+
+function LocalAnnotationDatabase.finish_thought_edit(store,book_id,row,verified)
+    return SQLiteStore.with_connection(database_path(store,book_id),false,function(conn)
+        local statement=conn:prepare([[
+            UPDATE local_annotations
+               SET synced_note=CASE WHEN ?=1 THEN ? ELSE synced_note END,
+                   sync_state=CASE WHEN note=? AND ?=1 THEN 'synced' ELSE 'local_only' END,
+                   last_stage=CASE WHEN note=? AND ?=1 THEN 'done' ELSE '' END,
+                   last_error='', updated_at=?
+             WHERE local_id=? AND present=1 AND remote_id=? AND (sync_state='local_only'
+                OR (sync_state='unknown' AND last_stage='eink_edit'))
+        ]])
+        local confirmed=verified and 1 or 0
+        statement:bind(confirmed,row.note,row.note,confirmed,row.note,confirmed,os.time(),row.local_id,row.remote_id):step()
+        statement:close()
+        return true
+    end)
+end
+
 function LocalAnnotationDatabase.set_sync_kind(store, book_id, local_id, kind)
     kind = tostring(kind or "")
     if kind ~= "" and kind ~= "bookmark" and kind ~= "highlight" and kind ~= "thought" then
@@ -456,6 +563,29 @@ function LocalAnnotationDatabase.delete_row(store, book_id, local_id)
     local ok, err = xpcall(function()
         local statement = conn:prepare("DELETE FROM local_annotations WHERE local_id = ?")
         statement:bind(tostring(local_id or "")):step()
+        statement:close()
+    end, debug.traceback)
+    pcall(conn.close, conn)
+    if not ok then return nil, tostring(err) end
+    return true
+end
+
+function LocalAnnotationDatabase.retry_search_locations(store, book_id)
+    if not LocalAnnotationDatabase.exists(store, book_id) then return true end
+    local conn = open(store, book_id, false)
+    local ok, err = xpcall(function()
+        local statement = conn:prepare([[
+            UPDATE local_annotations
+               SET sync_state = 'local_only', last_stage = '', last_error = '',
+                   last_attempt_at = 0, updated_at = ?
+             WHERE book_id = ? AND present = 1 AND remote_id = ''
+               AND sync_state = 'locate_failed' AND last_stage = 'locate'
+               AND (last_error IN ('eink_search_not_unique','eink_source_search_anchor_unconfirmed')
+                    OR (last_error = 'eink_search_quote_unavailable'
+                        AND length(CAST(COALESCE(NULLIF(trim(selected_text), ''), trim(text)) AS BLOB))
+                            BETWEEN 1 AND 11))
+        ]])
+        statement:bind(os.time(), tostring(book_id)):step()
         statement:close()
     end, debug.traceback)
     pcall(conn.close, conn)

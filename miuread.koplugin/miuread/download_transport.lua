@@ -1,6 +1,4 @@
--- One deterministic route per download run. Book content and services prefer E-Ink;
--- an ordinary Native failure pins the remaining run to Web. Rate limits,
--- cancellation and hibernation propagate without issuing a fallback request.
+-- Book downloads, including public thoughts and translation, use E-Ink.
 local U=require("miuread.util")
 local Http=require("miuread.http")
 local Protocol=require("miuread.protocol")
@@ -16,6 +14,8 @@ local KNOWN_FAILURES={
     {"E-Ink 未返回对应书籍目录","catalog_missing","catalog"},
     {"E-Ink 目录中不存在当前章节","chapter_missing","catalog"},
     {"E-Ink 目录未确认章节免费或已购买","chapter_access","catalog"},
+    {"未确认本章在线阅读权限","chapter_access","online_access"},
+    {"未确认本章离线下载权限","chapter_access","catalog"},
     {"E-Ink 书籍格式暂不支持","book_format","catalog"},
     {"E-Ink 书籍版本缺失","book_version","catalog"},
     {"E-Ink 接口需要客户端授权","authorization","client_download"},
@@ -48,11 +48,22 @@ local KNOWN_FAILURES={
     {"客户端授权未返回完整登录凭证","refresh_incomplete","refresh"},
 }
 
+function M.content_mode(options)
+    options=options or {}
+    if options.generate_translation_uid then return "eink-translation" end
+    return (options.read_online==true or options.prefetch_hidden==true or options.chapter_continuous_open==true)
+        and "eink-online" or "eink-offline"
+end
+
 function M.new(reader,options)
     local route=Transport.new(reader.store,options)
     route.reader=reader
     route.web_chapters,route.eink_chapters=0,0
-    route.restart_annotations=true
+    route.content_mode=M.content_mode(options)
+    route.eink_only=route.content_mode~=nil
+    if route.eink_only then
+        route.mode,route.selected,route.reason="eink","eink","eink_only"
+    end
     return setmetatable(route,M)
 end
 function M:native()
@@ -66,6 +77,7 @@ function M:native()
 end
 function M:use_web(value)
     self:note_eink_failure(value)
+    if self.eink_only then error(value,0) end
     self.selected,self.reason="web","eink_failed"
     self.fallback=true
     Log.record(self.store,{operation="download",channel="web",outcome="fallback",
@@ -77,14 +89,19 @@ function M:service(api)
     return require("miuread.api").bind(api,self.reader,self)
 end
 function M:configure(format)
-    if self.selected=="eink" and format and format~="epub" and format~="txt" then
+    if self.selected=="eink" and format~="epub" and format~="txt" then
+        if self.eink_only then
+            if format=="json" then error("E-Ink 返回 JSON 内容，当前无法生成离线阅读文件",0) end
+            error("E-Ink 暂不支持此章节格式",0)
+        end
+        if not format then return end
         self.selected,self.reason="web","unsupported_format"
     end
 end
 function M:restore(prior)
     -- A partial download must not hammer a failed Native route after a worker
     -- restart. This cannot grant Native access or override explicit Web mode.
-    if self.selected=="eink" and type(prior)=="table"
+    if not self.eink_only and self.selected=="eink" and type(prior)=="table"
         and prior.selected=="web" and prior.reason=="eink_failed" then
         self.selected,self.reason="web","eink_failed"
         self.fallback=true
@@ -138,6 +155,7 @@ function M:note_rate_limit(value)
 end
 
 function M:_chapter_once(book,chapter,format,opt)
+    if self.eink_only then opt.eink_only=true end
     if Protocol.is_mp(tostring(book.bookId or book.book_id or "")) then self.selected,self.reason="web","mp" end
     local function web()
         self:activity(opt,"web")
@@ -154,9 +172,19 @@ function M:_chapter_once(book,chapter,format,opt)
         return a,b,c,d
     end,web,{phase="download",web_only=opt.fresh_context==true})
 end
+function M:invoke(name,native,web,options)
+    if self.eink_only then
+        options=U.copy(options or {})
+        options.native_only,options.web_only=true,false
+    end
+    return Transport.invoke(self,name,native,web,options)
+end
 function M:chapter(book,chapter,format,opt)
     local ok,a,b,c,d=pcall(self._chapter_once,self,book,chapter,format,opt or {})
-    if not ok then self:note_rate_limit(a) end
+    if not ok then
+        self:note_rate_limit(a)
+        if self.eink_only then self:note_eink_failure(a) end
+    end
     self.active_channel,self.active_phase=nil,nil
     if not ok then error(a,0) end
     return a,b,c,d

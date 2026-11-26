@@ -54,7 +54,7 @@ local function source_parts(source)
     if type(source) == "string" then return {source} end
     if type(source) ~= "table" then return {""} end
     if source.parts then return source.parts end
-    if source.path then return {{path = source.path}} end
+    if source.path then return {source} end
     if source.data ~= nil then return {source.data} end
     return source
 end
@@ -67,9 +67,12 @@ local function visit_source(source, callback)
         elseif type(part) == "table" and part.path then
             local file, open_error = io.open(part.path, "rb")
             if not file then return nil, open_error or ("无法打开文件：" .. tostring(part.path)) end
-            while true do
-                local chunk = file:read(CHUNK_SIZE)
+            if part.offset and not file:seek("set",part.offset) then file:close(); return nil,"无法读取 EPUB 条目" end
+            local remaining=part.length
+            while remaining==nil or remaining>0 do
+                local chunk = file:read(remaining and math.min(CHUNK_SIZE,remaining) or CHUNK_SIZE)
                 if not chunk or #chunk == 0 then break end
+                if remaining then remaining=remaining-#chunk end
                 local ok, err = callback(chunk)
                 if ok == false then
                     file:close()
@@ -77,6 +80,7 @@ local function visit_source(source, callback)
                 end
             end
             file:close()
+            if remaining and remaining>0 then return nil,"EPUB 条目内容不完整" end
         else
             local data = tostring(part and part.data or "")
             local ok, err = callback(data)

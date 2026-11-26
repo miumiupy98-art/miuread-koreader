@@ -456,6 +456,11 @@ function M.capture(ui, record, catalog)
 
     local xp, xp_error = current_xpointer(ui, document)
     if not xp then return nil, xp_error end
+    if (record.record or {}).document_format=="txt" then
+        local candidates=capture_source_anchors(document,nil,xp,"")
+        if #candidates==0 then return nil,"anchor_unavailable" end
+        return {xpointer=xp,book_version=0,anchor_candidates=candidates}
+    end
     local toc_index, toc_error = toc_index_for_xpointer(toc, xp)
     if not toc_index then return nil, toc_error end
     local local_row, uid, idx, standalone, chapter_error = local_chapter(record, toc_index)
@@ -479,16 +484,18 @@ function M.capture(ui, record, catalog)
     end
     if catalog_row.words > MAX_CHAPTER_WORDS then return nil, "chapter_too_large_for_precision" end
 
-    local local_toc_title = tostring(type(toc.toc[toc_index]) == "table"
-        and (toc.toc[toc_index].title or toc.toc[toc_index].text) or "")
+    local toc_item=type(toc.toc[toc_index])=="table" and toc.toc[toc_index] or {}
+    local local_toc_title=tostring(toc_item.title or toc_item.text or "")
+    local at_chapter_start=xp==(toc_item.xpointer or toc_item.xp)
     local chapter_title = tostring(catalog_row.chapter.title or local_row.title or local_toc_title or "")
     local title_only = chapter_title_only(document, toc, toc_index, catalog_row.words, {local_toc_title, chapter_title})
     local anchor_candidates = capture_source_anchors(document, toc, xp, chapter_title)
-    if #anchor_candidates == 0 and not title_only then return nil, "anchor_unavailable" end
+    if #anchor_candidates == 0 and not title_only and not at_chapter_start then return nil, "anchor_unavailable" end
     local primary_anchor = anchor_candidates[1] or {}
 
     return {
         xpointer = xp,
+        at_chapter_start = at_chapter_start,
         toc_index = toc_index,
         chapter_uid = chapter_uid(catalog_row.chapter) ~= "" and chapter_uid(catalog_row.chapter) or uid,
         chapter_index = chapter_index(catalog_row.chapter, catalog_row.index),

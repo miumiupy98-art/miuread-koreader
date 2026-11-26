@@ -124,7 +124,94 @@ do
     assert(queue:recover("uncertain")~=nil)
     local after=assert(queue:pending("uncertain",HOUR+100000))
     assert(#after.rows==0 and #after.invalid_rows==0)
-    assert(queue:summary("uncertain").unknown==120)
+    local summary=queue:summary("uncertain")
+    assert(summary.unknown==0 and summary.rows==0 and summary.confirmed_seconds==0)
+    assert(summary.unverified_seconds==120 and summary.unverified_batches==1)
+    local history=assert(queue:unverified_history("uncertain"))
+    assert(#history.batches==1 and history.batches[1].rows==2)
+end
+
+-- Opening a v3 ledger migrates the real seven-row batch shape, plus a
+-- crash-recovered in-flight fragment of that same upload, without making
+-- the account lose new unsent time or credit old time as an accepted result.
+do
+    local rows=segments(HOUR,58,9)
+    rows[#rows+1]={start_time=HOUR+70,duration=8,book_id="new-book"}
+    local queue=make("legacy",rows)
+    local batch=assert(queue:pending("legacy",HOUR+60))
+    assert(batch.seconds==58 and #batch.rows==7)
+    assert(queue:claim("legacy",batch,"legacy-58"))
+    local data=database[queue.path..":account:legacy"]
+    for i=1,6 do
+        local item=data.items[tostring(i)]
+        item.state,item.reason="unknown","interrupted"
+    end
+    assert(queue:recover("legacy")~=nil)
+    assert(queue:recover("legacy")~=nil,"migration must be idempotent")
+    local summary=assert(queue:summary("legacy"))
+    assert(summary.rows==1 and summary.pending==8 and summary.unknown==0 and summary.confirmed_seconds==0)
+    assert(summary.unverified_seconds==58 and summary.unverified_batches==1)
+    local history=assert(queue:unverified_history("legacy"))
+    assert(#history.batches==1 and history.batches[1].id=="legacy-58" and history.batches[1].rows==7)
+    local later=assert(queue:pending("legacy",HOUR+100))
+    assert(later.seconds==8 and later.book_id=="new-book")
+    confirmed(queue,"legacy",later,"new-accepted")
+    assert(queue:summary("legacy").confirmed_seconds==8)
+    assert(queue:summary("legacy").unverified_seconds==58)
+end
+
+-- Keep every batch inside the time window, even beyond one UI page.
+-- Archived seconds never enter the queue or cloud-confirmed count.
+do
+    local rows={}
+    for i=1,53 do rows[i]={start_time=HOUR+i,duration=1,book_id="batch"..i} end
+    local queue=make("history",rows)
+    for i=1,53 do
+        local batch=assert(queue:pending("history",HOUR+100))
+        local attempt="attempt"..i
+        assert(queue:claim("history",batch,attempt))
+        assert(queue:finish("history",batch,attempt,"unknown",HOUR+100,"request_failed"))
+    end
+    local result=assert(queue:unverified_history("history"))
+    assert(result.batch_count==53 and result.seconds==53 and #result.batches==53)
+    assert(result.batches[1].book_id=="batch53" and result.batches[53].book_id=="batch1")
+    local summary=assert(queue:summary("history"))
+    assert(summary.rows==0 and summary.pending==0 and summary.confirmed_seconds==0)
+end
+
+-- An old waiting-to-send entry and the confirmed balance survive expiry.
+-- A v3 archive's undated aggregate cannot leak into the five-day total.
+do
+    local original_time=os.time
+    local now=HOUR+5*86400+90
+    os.time=function() return now end
+    local queue=make("history-expiry",{{start_time=HOUR,duration=15}})
+    local key=queue.path..":account:history-expiry"
+    database[key].confirmed_seconds=137
+    database[key].unverified={batch_count=5,seconds=180,batches={
+        {id="recent",seconds=8,start_time=HOUR+83,end_time=HOUR+91},
+        {id="exact-limit",seconds=9,start_time=HOUR+81,end_time=HOUR+90},
+        {id="expired",seconds=10,start_time=HOUR+79,end_time=HOUR+89},
+    }}
+    local history=assert(queue:unverified_history("history-expiry"))
+    assert(history.batch_count==1 and history.seconds==8 and history.batches[1].id=="recent")
+    assert(database[key].unverified.batch_count==5,"read-only view must not write to SQLite")
+    assert(queue:recover("history-expiry")~=nil)
+    assert(database[key].unverified.batch_count==1 and database[key].unverified.seconds==8)
+    local summary=assert(queue:summary("history-expiry"))
+    assert(summary.pending==15 and summary.confirmed_seconds==137)
+    now=now+1
+    assert(queue:summary("history-expiry").unverified_batches==0)
+    assert(queue:recover("history-expiry")~=nil and database[key].unverified==nil)
+    assert(queue:summary("history-expiry").pending==15)
+    -- Interrupted uploads that were already older than the window also
+    -- leave the queue without adding history or confirmed seconds.
+    local batch=assert(queue:pending("history-expiry",now))
+    assert(queue:claim("history-expiry",batch,"old-interruption"))
+    assert(queue:recover("history-expiry")~=nil)
+    summary=assert(queue:summary("history-expiry"))
+    assert(summary.unverified_batches==0 and summary.rows==0 and summary.confirmed_seconds==137)
+    os.time=original_time
 end
 
 -- More bad fragments than one quarantine pass are drained in bounded

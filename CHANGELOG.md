@@ -1,20 +1,16 @@
-## 6.4.1 - 2026-11-09
+## 6.7.0-beta.17 - 2026-11-26
 
-- perf(reader): skip toolbar state refresh when reader toolbar is disabled
-- perf(store): use ZIP central directory for EPUB identity instead of 1.75MB read and unzip subprocesses
-- perf(reader): gate WeRead-only and toolbar-only onReaderReady tasks on local books
-- fix(lifecycle): avoid 18s rebuild candidate false positive on CloseDocument
-- perf(store): bound settings_equal seen stack, deduplicate incremental flush pass, and skip clean native close flushes
-- perf(reader): isolate plugin-mode native books from recent-read writes, idle transition timers, and eager thought link guard
-- fix(readtime): allow time reports when rereading finished books (#183)
-- fix(readtime): preserve Web report status and failure scope
-- feat(readtime): include Web reports in opt-in diagnostics
-- fix(readtime): aggregate E-Ink offline reports and preserve unsent time (#184)
-- fix(readtime): reserve safe Web retries before dispatch
-- fix(readtime): exclude inactive gaps from Web reading time
-- 本次更新准备发布 MiuRead 6.5.0-beta.24，重点修复 EPUB 多级目录问题，并完善 GitHub Release 与 Issue 自动关联机制。
-- 导入书籍评论获取/稳定性提升
-- 测试流程修改
+- 「书源」统一主页、快捷操作和 KOReader 插件菜单的找书入口。普通书架只在底部切换来源，微信分组与最近阅读筛选保留。
+- 微信读书来源首页展示推荐书目与榜单预览。Z-Library 搜索结果显示作者和格式。
+- 保留搜索词和列表位置。详情、微信书架加入确认和 Z-Library 下载完成后可返回原列表。
+- 底部「最近」加入微信读书云端记录。使用实际返回的时间戳，缺少时间戳的记录保留服务端顺序。上方继续阅读仍使用本机记录。
+
+## 6.7.0-beta.16 - 2026-11-26
+
+- 主页下半区按已接入的来源展示。「最近」默认跨来源，书架搜索按当前列表和分组查找。
+- 本地书库校验目录可读性并检查子目录变化。暂时无法读取时保留上次扫描结果。Z-Library 下载登记来源。
+- 续读按保存的章节选择本机文件或在线加载。书架和阅读器共用下载管理，删除下载时保留阅读进度及批注。
+- 微信读书在线阅读、下载和刷新可从操作现场发起扫码登录。同一账号完成登录后回到原操作。
 
 ## 6.5.0-beta.28 - 2026-11-09
 

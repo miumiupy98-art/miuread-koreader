@@ -12,4 +12,8 @@ function Json.decode(value)
     if engine.parse then return engine.parse(value) end
     error("JSON decoder unavailable")
 end
+function Json.is_null(value)
+    local null=engine.null or (engine.util and engine.util.null)
+    return null~=nil and value==null
+end
 return Json

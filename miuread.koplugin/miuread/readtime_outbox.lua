@@ -6,6 +6,7 @@ local Clock=require("miuread.readtime_clock")
 local bit=require("bit")
 local M={}; M.__index=M
 local MAX_ROWS=50000
+local UNVERIFIED_RETENTION_SECONDS=5*24*3600
 -- Conservative resource budgets, not server-side protocol limits.  The first
 -- full hour is preferred; an unusually fragmented single hour may be split
 -- to keep the worker bounded.  The 3690s/123-row #184 case fits in one batch.
@@ -89,6 +90,65 @@ local function prune(data)
         end
     end
 end
+-- An ambiguous POST is terminal for retries. Archive one record per batch
+-- in the same transaction that removes its rows from the upload queue.
+local function archive_unverified(data)
+    local groups={}
+    for id,row in pairs(data.items) do
+        if row.state=="unknown" then
+            local attempt=tostring(row.attempt or ("row:"..id))
+            local key=tostring(row.book_id)..":"..attempt
+            local start,finish=row.start_time,row.start_time+row.duration
+            local group=groups[key] or {id=attempt,book_id=row.book_id,seconds=0,rows=0,
+                start_time=start,end_time=finish,reason=row.reason}
+            group.seconds=group.seconds+row.duration
+            group.rows=group.rows+1
+            group.start_time=math.min(group.start_time,start)
+            group.end_time=math.max(group.end_time,finish)
+            groups[key]=group
+            data.items[id]=nil
+        end
+    end
+    if next(groups)==nil then return end
+    local history=data.unverified or {seconds=0,batch_count=0,batches={}}
+    for _,group in pairs(groups) do
+        history.seconds=history.seconds+group.seconds
+        history.batch_count=history.batch_count+1
+        history.batches[#history.batches+1]=group
+    end
+    table.sort(history.batches,function(a,b)
+        if a.end_time~=b.end_time then return a.end_time>b.end_time end
+        if a.id~=b.id then return a.id>b.id end
+        return tostring(a.book_id)>tostring(b.book_id)
+    end)
+    data.unverified=history
+end
+
+local function expire_unverified(data,now)
+    local history=data.unverified
+    if not history then return false end
+    local batches=history.batches
+    local cutoff=now-UNVERIFIED_RETENTION_SECONDS
+    local original_count=#batches
+    -- History is ordered by reading end time, newest first.
+    for index=original_count,1,-1 do
+        if batches[index].end_time>cutoff then break end
+        batches[index]=nil
+    end
+    local retained=#batches
+    if retained==original_count and history.batch_count==retained then return false end
+    if retained==0 then
+        data.unverified=nil
+        return true
+    end
+    local seconds=0
+    for _,batch in ipairs(batches) do seconds=seconds+batch.seconds end
+    -- Earlier versions kept undated totals after discarding old details.
+    -- Only batches with an end time inside the window count in the new total.
+    history.seconds,history.batch_count=seconds,retained
+    return true
+end
+
 function M:_access(account,change,read_only)
     account=tostring(account or "")
     if account=="" then return nil,"missing_account" end
@@ -101,8 +161,12 @@ function M:_access(account,change,read_only)
                 or type(data.seen)~="table" then error("invalid reading-time ledger") end
             data.aliases=data.aliases or {}
             data.control=data.control or {}
+            local now=os.time()
+            local expired=expire_unverified(data,now)
             local result,dirty=change(data)
-            if dirty then
+            if not read_only and (dirty or expired) then
+                -- A write can add an archived batch, including during recovery.
+                expire_unverified(data,now)
                 data.version=3
                 prune(data)
                 if SQL.set_json(conn,"account:"..account,data)~=true then error("reading-time save failed") end
@@ -375,6 +439,7 @@ function M:finish(account,batch,attempt,state,now,reason)
                 changed=true
             end
         end
+        if changed and state~="confirmed" and state~="pending" then archive_unverified(data) end
         return true,changed
     end)
 end
@@ -387,17 +452,20 @@ function M:recover(account)
         for _,window in pairs(data.windows) do
             if not window.closed then window.closed=true; window.end_time=window.last_seen; count=count+1 end
         end
+        archive_unverified(data)
         return count,true
     end)
 end
 function M:summary(account)
     return self:_access(account,function(data)
+        local history=data.unverified or {}
         local result={pending=0,unknown=0,in_flight=0,rows=0,blocked=data.blocked,
             blocked_book=data.blocked_book,control=U.copy(data.control),
-            confirmed_seconds=data.confirmed_seconds or 0,last_success_at=data.last_success_at}
+            confirmed_seconds=data.confirmed_seconds or 0,last_success_at=data.last_success_at,
+            unverified_seconds=history.seconds or 0,unverified_batches=history.batch_count or 0}
         for _,row in pairs(data.items) do
             result[row.state]=(result[row.state] or 0)+row.duration
-            result.rows=result.rows+1
+            if row.state~="unknown" then result.rows=result.rows+1 end
         end
         return result,false
     end,true)
@@ -461,38 +529,9 @@ function M:clear_auth_retry(account,now)
         return true,changed
     end)
 end
-function M:unknown(account)
+function M:unverified_history(account)
     return self:_access(account,function(data)
-        local groups={}
-        for _,row in pairs(data.items) do
-            if row.state=="unknown" then
-                local key=row.attempt or ("row:"..row.id)
-                local group=groups[key] or {id=key,book_id=row.book_id,seconds=0,ids={},
-                    start_time=row.start_time,end_time=row.start_time+row.duration,reason=row.reason}
-                groups[key]=group
-                group.seconds=group.seconds+row.duration
-                group.start_time=math.min(group.start_time,row.start_time)
-                group.end_time=math.max(group.end_time,row.start_time+row.duration)
-                group.ids[#group.ids+1]=row.id
-            end
-        end
-        local result={}
-        for _,group in pairs(groups) do result[#result+1]=group end
-        table.sort(result,function(a,b) return a.start_time<b.start_time end)
-        return result,false
+        return U.copy(data.unverified or {seconds=0,batch_count=0,batches={}}),false
     end,true)
-end
-function M:ignore(account,group)
-    return self:_access(account,function(data)
-        local seconds=0
-        for _,id in ipairs(group.ids or {}) do
-            local row=data.items[id]
-            if row and row.state=="unknown" and (row.attempt or ("row:"..row.id))==group.id then
-                seconds=seconds+row.duration
-                data.items[id]=nil
-            end
-        end
-        return seconds,true
-    end)
 end
 return M

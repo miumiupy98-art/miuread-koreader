@@ -82,7 +82,7 @@ function Compact:_build()
     local title_w=math.floor(content_w*.55)
     local count_w=content_w-title_w
     self.title_label=TextWidget:new{
-        text=(self.paused and "评论获取已暂停" or "正在获取评论"),
+        text=(self.complete and "评论获取完成" or (self.paused and "评论获取已暂停" or "正在获取评论")),
         face=Font:getFace("x_smallinfofont"),bold=true,
         max_width=title_w,truncate_with_ellipsis=true,
     }
@@ -93,6 +93,9 @@ function Compact:_build()
     self.detail_label=TextWidget:new{
         text="准备获取评论",face=Font:getFace("x_smallinfofont"),
         max_width=content_w,truncate_with_ellipsis=true,
+    }
+    self.summary_label=TextWidget:new{
+        text="",face=Font:getFace("x_smallinfofont"),max_width=content_w,truncate_with_ellipsis=true,
     }
     self.progress=ProgressWidget:new{
         width=content_w,height=bar_h,percentage=0,
@@ -105,11 +108,17 @@ function Compact:_build()
             if self.on_background then self.on_background() end
         end),
         HorizontalSpan:new{width=gap},
-        self:_button(self.paused and "play" or "pause",self.paused and "继续" or "暂停",bw,button_h,function()
-            if self.on_pause then self.on_pause(self.paused~=true) end
-        end),
+        self:_button(self.complete and "check" or (self.paused and "play" or "pause"),
+            self.complete and "完成" or (self.paused and (self.retry and "重试" or "继续") or "暂停"),
+            bw,button_h,function()
+                if self.complete then
+                    if self.on_background then self.on_background() end
+                elseif self.on_pause then
+                    self.on_pause(self.paused~=true)
+                end
+            end),
         HorizontalSpan:new{width=gap},
-        self:_button("close","取消",bw3,button_h,function()
+        self:_button("close",self.complete and "清除任务" or "取消",bw3,button_h,function()
             if self.on_cancel then self.on_cancel() end
         end),
     }
@@ -126,6 +135,8 @@ function Compact:_build()
         self.progress,
         VerticalSpan:new{width=gap},
         self.detail_label,
+        VerticalSpan:new{width=gap},
+        self.summary_label,
         VerticalSpan:new{width=gap},
         buttons,
     }
@@ -167,9 +178,10 @@ end
 
 function Compact:set_state(state)
     state=state or {}
-    local paused=state.paused==true
-    if paused~=self.paused then
-        self.paused=paused
+    local paused,complete,retry=state.paused==true,state.complete==true,state.retry==true
+    if paused~=self.paused or complete~=self.complete or retry~=self.retry then
+        self.paused,self.complete,self.retry=paused,complete,retry
+        self._last_signature=nil
         local old_region=self.popup_dimen and self.popup_dimen:copy() or nil
         self:_build()
         -- A resized paused/running layout may expose old ink: invalidate both rectangles.
@@ -187,15 +199,16 @@ function Compact:set_state(state)
     local single=total==1
     local label=single and "当前章节" or (tostring(current).."/"..tostring(total).."章")
     local detail=tostring(state.message or "")
-    if paused then detail="已暂停 · "..detail end
-    if single and current==0 and detail=="" then detail="正在获取评论" end
-    if not single then detail=detail.." · 已保存 "..tostring(number(state.comments)).." 条" end
-    local signature=(paused and "paused" or "running")..":"..label..":"..detail
+    if detail=="" then detail=complete and "已保存所选章节" or "准备获取评论" end
+    local summary=string.format("缓存 %d · 部分 %d · 失败 %d · 待续 %d",
+        number(state.cached)+number(state.reused),number(state.partial),number(state.failed),number(state.pending))
+    local signature=table.concat({tostring(paused),label,detail,summary},":")
     if signature==self._last_signature then return end
     self._last_signature=signature
     self.progress:setPercentage(fraction)
     self.count_label:setText(label)
     self.detail_label:setText(detail)
+    self.summary_label:setText(summary)
     self:_redraw()
 end
 

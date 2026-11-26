@@ -249,10 +249,11 @@ local function progress_bar(width, height, progress)
     return row
 end
 
-local function section_header(title, width, height, on_more, on_source, filter_label)
-    local right_w = on_more and math.max(UiScale.dp(68, 58, 92), math.floor(width * .14)) or 0
-    local gap = on_more and UiScale.dp(4, 3, 7) or 0
-    local left_w = math.max(1, width - right_w - gap)
+local function section_header(title, width, height, on_more, on_source, filter_label, on_folder)
+    local control_w=math.max(UiScale.dp(68,58,92),math.floor(width*.14))
+    local gap=UiScale.dp(4,3,7)
+    local count=(on_more and 1 or 0)+(on_folder and 1 or 0)
+    local left_w=math.max(1,width-count*(control_w+gap))
     local label = tostring(title or "") .. (on_source and " ▾" or "")
     local left_text = fixed_frame(left_w, height, {bordersize=0, background=Blitbuffer.COLOR_WHITE},
         LeftContainer:new{dimen=Geom:new{w=left_w,h=height}, TextWidget:new{
@@ -261,12 +262,15 @@ local function section_header(title, width, height, on_more, on_source, filter_l
     local row = HorizontalGroup:new{align = "center"}
     if on_source then row[#row + 1] = tappable(left_w, height, left_text, on_source)
     else row[#row + 1] = left_text end
-    if on_more then
-        row[#row + 1] = HorizontalSpan:new{width=gap}
-        row[#row + 1] = tappable(right_w, height,
-            fixed_frame(right_w, height, {bordersize=0, background=Blitbuffer.COLOR_WHITE},
-                Ui.text(tostring(filter_label or "筛选"),right_w,height,face("smallinfofont",10.5,14.5),{bold=true})), on_more)
+    local function add_control(text,callback)
+        if not callback then return end
+        row[#row+1]=HorizontalSpan:new{width=gap}
+        row[#row+1]=tappable(control_w,height,
+            fixed_frame(control_w,height,{bordersize=0,background=Blitbuffer.COLOR_WHITE},
+                Ui.text(text,control_w,height,face("smallinfofont",10.5,14.5),{bold=true})),callback)
     end
+    add_control("文件夹",on_folder)
+    add_control(tostring(filter_label or "筛选"),on_more)
     return row
 end
 
@@ -858,16 +862,18 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
     local progress_known = book.progress_known~=false and tonumber(book.progress)~=nil
     local progress = progress_known and math.max(0, math.min(100, tonumber(book.progress))) or 0
     local status = U.trim(tostring(book.status_text or ""))
-    local downloaded = status == "已生成" or status == "已下载" or book.generated == true
+    local offline=book.offline_download
+    local downloaded=offline=="whole" or (offline==nil and (status == "已生成" or status == "已下载" or book.generated == true
         or book.downloaded == true or tostring(book.shelf_section or "") == "generated"
-        or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))
+        or (book.file and tostring(book.file) ~= "" and U.file_exists(tostring(book.file)))))
     local reading_badge = ""
     if ShelfProgress.is_finished(book) then reading_badge = "已读完"
     elseif progress > 0 then reading_badge = tostring(math.floor(progress + .5)) .. "%" end
 
     local download_active = book.download_active == true
     local download_progress = math.max(0, math.min(1, tonumber(book.download_progress) or 0))
-    if status == "已生成" or status == "已下载" or status == "未生成" or status == "未开始"
+    if status == "整本已下载" or status == "已下载部分章节" or status == "未下载"
+        or status == "已生成" or status == "已下载" or status == "未生成" or status == "未开始"
         or status == "已读完" or status:match("^阅读%s+%d+%%$")
         or status:match("下载中") or status:match("生成中") then
         status = ""
@@ -916,12 +922,12 @@ local function shelf_book_card(book, width, height, callback, hold_callback, sho
 
     local cover_layer = OverlapGroup:new{dimen = Geom:new{w = cover_w, h = cover_h}, allow_mirroring = false}
     cover_layer[#cover_layer + 1] = cover
-    if downloaded then
-        local badge = UiScale.dp(20, 17, 27)
+    if downloaded or offline=="partial" then
+        local badge = offline=="partial" and UiScale.dp(34, 29, 38) or UiScale.dp(20, 17, 27)
         local inset = UiScale.dp(2, 1, 4)
         cover_layer[#cover_layer + 1] = OffsetContainer:new{
             x_off = inset, y_off = inset,
-            outlined_badge_text("✓", badge, badge, face("cfont", 9.4, 13.5)),
+            outlined_badge_text(offline=="partial" and "部分" or "✓",badge,UiScale.dp(20,17,27),face("cfont",9.4,13.5)),
         }
     end
     if reading_badge ~= "" then
@@ -1065,7 +1071,8 @@ local function category_tabs(tabs, width, height, on_more)
     return row
 end
 
-local function empty_section(width, height, text, callback)
+local function empty_section(width, height, text, callback, action)
+    if callback and action then text=tostring(text or "").."\n\n"..action end
     return tappable(width, height, fixed_frame(width, height, {
         bordersize = 0,
         padding = UiScale.dp(7, 6, 12),
@@ -1279,10 +1286,8 @@ function HomeWidget:_build_header(children, m)
     local account=tostring(self.opts.account_name or "")
     if account=="" then account="未登录" end
     local battery=tostring(self.opts.battery_text or "--%")
-    local sync=tostring(self.opts.sync_text or "已同步")
     local account_width=math.min(math.floor(header_w*.22),measured(account,label_face,true)+inside*2)
     local battery_width=math.max(min_hit,icon_size+UiScale.dp(3,2,5)+measured("100%",label_face,true)+inside*2)
-    local sync_width=math.min(math.floor(header_w*.19),icon_size+UiScale.dp(3,2,5)+measured(sync,label_face,true)+inside*2)
     local time_string=tostring(self.opts.time_text or "--:--")
     local time_cell
     add("title",measured(self.opts.title or "觅阅",title_face,true)+inside*2,function(w)
@@ -1299,12 +1304,6 @@ function HomeWidget:_build_header(children, m)
     add("bluetooth",min_hit,function(w)
         return Ui.icon("bluetooth",w,m.header_h,icon_size,{icon_key="bluetooth"})
     end,self.opts.on_bluetooth or self.opts.on_quick_panel,5)
-    local sync_cell
-    add("sync",sync_width,function(w)
-        local icon_w=icon_size+UiScale.dp(3,2,5)
-        sync_cell=Ui.textbox(sync,math.max(1,w-icon_w),m.header_h,label_face,{bold=true,alignment="center"})
-        return HorizontalGroup:new{align="center",Ui.icon("sync",icon_size,m.header_h,icon_size),sync_cell}
-    end,self.opts.on_sync or self.opts.on_quick_panel,3)
     local battery_cell
     add("battery",battery_width,function(w)
         local icon_w=icon_size+UiScale.dp(3,2,5)
@@ -1336,7 +1335,6 @@ function HomeWidget:_build_header(children, m)
     end
     self._header_text_refs={
         account=account_cell and account_cell[1] or nil,
-        sync=sync_cell and sync_cell[1] or nil,
         battery=battery_cell and battery_cell[1] or nil,
         time=time_cell and time_cell[1] or nil,
     }
@@ -1678,7 +1676,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
                 sy = sy + subtabs_h + math.max(2, math.floor(gap * .25))
             end
             if section_h > 0 then
-                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label))
+                self:_add(children, shelf_x, sy, section_header(title, shelf_w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label, self.opts.on_shelf_folder))
                 sy = sy + section_h + math.max(2, math.floor(gap * .25))
             end
             local footer_h = math.max(34, math.min(44, math.floor(available_h * .10)))
@@ -1686,7 +1684,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
             if #books > 0 then
                 self:_render_grid(children, m, shelf_x, sy, shelf_w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
             else
-                self:_add(children, shelf_x, sy, empty_section(shelf_w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
+                self:_add(children, shelf_x, sy, empty_section(shelf_w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_empty, self.opts.shelf_empty_action))
             end
             self:_add(children, shelf_x, bottom - footer_h, page_footer(shelf_w, footer_h, self.opts.shelf_page, self.opts.shelf_pages, self.opts.on_shelf_page or function() end))
         end
@@ -1808,7 +1806,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
         y = y + subtabs_h + math.max(2, math.floor(gap * .25))
     end
     if section_h > 0 and y + section_h < bottom then
-        self:_add(children, x, y, section_header(title, w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label))
+        self:_add(children, x, y, section_header(title, w, section_h, self.opts.on_shelf_filter, self.opts.on_shelf_source, self.opts.shelf_filter_label, self.opts.on_shelf_folder))
         y = y + section_h + math.max(2, math.floor(gap * .25))
     end
     local footer_h = math.max(36, math.min(48, math.floor(m.body_h * .045)))
@@ -1816,7 +1814,7 @@ function HomeWidget:_build_sections(children, m, compact, mode)
     if #books > 0 then
         self:_render_grid(children, m, x, y, w, grid_h, books, self.opts.on_open_book, self.opts.on_hold_book, 2)
     else
-        self:_add(children, x, y, empty_section(w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_all))
+        self:_add(children, x, y, empty_section(w, grid_h, self.opts.empty_text or "暂时没有内容", self.opts.on_shelf_empty, self.opts.shelf_empty_action))
     end
     self:_add(children, x, bottom - footer_h, page_footer(w, footer_h, self.opts.shelf_page, self.opts.shelf_pages, self.opts.on_shelf_page or function() end))
 end
@@ -1922,38 +1920,52 @@ local function foreground_over_home(home)
     if not home_index then return false end
     for index=home_index+1,#stack do
         local widget=stack[index] and stack[index].widget
-        if widget and widget._miuread_modal_surface==true then return true end
+        if widget and not widget.invisible and not widget.toast
+            and (widget._miuread_modal_surface==true or widget.modal==true) then return true end
     end
     return false
 end
 
-function HomeWidget:_mark_dirty(kind, previous_region)
+function HomeWidget:_paint_region(region,mode)
     if foreground_over_home(self) then
-        -- Keep just one coalesced retry. The live Home layer may continue
-        -- updating data in the meantime; repaint only after dialogs close.
+        local queued=self._miu_occluded_dirty_region
+        self._miu_occluded_dirty_region=queued and queued:combine(region) or region:copy()
         if not self._miu_occluded_dirty_task then
             local task
             task=function()
                 if self._miu_closed or self._miu_occluded_dirty_task~=task then return end
                 self._miu_occluded_dirty_task=nil
-                self:_mark_dirty("page")
+                local pending=self._miu_occluded_dirty_region
+                self._miu_occluded_dirty_region=nil
+                if pending then self:_paint_region(pending,"ui") end
             end
             self._miu_occluded_dirty_task=task
             UIManager:scheduleIn(.35,task)
         end
-        return
+        return false
     end
+    if self._miu_occluded_dirty_task then
+        UIManager:unschedule(self._miu_occluded_dirty_task)
+        self._miu_occluded_dirty_task=nil
+    end
+    if self._miu_occluded_dirty_region then
+        region=region:combine(self._miu_occluded_dirty_region)
+        self._miu_occluded_dirty_region=nil
+        mode="ui"
+    end
+    UIManager:setDirty(self,mode,region)
+    return true
+end
+
+function HomeWidget:_mark_dirty(kind, previous_region)
     local region
     if kind == "section" then region = self.section_dimen
     elseif kind == "header" then region = self.header_dimen
     elseif kind == "content" then region = self.content_dimen
-    elseif kind == "page" then region = self.dimen
-    else
-        UIManager:setDirty(self, "full")
-        return
-    end
+    elseif kind == "page" then region = self.dimen end
+    local precise=region~=nil or previous_region~=nil
     if previous_region and region then region = previous_region:combine(region)
-    else region = region or previous_region end
+    else region = region or previous_region or self.dimen end
     if region then
         local safety=UiScale.dp(4,3,7)
         local x=math.max(0,(region.x or 0)-safety)
@@ -1961,11 +1973,10 @@ function HomeWidget:_mark_dirty(kind, previous_region)
         local right=math.min(Screen:getWidth(),(region.x or 0)+(region.w or 1)+safety)
         local bottom=math.min(Screen:getHeight(),(region.y or 0)+(region.h or 1)+safety)
         region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
-        if kind=="section" then
-            -- First surface uses the normal UI waveform so tab/source/page
-            -- switching is responsive. A coalesced full cleanup runs only after
-            -- the user stops switching, preserving final e-ink quality.
-            UIManager:setDirty(self,function() return "ui",region end)
+        local painted=self:_paint_region(region,precise and "ui" or "full")
+        if kind=="section" and painted then
+            -- First surface uses the normal UI waveform. The quality pass
+            -- runs after the user stops switching sections.
             if self._section_clean_refresh_task then UIManager:unschedule(self._section_clean_refresh_task) end
             local clean_region=region:copy()
             local task
@@ -1973,21 +1984,14 @@ function HomeWidget:_mark_dirty(kind, previous_region)
                 if self._miu_closed or self._section_clean_refresh_task~=task then return end
                 self._section_clean_refresh_task=nil
                 if self._miu_input_suspended==true or self._miu_device_suspended==true then return end
-                if foreground_over_home(self) then
-                    -- Defer the full waveform rather than corrupt the modal.
-                    self:_mark_dirty("page")
-                    return
-                end
-                UIManager:setDirty(self,function() return "full",clean_region end)
+                if not self:_paint_region(clean_region,"full") then return end
                 logger.info("[MiuRead][HomeSwitchPerf] quality cleanup","delay_ms=",tostring(math.floor((tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8)*1000+.5)))
             end
             self._section_clean_refresh_task=task
             UIManager:scheduleIn(math.max(.8,tonumber(Config.HOME_SECTION_CLEAN_REFRESH_DELAY) or 2.8),task)
-        else
-            UIManager:setDirty(self,function() return "ui",region end)
         end
-    else
-        UIManager:setDirty(self, "full")
+    elseif not foreground_over_home(self) then
+        UIManager:setDirty(self,"full")
     end
 end
 
@@ -2026,7 +2030,6 @@ function HomeWidget:updateHeader(fields)
     local dimens=type(self._header_field_dimens)=="table" and self._header_field_dimens or {}
     local mapping={
         account_name={ref="account",default="未登录"},
-        sync_text={ref="sync",default="已同步"},
         battery_text={ref="battery",default="--%"},
         time_text={ref="time",default="--:--"},
     }
@@ -2065,7 +2068,7 @@ function HomeWidget:updateHeader(fields)
     local right=math.min(Screen:getWidth(),(changed_region.x or 0)+(changed_region.w or 1)+safety)
     local bottom=math.min(Screen:getHeight(),(changed_region.y or 0)+(changed_region.h or 1)+safety)
     local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
-    UIManager:setDirty(self,function() return "ui",region end)
+    self:_paint_region(region,"ui")
     return true
 end
 
@@ -2141,7 +2144,7 @@ function HomeWidget:updateDashboard(fields)
     local right=math.min(Screen:getWidth(),(changed_region.x or 0)+(changed_region.w or 1)+safety)
     local bottom=math.min(Screen:getHeight(),(changed_region.y or 0)+(changed_region.h or 1)+safety)
     local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
-    UIManager:setDirty(self,function() return "ui",region end)
+    self:_paint_region(region,"ui")
     return true
 end
 
@@ -2154,12 +2157,16 @@ function HomeWidget:updateSection(opts)
     self.opts.shelf_books = opts.shelf_books or {}
     self.opts.empty_text = opts.empty_text or self.opts.empty_text
     self.opts.on_open_book = opts.on_open_book or self.opts.on_open_book
+    self.opts.on_empty_account=opts.on_empty_account or self.opts.on_empty_account
     self.opts.on_hold_book = opts.on_hold_book or self.opts.on_hold_book
     self.opts.home_actions = opts.home_actions or self.opts.home_actions
     if opts.on_shelf_all ~= nil then self.opts.on_shelf_all = opts.on_shelf_all end
+    if opts.on_shelf_empty ~= nil then self.opts.on_shelf_empty = opts.on_shelf_empty end
+    if opts.shelf_empty_action ~= nil then self.opts.shelf_empty_action = opts.shelf_empty_action end
     if opts.on_shelf_filter ~= nil then self.opts.on_shelf_filter = opts.on_shelf_filter end
     if opts.on_shelf_source ~= nil then self.opts.on_shelf_source = opts.on_shelf_source end
     if opts.shelf_filter_label ~= nil then self.opts.shelf_filter_label = opts.shelf_filter_label end
+    if opts.on_shelf_folder ~= nil then self.opts.on_shelf_folder = opts.on_shelf_folder end
     self.opts.on_shelf_page = opts.on_shelf_page or self.opts.on_shelf_page
     self.opts.shelf_page = opts.shelf_page or self.opts.shelf_page
     self.opts.shelf_pages = opts.shelf_pages or self.opts.shelf_pages
@@ -2275,7 +2282,7 @@ function HomeWidget:updateBook(book_id)
     local right=math.min(Screen:getWidth(),slot.x+slot.w+safety)
     local bottom=math.min(Screen:getHeight(),slot.y+slot.h+safety)
     local region=Geom:new{x=x,y=y,w=math.max(1,right-x),h=math.max(1,bottom-y)}
-    UIManager:setDirty(self,function() return "ui",region end)
+    self:_paint_region(region,"ui")
     logger.info("[MiuRead][HomeBook] updated", "book=",key,"w=",tostring(slot.w),"h=",tostring(slot.h))
     return true
 end
@@ -2427,6 +2434,7 @@ function HomeWidget:onCloseWidget()
     if self._dimension_refresh_task then UIManager:unschedule(self._dimension_refresh_task); self._dimension_refresh_task=nil end
     if self._section_clean_refresh_task then UIManager:unschedule(self._section_clean_refresh_task); self._section_clean_refresh_task=nil end
     if self._miu_occluded_dirty_task then UIManager:unschedule(self._miu_occluded_dirty_task); self._miu_occluded_dirty_task=nil end
+    self._miu_occluded_dirty_region=nil
     self:_clear_inactive_section_cache()
     if live_widget == self then live_widget = nil end
     if self.opts and self.opts.on_close then pcall(self.opts.on_close, self) end
