@@ -9,6 +9,7 @@ package.loaded["miuread.util"]={
         if file then file:close(); return true end
         return false
     end,
+    free_space=function() return 80*1024*1024 end,
     file_size=function(path)
         local file=io.open(path,"rb")
         if file then local size=file:seek("end"); file:close(); return size end
@@ -42,6 +43,7 @@ assert(Groups.change(account,{action="delete",group=8}) and calls==3)
 
 local Fonts=require("miuread.weread_font_download")
 assert(#Fonts.catalog==29)
+package.loaded["fontlist"]={fontdir=root}
 local payload="OTTO"..string.rep("x",28)
 local entries={{index=1,path="nest/other.otf",mode="file",size=#payload},
     {index=2,path="nest/face.otf",mode="file",size=#payload}}
@@ -50,10 +52,27 @@ function reader:iterate()
     local i=0
     return function() i=i+1; return entries[i] end
 end
-function reader:extractToMemory(i) assert(i==2); return payload end
+local selected
+function reader:extractToPath(i,path)
+    selected=i
+    local file=assert(io.open(path,"wb"))
+    assert(file:write(payload))
+    assert(file:seek("set",entries[i].size-1))
+    assert(file:write("x"))
+    file:close()
+    return true
+end
 package.loaded["ffi/archiver"]={Reader={new=function() return reader end}}
-assert(Fonts.read_archive("fixture.zip",{file="face.otf"})==payload)
-assert(not pcall(Fonts.read_archive,"fixture.zip",{file="unknown.otf"}))
+local extracted=root.."/font-stage.otf"
+Fonts.extract_archive("fixture.zip",{file="face.otf"},extracted)
+assert(selected==2)
+assert(not pcall(Fonts.extract_archive,"fixture.zip",{file="unknown.otf"},extracted))
+os.remove(extracted)
+entries={{index=1,path="actual.otf",mode="file",size=30*1024*1024},
+    {index=2,path="__MACOSX/._actual.otf",mode="file",size=219}}
+Fonts.extract_archive("fixture.zip",{file="client-name.otf"},extracted)
+assert(selected==1 and package.loaded["miuread.util"].file_size(extracted)==30*1024*1024)
+os.remove(extracted)
 
 package.loaded["miuread.protocol"]={query=function(fields)
     if fields.action=="login" then assert(fields.password=="fixture-only") end

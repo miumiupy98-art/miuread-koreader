@@ -7,6 +7,7 @@ local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local LineWidget = require("ui/widget/linewidget")
+local ImageWidget = require("ui/widget/imagewidget")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local UIManager = require("ui/uimanager")
 local Widget = require("ui/widget/widget")
@@ -240,20 +241,31 @@ function Dialog:_row_widget(item, width, height, index)
     local text_w = math.max(1, width - pad * 2 - icon_w - value_w - arrow_w
         - gap * ((icon_w > 0 and 1 or 0) + (value_w > 0 and 1 or 0) + (arrow_w > 0 and 1 or 0)))
     local detail = tostring(item.detail or "")
-    local label_h = detail ~= "" and math.max(1, math.floor(height * .60)) or height
+    local preview = item.preview_image
+    local two_lines = preview or detail ~= ""
+    local label_h = two_lines and math.max(1, math.floor(height * (preview and .44 or .60))) or height
     local detail_h = math.max(1, height - label_h)
 
     local text_layers = OverlapGroup:new{dimen = Geom:new{w = text_w, h = height}, allow_mirroring = false}
     text_layers[#text_layers + 1] = OffsetContainer:new{
         x_off = 0, y_off = 0,
         Ui.textbox(tostring(item.label or item.text or ""), text_w, label_h,
-            Skin.face("cfont", detail ~= "" and 11.1 or 11.6, detail ~= "" and 14.9 or 15.6, detail ~= "" and 9.4 or 9.9), {
+            Skin.face("cfont", two_lines and 11.1 or 11.6, two_lines and 14.9 or 15.6, two_lines and 9.4 or 9.9), {
                 bold = item.bold == true or item.checked == true,
                 alignment = "left",
                 fgcolor = readable and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY,
             }),
     }
-    if detail ~= "" then
+    if preview then
+        local image_h = math.min(detail_h, Skin.dp(43, 35, 50), math.max(1, math.floor(text_w / 5)))
+        text_layers[#text_layers + 1] = OffsetContainer:new{
+            x_off = 0, y_off = label_h + math.floor((detail_h - image_h) / 2),
+            ImageWidget:new{
+                file = preview, width = 5 * image_h, height = image_h,
+                original_in_nightmode = false,
+            },
+        }
+    elseif detail ~= "" then
         text_layers[#text_layers + 1] = OffsetContainer:new{
             x_off = 0, y_off = label_h,
             Ui.textbox(detail, text_w, detail_h, Skin.face("smallinfofont", 9.0, 11.9, 7.7), {

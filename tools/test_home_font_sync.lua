@@ -34,7 +34,7 @@ package.loaded["miuread.util"]=U
 local scanned,registered,cleared=0,0,0
 local fontlist={fontlist={"old"}}
 function fontlist:getFontList()
-    assert(#self.fontlist==0)
+    if self.fontlist[1] then return self.fontlist end
     scanned=scanned+1
     self.fontlist={"font/weread/weread.otf"}
 end
@@ -54,7 +54,7 @@ assert(scanned==1 and registered==0 and cleared==1)
 Fonts.refresh_registry("font/weread/weread.otf")
 assert(scanned==2 and registered==1 and cleared==2)
 load("home_ui_font_menu","home_customization_menu")
-load("_show_weread_fonts","_show_reader_spacing_panel")
+load("_apply_weread_font","_show_reader_spacing_panel")
 package.loaded["miuread.extension_center"]={}
 package.loaded["miuread.menu_icons"]={key=function() return "font" end}
 local Settings=require("miuread.plugin_settings")
@@ -64,7 +64,9 @@ function plugin:_home_preferences() return home end
 function plugin:_home_lockscreen_style_label() return "Default" end
 function plugin:_reader_toolbar_setting_summary() return "Enabled" end
 function plugin:_time_settings_label() return "Device" end
-function plugin:_show_standalone_menu(_,items) surface,shown="home",items end
+function plugin:_show_miuread_menu(_,items,options)
+    surface,shown=options.on_home and "reader" or "home",items
+end
 function plugin:_show_reader_menu_table(_,items) surface,shown="reader",items end
 function plugin:toast() end
 local function item(rows,label)
@@ -82,17 +84,44 @@ Fonts.install=function(http,index)
     return embedded
 end
 Fonts.refresh_registry=function(path) assert(path==embedded) end
+fontlist.fontinfo={[embedded]={{name="Source Han Serif CN"}}}
+function plugin:_set_home_ui_font(mode,face)
+    home.ui_font_mode,home.ui_font_face=mode,face
+    return true
+end
+function plugin:_reader_font_label() return self.ui.font.font_face end
 local interface=item(Settings.menu(plugin),"首页与界面").sub_item_table_func()
 local displays=item(interface,"字体与显示").sub_item_table_func()
 local font_rows=item(displays,"觅阅界面字体").sub_item_table_func()
 item(font_rows,"微信读书字体").callback()
 assert(surface=="home" and #shown==#Fonts.catalog)
-assert(item(shown,"思源宋体").post_text=="安装")
+assert(item(shown,"思源宋体").post_text_func()=="安装")
+assert(item(shown,"系统字体").preview_image==nil)
+for _,row in ipairs(shown) do
+    if row.text~="系统字体" then
+        local preview=assert(io.open(row.preview_image,"rb"))
+        assert(preview:read(8)=="\137PNG\r\n\26\n")
+        preview:close()
+    end
+end
 item(shown,"思源宋体").callback()
-assert(item(shown,"思源宋体").post_text=="已可用")
-plugin.ui={font={face_table={{text="Native face"}}}}
+assert(item(shown,"思源宋体").post_text_func()=="应用")
+item(shown,"思源宋体").callback()
+assert(home.ui_font_face=="Source Han Serif CN" and item(shown,"思源宋体").post_text_func()=="使用中")
+item(shown,"系统字体").callback()
+assert(home.ui_font_mode=="default" and item(shown,"思源宋体").post_text_func()=="应用")
+local wenkai=item(shown,"霞鹜文楷")
+assert(wenkai.post_text_func()=="下载")
+plugin._interactive_network_key="weread-font:8"
+assert(wenkai.post_text_func()=="下载中")
+assert(item(shown,"仓耳今楷 04").post_text_func()=="下载")
+plugin._interactive_network_key=nil
+plugin.ui={font={face_table={{text="Native face"}},onSetFont=function(self,face) self.font_face=face end}}
 plugin:_show_reader_font_face_menu(function() end)
 assert(surface=="reader" and item(shown,"Native face"))
 item(shown,"微信读书字体").callback()
-assert(surface=="reader" and item(shown,"思源宋体").post_text=="已可用")
+assert(surface=="reader" and item(shown,"思源宋体").post_text_func()=="应用")
+item(shown,"思源宋体").callback()
+assert(home.ui_font_mode=="default" and plugin.ui.font.font_face=="Source Han Serif CN")
+assert(item(shown,"思源宋体").post_text_func()=="使用中")
 print("Home follows the last book font; settings and reader open the same catalog and share installed fonts")
