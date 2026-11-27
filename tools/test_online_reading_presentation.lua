@@ -24,8 +24,11 @@ local env={
     RuntimePressure={memory_snapshot=function() return {} end},
     U={copy=copy,first_line=tostring,file_exists=function() return true end},
     reader_close_active=function() return false end,
-    logger={warn=function() end},Http={is_auth_error=function() return false end},
-    DownloadResult={failure_kind=function() return nil end},
+    logger={warn=function() end},Http={is_auth_error=function(e) return e=="HTTP 401" end,
+        is_network_error=function(e) return e=="Network failed" end},
+    DownloadResult={chapter_access=function(e)
+        if e=="locked" or e=="unconfirmed" then return e end
+    end},
     StatusToast={show=function(opts)
         assert(opts.timeout==0 and opts.title=="阅读")
         return {_close=function(widget) widget.closed=true end,opts=opts}
@@ -85,6 +88,9 @@ local function host()
     return h
 end
 local book={bookId="id",title="Book"}
+function plugin:_show_weread_locked_chapter(runtime) self.locked=runtime.options.chapter_uid end
+function plugin:_mark_auth_problem() end
+function plugin:_prompt_weread_login() self.login_prompted=true end
 local h=host()
 assert(h:download(book,{chapter_uid="7",read_online=true},true))
 assert(h.download_task.options.prefetch and not h.download_task.options.prefetch_hidden and h.download_task.options.read_online)
@@ -111,7 +117,19 @@ h:_finish_online_read(h._download_runtime,{ok=true,value={file="/cache/7-online.
 assert(not h.opened)
 h.context_valid=true
 h:_finish_online_read(h._download_runtime,{ok=false,error="Network failed"})
-assert(h.notices[1][1]=="正文加载失败" and h.store:download_state().status=="failed")
+assert(h.notices[1][1]=="网络连接失败" and h.store:download_state().status=="failed")
+h=host()
+assert(h:download(book,{chapter_uid="8",chapter_continuous_open=true},true))
+h:_finish_online_read(h._download_runtime,{ok=false,error="locked"})
+assert(h.locked=="8" and h.cleared and #h.notices==0 and h.store:download_state().status=="failed")
+h=host()
+assert(h:download(book,{chapter_uid="7",read_online=true},true))
+h:_finish_online_read(h._download_runtime,{ok=false,error="unconfirmed"})
+assert(not h.locked and h.notices[1][1]=="阅读权限")
+h=host()
+assert(h:download(book,{chapter_uid="7",read_online=true},true))
+h:_finish_online_read(h._download_runtime,{ok=false,error="HTTP 401"})
+assert(h.login_prompted and not h.locked and #h.notices==0)
 
 h=host()
 h.download_task.running=true

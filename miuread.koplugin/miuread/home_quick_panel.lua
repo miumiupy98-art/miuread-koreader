@@ -277,6 +277,7 @@ local QuickPanelWidget = InputContainer:extend{
     name = "miuread_quick_panel",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- Input captures screen, but opaque drawing occupies only the top panel.
     covers_fullscreen = false,
     stop_events_propagation = true,
@@ -401,6 +402,8 @@ function QuickPanelWidget:_build()
     -- least one visible control has a short runtime status.
     local button_h = has_button_detail and UiScale.dp(88, 82, 112) or UiScale.dp(70, 66, 90)
     local status_h = (self.opts.status_text and self.opts.status_text ~= "") and UiScale.dp(34, 30, 46) or 0
+    local shortcuts=self.opts.shortcuts or {}
+    local shortcuts_h=#shortcuts>0 and UiScale.dp(42,37,54) or 0
 
     self.panel_h = margin * 2 + title_h + line + gap * 2
     if rows > 0 then
@@ -408,6 +411,7 @@ function QuickPanelWidget:_build()
     end
     if status_h > 0 then self.panel_h = self.panel_h + status_h + gap end
     if frontlight_h > 0 then self.panel_h = self.panel_h + line + gap + frontlight_h + gap end
+    self.panel_h=self.panel_h+shortcuts_h+(shortcuts_h>0 and gap or 0)
     self.panel_h = math.min(sh - margin, self.panel_h)
 
     self.dimen = Geom:new{x = 0, y = 0, w = sw, h = sh}
@@ -570,6 +574,23 @@ function QuickPanelWidget:_build()
         y = y + status_h + gap
     end
 
+    if shortcuts_h>0 and y+shortcuts_h<=self.panel_h then
+        local available=sw-margin*2-gap*(#shortcuts-1)
+        local width=math.floor(available/#shortcuts)
+        local x=margin
+        for index,shortcut in ipairs(shortcuts) do
+            local w=index==#shortcuts and (sw-margin-x) or width
+            local button=tappable(w,shortcuts_h,
+                fixed_frame(w,shortcuts_h,{bordersize=UiScale.line(),background=Blitbuffer.COLOR_WHITE},
+                    Ui.text(shortcut.label,w,shortcuts_h,face("smallinfofont",10.5,14),{bold=true})),
+                self:_guarded(function()
+                    local active=(self.opts.shortcuts or {})[index]
+                    if active then self:_close(active.callback) end
+                end))
+            self:_add(children,x,y,button)
+            x=x+w+gap
+        end
+    end
 
     self:_add(children, 0, self.panel_h - UiScale.line("thick"), LineWidget:new{
         background = Blitbuffer.COLOR_BLACK,
@@ -594,6 +615,7 @@ local function panel_signature(opts)
         parts[#parts+1]=tostring(entry.icon_key or entry.icon or "")..":"..tostring(entry.label or "")
     end
     parts[#parts+1]="detail:"..tostring(any_detail)
+    for _,shortcut in ipairs(opts.shortcuts or {}) do parts[#parts+1]=shortcut.label end
     return table.concat(parts,"|")
 end
 

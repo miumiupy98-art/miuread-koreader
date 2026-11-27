@@ -17,6 +17,7 @@ local Size = require("ui/size")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
+local DialogTransition = require("miuread.dialog_transition")
 local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Widget = require("ui/widget/widget")
@@ -1920,8 +1921,7 @@ local function foreground_over_home(home)
     if not home_index then return false end
     for index=home_index+1,#stack do
         local widget=stack[index] and stack[index].widget
-        if widget and not widget.invisible and not widget.toast
-            and (widget._miuread_modal_surface==true or widget.modal==true) then return true end
+        if DialogTransition.is_visible_overlay(widget) and not widget.toast then return true end
     end
     return false
 end
@@ -2538,20 +2538,17 @@ function HomeView.raise(skip_dirty)
         end
     end
     if not window then return false end
-    table.remove(stack, index)
-    local insert_at = 1
-    -- Match UIManager:show ordering for a standard non-modal widget: below
-    -- modal dialogs/toasts, above the uppermost normal page.
-    for i = #stack, 0, -1 do
-        local top = stack[i]
-        if top and top.widget and top.widget.toast then
-            -- Keep looking below the toast group.
-        elseif not top or not top.widget or not top.widget.modal then
-            insert_at = i + 1
-            break
-        end
+    local boundary = #stack + 1
+    for i, entry in ipairs(stack) do
+        if DialogTransition.is_visible_overlay(entry.widget) then boundary=i;break end
     end
-    table.insert(stack, insert_at, window)
+    -- Remove the existing entry only when it needs to move. Keep the page
+    -- under every foreground surface, including a legacy MiuRead overlay.
+    local insert_at = boundary - (index < boundary and 1 or 0)
+    if index ~= insert_at then
+        table.remove(stack, index)
+        table.insert(stack, insert_at, window)
+    end
     if skip_dirty~=true then UIManager:setDirty(live_widget, "ui") end
     return true
 end

@@ -499,6 +499,53 @@ function Sync:_read_report_allowed(record)
     return row.read_report_enabled~=false
 end
 
+function Sync:entitlement_context(record)
+    local row=record and record.record
+    if not row or not row.entitlement_owner then return nil end
+    local owner=require("miuread.download_database").account_key(self.store)
+    local snapshots=self.store:get("download_entitlement_accounts",{})
+    return {owner=owner,snapshot=snapshots[owner]}
+end
+
+function Sync:entitlement_page(record,document,page,xpointer,when,context)
+    local row=record and record.record
+    if not row or not row.entitlement_owner then return true end
+    context=context or self:entitlement_context(record)
+    local Entitlement=require("miuread.download_entitlements")
+    local grants=context.pages and context.pages[page]
+    if not grants then
+        grants=Entitlement.page_grants(row,document or {},page,xpointer)
+        if context.pages and page~=nil then context.pages[page]=grants end
+    end
+    return Entitlement.window_end(row,grants,context.snapshot,context.owner,when or os.time())
+end
+
+function Sync:entitlement_position(record,position,when,context)
+    local row=record and record.record
+    if not row or not row.entitlement_owner then return true end
+    context=context or self:entitlement_context(record)
+    local Entitlement=require("miuread.download_entitlements")
+    local uid=tostring(position and position.chapter_uid or "")
+    when=when or os.time()
+    local proof=position and position.download_entitlement_proof
+    if type(proof)=="table" and proof.owner==context.owner and proof.owner==row.entitlement_owner
+        and proof.uid==uid and proof.at==when and Entitlement.by_uid(row,uid) then return true end
+    return Entitlement.active_for(row,Entitlement.by_uid(row,uid),context.snapshot,context.owner,when)
+end
+
+function Sync:current_entitlement(record)
+    local row=record and record.record
+    if not row or not row.entitlement_owner then return true end
+    local ui=self.host and self.host.ui
+    local xp=ui and ui.rolling and ui.rolling.xpointer
+    local page=self.host._reader_current_page and self.host:_reader_current_page()
+    return self:entitlement_page(record,ui and ui.document,page,xp)
+end
+
+function Sync:capture_entitlement_anchor(record,xpointer)
+    return PrecisePosition.capture(self.host.ui,record,self:_precision_catalog(record),xpointer)
+end
+
 function Sync:local_ratio()
     local ui = self.host.ui
     if not ui or not ui.document then return nil end
@@ -2612,6 +2659,9 @@ end
 
 function Sync:_save_local_snapshot(book_id,position)
     if type(position)~="table" or tostring(book_id or "")=="" then return end
+    local active=self.current
+    if active and active.record and active.record.entitlement_owner
+        and not self:entitlement_position(active,position,tonumber(position.captured_at) or os.time()) then return end
     local snapshot=PositionResolution.snapshot(position) or {}
     snapshot.captured_at=os.time()
     local session=self.store:session(book_id) or {}
@@ -3018,6 +3068,11 @@ function Sync:upload_progress(callback,options)
         if book_id=="" or type(position)~="table" or position.eink_coordinate~=true
             or tostring(position.book_id or "")~=book_id then
             failed("当前位置尚未通过 E-Ink 原文校验","position")
+            return false
+        end
+        if record and record.record and record.record.entitlement_owner
+            and not self:entitlement_position(record,position,tonumber(position.captured_at) or os.time()) then
+            failed("本地章节没有已确认的阅读权益","entitlement")
             return false
         end
         if not self.async or not self.async:available() or self.async:busy() then
@@ -4897,6 +4952,7 @@ function Sync:on_page(page)
     end
     if page ~= self.last_page then
         self.last_page = page
+        if self.current.record and self.current.record.entitlement_owner and not self:current_entitlement(self.current) then return end
         self.last_activity = os.time()
         if self.time_enabled==true then self:_write_daemon_control(true, false) end
     end
@@ -4932,6 +4988,7 @@ function Sync:on_suspend(options)
     end
 
     local r=self.current
+    if r and r.record and r.record.entitlement_owner and not self:current_entitlement(r) then r=nil end
     local now=os.time()
 
     if r and r.book and tostring(r.book.book_id or "")~="" then
@@ -5043,6 +5100,7 @@ function Sync:on_close(options)
     self:_cancel_record_retry()
     if self.identity_async then self.identity_async:cancel("document_closed") end
     local r = self.current or self:record()
+    if r and r.record and r.record.entitlement_owner and not self:current_entitlement(r) then r=nil end
     local now=os.time()
     local duplicate=false
     if r then

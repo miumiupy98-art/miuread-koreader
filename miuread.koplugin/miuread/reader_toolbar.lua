@@ -352,6 +352,7 @@ local Toolbar = InputContainer:extend{
     name = "miuread_reader_toolbar",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- Full-screen gesture capture, partial opaque ink frame.
     covers_fullscreen = false,
     stop_events_propagation = true,

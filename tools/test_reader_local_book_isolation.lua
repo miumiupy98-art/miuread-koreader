@@ -269,6 +269,7 @@ local function new_plugin(opts)
         _schedule_online_cache_cleanup=function() end,
         _install_eink_dictionary_action=function() end,
         _watch_limited_read=function() end,
+        _watch_downloaded_entitlement=function() end,
         _teardown_thought_tap=function() end,
         _install_comment_overlay=function() overlay_install_calls=overlay_install_calls+1 end,
         _schedule_thought_prewarm=function() end,

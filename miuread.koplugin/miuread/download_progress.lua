@@ -26,6 +26,7 @@ local DownloadProgress = InputContainer:extend{
     title = "MiuRead",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     _miuread_download_progress = true,
     covers_fullscreen = false,
     stop_events_propagation = true,

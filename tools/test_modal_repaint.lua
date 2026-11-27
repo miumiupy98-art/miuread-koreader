@@ -47,9 +47,28 @@ local text=file:read("*a")
 file:close()
 local left=assert(text:find("local function foreground_over_home(",1,true))
 local right=assert(text:find("function HomeWidget:_mark_dirty(",left+1,true))
-setfenv(assert(loadstring(text:sub(left,right-1))),setmetatable({HomeWidget=home_class,UIManager=ui}, {__index=_G}))()
+setfenv(assert(loadstring(text:sub(left,right-1))),setmetatable({
+    HomeWidget=home_class,UIManager=ui,DialogTransition=Transition,
+}, {__index=_G}))()
 local home=setmetatable({},{__index=home_class})
 local modal={modal=true,frame={dimen=geom:new{x=20,y=10,w=200,h=160}}}
+local legacy={modal=false,_miuread_modal_surface=true}
+local toast={toast=true}
+local page={covers_fullscreen=true}
+home.covers_fullscreen=true
+local home_view={is_shown=function() return true end,prune_duplicates=function() end}
+left=assert(text:find("function HomeView.raise(",1,true))
+right=assert(text:find("function HomeView.resume(",left+1,true))
+setfenv(assert(loadstring(text:sub(left,right-1))),setmetatable({
+    HomeView=home_view,UIManager=ui,DialogTransition=Transition,live_widget=home,
+},{__index=_G}))()
+ui._window_stack={{widget=home},{widget=page},{widget=legacy},{widget=modal},{widget=toast}}
+assert(home_view.raise(true))
+for i,expected in ipairs({page,home,legacy,modal,toast}) do
+    assert(ui._window_stack[i].widget==expected,"Home repainted over a foreground window")
+end
+assert(home_view.raise(true) and ui._window_stack[2].widget==home and #refreshes==0)
+assert(Transition.modal_attributes{}.modal and not Transition.is_modal(toast))
 ui._window_stack={{widget=home},{widget=modal}}
 assert(not home:_paint_region(geom:new{x=10,y=50,w=50,h=15},"ui"))
 assert(not home:_paint_region(geom:new{x=50,y=70,w=30,h=35},"full"))

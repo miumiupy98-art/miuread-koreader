@@ -90,6 +90,7 @@ local Dialog = InputContainer:extend{
     name = "miuread_reader_list_dialog",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- Full-screen input layer, but only the centered dialog frame is opaque.
     -- Keeping this false lets UIManager repaint HomeView beneath us and then
     -- paint this dialog on top instead of treating transparent margins as opaque.
@@ -494,7 +495,7 @@ function Dialog:_build_content()
                 end}}
             end
             local ButtonDialog=require("ui/widget/buttondialog")
-            dialog=ButtonDialog:new{title=self.opts.title,buttons=buttons,
+            dialog=ButtonDialog:new{modal=true,title=self.opts.title,buttons=buttons,
                 _miuread_modal_surface=true,_miuread_transient=true}
             UIManager:show(dialog)
         end}

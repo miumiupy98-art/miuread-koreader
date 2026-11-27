@@ -402,7 +402,7 @@ local function loading_card(period,width,height)
 end
 
 local Dialog = InputContainer:extend{
-    name="miuread_reading_stats_dialog",_miuread_transient=true,_miuread_modal_surface=true,
+    name="miuread_reading_stats_dialog",_miuread_transient=true,_miuread_modal_surface=true,modal=true,
     covers_fullscreen=true,stop_events_propagation=true,opts=nil,data=nil,kind="local",
     selected_key="weekly",closed=false,pending_action=nil,
 }
@@ -420,6 +420,16 @@ function Dialog:_period()
     return get_period(self.kind,self.data,self.selected_key)
 end
 
+function Dialog:_select_tab(key)
+    if self.selected_key==key then return end
+    self.selected_key=key
+    if key=="rewards" and not self.rewards then
+        self:_load_rewards()
+    else
+        self:_rebuild()
+    end
+end
+
 function Dialog:_tab(label,key,width,height)
     local selected=self.selected_key==key
     local layers=OverlapGroup:new{dimen=Geom:new{w=width,h=height},allow_mirroring=false}
@@ -433,10 +443,154 @@ function Dialog:_tab(label,key,width,height)
         }}
     end
     local tap=TapBox:new{dimen=Geom:new{w=width,h=height},callback=function()
-        if self.selected_key~=key then self.selected_key=key; self:_rebuild() end
+        self:_select_tab(key)
     end}
     tap[1]=layers
     return tap
+end
+
+local function reward_button(label,width,height,callback)
+    local bg=callback and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_LIGHT_GRAY
+    local fg=callback and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_DARK_GRAY
+    local shape=Skin.frame(width,height,{
+        bordersize=0,padding=0,radius=math.floor(height/2),background=bg,color=bg,
+    },Ui.text(label,width,height,Skin.face("smallinfofont",8.6,11.5,7.2),{
+        bold=true,halign="center",fgcolor=fg,max_width=math.max(1,width-6),
+    }))
+    if not callback then return shape end
+    return TapBox:new{dimen=Geom:new{w=width,h=height},callback=callback,shape}
+end
+
+function Dialog:set_rewards(value)
+    if self.closed then return end
+    self.rewards=value
+    self.reward_busy=false
+    if self.selected_key=="rewards" then self:_rebuild() end
+end
+
+function Dialog:_load_rewards()
+    if self.reward_busy then return end
+    self.reward_page=1
+    self.rewards={loading=true}
+    self.reward_busy=true
+    self:_rebuild()
+    self.opts.on_load_rewards(self)
+end
+
+function Dialog:_claim_reward(row,choice)
+    if self.reward_busy or self.closed then return end
+    self.opts.on_confirm_reward(row,choice,function()
+        if self.reward_busy or self.closed then return end
+        self.reward_busy=true
+        self:_rebuild()
+        self.opts.on_claim_reward(self,row,choice)
+    end)
+end
+
+function Dialog:_reward_row(row,width,height)
+    local gap=Skin.dp(8,6,11)
+    local count=#row.choices
+    local right_w=count>0 and math.min(math.floor(width*.54),Skin.dp(300,250,392))
+        or math.floor(width*.33)
+    local left_w=math.max(1,width-right_w-gap)
+    local title_h=math.ceil(height*.52)
+    local line=HorizontalGroup:new{align="center",
+        VerticalGroup:new{align="left",
+            Ui.textbox(row.title,left_w,title_h,Skin.face("cfont",10.8,14.4,9.0),{
+                bold=true,alignment="left",height_overflow_show_ellipsis=true,
+            }),
+            Ui.textbox(row.detail,left_w,math.max(1,height-title_h),Skin.face("smallinfofont",8.4,11.2,7.0),{
+                bold=true,alignment="left",fgcolor=Blitbuffer.COLOR_DARK_GRAY,height_overflow_show_ellipsis=true,
+            }),
+        },
+        HorizontalSpan:new{width=gap},
+    }
+    if count>0 then
+        local pill_h=math.min(height,Skin.dp(38,32,51))
+        local cell_w=math.max(1,math.floor((right_w-(count-1)*gap)/count))
+        local group=HorizontalGroup:new{align="center"}
+        for index,choice in ipairs(row.choices) do
+            if index>1 then group[#group+1]=HorizontalSpan:new{width=gap} end
+            local w=index==count and math.max(1,right_w-(cell_w+gap)*(count-1)) or cell_w
+            group[#group+1]=reward_button(choice.label,w,pill_h,not self.reward_busy and function()
+                self:_claim_reward(row,choice)
+            end or nil)
+        end
+        line[#line+1]=CenterContainer:new{dimen=Geom:new{w=right_w,h=height},group}
+    else
+        line[#line+1]=Ui.textbox(row.status or "",right_w,height,Skin.face("smallinfofont",8.6,11.5,7.2),{
+            bold=true,alignment="right",halign="right",fgcolor=Blitbuffer.COLOR_DARK_GRAY,
+            height_overflow_show_ellipsis=true,
+        })
+    end
+    return line
+end
+
+function Dialog:_rewards_card(width,height)
+    local pad=Skin.dp(9,7,13)
+    local w,h=math.max(1,width-pad*2),math.max(1,height-pad*2)
+    local data=self.rewards or {loading=true}
+    local small=Skin.face("smallinfofont",8.8,11.6,7.4)
+    local body=VerticalGroup:new{align="left"}
+    local function centered(text,text_h)
+        return Ui.textbox(text,w,text_h,Skin.face("cfont",10.6,14.2,8.9),{
+            alignment="center",halign="center",height_overflow_show_ellipsis=true,
+        })
+    end
+    if data.loading then return card(width,height,centered("正在获取本周奖励…",h),pad) end
+    if data.error then
+        local button_h=math.min(h,Skin.dp(44,38,60))
+        body[#body+1]=centered(data.error,math.max(1,h-button_h))
+        body[#body+1]=CenterContainer:new{dimen=Geom:new{w=w,h=button_h},
+            reward_button("重新获取",math.min(w,Skin.dp(150,124,196)),button_h,function() self:_load_rewards() end)}
+        return card(width,height,body,pad)
+    end
+    local title_h=Skin.dp(28,24,35)
+    local sub_h=Skin.dp(23,20,32)
+    body[#body+1]=Ui.textbox(data.headline,w,title_h,Skin.face("cfont",10.6,14.2,8.9),{bold=true,alignment="left"})
+    body[#body+1]=Ui.textbox(data.summary,w,sub_h,small,{bold=true,alignment="left",fgcolor=Blitbuffer.COLOR_DARK_GRAY})
+    local detail=self.reward_busy and "正在确认领取结果…" or data.notice or data.balance_text
+    local list_h=h-title_h-sub_h
+    if detail and detail~="" then
+        body[#body+1]=Ui.textbox(detail,w,sub_h,small,{bold=true,alignment="left",fgcolor=Blitbuffer.COLOR_DARK_GRAY})
+        list_h=list_h-sub_h
+    end
+    local rows=data.rows
+    if #rows==0 then
+        body[#body+1]=centered("本周暂无奖励档位",math.max(1,list_h))
+        return card(width,height,body,pad)
+    end
+    local rule=Skin.line("thin")
+    local min_row=Skin.dp(45,38,58)
+    local per_page=math.max(1,math.floor((list_h+rule)/(min_row+rule)))
+    local page_h=0
+    if per_page<#rows then
+        page_h=Skin.dp(31,27,42)
+        list_h=list_h-page_h
+        per_page=math.max(1,math.floor((list_h+rule)/(min_row+rule)))
+    end
+    local pages=math.ceil(#rows/per_page)
+    local page=math.min(self.reward_page or 1,pages)
+    local first,last=(page-1)*per_page+1,math.min(page*per_page,#rows)
+    local slots=math.min(#rows,per_page)
+    local row_h=math.max(1,math.floor((list_h-(slots-1)*rule)/slots))
+    for index=first,last do
+        if index>first then body[#body+1]=Skin.divider(w,Blitbuffer.COLOR_LIGHT_GRAY,rule) end
+        body[#body+1]=self:_reward_row(rows[index],w,row_h)
+    end
+    if page_h>0 then
+        local side=math.floor(w/4)
+        local function move(delta)
+            self.reward_page=page+delta
+            self:_rebuild()
+        end
+        body[#body+1]=HorizontalGroup:new{align="center",
+            reward_button("上一页",side,page_h,page>1 and function() move(-1) end or nil),
+            Ui.text(page.." / "..pages,w-side*2,page_h,small,{halign="center"}),
+            reward_button("下一页",side,page_h,page<pages and function() move(1) end or nil),
+        }
+    end
+    return card(width,height,body,pad)
 end
 
 function Dialog:_period_nav(period,width,height)
@@ -508,13 +662,21 @@ function Dialog:_build_content()
     y=y+subtitle_h
 
     local tabs={{"周","weekly"},{"月","monthly"},{"年","annually"},{"总","overall"}}
-    local tab_w=math.max(1,math.floor(content_w/4))
+    if self.kind=="weread" and self.opts.on_load_rewards then table.insert(tabs,1,{"奖励","rewards"}) end
+    local tab_w=math.max(1,math.floor(content_w/#tabs))
     for i,item in ipairs(tabs) do
         local x=outer+pad+(i-1)*tab_w
-        local actual=i==4 and math.max(1,outer+pad+content_w-x) or tab_w
+        local actual=i==#tabs and math.max(1,outer+pad+content_w-x) or tab_w
         root[#root+1]=OffsetContainer:new{x_off=x,y_off=y,self:_tab(item[1],item[2],actual,tab_h)}
     end
     y=y+tab_h
+
+    if self.selected_key=="rewards" then
+        root[#root+1]=OffsetContainer:new{x_off=outer+pad,y_off=y,
+            self:_rewards_card(content_w,math.max(1,sh-pad-y))}
+        self[1]=root
+        return
+    end
 
     local period=self:_period()
     root[#root+1]=OffsetContainer:new{x_off=outer+pad,y_off=y,self:_period_nav(period,content_w,nav_h)}

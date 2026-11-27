@@ -121,6 +121,7 @@ function M.rows(owner, items, options)
                 value = value,
                 detail = tostring(source.detail or source.help_text or ""),
                 enabled = enabled,
+                readonly_label = source.readonly_label == true,
                 checked = checked,
                 radio = source.radio == true,
                 bold = source.bold == true or source.heading == true,

@@ -271,6 +271,7 @@ local NativePopup = InputContainer:extend{
     name = "miuread_thought_native_popup",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- This is a transparent full-screen input layer around a smaller popup.
     -- Marking it as opaque prevents ReaderUI from repainting areas exposed when
     -- a dynamically sized page becomes shorter.
@@ -1244,7 +1245,7 @@ function NativePopup:_show_action_menu(comment)
         end
         return self:_handle_action(index,comment)
     end
-    dialog=ButtonDialog:new{
+    dialog=ButtonDialog:new{modal=true,
         title="评论操作",
         title_align="center",
         buttons={

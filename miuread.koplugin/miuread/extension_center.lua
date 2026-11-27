@@ -797,7 +797,7 @@ local function run_async_with_progress(plugin,text,label,fn,done,timeout,options
         cleanup_cancel()
         if dialog then pcall(function() UIManager:close(dialog) end) end
     end
-    dialog=ButtonDialog:new{
+    dialog=ButtonDialog:new{modal=true,
         title=tostring(text or "正在处理……").."\n\n可按返回键或点击取消。",
         title_align="center",
         close_callback=function() cancel("dialog_closed") end,
@@ -1650,7 +1650,7 @@ local function show_extension_task_detail(plugin,target)
         end}}
     end
     buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
-    dialog=ButtonDialog:new{title=table.concat(rows,"\n"),title_align="center",buttons=buttons}
+    dialog=ButtonDialog:new{modal=true,title=table.concat(rows,"\n"),title_align="center",buttons=buttons}
     UIManager:show(dialog)
 end
 
@@ -1717,7 +1717,7 @@ local function uninstall(plugin,item)
         for _,path in ipairs(item.duplicate_paths or {}) do if removable_plugin_copy(path) then paths[#paths+1]=path end end
         if #paths==0 then plugin:info("这些重复插件目录已经不存在。") return end
         local dialog
-        dialog=ButtonDialog:new{title="检测到 "..tostring(#paths).." 个“"..name.."”副本",title_align="center",buttons={
+        dialog=ButtonDialog:new{modal=true,title="检测到 "..tostring(#paths).." 个“"..name.."”副本",title_align="center",buttons={
             {{text="删除全部副本",callback=function()
                 UIManager:close(dialog)
                 UIManager:show(ConfirmBox:new{

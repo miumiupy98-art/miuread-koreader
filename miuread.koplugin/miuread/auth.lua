@@ -5,7 +5,7 @@ local RawButtonDialog=require("ui/widget/buttondialog")
 local RawInputDialog=require("ui/widget/inputdialog")
 local GestureBridge=require("miuread.gesture_bridge")
 local function gesture_aware_class(base)
-    local class=base:extend{_miuread_transient=true}
+    local class=base:extend{modal=true,_miuread_transient=true}
     function class:handleEvent(event)
         return GestureBridge.handle(base,self,event)
     end
