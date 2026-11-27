@@ -120,6 +120,7 @@ function M.rows(owner, items, options)
                 label = label,
                 value = value,
                 detail = tostring(source.detail or source.help_text or ""),
+                preview_image = source.preview_image,
                 enabled = enabled,
                 readonly_label = source.readonly_label == true,
                 checked = checked,

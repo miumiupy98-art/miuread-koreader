@@ -7226,6 +7226,7 @@ function Plugin:_show_miuread_menu(title,items,options)
         actions=options.actions,initial_page=options.initial_page,on_page_change=options.on_page_change,
         on_back=options.on_back or options.on_close,
         on_close=options.on_close,
+        on_home=options.on_home,
     }
     if not dialog then logger.warn("[MiuRead][Menu] custom list unavailable",tostring(err or "unknown")) end
     return dialog
@@ -18268,39 +18269,109 @@ function Plugin:_reader_adjust_font_weight(delta)
     return self:_reader_set_font_weight(self:_reader_font_weight_value()+(tonumber(delta) or 0))
 end
 
+function Plugin:_apply_weread_font(face,from_home,system_default)
+    if from_home then
+        return self:_set_home_ui_font(system_default and "default" or "custom",face)
+    end
+    local font=self.ui and self.ui.font
+    if not (face and font and type(font.onSetFont)=="function") then return false end
+    font:onSetFont(face)
+    if font.font_face~=face then return false end
+    if type(font.addToRecentlySelectedList)=="function" then font:addToRecentlySelectedList(face) end
+    self:_remember_home_body_font()
+    return true
+end
+
 function Plugin:_show_weread_fonts(back_callback,from_home)
     local Fonts=require("miuread.weread_font_download")
-    local function show_catalog() self:_show_weread_fonts(back_callback,from_home) end
     local rows={}
+    local dialog
     local directory=Fonts.directory()
+    local function refresh()
+        if dialog then ReaderListDialog.refresh(dialog) end
+    end
     for index,font in ipairs(Fonts.catalog) do
         local face_index=index
-        local installed=index==1 or U.file_exists(directory.."/"..font.file)
-        rows[#rows+1]={text=font.name,post_text=installed and "已可用" or (font.url and "下载" or "安装"),
+        local key="weread-font:"..face_index
+        local path=directory.."/"..font.file
+        local function installed()
+            return face_index==1 or U.file_exists(path)
+        end
+        local function face_name()
+            if face_index~=1 then return Fonts.face_name(path) end
+            local doc=self.ui and self.ui.document
+            return (G_reader_settings and G_reader_settings:readSetting("cre_font")) or (doc and doc.default_font)
+        end
+        local function using(face)
+            if from_home then
+                local home=self:_home_preferences()
+                if face_index==1 then return home.ui_font_mode=="default" end
+                return face and self:_home_ui_font_name(home)==face
+            end
+            return face and self:_reader_font_label()==face
+        end
+        rows[#rows+1]={
+            text=font.name,
+            preview_image=Fonts.preview_path(face_index),
+            keep_menu_open=true,
+            post_text_func=function()
+                if self._interactive_network_key==key then return "下载中" end
+                if installed() then return using(face_name()) and "使用中" or "应用" end
+                return font.url and "下载" or "安装"
+            end,
             callback=function()
-                if installed then return back_callback() end
+                if installed() then
+                    local face=face_name()
+                    if not using(face) then
+                        if (not (from_home and face_index==1) and not face)
+                            or not self:_apply_weread_font(face,from_home,face_index==1) then
+                            self:info("KOReader 暂未识别此字体，请重启后重试。")
+                        end
+                    end
+                    return
+                end
+                if tostring(self._interactive_network_key or ""):match("^weread%-font:") then
+                    self:toast("请等当前字体下载完成",2)
+                    return
+                end
+                local stem
+                local function cleanup()
+                    Fonts.clear_temporary(stem)
+                    refresh()
+                end
                 local function ready(result)
+                    cleanup()
                     if not (result and result.ok and result.value) then
-                        self:info("字体安装失败。"..self:_friendly_remote_error(result and result.error,"字体"))
+                        local detail=U.first_line(tostring(result and result.error or "未知错误"),160)
+                            :gsub("^.-%.lua:%d+:%s*","")
+                        logger.warn("[MiuRead][Fonts]","index=",face_index,detail)
+                        self:info(font.name.."\n\n"..self:_friendly_remote_error(detail,"字体安装"))
                         return
                     end
                     local refreshed=pcall(Fonts.refresh_registry,result.value)
-                    if refreshed then self:toast("字体已安装，主页和正文都可选用",2)
-                    else self:toast("字体已安装，重启 KOReader 后可选用",3) end
-                    show_catalog()
+                    if refreshed then self:toast("字体已安装，点「应用」即可使用",2)
+                    else
+                        logger.warn("[MiuRead][Fonts] KOReader registry refresh failed","index=",face_index)
+                        self:toast("字体已安装，重启 KOReader 后可选用",3)
+                    end
                 end
                 if face_index==2 then
                     local ok,path=pcall(Fonts.install,nil,face_index)
                     return ready({ok=ok,value=ok and path,error=not ok and path})
                 end
                 local store=self.store
-                self:_run_interactive_network("weread-font:"..tostring(face_index),"微信读书字体",function()
-                    return Fonts.install(Http:new(store),face_index)
-                end,ready,{status_title=font.name,status_text="正在下载字体…",timeout=155})
+                stem=Fonts.temporary_stem()
+                self:_run_interactive_network(key,"微信读书字体",function()
+                    return Fonts.install(Http:new(store),face_index,stem)
+                end,ready,{on_cancel=cleanup,timeout=275})
             end}
     end
-    if from_home then return self:_show_standalone_menu("微信读书字体",rows,{on_close=back_callback}) end
-    return self:_show_reader_menu_table("微信读书字体",rows,back_callback)
+    dialog=self:_show_miuread_menu("微信读书字体",rows,{
+        page_size=6,
+        on_back=back_callback,
+        on_home=not from_home and function() return self:_reader_home_action("reader surface") end or nil,
+    })
+    return dialog
 end
 
 function Plugin:_show_reader_font_face_menu(back_callback)
