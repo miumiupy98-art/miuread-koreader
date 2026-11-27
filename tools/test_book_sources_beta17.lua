@@ -19,16 +19,27 @@ package.loaded["miuread.reader_list_dialog"]={refresh=function() repaints=repain
 package.loaded.logger={info=noop,warn=noop}
 local Data=require("miuread.bookstore_data")
 local Storefront=require("miuread.bookstore")
-local rank={{categoryId="rising",title="飙升榜"}}
 local api={}
 local calls={}
-function api:recommend_books() calls[#calls+1]="recommend"; return {books={{bookId="r",title="推荐书",author="作者甲"}}} end
-function api:store_categories() calls[#calls+1]="categories"; return {_api_channel="eink",data={{categories=rank}}} end
-function api:for_channel(channel) assert(channel=="eink"); return self end
-function api:category_books(id,offset,is_rank)
-    assert(id=="rising" and offset==0 and is_rank)
-    calls[#calls+1]="rank"
-    return {books={{bookId="s",title="榜单书",author="作者乙"}}}
+function api:store_home()
+    calls[#calls+1]="home"
+    local recommendations={}
+    for i=1,7 do
+        recommendations[i]={bookInfo={bookId="r"..i,title="推荐书"..i,author="作者甲"}}
+    end
+    return {search={text="书城搜索"},data={
+        {type=23,name="旧推荐"},
+        {type=1001,name="榜单",categories={{categoryId="raw-only",title="raw-only"},{categoryId="rising",title="飙升榜",
+            lectureBooks={{bookInfo={bookId="s",title="榜单书",author="作者乙"}}}}}},
+        {type=40,name="分类",categories={{categoryId="fiction",title="文学",covers={"cover1","cover2"},
+            sublist={{categoryId="fiction2",title="小说"}}}}},
+        {type=9999,name="忽略"},
+    },updated={{type=23,name="猜你喜欢",books=recommendations}}}
+end
+function api:store_categories()
+    calls[#calls+1]="categories"
+    return {data={{categories={{categoryId="raw-only",title="raw-only"},
+        {categoryId="rising",title="飙升榜"},{categoryId="1",title="文学"}}}}}
 end
 package.loaded["miuread.api"]={new=function() return api end}
 package.loaded["miuread.reader"]={new=function() end}
@@ -46,17 +57,58 @@ function host:_run_interactive_network(_,_,worker,done,opts)
 end
 function host:book_menu(book,back) opened=book; back() end
 function host:show_book_sources() opened="sources" end
+function host:search_dialog(title,back) opened=title; back() end
 online=true
 Storefront.open(host)
-assert(#calls==3 and calls[3]=="rank" and repaints==1)
-assert(menu.title=="微信读书" and menu.rows[2].text=="推荐书" and menu.rows[4].text=="榜单书")
+assert(#calls==1 and calls[1]=="home" and repaints==1)
+assert(menu.title=="微信读书书城" and menu.rows[1].text=="猜你喜欢" and menu.rows[1].cards[1].title=="推荐书1")
+assert(menu.opts.toolbar[1][1].label=="搜索书名、作者")
+menu.opts.on_page_change(2)
+menu.opts.toolbar[1][1].callback()
+assert(opened=="搜索微信读书" and menu.opts.initial_page==2)
+assert(menu.rows[1].section_actions[1].label=="换一批")
+menu.rows[1].section_actions[1].callback()
+assert(menu.rows[1].cards[1].title=="推荐书4")
+menu.rows[1].section_actions[2].callback()
+assert(menu.title=="猜你喜欢" and #menu.rows==7)
 menu.rows[2].callback()
-assert(opened.bookId=="r" and #calls==3,"return to discovery must reuse loaded books")
+assert(opened.bookId=="r2" and #calls==1,"return to discovery must reuse loaded books")
+menu.opts.on_back()
+menu.opts.toolbar[2][2].callback()
+assert(menu.title=="榜单" and #menu.rows==1 and menu.rows[1].text=="飙升榜")
+menu.opts.on_back()
 menu.opts.on_back()
 assert(opened=="sources")
 online=false
 Storefront.open(host)
-assert(menu.rows[4].text=="榜单书" and #calls==3)
+assert(menu.rows[2].text=="榜单" and #calls==2)
+local home=Data.home(api:store_home())
+assert(home.search_hint=="书城搜索" and #home.sections==3)
+assert(home.sections[2].categories[1].rank and home.sections[2].categories[1].id=="rising"
+    and home.sections[2].books[1].bookId=="s")
+assert(not home.sections[3].categories[1].rank and #home.sections[3].categories[1].covers==2)
+
+local pending,finished,cover_runs
+package.loaded["ui/uimanager"].scheduleIn=function(_,_,fn) pending=fn end
+package.loaded["miuread.async"]={new=function() return {
+    available=function() return true end,cancel=noop,
+    run=function(_,_,_,done) cover_runs=(cover_runs or 0)+1; finished=done end,
+} end}
+host.library={}
+host.store.temp_dir="/app/tmp"
+online=true
+Storefront.open(host)
+local home_view=menu
+local repaint_before=repaints
+local first_book=menu.rows[1].cards[1].book
+first_book.cover="https://synthetic.invalid/cover"
+menu.opts.on_visible(menu,menu.rows,1,1)
+assert(pending and not cover_runs)
+pending()
+assert(cover_runs==1 and finished and repaints==repaint_before)
+menu.opts.on_dismiss()
+finished{ok=true,value={[first_book.cover]="/app/cover.jpg"}}
+assert(repaints==repaint_before and not home_view.rows[1].cards[1].path())
 
 local cloud=Data.recent_books({items={
     {book={bookId="fresh",title="云端最新"},readUpdateTime=1800000000000},

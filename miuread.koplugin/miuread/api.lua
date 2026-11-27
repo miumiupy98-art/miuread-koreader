@@ -11,7 +11,7 @@ local capabilities={
     add_to_shelf={phase="shelf",write=true},remove_from_shelf={phase="shelf",write=true},
     book={phase="book"},chapters={phase="catalog"},catalog={phase="catalog"},
     search={phase="search"},book_search={phase="search"},recommend_books={phase="store"},similar_books={phase="store"},
-    store_categories={phase="store"},category_books={phase="store"},reading_stats={phase="statistics"},
+    store_home={phase="store"},store_categories={phase="store"},category_books={phase="store"},reading_stats={phase="statistics"},
     notebooks={phase="annotations"},bookmark_list={phase="annotations"},review_list_mine={phase="annotations"},
     underlines={phase="annotations"},readreviews={phase="annotations"},review_single={phase="annotations"},
     best_bookmarks={phase="annotations"},

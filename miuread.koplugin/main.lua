@@ -7224,8 +7224,11 @@ function Plugin:_show_miuread_menu(title,items,options)
         items=function() return self:_miuread_menu_rows(items,options) end,
         page_size=tonumber(options.page_size) or 7,
         actions=options.actions,initial_page=options.initial_page,on_page_change=options.on_page_change,
+        toolbar=options.toolbar,card_rows=options.card_rows,on_visible=options.on_visible,
         on_back=options.on_back or options.on_close,
         on_close=options.on_close,
+        on_dismiss=options.on_dismiss,
+        dismiss_to_back=options.dismiss_to_back,
         on_home=options.on_home,
     }
     if not dialog then logger.warn("[MiuRead][Menu] custom list unavailable",tostring(err or "unknown")) end

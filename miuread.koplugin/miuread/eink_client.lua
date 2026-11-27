@@ -573,6 +573,9 @@ end
 function M:recommend_books(offset,count)
     return array(self:request("GET","/book/recommend",{maxIdx=offset or 0,count=count or 20},"store"),"books","store")
 end
+function M:store_home()
+    return self:request("GET","/market/list",{synckey=0,subtype=0,eink_new=1,rn=1},"store")
+end
 function M:similar_books(id,offset,count,session_id)
     local value=self:request("GET","/book/detailinfo",{bookId=book_id(id),listtypes=2,synckey=0,
         maxIdx=offset or 0,count=count or 20,sessionId=session_id},"store")

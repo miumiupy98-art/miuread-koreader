@@ -136,6 +136,8 @@ function Dialog:_push(title, items, subtitle)
         empty_text = parent.empty_text,
         on_close = parent.on_close,
         on_back = parent.on_back,
+        on_dismiss = parent.on_dismiss,
+        dismiss_to_back = parent.dismiss_to_back,
     }
     self.page = 1
     self.selected_key = ""
@@ -226,6 +228,7 @@ function Dialog:_run_item(item, index)
 end
 
 function Dialog:_row_widget(item, width, height, index)
+    if item.cards then return self:_section_widget(item,width,height) end
     local enabled = item.enabled ~= false
     -- Opt-in readonly rows keep readable contrast without making them tappable.
     local readable = enabled or item.readonly_label == true
@@ -310,6 +313,54 @@ function Dialog:_row_widget(item, width, height, index)
     }
     tap[1] = CenterContainer:new{dimen = Geom:new{w = width, h = height}, row}
     return tap
+end
+
+function Dialog:_action_button(label,width,height,callback,search)
+    local tap=TapBox:new{dimen=Geom:new{w=width,h=height},callback=callback}
+    tap[1]=Skin.frame(width,height,{bordersize=Skin.line("thin"),radius=Skin.dp(6,5,9),
+        padding=0,background=Blitbuffer.COLOR_WHITE,color=Blitbuffer.COLOR_GRAY},
+        Ui.textbox(label,math.max(1,width-8),math.max(1,height-4),Skin.face("cfont",10.5,14,9),{
+            alignment="center",halign="center",bold=search==true,
+        }))
+    return tap
+end
+
+function Dialog:_section_widget(item,width,height)
+    local root=OverlapGroup:new{dimen=Geom:new{w=width,h=height},allow_mirroring=false}
+    local header=math.max(1,math.floor(height*.24))
+    local actions=item.section_actions or {}
+    local action_w=math.floor(math.min(width*.25, Skin.dp(95,78,118)))
+    local title_w=math.max(1,width-#actions*action_w)
+    root[#root+1]=OffsetContainer:new{Ui.textbox(item.label,title_w,header,Skin.face("cfont",12,16,10),
+        {bold=true,alignment="left"})}
+    for i,action in ipairs(actions) do
+        root[#root+1]=OffsetContainer:new{x_off=title_w+(i-1)*action_w,
+            self:_action_button(action.label,action_w,header,function()
+                if action.stay then action.callback(); self:_rebuild()
+                else self:_close(action.callback) end
+            end)}
+    end
+    local cell_w=math.max(1,math.floor(width/3))
+    local body=height-header
+    local label_h=math.max(1,math.floor(body*.34))
+    local cover_h=math.max(1,body-label_h-4)
+    local cover_w=math.max(1,math.min(cell_w-6,math.floor(cover_h*.7)))
+    for i,card in ipairs(item.cards) do
+        local tap=TapBox:new{dimen=Geom:new{w=cell_w,h=body},
+            callback=function() self:_close(card.callback) end}
+        local tile=OverlapGroup:new{dimen=Geom:new{w=cell_w,h=body},allow_mirroring=false}
+        local cover=card.path and card.path()
+        local image=cover and ImageWidget:new{file=cover,width=cover_w,height=cover_h}
+            or Skin.frame(cover_w,cover_h,{background=Blitbuffer.COLOR_LIGHT_GRAY})
+        tile[#tile+1]=OffsetContainer:new{x_off=math.floor((cell_w-cover_w)/2),image}
+        tile[#tile+1]=OffsetContainer:new{y_off=cover_h,
+            Ui.textbox(card.title,cell_w,label_h,Skin.face("cfont",10,13,8.5),{
+                alignment="center",halign="center",
+            })}
+        tap[1]=tile
+        root[#root+1]=OffsetContainer:new{x_off=(i-1)*cell_w,y_off=header,tap}
+    end
+    return root
 end
 
 function Dialog:_inline_actions_widget(item, width, height)
@@ -418,9 +469,12 @@ function Dialog:_build_content()
     local row_h = math.max(Skin.dp(83, 72, 109), math.floor(sh * (portrait and .078 or .11)))
     local action_h = Skin.dp(40, 35, 52)
     local action_gap = Skin.dp(5, 4, 7)
+    local toolbar=self.opts.toolbar or {}
+    local toolbar_h=#toolbar*action_h
+    if self.opts.card_rows then row_h=math.floor(row_h*2) end
     local requested_page_size = self:_page_size()
     local max_h = math.floor(sh * (portrait and .76 or .84))
-    local fixed_h = pad * 2 + header_h + subtitle_h + tab_h + Skin.dp(8, 6, 12)
+    local fixed_h = pad * 2 + header_h + subtitle_h + tab_h + toolbar_h + Skin.dp(8, 6, 12)
     -- Reserve the inline action strip and pager even when they are initially
     -- hidden: expanding a row must never push the final row under the footer.
     local available_rows = max_h - fixed_h - pager_h_default - action_h - action_gap
@@ -437,6 +491,7 @@ function Dialog:_build_content()
     end
     local first = (self.page - 1) * page_size + 1
     local last = math.min(#items, first + page_size - 1)
+    if self.opts.on_visible then self.opts.on_visible(self,items,first,last) end
 
     local visible_slots = math.min(page_size, math.max(1, #items))
     local has_pager = #items > page_size
@@ -525,6 +580,18 @@ function Dialog:_build_content()
         },
     }
     y = y + header_h
+
+    for _,group in ipairs(toolbar) do
+        local controls=HorizontalGroup:new{align="center"}
+        local width=math.floor(content_w/#group)
+        for _,action in ipairs(group) do
+            controls[#controls+1]=self:_action_button(action.label,width,action_h,function()
+                self:_close(action.callback)
+            end,#group==1)
+        end
+        root[#root+1]=OffsetContainer:new{x_off=panel_x+pad,y_off=y,controls}
+        y=y+action_h
+    end
 
     if subtitle_h > 0 then
         root[#root + 1] = OffsetContainer:new{x_off = panel_x + pad, y_off = y,
@@ -627,12 +694,16 @@ function Dialog:onTapDismiss(_, ges)
     local pos = ges and ges.pos
     if pos and (pos.y < self.frame_dimen.y or pos.y > self.frame_dimen.y + self.frame_dimen.h
         or pos.x < self.frame_dimen.x or pos.x > self.frame_dimen.x + self.frame_dimen.w) then
+        if self.opts.dismiss_to_back then return self:_close(self.opts.on_back) end
         return self:_close(nil, true)
     end
     return false
 end
 function Dialog:onSwipeDismiss(_, ges)
-    if ges and ges.direction == "north" then return self:_close(nil, true) end
+    if ges and ges.direction == "north" then
+        if self.opts.dismiss_to_back then return self:_close(self.opts.on_back) end
+        return self:_close(nil, true)
+    end
     return false
 end
 function Dialog:onClose()
@@ -648,6 +719,7 @@ function Dialog:onCloseWidget()
     self.pending_action = nil
     self.closed = true
     if live_dialog == self then live_dialog = nil end
+    if self.opts.on_dismiss then self.opts.on_dismiss() end
     DialogTransition.after_close(region, action, "ReaderListDialog")
 end
 
