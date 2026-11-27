@@ -106,6 +106,11 @@ function M:start(sync,record,capture_floor)
     window=saved
     self.active={sync=sync,record=record,stats=stats,stats_book=stats.id_curr_book,vid=vid,window=window,book_id=window.book_id,last_scan=now,
         sources=setmetatable({},{__mode="k"})}
+    if record.record and record.record.entitlement_owner then
+        self.active.entitlement=sync:entitlement_context(record)
+        self.active.entitlement.pages={}
+        self.active.document=sync.host.ui.document
+    end
     Stats.snapshot(stats,now,self.active.sources)
     self.capture_error=nil
     self:log("start","success",{book_id=window.book_id,source="koreader",start_time=now,
@@ -155,6 +160,20 @@ function M:collect(close)
         local ok,persisted=pcall(Stats.persisted,active.stats,active.last_scan,now)
         if ok then for _,row in ipairs(persisted) do spans[#spans+1]=row end
         else self:log("statistics_db","error",{reason="snapshot_failed"}) end
+    end
+    if active.entitlement then
+        local filtered={}
+        local Entitlements=require("miuread.download_entitlements")
+        for _,span in ipairs(spans) do
+            local start=math.max(tonumber(span.start_time) or now,active.window.capture_not_before)
+            local allowed,expires=active.sync:entitlement_page(active.record,active.document,span.page,nil,start,
+                active.entitlement)
+            if allowed then
+                local eligible=Entitlements.clip_span(span,expires)
+                if eligible then filtered[#filtered+1]=eligible end
+            end
+        end
+        spans=filtered
     end
     local result,err=self.queue:collect(active.vid,active.window.id,spans,now,close)
     if not result then self.capture_error=err; self:log("capture","error",{reason=err}); return false end

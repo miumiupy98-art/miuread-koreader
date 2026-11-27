@@ -140,6 +140,9 @@ local PluginMenu=require("miuread.plugin_menu")
 local PluginSettings=require("miuread.plugin_settings")
 local Actions=require("miuread.actions")
 local function gesture_aware_class(base, attributes)
+    if attributes and attributes._miuread_modal_surface then
+        require("miuread.dialog_transition").modal_attributes(attributes)
+    end
     local class=base:extend(attributes or {})
     function class:handleEvent(event)
         return GestureBridge.handle(base,self,event)
@@ -2120,16 +2123,79 @@ function Plugin:show_eink_account_overview()
         if type(value)~="table" then self:info("E-Ink 账户资料暂时无法读取"); return end
         if value.changed then self:_apply_interactive_auth(value) end
         local row=value.overview
+        if row.download_entitlement then self:_save_download_entitlement_state(row.download_entitlement) end
         local balance=row.balance and string.format("%.2f",row.balance) or "暂未取得"
         local gift=row.gift_balance and string.format("%.2f",row.gift_balance) or "暂未取得"
-        local remaining=row.remaining and (row.permanent and "永久" or tostring(math.ceil(row.remaining/86400)).." 天") or "暂未取得"
-        self:list("账户资料",{
-            {text="书币",post_text=balance,enabled=false},
-            {text="赠币",post_text=gift,enabled=false},
-            {text="会员剩余",post_text=remaining,enabled=false},
-        })
+        local function remaining(seconds,expires,expired)
+            if seconds==nil then return "暂未取得" end
+            if expired or seconds<=0 then return expires and expires>0 and "已到期" or "无" end
+            local days=math.floor(seconds/86400)
+            local label=days==0 and "今日到期" or (tostring(days).." 天")
+            return label,expires and expires>0 and (os.date("%Y-%m-%d",expires).." 到期") or nil
+        end
+        local paid=row.paying and row.paid_remaining or (row.paying==false and row.remaining~=nil and 0 or nil)
+        local paid_expires=row.paying and paid and os.time()+paid or nil
+        local trial_expires=(row.trial_remaining and row.trial_remaining>0 or (not row.paying and row.expired))
+            and row.expires or nil
+        local function readout(label,value,detail)
+            return {text=label,post_text=value,detail=detail,enabled=false,readonly_label=true}
+        end
+        local paid_value,paid_detail=remaining(paid,paid_expires,row.expired)
+        local panel
+        panel=self:_show_miuread_menu("账户资料",{
+            readout("书币",balance),
+            readout("赠币",gift),
+            readout("会员卡",row.permanent and "终身会员" or paid_value,not row.permanent and paid_detail or nil),
+            readout("体验卡",remaining(row.trial_remaining,trial_expires,row.expired)),
+            readout("章节券",row.coupons~=nil and tostring(row.coupons).." 张" or "暂未取得"),
+            {text="卡券有效期",callback=function()
+                local dates={}
+                local function date_or_status(seconds,expires,expired)
+                    local status,date=remaining(seconds,expires,expired)
+                    return date or status
+                end
+                dates[1]=readout("会员卡",row.permanent and "终身会员" or date_or_status(paid,paid_expires,row.expired))
+                dates[2]=readout("体验卡",date_or_status(row.trial_remaining,trial_expires,row.expired))
+                dates[3]=readout("章节券余额",row.coupons and (row.coupons.." 张") or "暂未取得")
+                dates[4]={text="会员权益明细",callback=function()
+                    require("miuread.reading_account_ui").member_benefits(self,function()
+                        self:show_eink_account_overview()
+                    end)
+                end}
+                self:_show_miuread_menu("卡券有效期",dates,{on_back=function() self:show_eink_account_overview() end})
+            end},
+            {text="购买会员卡",keep_menu_open=true,callback=function()
+                self:_show_weread_member_qr(function()
+                    if panel and UIManager:isWidgetShown(panel) then UIManager:close(panel) end
+                    self:show_eink_account_overview()
+                end)
+            end},
+        },{on_close=function() self:show_account_status() end,page_size=7})
     end,{context=context,timeout=42,status_title="账户资料",status_text="正在读取 E-Ink 账户资料…"})
 end
+function Plugin:_show_weread_member_qr(on_refresh)
+    local auth=self.store:auth()
+    local credentials=require("miuread.shelf_client").credentials(auth)
+    local url=credentials and require("miuread.eink_entitlements").purchase_url(credentials.vid)
+    if not url then self:info("微信读书账号信息暂未取得，请检查登录状态。");return false end
+    local dialog
+    dialog=ButtonDialog:new{title="微信扫码购买会员卡",title_align="center",buttons={
+        {{text="我已购买，刷新天数",callback=function()
+            UIManager:close(dialog)
+            if self.store:auth().login_session_id==auth.login_session_id then on_refresh() end
+        end}},
+        {{text="关闭",callback=function() UIManager:close(dialog) end}},
+    }}
+    local width=dialog:getAddedWidgetAvailableWidth() or math.floor(Device.screen:getWidth()*.76)
+    local size=math.floor(math.min(width,Device.screen:getHeight())*.66)
+    local qr=require("ui/widget/qrwidget"):new{text=url,width=size,height=size,scale_factor=.92}
+    dialog:addWidget(require("ui/widget/container/centercontainer"):new{
+        dimen=require("ui/geometry"):new{w=width,h=size},qr,
+    })
+    UIManager:show(dialog)
+    return true
+end
+
 function Plugin:confirm_logout()
     if not self:logged_in() then self:toast("当前没有登录微信读书账号",3); return end
     local downloading=self.download_task and self.download_task:busy()
@@ -2296,7 +2362,7 @@ function Plugin:_account_diagnostics_menu()
 end
 
 function Plugin:show_account_status()
-    return self:_show_miuread_menu("微信读书账号",self:account_menu(),{page_size=7})
+    return self:_show_miuread_menu("账号状态",self:account_menu(),{page_size=7})
 end
 
 function Plugin:on_auth_success(name)
@@ -2402,6 +2468,23 @@ function Plugin:current_book_download_menu(book)
     return items
 end
 
+function Plugin:_show_cloud_progress_routes(id)
+    if id=="" then return false end
+    return self:_fetch_eink_display("progress-routes:"..id,"云端阅读进度",
+        require("miuread.reading_account_ui").progress_views,{id},function(rows)
+            local items={}
+            for _,row in ipairs(rows) do
+                local position=row.position
+                items[#items+1]={text=row.label,
+                    post_text=position and string.format("%.1f%%",position.percent) or "暂未取得",
+                    detail=position and position.updated_at and position.updated_at>0
+                        and os.date("%m-%d %H:%M 更新",position.updated_at) or nil,
+                    enabled=false,readonly_label=true}
+            end
+            self:_show_miuread_menu("云端阅读进度",items,{subtitle="只读查询"})
+        end)
+end
+
 function Plugin:current_book_menu()
     local r=self:_current_book_record()
     if not r or not r.book then
@@ -2431,6 +2514,23 @@ function Plugin:current_book_menu()
     end
     local finished_action=self:_finished_status_action(b)
     if finished_action then items[#items+1]=finished_action end
+    if self:logged_in() then
+        items[#items+1]={text="查看各通道云端进度",callback=function()
+            self:_show_cloud_progress_routes(tostring(b.bookId or ""))
+        end}
+    end
+    if r.record and r.record.entitlement_owner then
+        local key=r.record.entitlement_owner..":"..tostring(b.bookId or "")
+        local decisions=self.store:get("download_entitlement_reminders",{})
+        if decisions[key] then
+            items[#items+1]={text="恢复到期提醒",callback=function()
+                local current=self.store:get("download_entitlement_reminders",{})
+                current[key]=nil
+                self.store:set("download_entitlement_reminders",current)
+                self:toast("已恢复此书的到期提醒",2)
+            end}
+        end
+    end
     return items
 end
 
@@ -2497,15 +2597,25 @@ end
 function Plugin:account_menu()
     local logged_in=self:logged_in()
     local rows={
-        {text="微信读书账号",post_text=self:_home_account_name(),enabled=false},
-        {text=logged_in and "重新扫码登录" or "扫码登录",callback=function() self.auth_flow:start() end},
+        {text="账号",post_text=self:_home_account_name(),enabled=false,readonly_label=true},
+        {text="基础登录",post_text=logged_in and "正常" or "尚未登录",enabled=false,readonly_label=true},
     }
     if logged_in then
-        table.insert(rows,2,{text="账户资料",callback=function() self:show_eink_account_overview() end})
-        for _,item in ipairs(self:_native_mp_feed_entries()) do rows[#rows+1]=item end
-        rows[#rows+1]={text="检查登录状态",callback=function() self:check_account_status() end}
+        rows[#rows+1]={text="账户资料",show_chevron=true,
+            callback=function() self:show_eink_account_overview() end}
+        rows[#rows+1]={text="云端笔记",callback=function()
+            require("miuread.reading_account_ui").notebooks(self,function() self:show_account_status() end)
+        end}
+    end
+    rows[#rows+1]={text="账号操作",separator=true,enabled=false,readonly_label=true}
+    if logged_in then
+        rows[#rows+1]={text="重新检查状态",callback=function() self:check_account_status() end}
+        rows[#rows+1]={text="重新扫码登录",callback=function() self.auth_flow:start() end}
         rows[#rows+1]={text="退出登录",callback=function() self:confirm_logout() end}
         rows[#rows+1]={text="详细状态",sub_item_table_func=function() return self:_account_diagnostics_menu() end}
+        for _,item in ipairs(self:_native_mp_feed_entries()) do rows[#rows+1]=item end
+    else
+        rows[#rows+1]={text="扫码登录",callback=function() self.auth_flow:start() end}
     end
     return rows
 end
@@ -2993,6 +3103,7 @@ function Plugin:_offline_download_scope(book_id)
     local function exists(kind,record)
         return kind~="online" and type(record)=="table" and record.file
             and record.eink_content_mode~="eink-online" and U.file_exists(record.file)
+            and (record.access_scope~="preview" or tonumber(record.readable_chapter_count)~=0)
     end
     if exists("notes",(book.variants or {}).notes) then return "variant" end
     for kind,record in pairs(book.variants or {}) do
@@ -3036,6 +3147,8 @@ function Plugin:_apply_shelf_download_state(book,state,queued)
             book.download_status=DownloadResult.shelf_status(state,true)
         elseif (state.status=="failed" or state.status=="interrupted") and options.generate_translation_uid==nil then
             book.download_status=DownloadResult.failure_label(state)
+        elseif state.status=="partial_access" then
+            book.download_status=(tonumber(state.readable_chapter_count) or 0)>0 and "已下载部分章节" or "未确认下载权限"
         elseif state.status=="annotation_pending" then
             book.download_status="正文可用 · 批注待修复"
         end
@@ -7213,7 +7326,7 @@ function Plugin:_show_standalone_menu(title,items,options)
     -- bridged Menu remains unchanged for MiuRead home pages.
     TransientGuard.close_all()
     local MenuClass=options.native_input==true and RawMenu or Menu
-    menu=MenuClass:new{title=tostring(title or "觅阅"),item_table=rows,is_borderless=true,title_bar_fm_style=true}
+    menu=MenuClass:new{modal=true,title=tostring(title or "觅阅"),item_table=rows,is_borderless=true,title_bar_fm_style=true}
     menu._miuread_transient=true
     menu._miuread_modal_surface=true
     -- TitleBar captures a dynamic self:onClose() call when it is created.
@@ -7631,7 +7744,7 @@ function Plugin:_reader_wifi_settings(back_callback)
                         math.max(screen:scaleBySize(58),row_height*math.max(1,#visible_networks)+screen:scaleBySize(12)))
                     logger.info("[MiuRead][WiFi] reader network picker", "scanned=",tostring(#networks),
                         "visible=",tostring(#visible_networks),"height=",tostring(list_height))
-                    local dialog=NetworkSetting:new{network_list=visible_networks,height=list_height}
+                    local dialog=NetworkSetting:new{modal=true,network_list=visible_networks,height=list_height}
                     dialog._miuread_modal_surface=true
                     local original_on_close=dialog.onCloseWidget
                     dialog.onCloseWidget=function(widget)
@@ -12304,6 +12417,13 @@ local function shifted_stats_base(mode,base_time,delta)
     return 0
 end
 
+function Plugin:_confirm_weekly_reward(row,choice,on_confirm)
+    UIManager:show(ConfirmBox:new{
+        text="领取「"..row.title.."」的奖励？\n\n领取后不能更改："..choice.label,
+        ok_text="领取 "..choice.label,ok_callback=on_confirm,
+    })
+end
+
 function Plugin:_show_home_weread_stats()
     local cache=self:_home_weread_stats_cache()
     local data_source={
@@ -12315,6 +12435,17 @@ function Plugin:_show_home_weread_stats()
     }
     local dialog
     dialog=require("miuread.reading_stats_dialog").show("weread",function() return data_source end,{
+        on_load_rewards=function(view)
+            local week=data_source.weekly and data_source.weekly.label
+            require("miuread.reading_account_ui").rewards(self,view,week)
+        end,
+        on_confirm_reward=function(row,choice,confirm)
+            self:_confirm_weekly_reward(row,choice,confirm)
+        end,
+        on_claim_reward=function(view,row,choice)
+            local week=data_source.weekly and data_source.weekly.label
+            require("miuread.reading_account_ui").rewards(self,view,week,row,choice)
+        end,
         on_shift_period=function(mode,delta)
             self:_show_home_weread_stats_period(data_source,dialog,mode,delta)
         end,
@@ -12770,7 +12901,7 @@ function Plugin:_home_wifi_settings()
                     logger.info("[MiuRead][WiFi] home network picker", "scanned=",tostring(#networks),
                         "visible=",tostring(#visible_networks),"height=",tostring(list_height))
                     local dialog=NetworkSetting:new{
-                        network_list=visible_networks,height=list_height,
+                        modal=true,network_list=visible_networks,height=list_height,
                         _miuread_modal_surface=true,
                         -- Deliberately omit connect_callback here. KOReader
                         -- auto-dismisses an already-connected network picker
@@ -13147,6 +13278,75 @@ function Plugin:export_runtime_log()
     self:info(path and ("运行日志已导出：\n"..path) or err)
 end
 
+function Plugin:_weather_choose_city()
+    local dialog
+    dialog=InputDialog:new{title="选择天气城市",input_hint="城市名，可加省份或国家",buttons={{
+        {text="取消",id="close",callback=function() UIManager:close(dialog);self:_show_home_weather() end},
+        {text="搜索",is_enter_default=true,callback=function()
+            local name=U.trim(dialog:getInputText() or "")
+            if U.utf8_len(name)<2 then self:toast("请输入至少两个字符的城市名",3);return end
+            UIManager:close(dialog)
+            self:_run_interactive_network("weather-cities","天气城市",function()
+                return require("miuread.weather").cities(Http:new(nil),name)
+            end,function(reply)
+                local cities=reply and reply.ok and reply.value
+                if type(cities)~="table" or #cities==0 then
+                    self:info(type(cities)=="table" and "未找到匹配的城市" or "暂时无法查询天气城市")
+                    return
+                end
+                local items={}
+                for _,city in ipairs(cities) do
+                    items[#items+1]={text=city.name,detail=city.detail,callback=function()
+                        self.store:set("home_weather",{city=city})
+                        self:_refresh_home_weather(city)
+                    end}
+                end
+                self:_show_miuread_menu("天气城市",items,{on_back=function() self:_show_home_weather() end})
+            end,{status_title="天气",status_text="正在查找城市…",timeout=15})
+        end},
+    }}}
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function Plugin:_refresh_home_weather(city)
+    return self:_run_interactive_network("home-weather","天气",function()
+        return require("miuread.weather").current(Http:new(nil),city)
+    end,function(reply)
+        local saved=self.store:get("home_weather",{})
+        if not saved.city or saved.city.name~=city.name or saved.city.latitude~=city.latitude
+            or saved.city.longitude~=city.longitude then return end
+        if reply and reply.ok and type(reply.value)=="table" then
+            saved.current=reply.value
+            self.store:set("home_weather",saved)
+        else
+            self:toast("天气暂时无法更新",3)
+        end
+        self:_show_home_weather()
+    end,{status_title="天气",status_text="正在查询天气…",timeout=15})
+end
+
+function Plugin:_show_home_weather()
+    local saved=self.store:get("home_weather",{})
+    local city,current=saved.city,saved.current
+    local items={}
+    if city then
+        items[#items+1]={text=city.name,post_text=current and current.text or "暂未更新",
+            detail=current and os.date("%m-%d %H:%M 更新",current.updated_at) or nil,
+            enabled=false,readonly_label=true}
+        items[#items+1]={text="更新天气",callback=function() self:_refresh_home_weather(city) end}
+    end
+    items[#items+1]={text=city and "更换城市" or "选择城市",callback=function() self:_weather_choose_city() end}
+    if city then
+        items[#items+1]={text="清除城市",callback=function()
+            self.store:set("home_weather",{})
+            self:_show_home_weather()
+        end}
+    end
+    return self:_show_miuread_menu("天气",items,{subtitle="天气 Open-Meteo · 城市 GeoNames",
+        on_back=function() self:show_home_quick_panel() end})
+end
+
 function Plugin:show_home_quick_panel(more_expanded)
     local started=monotonic_wall_time()
     local now=started
@@ -13236,11 +13436,22 @@ function Plugin:show_home_quick_panel(more_expanded)
         }
     end
     local prepared=monotonic_wall_time()
+    local shortcuts={{label="天气",callback=function() self:_show_home_weather() end}}
+    if self:logged_in() then
+        shortcuts[#shortcuts+1]={label="阅读统计",callback=function() self:_show_home_weread_stats() end}
+        shortcuts[#shortcuts+1]={label="云端笔记",callback=function()
+            require("miuread.reading_account_ui").notebooks(self,function() self:show_home_quick_panel() end)
+        end}
+    end
+    if bluetooth_state.supported==true then
+        shortcuts[#shortcuts+1]={label="蓝牙设备",callback=function() self:_bluetooth_show_devices() end}
+    end
     local panel,err=HomeQuickPanel.show{
         time_text=self:_display_time("%H:%M"),
         battery_text=battery,
         status_text=status_text,
         buttons=buttons,
+        shortcuts=shortcuts,
         frontlight=frontlight_control,
         customize_callback=function(anchor)
             self:_show_standalone_menu("自定义控制中心",self:home_customization_menu(),{anchor=anchor})
@@ -15891,7 +16102,7 @@ function Plugin:_show_comment_replies(review,info,back_callback)
         local items={{label=U.utf8_truncate(original,130,"…"),
             value=author~="" and author or "原想法",keep_open=true,callback=function()
                 local TextViewer=require("ui/widget/textviewer")
-                UIManager:show(TextViewer:new{title=author~="" and author or "原想法",text=original})
+                UIManager:show(TextViewer:new{modal=true,title=author~="" and author or "原想法",text=original})
             end}}
         for _,row in ipairs(data and data.items or {}) do
             local title=row.reply_to and row.reply_to~="" and (row.author.." 回复 "..row.reply_to) or row.author
@@ -15899,7 +16110,7 @@ function Plugin:_show_comment_replies(review,info,back_callback)
                 value=title.." · ♥ "..tostring(row.likes or 0),keep_open=true,
                 callback=function()
                     local TextViewer=require("ui/widget/textviewer")
-                    UIManager:show(TextViewer:new{title=title,text=row.content})
+                    UIManager:show(TextViewer:new{modal=true,title=title,text=row.content})
                 end}
         end
         local count=#items-1
@@ -16773,7 +16984,7 @@ function Plugin:_install_eink_dictionary_action()
                         end
                         if result=="" then return host:info("微信读书没有找到这个词的释义。") end
                         local TextViewer=require("ui/widget/textviewer")
-                        UIManager:show(TextViewer:new{title=word,text=result})
+                        UIManager:show(TextViewer:new{modal=true,title=word,text=result})
                     end)
                 end)
             end,
@@ -16872,7 +17083,7 @@ function Plugin:_show_reader_own_thought(item,close_callback)
     local note=tostring(item and item.note or "")
     if U.trim(note)=="" then return false end
     local TextViewer=require("ui/widget/textviewer")
-    UIManager:show(TextViewer:new{title="我的想法",text=note,close_callback=close_callback,
+    UIManager:show(TextViewer:new{modal=true,title="我的想法",text=note,close_callback=close_callback,
         _miuread_transient=true,_miuread_modal_surface=true})
     return true
 end
@@ -19968,7 +20179,6 @@ function Plugin:_show_miuread_home_now(force_scan,from_refresh,quiet,refresh_kin
     end
     if self:_home_background_blocked() and HomeView.is_shown() and not self:_active_reader_ui() then
         self:_home_defer_refresh_kind(refresh_kind or "content")
-        HomeView.raise()
         return true
     end
     HOME_SESSION_SUPPRESSED=false
@@ -20819,7 +21029,7 @@ function Plugin:_show_zlibrary_login()
     local MultiInputDialog=require("ui/widget/multiinputdialog")
     local previous=self.store:get("zlibrary_source",{}) or {}
     local dialog
-    dialog=MultiInputDialog:new{title="登录 Z-Library",fields={
+    dialog=MultiInputDialog:new{modal=true,title="登录 Z-Library",fields={
         {description="HTTPS 服务地址",text=previous.origin or "",hint="https://"},
         {description="邮箱",hint="账号邮箱"},
         {description="密码",text_type="password"},
@@ -21737,7 +21947,7 @@ function Plugin:_eink_rating_summary(detail,stored)
     return count and (label.." · "..tostring(math.floor(count)).." 人评分") or label
 end
 
-function Plugin:_fetch_eink_display(key,label,operation,arguments,on_ready,check_persisted_auth)
+function Plugin:_fetch_eink_display(key,label,operation,arguments,on_ready,check_persisted_auth,on_error,network)
     if not self:require_login() then return false end
     local store=self.store
     local auth=U.copy(store:auth())
@@ -21755,11 +21965,15 @@ function Plugin:_fetch_eink_display(key,label,operation,arguments,on_ready,check
             auth=credentials,auth_changed=changed}
     end,function(reply)
         local current=self.store:auth()
-        if current.login_session_id~=auth.login_session_id then return end
+        if current.login_session_id~=auth.login_session_id then
+            if network and network.on_cancel then network.on_cancel() end
+            return
+        end
         local payload=reply and reply.ok and reply.value
         if payload and payload.auth_changed then self:_apply_interactive_auth{auth=payload.auth,changed=true} end
         if not payload or not payload.request_ok then
             local message=payload and payload.error or (reply and reply.error)
+            if on_error then return on_error(message) end
             if Http.is_auth_error(message) then
                 self:info("微信读书登录暂不可用，请在账户页检查登录状态。")
             else
@@ -21768,7 +21982,7 @@ function Plugin:_fetch_eink_display(key,label,operation,arguments,on_ready,check
             return
         end
         on_ready(payload.value)
-    end,{status_title=label,status_text="正在读取…",timeout=28})
+    end,network or {status_title=label,status_text="正在读取…",timeout=28})
 end
 
 function Plugin:_show_eink_book_reviews(id)
@@ -21779,7 +21993,7 @@ function Plugin:_show_eink_book_reviews(id)
             items[#items+1]={text=row.content~="" and U.utf8_truncate(row.content,54,"…") or author,
                 post_text=author,callback=function()
                     local TextViewer=require("ui/widget/textviewer")
-                    UIManager:show(TextViewer:new{title="书评 · "..author,
+                    UIManager:show(TextViewer:new{modal=true,title="书评 · "..author,
                         text=row.content~="" and row.content or "暂无文字内容"})
                 end}
         end
@@ -21799,7 +22013,7 @@ function Plugin:_fetch_book_details_online(b)
         local rating=self:_eink_rating_summary(x)
         local summary=title.."\n"..author..(rating and ("\n推荐值 "..rating) or "")
         local TextViewer=require("ui/widget/textviewer")
-        UIManager:show(TextViewer:new{title="书籍详情",
+        UIManager:show(TextViewer:new{modal=true,title="书籍详情",
             text=summary.."\n\n"..tostring(x.intro or x.description or b.intro or b.description or "暂无简介")})
     end)
 end
@@ -21934,6 +22148,8 @@ function Plugin:_download_summary(rec,opt)
     local heading=preview and (preview_mode=="info" and "试读信息版生成完成"
         or (preview_mode=="partial" and "部分试读版生成完成" or "试读版生成完成")) or "下载完成"
     local lines={heading}
+    local access_note=DownloadResult.access_summary(rec)
+    if access_note then lines={access_note} end
     local annotation_note=DownloadResult.summary_note(rec)
     if annotation_note then lines[#lines+1]=annotation_note end
     lines[#lines+1]="保存位置："..tostring(rec.file or "")
@@ -22285,6 +22501,76 @@ function Plugin:_restore_download_after_chapter(previous)
     else self.store:clear_download_state() end
 end
 
+function Plugin:_show_weread_locked_chapter(runtime)
+    local book,opt=runtime.book,runtime.options
+    local id=tostring(book.bookId or book.book_id or "")
+    local uid=tostring(opt.chapter_uid or "")
+    if uid=="" or opt.rights_recheck then
+        self:info("微信读书仍未开放当前章节的阅读权限。")
+        return false
+    end
+    local function current()
+        return tostring(self.store:auth().login_session_id or "")==runtime.login_session_id
+            and self:_interactive_network_context_valid(runtime.online_context) and not reader_close_active()
+    end
+    local function resume()
+        if not current() then return end
+        local options=U.copy(opt)
+        options.rights_recheck=true
+        self:download(book,options,runtime.open_after,nil,true)
+    end
+    local function lookup(api,book_id,chapter_uid)
+        local client=require("miuread.eink_client").new(api.http,api.store)
+        return require("miuread.eink_entitlements").locked_options(client,book_id,chapter_uid)
+    end
+    local function apply(api,book_id,chapter_uid,action)
+        local client=require("miuread.eink_client").new(api.http,api.store)
+        return require("miuread.eink_entitlements").apply(client,book_id,chapter_uid,action)
+    end
+    return self:_fetch_eink_display("locked-chapter:"..id..":"..uid,"阅读权限",lookup,{id,uid},function(state)
+        if not current() then return end
+        local title=U.utf8_truncate(state.title or book.title or "",55,"…")
+        local actions={}
+        local function add_action(label,action,detail)
+            actions[#actions+1]={label=label,detail=detail,callback=function()
+                if not current() then return end
+                UIManager:show(ConfirmBox:new{text=label.."后将重新打开本章。",ok_text="确认",
+                    ok_callback=function()
+                        if not current() then return end
+                        self:_fetch_eink_display("chapter-rights-change:"..id..":"..uid,label,apply,
+                            {id,uid,action},function(result) if result.reopen then resume() end end,true)
+                    end})
+            end}
+        end
+        if state.trial_days then add_action("领取 "..state.trial_days.." 天体验卡","trial") end
+        if state.can_use_coupon then
+            add_action("用券解锁本章","coupon",state.coupons and ("剩余 "..state.coupons.." 张") or nil)
+        end
+        if state.can_buy_member then
+            actions[#actions+1]={label="购买会员卡",callback=function()
+                if not current() then return end
+                self:_show_weread_member_qr(function()
+                    self:_fetch_eink_display("chapter-member-refresh","会员卡",lookup,{id,uid},function(updated)
+                        if not current() then return end
+                        if updated.already_paid or updated.member.permanent
+                            or (not updated.member.expired and (updated.member.paid_remaining or 0)>0) then
+                            resume()
+                        else self:info("微信读书尚未返回有效的会员权益。") end
+                    end)
+                end)
+            end}
+        end
+        if state.already_paid then actions[#actions+1]={label="重新加载本章",callback=resume} end
+        return ActionSheet.show{title="当前章节需要阅读权限",subtitle=title,
+            actions=actions,footer_action={label="返回",callback=function() end}}
+    end,nil,function(err)
+        if not current() then return end
+        local detail=Http.is_auth_error(err) and "请在账户页检查微信读书登录状态。"
+            or "暂时无法查看此章可用的权益操作。"
+        self:info("当前章节需要阅读权限。"..detail)
+    end)
+end
+
 function Plugin:_finish_online_read(runtime,result)
     self:_close_online_loading(runtime)
     local book,opt=runtime.book,runtime.options
@@ -22307,10 +22593,18 @@ function Plugin:_finish_online_read(runtime,result)
                 self:download(book,retry_options,runtime.open_after,nil,true)
             end)
         elseif err~="下载已取消" then
-            local message=DownloadResult.failure_kind(err)=="chapter_access"
-                and "微信读书未确认当前章节的阅读权限。"
-                or self:_friendly_remote_error(err,"阅读正文")
-            self:status_toast("正文加载失败",U.first_line(message,80),4)
+            local access=DownloadResult.chapter_access(err)
+            if access=="locked" then
+                self:_show_weread_locked_chapter(runtime)
+            elseif access then
+                self:status_toast("阅读权限","微信读书暂未确认当前章节的阅读权限。",4)
+            elseif Http.is_auth_error(err) then
+                self:status_toast("微信读书登录","登录暂未恢复，请在账户页检查。",4)
+            elseif Http.is_network_error(err) then
+                self:status_toast("网络连接失败","确认联网后可继续阅读。",4)
+            else
+                self:status_toast("正文加载失败",U.first_line(self:_friendly_remote_error(err,"阅读正文"),80),4)
+            end
         end
     elseif current and runtime.open_after and ready then
         local id=tostring(book.bookId or book.book_id or "")
@@ -22548,12 +22842,16 @@ function Plugin:_finish_download_runtime(runtime,result)
     local pending=rec.pending_install==true and rec.pending_file and U.file_exists(rec.pending_file)
     local annotation_pending=DownloadResult.annotation_pending(rec)
     local annotation_fallback=DownloadResult.annotation_fallback(rec)
-    if pending or annotation_pending then
+    local partial_access=DownloadResult.state(rec)=="partial_access"
+    if pending or annotation_pending or partial_access then
         self:_write_download_state(DownloadResult.state(rec,pending),{
             title=b.title,book_id=b.bookId,book=U.copy(b),options=U.copy(opt),file=rec.file,
             eink_content_mode=rec.eink_content_mode,
             pending_file=pending and rec.pending_file or nil,pending_install=pending or nil,percent=1,
             current=rec.chapter_count,total=rec.expected_chapter_count,completed_at=os.time(),
+            readable_chapter_count=rec.readable_chapter_count,restricted_chapter_count=rec.restricted_chapter_count,
+            catalog_chapter_count=rec.catalog_chapter_count,restricted_chapters=rec.restricted_chapters,
+            online_chapter_uid=rec.online_chapter_uid,
             annotation_pending=annotation_pending or nil,
             annotation_fallback=annotation_fallback or nil,
             annotation_error_kind=rec.annotation_error_kind,
@@ -22669,7 +22967,7 @@ function Plugin:_has_download_status()
     local state=self.store:download_state()
     if state.status=="completed" then self.store:clear_download_state(); return false end
     return state.status=="active" or state.status=="failed" or state.status=="interrupted" or state.status=="pending_install"
-        or state.status=="annotation_pending"
+        or state.status=="annotation_pending" or state.status=="partial_access"
 end
 function Plugin:_download_status_label()
     local state=self:_download_state()
@@ -22701,6 +22999,9 @@ function Plugin:_download_status_label()
         return "后台下载 · 等待更新"
     end
     if state.status=="annotation_pending" then return "后台下载 · 历史任务待处理" end
+    if state.status=="partial_access" then
+        return (tonumber(state.readable_chapter_count) or 0)>0 and "后台下载 · 部分章节可下载" or "后台下载 · 下载权限未确认"
+    end
     if state.status=="completed" then return "后台下载 · 已完成" end
     if state.status=="failed" then return DownloadResult.failure_label(state) end
     if state.status=="interrupted" then return "后台下载 · 可继续" end
@@ -22959,12 +23260,50 @@ function Plugin:_merge_download_result(result,book,opt)
     end
     return rec
 end
-function Plugin:_show_download_complete(rec,opt,book)
+function Plugin:_download_access_actions(buttons,state,book,close)
+    if type(book)~="table" or (tonumber(state.restricted_chapter_count) or 0)==0 then return end
+    local uid=state.online_chapter_uid
+    if uid then
+        buttons[#buttons+1]={{text="继续在线阅读",callback=function()
+            close()
+            self:download(book,{annotations=false,chapter_uid=uid,read_online=true},true)
+        end}}
+    end
+    buttons[#buttons+1]={{text="打开章节目录",callback=function()
+        close()
+        self:chapters(book)
+    end}}
+end
+
+function Plugin:_show_restricted_download_details(state,book)
+    local summary=DownloadResult.access_summary(state)
+    if not summary then return false end
+    local title=U.utf8_truncate((book and book.title) or state.title or "未命名",36,"…")
     local dialog
-    local buttons={
-        {{text="立即阅读",callback=function() UIManager:close(dialog); self:open_file(rec.file) end}},
-    }
-    buttons[#buttons+1]={{text="关闭",callback=function() UIManager:close(dialog) end}}
+    local buttons={}
+    local function close() UIManager:close(dialog) end
+    if (tonumber(state.readable_chapter_count) or 0)>0 and state.file and U.file_exists(state.file) then
+        buttons[#buttons+1]={{text="阅读已下载部分",callback=function() close(); self:open_file(state.file) end}}
+    end
+    self:_download_access_actions(buttons,state,book,close)
+    buttons[#buttons+1]={{text="关闭",callback=close}}
+    local heading,details=summary:match("^([^\n]+)\n(.*)$")
+    dialog=ButtonDialog:new{title=heading.."\n《"..title.."》\n"..details,title_align="center",buttons=buttons}
+    UIManager:show(dialog)
+    return true
+end
+
+function Plugin:_show_download_complete(rec,opt,book)
+    if rec.eink_content_mode and (tonumber(rec.restricted_chapter_count) or 0)>0 then
+        return self:_show_restricted_download_details(rec,book)
+    end
+    local dialog
+    local buttons={}
+    local function close() UIManager:close(dialog) end
+    if rec.access_scope~="preview" or (tonumber(rec.readable_chapter_count) or 0)>0 then
+        buttons[#buttons+1]={{text="立即阅读",callback=function() close(); self:open_file(rec.file) end}}
+    end
+    buttons[#buttons+1]={{text="关闭",callback=close}}
     local summary=self:_download_summary(rec,opt)
     if rec.eink_content_mode then
         summary=summary.."\n正文来源：E-Ink"
@@ -23074,6 +23413,7 @@ function Plugin:show_download_status()
         self:info("下载已经完成，记录已自动清除。\n\n可在下载管理的已完成列表中打开书籍。")
         return
     end
+    if state.status=="partial_access" then return self:_show_restricted_download_details(state,state.book) end
     local title=tostring(state.title or "未命名")
     local translation_update=state.status=="pending_install" and state.options and state.options.generate_translation_uid~=nil
     local failure_kind=DownloadResult.failure_kind(state.error) or state.error_kind
@@ -25314,7 +25654,7 @@ function Plugin:_show_book_delete_dialog(title,text,actions)
         end
         buttons[#buttons+1]=row
     end
-    dialog=TextViewer:new{
+    dialog=TextViewer:new{modal=true,
         title=title,text=text,add_default_buttons=false,show_menu=false,buttons_table=buttons,
         width=math.floor(screen:getWidth()*.92),height=math.floor(screen:getHeight()*.86),
         _miuread_transient=true,_miuread_modal_surface=true,
@@ -26740,6 +27080,10 @@ function Plugin:_recover_pending_progress_anchor(item,callback)
         position.progress_sequence=tonumber(unresolved.progress_sequence or 0) or nil
         position.progress_epoch=tonumber(unresolved.progress_epoch)
         position.captured_at=tonumber(unresolved.captured_at) or os.time()
+        local proof=anchor.download_entitlement_proof
+        if proof and proof.uid==tostring(position.chapter_uid) and proof.at==position.captured_at then
+            position.download_entitlement_proof=proof
+        end
         if tonumber(position.progress)==nil then
             if self:_save_pending_progress_coordinate(book_id,position,"saved_anchor_whole_progress_pending") then
                 self.store:save_session(book_id,{pending_unresolved_position=false})
@@ -28195,7 +28539,7 @@ function Plugin:_passive_exact_position_for_xpointer(book_id,xpointer)
     return row
 end
 
-function Plugin:_save_unresolved_position_snapshot(book_id,xpointer,progress,reason,source_anchor)
+function Plugin:_save_unresolved_position_snapshot(book_id,xpointer,progress,reason,source_anchor,captured_at)
     book_id=tostring(book_id or "")
     progress=tonumber(progress)
     if book_id=="" or type(xpointer)~="string" or xpointer=="" then return false end
@@ -28208,7 +28552,7 @@ function Plugin:_save_unresolved_position_snapshot(book_id,xpointer,progress,rea
         tonumber(type(session.pending_unresolved_position)=="table" and session.pending_unresolved_position.progress_sequence or 0) or 0
     )
     local row={xpointer=xpointer,progress=progress and U.clamp(progress,0,100) or nil,
-        captured_at=os.time(),reason=tostring(reason or "position_unavailable"),
+        captured_at=tonumber(captured_at) or os.time(),reason=tostring(reason or "position_unavailable"),
         progress_sequence=latest+1,
         progress_epoch=math.max(1,tonumber(session.progress_epoch or 1) or 1),
         source_anchor=type(source_anchor)=="table" and U.copy(source_anchor) or nil}
@@ -28573,6 +28917,10 @@ function Plugin:ensure_read_report_progress(reason,automatic)
         return false
     end
     local id=tostring(r.book.book_id)
+    if r.record and r.record.entitlement_owner and not self.sync:current_entitlement(r) then
+        self:_open_sync_close("entitlement_unavailable")
+        return false
+    end
     if automatic==true then
         local same_check=tostring(self._auto_position_check_book_id or "")==id and self._auto_position_check_active==true
         if not same_check then
@@ -28918,6 +29266,7 @@ end
 function Plugin:_save_pending_progress_coordinate(book_id,position,reason)
     book_id=tostring(book_id or "")
     if book_id=="" or type(position)~="table" then return false end
+    if self._download_entitlement_reader and not self:_download_position_may_sync(book_id,position) then return false end
     local co=tonumber(position.canonical_offset or position.chapter_offset or position.offset)
     local uid=tostring(position.chapter_uid or "")
     if uid=="" or co==nil or position.native_offset~=true
@@ -28955,6 +29304,7 @@ end
 function Plugin:_save_pending_progress(book_id,position,reason,sync_state)
     book_id=tostring(book_id or "")
     if book_id=="" or type(position)~="table" then return false end
+    if self._download_entitlement_reader and not self:_download_position_may_sync(book_id,position) then return false end
     -- pending_progress and its sequence belong to one durable transaction;
     -- avoid an extra synchronous session write on the Reader -> Home path.
     local snapshot=self:_prepare_progress_snapshot(book_id,position,false)
@@ -29251,6 +29601,12 @@ function Plugin:_submit_progress_snapshot(book_id,position,options,callback)
         callback(false,nil,"position_missing",position)
         return false
     end
+    if (self._download_entitlement_reader or (options.record_override and options.record_override.record
+        and options.record_override.record.entitlement_owner))
+        and not self:_download_position_may_sync(book_id,position,options.record_override) then
+        callback(false,nil,"entitlement_unavailable",position)
+        return false
+    end
     local snapshot=self:_prepare_progress_snapshot(book_id,position)
     if not snapshot then
         callback(false,nil,"position_missing",position)
@@ -29473,6 +29829,11 @@ function Plugin:upload_local_progress(manual,callback)
         return false
     end
     local id=tostring(r.book.book_id)
+    if r.record and r.record.entitlement_owner and not self.sync:current_entitlement(r) then
+        if manual then self:toast("当前章节的阅读权益尚未确认，已保留本机阅读位置",3) end
+        if callback then callback(false,"entitlement_unavailable") end
+        return false
+    end
     local session=self.store:session(id) or {}
     if manual~=true then
         local blocked,block_reason=self:_progress_write_fence(id)
@@ -34358,6 +34719,138 @@ function Plugin:onReadSettings()
     return false
 end
 
+function Plugin:_save_download_entitlement_state(state)
+    if type(state)~="table" then return end
+    local owner=require("miuread.download_database").account_key(self.store)
+    if owner=="anonymous" then return end
+    local values=self.store:get("download_entitlement_accounts",{})
+    local previous=values[owner]
+    if previous and previous.observed_at>state.observed_at then return end
+    local controller=self.sync and self.sync.offline_time
+    local active=controller and controller.active
+    if active and active.entitlement and not controller:collect(true) then return end
+    state.owner=owner
+    values[owner]=state
+    if self.store:set("download_entitlement_accounts",values)~=true then return end
+    local reader=self._download_entitlement_reader
+    if reader then
+        reader.context=self.sync:entitlement_context(reader.record)
+        self:_update_downloaded_entitlement()
+    end
+    if active and active.entitlement and self.sync and self:_active_reader_ui() then
+        controller:start(active.sync,active.record,state.observed_at)
+    end
+end
+
+function Plugin:_refresh_download_entitlement_state()
+    if not self:logged_in() or not self.interactive_network_async or self.interactive_network_async:busy() then return end
+    local owner=require("miuread.download_database").account_key(self.store)
+    local cached=self.store:get("download_entitlement_accounts",{})[owner]
+    if cached and os.time()-(tonumber(cached.observed_at) or 0)<60 then return end
+    self:_fetch_eink_display("download-entitlement-status","会员状态",function(api)
+        return require("miuread.download_entitlements").account_status(api:_native({}):membership_summary(),os.time())
+    end,{},function(state) self:_save_download_entitlement_state(state) end,false,function() end,{silent=true})
+end
+
+function Plugin:_watch_downloaded_entitlement(path,reset)
+    local previous=self._download_entitlement_reader
+    if previous and previous.timer then UIManager:unschedule(previous.timer) end
+    self._download_entitlement_reader=nil
+    if not path then return end
+    local book,row,variant=self.store:file_record_fast(path,false)
+    if not book or not row or not row.entitlement_owner then return end
+    local record={book=book,record=row,variant=variant,path=path}
+    local key=row.entitlement_owner..":"..tostring(book.book_id or "")
+    local state=not reset and previous and previous.path==path and previous or {
+        path=path,key=key,record=record,page=self:_reader_current_page(),
+    }
+    state.timer,state.next_expiry=nil,nil
+    state.context=self.sync:entitlement_context(record)
+    self._download_entitlement_reader=state
+    self:_update_downloaded_entitlement()
+end
+
+function Plugin:_download_position_may_sync(book_id,position,record)
+    local active=self._download_entitlement_reader
+    if not record and active and tostring(active.record.book.book_id)==book_id then record=active.record end
+    if not record or not record.record or not record.record.entitlement_owner then return true end
+    local when=tonumber(position.captured_at) or os.time()
+    local allowed=self.sync:entitlement_position(record,position,when)
+    if allowed==true then
+        position.captured_at=when
+        position.download_entitlement_proof={owner=record.record.entitlement_owner,
+            uid=tostring(position.chapter_uid),at=when}
+    end
+    return allowed==true
+end
+
+function Plugin:_update_downloaded_entitlement(page)
+    local state=self._download_entitlement_reader
+    if not state or not self.ui or not self.ui.document
+        or self:_current_document_path()~=state.path and normalized_reader_file(self:_current_document_path())~=state.path
+        or reader_close_active() then return end
+    local now=os.time()
+    local xp=self:_current_reader_xpointer()
+    local allowed,expires=self.sync:entitlement_page(state.record,self.ui.document,page or state.page,
+        xp,now,state.context)
+    local moved=page~=nil and state.page~=nil and page~=state.page
+    if page~=nil then state.page=page end
+    if allowed and moved and xp and not self._position_resolution_applying then
+        state.last_eligible={xpointer=xp,at=now,ratio=self.sync:local_ratio()}
+    elseif not allowed and state.last_eligible then
+        local last=state.last_eligible
+        state.last_eligible=nil
+        local anchor=self.sync:capture_entitlement_anchor(state.record,last.xpointer)
+        if anchor and (not anchor.chapter_uid or
+            self.sync:entitlement_position(state.record,anchor,last.at,state.context)) then
+            anchor.captured_at=last.at
+            if anchor.chapter_uid then
+                anchor.download_entitlement_proof={owner=state.record.record.entitlement_owner,
+                    uid=tostring(anchor.chapter_uid),at=last.at}
+            end
+            self:_save_unresolved_position_snapshot(state.record.book.book_id,last.xpointer,
+                last.ratio and last.ratio*100 or nil,"eligible_offline_position",anchor,last.at)
+        end
+    end
+    if state.next_expiry~=expires then
+        if state.timer then UIManager:unschedule(state.timer);state.timer=nil end
+        state.next_expiry=expires
+        if expires and expires>now then
+            state.timer=function()
+                if self._download_entitlement_reader~=state then return end
+                state.timer=nil
+                self:_update_downloaded_entitlement()
+            end
+            UIManager:scheduleIn(math.max(.1,expires-now),state.timer)
+        end
+    end
+    if allowed~=false or state.reminded or self._miuread_suspended or self._sync_dialog then return end
+    local options=self.store:get("download_entitlement_reminders",{})
+    if not require("miuread.download_entitlements").reminder_due(options[state.key],now) then return end
+    state.reminded=true
+    UIManager:nextTick(function()
+        if self._download_entitlement_reader~=state or reader_close_active()
+            or normalized_reader_file(self:_current_document_path())~=state.path then return end
+        if self.sync:current_entitlement(state.record)~=false then return end
+        local dialog
+        local function select_reminder(value)
+            if value then
+                local choices=self.store:get("download_entitlement_reminders",{})
+                choices[state.key]=value
+                self.store:set("download_entitlement_reminders",choices)
+            end
+            UIManager:close(dialog)
+        end
+        dialog=ButtonDialog:new{title="上次确认的阅读权益已到期。此本地副本仍可阅读，超出有效期的进度和时长不上传。",
+            buttons={
+                {{text="继续阅读",callback=function() select_reminder() end}},
+                {{text="3 天内不再提醒",callback=function() select_reminder(os.time()+3*86400) end}},
+                {{text="此书不再提醒",callback=function() select_reminder("never") end}},
+            }}
+        UIManager:show(dialog)
+    end)
+end
+
 function Plugin:_watch_limited_read(path)
     if self._limited_read_timer then UIManager:unschedule(self._limited_read_timer);self._limited_read_timer=nil end
     local cache=require("miuread.online_cache")
@@ -34444,6 +34937,9 @@ function Plugin:onReaderReady()
     HOME_SESSION.reader_session_file=ready_path
     self._reader_session_generation=HOME_SESSION.reader_session_generation
     self:_watch_limited_read(ready_path)
+    if ready_path or self._download_entitlement_reader then
+        self:_watch_downloaded_entitlement(self:_reader_session_is_weread() and ready_path or nil,not preserve_session)
+    end
     -- A preserved Reader session is either an internal KOReader rebuild or a
     -- same-book chapter handoff. Both keep the already verified cloud session;
     -- every genuine book reopen still re-reads WeRead.
@@ -34468,6 +34964,8 @@ function Plugin:onReaderReady()
     if is_weread and preserve_session~=true then
         local open_sync_prefs=self.store:preferences().sync or {}
         open_sync_requested=open_sync_prefs.auto_latest_position~=false and open_sync_prefs.pull_on_open~=false
+        local entitlement=self._download_entitlement_reader
+        if entitlement and not self.sync:current_entitlement(entitlement.record) then open_sync_requested=false end
     end
     if is_weread or self:_reader_panel_active() then
         self:_arm_reader_gesture_guard(tonumber(Config.READER_OPEN_GESTURE_GUARD_SECONDS) or .20,
@@ -34798,6 +35296,7 @@ function Plugin:onNetworkConnected()
             return
         end
         logger.info("[MiuRead][ResumeSync] network_online","source=network_restored")
+        self:_refresh_download_entitlement_state()
         self.sync:wake_offline_reading_time()
         if HomeView.is_shown() and not self:_active_reader_ui() then
             self:_sync_home_pending({silent=true,source="network_restored"})
@@ -34911,6 +35410,7 @@ function Plugin:onPageUpdate(page)
         self:_schedule_comment_overlay_refresh(false)
     end
     if weread then
+        if self._download_entitlement_reader then self:_update_downloaded_entitlement(page) end
         self.sync:on_page(page)
         self:_schedule_thought_prewarm()
         -- No network or full-document search on the page-turn hot path.
@@ -34946,6 +35446,14 @@ function Plugin:_reading_end_sync(reason,options,callback)
     end
     local current=self:_current_book_record()
     if not (current and current.book and self.sync) then return false end
+    if current.record and current.record.entitlement_owner then
+        self:_update_downloaded_entitlement()
+        local state=self._download_entitlement_reader
+        if not state or not state.last_eligible or not self.sync:current_entitlement(current) then
+            self.sync:stop_fast("download_entitlement_inactive")
+            return false
+        end
+    end
 
     local record_snapshot=U.copy(current)
     local record_generation_snapshot=tonumber(self.sync.record_generation or 0) or 0
@@ -36287,6 +36795,9 @@ function Plugin:onResume()
     self:_download_idle_pump_ensure("device resumed")
     self:_schedule_online_cache_cleanup()
     self:_watch_limited_read(normalized_reader_file(self:_current_document_path()))
+    if self._download_entitlement_reader then
+        self:_watch_downloaded_entitlement(normalized_reader_file(self:_current_document_path()))
+    end
     -- Ref #92: on Kobo the radio is expected to be OFF at the raw wake edge
     -- because KOReader unloads Wi-Fi for suspend. Restore the *pre-suspend user
     -- intent* through KOReader's own network backend instead of interpreting

@@ -26,9 +26,15 @@ local function show_variant(plugin, book_id, variant)
     local book = generated_book(plugin, book_id)
     local kind = tostring(variant.kind or "")
     local label = tostring(variant.label or "版本")
-    local items = {
-        {text = "打开" .. label, callback = function() plugin:open_file(variant.file) end},
-    }
+    local record=variant.record or {}
+    local restricted=(tonumber(record.restricted_chapter_count) or 0)>0 and record.eink_content_mode
+    local items = {}
+    if not restricted or (tonumber(record.readable_chapter_count) or 0)>0 then
+        items[#items+1]={text="打开"..label,callback=function() plugin:open_file(variant.file) end}
+    end
+    if restricted then
+        items[#items+1]={text="下载详情",callback=function() plugin:_show_restricted_download_details(record,book) end}
+    end
     if kind == "clean" then
         items[#items + 1] = {
             text = "重新下载正文",

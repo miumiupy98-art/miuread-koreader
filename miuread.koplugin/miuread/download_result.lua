@@ -1,4 +1,5 @@
 local Result = {}
+local U=require("miuread.util")
 
 function Result.failed_chapter(err)
     local line=tostring(err or ""):match("\n•%s*([^\r\n]+)")
@@ -7,14 +8,22 @@ function Result.failed_chapter(err)
     if separator then return line:sub(1,separator-1) end
 end
 
+function Result.chapter_access(err)
+    err=tostring(err or "")
+    if err:find("[MiuReadChapterLocked]",1,true) then return "locked" end
+    if err:find("E-Ink 目录未确认章节免费或已购买",1,true)
+        or err:find("E-Ink 书籍没有可离线下载的阅读权益",1,true)
+        or err:find("未确认本章离线下载权限",1,true)
+        or err:find("未确认本章在线阅读权限",1,true)
+        or err:find("未确认此 PDF 的整书下载权限",1,true)
+        or err:find("未确认本章限时在线授权",1,true) then return "unconfirmed" end
+end
+
 function Result.failure_kind(err)
     err=tostring(err or "")
     if err:find("[MiuReadImageMissing]",1,true) or err:find("[MiuReadImageExternal]",1,true)
         or err:find("E-Ink 正文图片未完整获取",1,true) then return "image_missing" end
-    if err:find("E-Ink 目录未确认章节免费或已购买",1,true)
-        or err:find("E-Ink 书籍没有可离线下载的阅读权益",1,true)
-        or err:find("未确认本章离线下载权限",1,true)
-        or err:find("未确认本章在线阅读权限",1,true) then return "chapter_access" end
+    if Result.chapter_access(err) then return "chapter_access" end
 end
 
 function Result.failure_label(state)
@@ -74,6 +83,7 @@ end
 function Result.state(record, pending_install)
     if pending_install == true then return "pending_install" end
     if Result.annotation_pending(record) then return "annotation_pending" end
+    if (tonumber(record and record.restricted_chapter_count) or 0)>0 then return "partial_access" end
     return "completed"
 end
 
@@ -81,6 +91,7 @@ function Result.shelf_status(record, pending_install)
     if pending_install == true and record and record.translation_mode then return "译文待应用" end
     if pending_install == true then return "等待关闭后更新" end
     if Result.annotation_pending(record) then return "批注待修复" end
+    if Result.state(record)=="partial_access" then return "部分章节可下载" end
     return "已生成"
 end
 
@@ -95,7 +106,27 @@ function Result.notice(title, record, pending_install)
     if Result.annotation_pending(record) then
         return title .. "正文下载完成，划线与想法待修复"
     end
+    if Result.state(record)=="partial_access" then
+        return title..((tonumber(record.readable_chapter_count) or 0)>0 and "仅部分章节可下载" or "下载权限未确认")
+    end
     return title .. "下载完成"
+end
+
+function Result.access_summary(record)
+    local restricted=tonumber(record and record.restricted_chapter_count) or 0
+    if restricted==0 then return nil end
+    local read=tonumber(record.readable_chapter_count) or 0
+    local pieces={read>0 and "部分章节可下载" or "下载权限未确认",
+        "已下载 "..read.." 章，"..restricted.." 章未取得下载权限。"}
+    local titles={}
+    for i,row in ipairs(record.restricted_chapters or {}) do
+        titles[#titles+1]=U.utf8_truncate(row.title or row.uid or "",25,"…")
+        if i==3 then break end
+    end
+    if #titles>0 then
+        pieces[#pieces+1]=table.concat(titles,"、")..(restricted>#titles and " 等" or "")
+    end
+    return table.concat(pieces,"\n")
 end
 
 function Result.summary_note(record)

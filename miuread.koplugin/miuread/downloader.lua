@@ -730,6 +730,7 @@ local function cache_save_base(cache, chapter, coord_body, body, style, assets, 
     entry.final_file = nil
     entry.content_format = state and state.content_format
     entry.source_channel = state and state.source_channel or "web"
+    entry.download_grant = state and state.download_grant
     entry.coordinate_source_authoritative = not (state and state.coordinate_source_authoritative==false)
     entry.structural = state and state.structural == true or false
     entry.image_only = state and state.image_only == true or false
@@ -1133,13 +1134,33 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
             path=self.store:epub_path(filename)
         end
     end
-    local map = {}
+    local map,entitlement_owner = {},nil
+    local previous_grants={}
+    if existing_record and existing_record.entitlement_owner then
+        for _,chapter in ipairs(existing_record.chapter_map or {}) do
+            previous_grants[tostring(chapter.uid)]=chapter.entitlement
+        end
+    end
     for index, chapter in ipairs(chapters) do
+        local grant=chapter.download_grant
+        local grant_owner=opt.eink_content_account
+        if not grant and previous_grants[tostring(chapter.uid)] then
+            grant=previous_grants[tostring(chapter.uid)]
+            grant_owner=existing_record.entitlement_owner
+        end
+        if grant and grant.kind~="owned" and entitlement_owner and entitlement_owner~=grant_owner then
+            error("章节下载权益属于不同账号，原文件已保留",0)
+        end
+        if grant and grant.kind~="owned" then entitlement_owner=grant_owner end
         map[#map + 1] = {
             uid=chapter.uid, index=chapter.index or index, title=chapter.title,
             word_count=chapter.word_count or 0, structural=chapter.structural == true,
             toc_level=chapter.toc_level, toc_parent_uid=chapter.toc_parent_uid,
+            entitlement=grant,
         }
+    end
+    if entitlement_owner then
+        for _,row in ipairs(map) do row.entitlement=row.entitlement or {kind="owned"} end
     end
     local core_map_hash=BookIntegrity.core_map_hash(book.bookId,
         type(opt.full_catalog_map)=="table" and opt.full_catalog_map or map,map)
@@ -1275,6 +1296,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
         range_end_title=opt.range_end_title,content_type="book",
         sync_enabled=true,progress_sync_enabled=true,read_report_enabled=true,
+        entitlement_owner=entitlement_owner or false,
         chapters=map,generated_at=now,complete=true,task_id=opt.download_run_id,
         eink_content_mode=opt.eink_content_mode,
         online_expires=opt.online_expires,
@@ -1457,6 +1479,7 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         sync_enabled=true,
         progress_sync_enabled=true,
         read_report_enabled=true,
+        entitlement_owner=entitlement_owner or false,
         partial_range=partial_range,range_start_index=tonumber(opt.range_start_index),
         range_end_index=tonumber(opt.range_end_index),range_start_title=opt.range_start_title,
         range_end_title=opt.range_end_title,
@@ -1469,6 +1492,8 @@ function Downloader:_save(book, chapters, assets, css, cover, opt, failures, ses
         failed_chapter_count=tonumber(opt.failed_chapter_count) or #(failures or {}),
         preview_mode=access_scope=="preview" and preview_mode or nil,
         access_scope=access_scope,
+        restricted_chapters=opt.restricted_chapters,
+        online_chapter_uid=opt.online_chapter_uid,
         guard_chapter_uid=opt.guard_chapter_uid or (chapters[#chapters] and chapters[#chapters].uid),
         chapter_map=map,failures=U.copy(failures or {}),complete=true,
         eink_content_mode=opt.eink_content_mode,
@@ -1571,6 +1596,7 @@ local function append_entry(chapters, assets, css_list, css_seen, entry, body_so
         uid=entry.uid, index=entry.index or index,
         word_count=tonumber(entry.word_count or 0) or 0,
         structural=entry.structural == true,
+        download_grant=entry.download_grant,
         toc_level=catalog_chapter and (catalog_chapter._miuread_toc_level
             or catalog_level(catalog_chapter)) or nil,
         toc_parent_uid=catalog_chapter and (catalog_chapter._miuread_toc_parent_uid
@@ -1660,6 +1686,8 @@ function Downloader:_book_once(input, opt, progress)
     local foreground_online=opt.eink_content_mode=="eink-online" and opt.read_online==true
         and opt.chapter_uid~=nil and opt.prefetch_hidden~=true
     opt.limited_online,opt.online_expires,opt.online_server_only=nil,nil,nil
+    local whole_offline=opt.eink_content_mode=="eink-offline" and not opt.chapter_uid
+        and not opt.range_start_index and not opt.range_end_index
     if transport.eink_only then
         opt.eink_content_account=DownloadDatabase.account_key(self.store)
     end
@@ -2434,6 +2462,7 @@ function Downloader:_book_once(input, opt, progress)
                 image_repair_requested=opt.prefetch_hidden~=true,
                 limited_online=opt.limited_online==true,
                 online_server_only=opt.online_server_only==true,
+                record_download_entitlement=whole_offline and opt.eink_content_account~="anonymous",
                 translation=refresh_translation or cached_translation,
                 require_translation=refresh_translation or cached_translation or uid==tostring(opt.generate_translation_uid or ""),
                 activity=chapter_activity,
@@ -2835,8 +2864,20 @@ function Downloader:_book_once(input, opt, progress)
         opt.image_repair=entry and entry.image_repair or nil
     end
 
-    local restricted_count=0
-    for _ in pairs(restricted_map) do restricted_count=restricted_count+1 end
+    local restricted_count,restricted=0,{}
+    for _,chapter in ipairs(selected) do
+        local uid=chapter_uid(chapter)
+        if restricted_map[uid] then
+            restricted_count=restricted_count+1
+            if #restricted<3 then restricted[#restricted+1]={uid=uid,title=chapter.title} end
+        end
+    end
+    if #restricted>0 and transport.eink_only and opt.eink_content_mode=="eink-offline" then
+        opt.restricted_chapters=restricted
+        local native=transport:native()
+        local ok,grant=pcall(native.online_chapter_access,native,book,restricted[1].uid)
+        if ok and grant and (grant.durable or grant.expires) then opt.online_chapter_uid=restricted[1].uid end
+    end
     local accessible_expected=expected-restricted_count
     local preview=restricted_count>0
     local readable_count=#chapters

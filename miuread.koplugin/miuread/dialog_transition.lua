@@ -6,6 +6,22 @@ local Screen = require("device").screen
 
 local M = {generation = 0}
 
+function M.is_modal(widget)
+    return widget and (widget.modal == true or widget._miuread_modal_surface == true)
+end
+
+function M.is_visible_overlay(widget)
+    return widget and not widget.invisible and (widget.toast == true or M.is_modal(widget))
+end
+
+-- UIManager places only actual modal widgets above normal pages. MiuRead
+-- surfaces use the same flag for event routing and native window stacking.
+function M.modal_attributes(attrs)
+    attrs.modal = true
+    attrs._miuread_modal_surface = true
+    return attrs
+end
+
 function M.cancel_pending()
     M.generation = M.generation + 1
     return M.generation
@@ -29,8 +45,7 @@ local function current_modal_frame()
     for i = #stack, 1, -1 do
         local window = stack[i]
         local widget = window and window.widget
-        if widget and not widget.invisible and not widget.toast
-            and (widget._miuread_modal_surface==true or widget.modal==true) then
+        if M.is_visible_overlay(widget) and not widget.toast then
             local rect=widget.bubble_dimen or widget.popup_dimen or widget.frame_dimen or widget.panel_dimen
                 or (widget.frame and widget.frame.dimen) or (widget.movable and widget.movable.dimen)
             rect=Geometry.rect(rect,0)

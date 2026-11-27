@@ -72,9 +72,11 @@ package.loaded["miuread.eink_archive"]={
     read=function() return chapter_xhtml,"p { margin: 0; }",{} end,
 }
 local requests,downloaded,info_requests={},0,0
+local download_error
 local book_info={bookId="sample",version=4,paid=1}
 local http={
     download_to_file=function(_,url,path,opt)
+        if download_error then error(download_error,0) end
         downloaded=downloaded+1
         assert(opt.max_response_bytes==32*1024*1024)
         requests[#requests+1]={url=url,opt=opt}
@@ -138,6 +140,15 @@ assert(not pcall(native.download,native,book,chapter,store.limited_online_dir.."
 
 local Result=require("miuread.download_result")
 assert(Result.failure_kind("微信读书未确认本章离线下载权限")=="chapter_access")
+download_error="download HTTP 402"
+local opened,locked=pcall(native.download,native,book,chapter,store.limited_online_dir.."/unused",
+    {read_online=true,limited_online=true,online_server_only=true})
+assert(not opened and Result.chapter_access(locked)=="locked")
+download_error="download HTTP 403"
+opened,locked=pcall(native.download,native,book,chapter,store.limited_online_dir.."/unused",
+    {read_online=true,limited_online=true,online_server_only=true})
+assert(not opened and Result.chapter_access(locked)==nil)
+download_error=nil
 native.request=original_request
 chapter.price=0
 native:download(book,chapter,root.."/unused",{})

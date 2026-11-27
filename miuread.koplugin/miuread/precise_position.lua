@@ -448,13 +448,14 @@ end
 -- Lightweight capture for the new source-coordinate path. It only reads a
 -- small text window around the current XPointer; it never scans the full local
 -- chapter and performs no network request.
-function M.capture(ui, record, catalog)
+function M.capture(ui, record, catalog, known_xpointer)
     if type(record) ~= "table" then return nil, "record_missing" end
     local document = ui and ui.document or nil
     local toc = ui and ui.toc or nil
     if not document then return nil, "document_missing" end
 
-    local xp, xp_error = current_xpointer(ui, document)
+    local xp,xp_error=known_xpointer,nil
+    if not xp then xp,xp_error=current_xpointer(ui,document) end
     if not xp then return nil, xp_error end
     if (record.record or {}).document_format=="txt" then
         local candidates=capture_source_anchors(document,nil,xp,"")

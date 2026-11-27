@@ -112,6 +112,7 @@ local SheetWidget = InputContainer:extend{
     name = "miuread_action_sheet",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- This widget captures input over the whole screen, but only paints the
     -- floating bubble. It must not claim to cover the framebuffer, otherwise
     -- UIManager may skip repainting the HomeView underneath during close/refresh

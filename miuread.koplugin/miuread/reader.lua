@@ -245,6 +245,7 @@ end
 -- downgraded into a preview book.
 local function is_access_denied_error(value)
     if is_auth_error(value) then return false end
+    if require("miuread.download_result").chapter_access(value) then return true end
     local text=tostring(value or "")
     local lower=text:lower()
     local markers={
@@ -1406,6 +1407,7 @@ function Reader:eink_chapter(book, chapter, format, opt)
             return html,"",{},{raw_xhtml=html,coord_html=AnnotationCoord.fromDownloadedXhtml(html),native_text=text,
                 source_channel="eink",coordinate_source_authoritative=false,content_format="txt",
                 book_version=chapter_info.version,online_expires=chapter_info.online_expires,
+                download_grant=chapter_info.download_grant,
                 online_server_only=chapter_info.online_server_only}
         end
         local archive_options={}
@@ -1432,6 +1434,7 @@ function Reader:eink_chapter(book, chapter, format, opt)
             url=Protocol.reader_url(id,uid),strict_images=true,
             image_archive_expected=false,image_archive_ok=true,book_version=version,
             online_expires=chapter_info and chapter_info.online_expires,
+            download_grant=chapter_info and chapter_info.download_grant,
             online_server_only=chapter_info and chapter_info.online_server_only}
         if single_source and not opt.translation and not opt.limited_online then
             state.native_progress_raw=html

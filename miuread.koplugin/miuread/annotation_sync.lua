@@ -507,6 +507,18 @@ function AnnotationSync.cloud_thoughts(api,book_id)
     return thoughts,present_ids
 end
 
+function AnnotationSync.cloud_bookmarks(api,book_id)
+    local records,err=fetch_cloud_annotations(api,book_id,false)
+    if not records then error(err,0) end
+    local marks={}
+    for _,row in ipairs(records) do
+        local content=scalar(row.markText or row.content or row.text)
+        marks[#marks+1]={content=content,chapter=scalar(row.chapterTitle),
+            kind=tonumber(row.type),updated_at=tonumber(row.updateTime or row.createTime) or 0}
+    end
+    return marks
+end
+
 function AnnotationSync.cloud_thought_snapshot(api,book_id)
     local checked_at=os.time()
     local rows,present_ids=AnnotationSync.cloud_thoughts(api,book_id)

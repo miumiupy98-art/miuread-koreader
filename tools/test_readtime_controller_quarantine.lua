@@ -96,4 +96,33 @@ do
     c.queue.quarantine_overlap_batch=function() return {rows=0} end
     assert(c:send()==true and selected,"position recovery must not prevent batch selection")
 end
+
+-- Confirm the actual controller seals only the verified prefix at expiry.
+do
+    local c=controller({})
+    local now=os.time()
+    local Stats=require("miuread.readtime_stats")
+    function Stats.snapshot()
+        return {{page=1,start_time=now-40,duration=30},{page=2,start_time=now-10,duration=10},
+            {page=3,start_time=now-12,duration=12}}
+    end
+    function Stats.persisted() return {} end
+    require("miuread.readtime_clock").sample=function() return {wall=now,zone="+00:00"} end
+    local sync={}
+    function sync:entitlement_page(_,_,page,_,start)
+        local expiry=now-20
+        if page==3 then return nil end
+        return start<expiry,expiry
+    end
+    c.active={vid="test-user",sync=sync,record={},entitlement={},stats_book=7,
+        stats={id_curr_book=7,isEnabledAndNotFrozen=function() return true end},
+        book_id="book",last_scan=now-50,sources={},
+        window={id="licensed-window",time_zone="+00:00",capture_not_before=now-50}}
+    function c.queue:observe() return {zone="+00:00"} end
+    function c.queue:collect(_,id,spans,_,close)
+        assert(id=="licensed-window" and close and #spans==1 and spans[1].page==1 and spans[1].duration==20)
+        return {seconds=20,rows=1}
+    end
+    assert(c:collect(true) and c.active==nil)
+end
 print("readtime controller pre-dispatch quarantine and preflight fallback passed")

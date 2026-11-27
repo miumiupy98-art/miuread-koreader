@@ -49,15 +49,26 @@ function M:authorized(fn,stage,allow_recovery)
     return x,y,z,extra
 end
 function M:request(method,path,parameters,stage,request_options)
+    local single=request_options and request_options.single_dispatch
+    local session=single and (self.store:auth() or {}).login_session_id
     local value=self:authorized(function(credentials)
         local options=self:options(credentials,{5,20})
         if request_options and request_options.timeout then options.timeout=request_options.timeout end
+        if single then
+            options.retries,options.rate_limit_retries,options.rate_limit_fail_fast=0,0,true
+            options.before_dispatch=function()
+                local saved=self.store:read_persisted("auth")
+                local current=Client.credentials(saved or {})
+                return session~=nil and saved and saved.login_session_id==session and current~=nil
+                    and current.vid==credentials.vid and current.accessToken==credentials.accessToken
+            end
+        end
         if method=="GET" then
             local query=next(parameters or {}) and ("?"..Protocol.query(parameters)) or ""
             return self.http:get_json(BASE..path..query,options)
         end
         return self.http:post_json(BASE..path,parameters,options)
-    end,stage,not (request_options and request_options.no_auth_recovery==true))
+    end,stage,not single and not (request_options and request_options.no_auth_recovery==true))
     if type(value)~="table" then error("E-Ink 客户端响应无效 native_stage="..stage,0) end
     return value
 end
@@ -77,6 +88,9 @@ function M:translation_member_summary()
     if value.isPaying==nil then error("E-Ink 会员响应不完整",0) end
     return value
 end
+function M:membership_summary()
+    return self:request("GET","/pay/memberCardSummary",{pf="android",snapshot=0,source="reader"},"account")
+end
 function M:account_overview()
     local result={}
     local balance_ok,balance=pcall(self.request,self,"POST","/pay/balance",
@@ -85,13 +99,11 @@ function M:account_overview()
         result.balance=tonumber(balance.balance)
         result.gift_balance=tonumber(balance.giftBalance) or 0
     end
-    local member_ok,member=pcall(self.request,self,"GET","/pay/memberCardSummary",
-        {pf="android",snapshot=0,source="reader"},"account")
-    if member_ok and tonumber(member.remainTime) and tonumber(member.expiredTime) then
-        result.remaining=tonumber(member.remainTime)
-        result.paid_remaining=tonumber(member.payingRemainTime) or 0
-        result.expires=tonumber(member.expiredTime)
-        result.permanent=tonumber(member.permanent)==1
+    local member_ok,member=pcall(self.membership_summary,self)
+    if member_ok then
+        local summary=require("miuread.eink_entitlements").summary(member,os.time())
+        for key,value in pairs(summary) do result[key]=value end
+        result.download_entitlement=require("miuread.download_entitlements").account_status(member,os.time())
     end
     if result.balance==nil and result.remaining==nil then error("E-Ink 未返回账户余额或会员资料",0) end
     return result
@@ -167,8 +179,6 @@ function M:_durable_download_access(id,version,catalog,chapter)
     if type(details)=="table" and (details.bookId==nil or tostring(details.bookId)==id)
         and durable_access(details,chapter) then return true end
 
-    -- Regular EPUBs survive outside the plugin. Time-limited membership
-    -- remains on the existing route until its expiry can travel with a file.
     local key=self:cache_key(id)..":"..version
     local cached=self.book_access[key]
     if not cached then
@@ -186,7 +196,9 @@ function M:_online_member_expiry(id,version,catalog)
     local key=self:cache_key(id)..":"..version
     local now=os.time()
     local saved=self.online_grants[key]
-    if saved and now<saved.expires and now>=saved.observed and now-saved.observed<=60 then return saved.expires end
+    if saved and now<saved.expires and now>=saved.observed and now-saved.observed<=60 then
+        return saved.expires,nil,saved.kind,saved.observed
+    end
     local book=self.book_access[key] or catalog.book
     if type(book)~="table" or tostring(book.bookId or "")~=id then return nil end
     local member=self:request("GET","/pay/memberCardSummary",{pf="android",snapshot=0,source="reader"},"online_access")
@@ -197,12 +209,14 @@ function M:_online_member_expiry(id,version,catalog)
     local paid_remaining=tonumber(member.payingRemainTime) or 0
     local paid=paid_remaining>0 and (confirmed(member.isPaying) or confirmed(member.paying))
     local pay_type=tonumber(book.payType) or 0
-    local eligible
+    local eligible,kind
     if bit.band(pay_type,1048576)~=0 then
         eligible=paid
+        kind="paid"
         if eligible then expires=math.floor(math.min(expires,now+paid_remaining)) end
     elseif bit.band(pay_type,4096)~=0 then
         eligible=true
+        kind="member"
     else
         local ok,tips=pcall(self.request,self,"GET","/reader/tips",{bookId=id,from="reader"},"online_access")
         if not ok then
@@ -210,11 +224,13 @@ function M:_online_member_expiry(id,version,catalog)
             return nil,expires
         end
         if tips.bookId~=nil and tostring(tips.bookId)~=id then return nil end
-        if confirmed(tips.canFreeRead) then
+        if tonumber(tips.payingType)==1 then
+            eligible=paid
+            kind="paid"
+            if eligible then expires=math.floor(math.min(expires,now+paid_remaining)) end
+        elseif confirmed(tips.canFreeRead) then
             eligible=true
-        elseif paid and tonumber(tips.payingType)==1 then
-            eligible=true
-            expires=math.floor(math.min(expires,now+paid_remaining))
+            kind="member"
         end
     end
     if expires<=os.time() then return nil end
@@ -226,8 +242,20 @@ function M:_online_member_expiry(id,version,catalog)
         end
         return nil,expires
     end
-    self.online_grants[key]={expires=expires,observed=now}
-    return expires
+    self.online_grants[key]={expires=expires,observed=now,kind=kind}
+    return expires,nil,kind,now
+end
+
+function M:_offline_download_grant(id,version,catalog)
+    local book=self.book_access[self:cache_key(id)..":"..version] or catalog.book
+    local loan=type(book)=="table" and tostring(book.bookId or "")==id and book.shortTimeRead
+    local now=os.time()
+    local due=type(loan)=="table" and tonumber(loan.expireTime)
+    if due and due>now and confirmed(loan.active) then
+        return {kind="loan",expires_at=math.floor(due),checked_at=now}
+    end
+    local expires,_,kind,checked=self:_online_member_expiry(id,version,catalog)
+    if expires and kind then return {kind=kind,expires_at=expires,checked_at=checked} end
 end
 
 function M:_chapter_request_scope(id,uid,book_version)
@@ -273,7 +301,7 @@ function M:download(book,chapter,path,opt)
     if opt.translation==false and self.translation_modes[self:cache_key(id)]==true then self:toggle_translate(id,false) end
     local access=opt.translation and chapter_access
         or (not opt.translation and self:_durable_download_access(id,version,catalog,selected))
-    local expires,session_only
+    local expires,session_only,download_grant
     if not access and not offline and opt.limited_online==true then
         local root=self.store.limited_online_dir
         if type(root)=="string" and type(path)=="string" and path:sub(1,#root+1)==root.."/"
@@ -283,6 +311,10 @@ function M:download(book,chapter,path,opt)
             session_only=grant and grant.session_only==true and opt.online_server_only==true
             access=expires~=nil or session_only==true
         end
+    end
+    if offline and opt.record_download_entitlement==true and not opt.translation then
+        download_grant=access and {kind="owned"} or self:_offline_download_grant(id,version,catalog)
+        access=download_grant~=nil
     end
     if not access then
         if not offline then error("微信读书未确认本章在线阅读权限",0) end
@@ -305,7 +337,14 @@ function M:download(book,chapter,path,opt)
             if type(opt.yield)=="function" then opt.yield("content") end
             if type(opt.activity)=="function" then opt.activity("native_archive_download",{bytes=bytes}) end
         end
-        local downloaded,headers,_,meta = self.http:download_to_file(url,path,options)
+        local ok,downloaded,headers,_,meta=pcall(self.http.download_to_file,self.http,url,path,options)
+        if not ok then
+            -- The APK distinguishes HTTP 402 from network and authentication errors.
+            if tostring(downloaded):match("HTTP%s+402%f[^%d]") then
+                error("[MiuReadChapterLocked] 微信读书确认当前章节需开通阅读权限",0)
+            end
+            error(downloaded,0)
+        end
         local envelope
         for key,value in pairs(headers or {}) do if tostring(key):lower()=="encryptkey" then envelope=value end end
         if not envelope then
@@ -321,6 +360,7 @@ function M:download(book,chapter,path,opt)
         if not opt.eink_only then self.resources[resource_key]=true end
         return downloaded,envelope,credentials.vid,{tar=selected.tar,version=version,resource_key=resource_key,
             online_expires=expires,online_server_only=session_only or nil,
+            download_grant=download_grant,
             includes_shared_resources=chapters~=uid,format=format}
     end,"chapter_download")
 end

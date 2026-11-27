@@ -51,6 +51,7 @@ local Dialog = InputContainer:extend{
     name = "miuread_reader_settings_dialog",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- Other settings retain the existing partial frame. Comment acquisition
     -- explicitly requests an opaque full-screen drawing surface.
     covers_fullscreen = false,

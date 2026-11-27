@@ -50,6 +50,7 @@ local Dialog = InputContainer:extend{
     name = "miuread_reader_toc_dialog",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     -- Captures full-screen input but paints only a partial frame.
     covers_fullscreen = false,
     stop_events_propagation = true,

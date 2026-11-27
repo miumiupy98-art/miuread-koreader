@@ -16,6 +16,7 @@ local KNOWN_FAILURES={
     {"E-Ink 目录未确认章节免费或已购买","chapter_access","catalog"},
     {"未确认本章在线阅读权限","chapter_access","online_access"},
     {"未确认本章离线下载权限","chapter_access","catalog"},
+    {"[MiuReadChapterLocked]","chapter_access","chapter_download"},
     {"E-Ink 书籍格式暂不支持","book_format","catalog"},
     {"E-Ink 书籍版本缺失","book_version","catalog"},
     {"E-Ink 接口需要客户端授权","authorization","client_download"},

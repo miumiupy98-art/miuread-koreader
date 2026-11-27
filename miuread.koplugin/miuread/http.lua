@@ -847,10 +847,10 @@ function Http:_request_once(opt)
     local method = opt.method or (opt.body and "POST" or "GET")
     local body = opt.body
     local max_response_bytes = tonumber(opt.max_response_bytes)
-    local auth_snapshot=self.store:auth()
+    local auth_snapshot=opt.auth~=false and self.store:auth() or {}
     local request_login_session_id=tostring(auth_snapshot.login_session_id or "")
     local request_auth_revision=math.max(0,tonumber(auth_snapshot.auth_revision or 0) or 0)
-    local jar = self:_jar()
+    local jar = opt.auth~=false and self:_jar() or {}
     local headers = {}
     for k, v in pairs(opt.headers or {}) do headers[k] = v end
     headers["User-Agent"] = headers["User-Agent"] or self.user_agent

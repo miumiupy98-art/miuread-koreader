@@ -7,7 +7,7 @@ local RawButtonDialog=require("ui/widget/buttondialog")
 local TransientGuard=require("miuread.transient_guard")
 local logger=require("logger")
 local M={}
-local ButtonDialog=RawButtonDialog:extend{_miuread_transient=true,_miuread_modal_surface=true}
+local ButtonDialog=RawButtonDialog:extend{modal=true,_miuread_transient=true,_miuread_modal_surface=true}
 function ButtonDialog:handleEvent(event)
     return require("miuread.gesture_bridge").handle(RawButtonDialog,self,event)
 end

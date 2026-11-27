@@ -240,6 +240,7 @@ local Editor = InputContainer:extend{
     name = "miuread_book_excerpt_editor",
     _miuread_transient = true,
     _miuread_modal_surface = true,
+    modal = true,
     covers_fullscreen = false, -- 非全屏居中框：reader 画在后面，点框外关闭
     stop_events_propagation = true,
     align = "center",           -- InputContainer:paintTo 据此居中 [1]=frame
