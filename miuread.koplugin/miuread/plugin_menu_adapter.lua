@@ -121,6 +121,8 @@ function M.rows(owner, items, options)
                 value = value,
                 detail = tostring(source.detail or source.help_text or ""),
                 preview_image = source.preview_image,
+                cards = source.cards,
+                section_actions = source.section_actions,
                 enabled = enabled,
                 readonly_label = source.readonly_label == true,
                 checked = checked,

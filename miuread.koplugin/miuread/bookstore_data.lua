@@ -11,6 +11,13 @@ local function text(value)
     return (type(value)=="string" or type(value)=="number") and tostring(value) or ""
 end
 
+local function category_title(row,id)
+    for _,key in ipairs({"title","name"}) do
+        local title=U.trim(text(row[key]))
+        if title~="" and title:lower()~=id:lower() then return title end
+    end
+end
+
 function M.book(row)
     if type(row)~="table" then return nil end
     local b=row
@@ -72,8 +79,9 @@ function M.categories(data)
         local id=text(row.CategoryId or row.categoryId)
         if id=="" or not id:match("^[%w_%-]+$") then return nil end
         if row.type~=nil and tonumber(row.type)~=0 then return nil end
-        local out={id=id,title=text(row.title),rank=not id:match("^%d+$"),children={},channel=data._api_channel}
-        if out.title=="" then return nil end
+        local title=category_title(row,id)
+        if not title then return nil end
+        local out={id=id,title=title,rank=not id:match("^%d+$"),children={},channel=data._api_channel}
         for _,child in ipairs(type(row.sublist)=="table" and row.sublist or {}) do
             local entry=parse(child,depth+1)
             if entry then out.children[#out.children+1]=entry end
@@ -98,6 +106,82 @@ function M.categories(data)
     end
     visit(data.data,0)
     return {ranks=ranks,categories=categories}
+end
+
+local function home_categories(rows,rank,depth)
+    local categories={}
+    if type(rows)~="table" or depth>8 then return categories end
+    for _,row in ipairs(rows) do
+        if type(row)=="table" then
+            local id=text(row.CategoryId or row.categoryId)
+            local title=category_title(row,id)
+            if id:match("^[%w_%-]+$") and title then
+                local covers={}
+                for _,cover in ipairs(type(row.covers)=="table" and row.covers or {}) do
+                    if type(cover)=="string" and cover~="" then covers[#covers+1]=cover end
+                end
+                categories[#categories+1]={id=id,title=title,rank=rank,covers=covers,channel="eink",
+                    children=home_categories(row.sublist,rank,depth+1)}
+            end
+        end
+    end
+    return categories
+end
+
+function M.home(data)
+    if type(data)~="table" or (type(data.data)~="table" and type(data.updated)~="table") then
+        error("微信读书书城首页响应不完整")
+    end
+    local order,by_type={},{}
+    for _,key in ipairs({"data","updated"}) do
+        for _,row in ipairs(type(data[key])=="table" and data[key] or {}) do
+            local kind=type(row)=="table" and tonumber(row.type)
+            if kind and (kind==12 or kind==23 or kind==40 or kind==41
+                or (kind>=101 and kind<200) or (kind>=1001 and kind<1100)) then
+                if not by_type[kind] then order[#order+1]=kind end
+                by_type[kind]=row
+            end
+        end
+    end
+    local sections={}
+    for _,kind in ipairs(order) do
+        local row=by_type[kind]
+        local rank=kind>=1001
+        local books,seen={},{}
+        local function add_books(list)
+            for _,entry in ipairs(type(list)=="table" and list or {}) do
+                local book=M.book(entry)
+                local info=book and (entry.bookInfo or entry.book or entry)
+                if type(info)=="table" and not seen[book.bookId] then
+                    local paid=info.paid==true or tonumber(info.paid)==1
+                    local paper_trial=math.floor((tonumber(info.payType) or 0)/524288)%2==1 and not paid
+                    if tonumber(info.ispub)~=2 and ((tonumber(info.soldout) or 0)==0 or paper_trial) then
+                        books[#books+1]=book
+                        seen[book.bookId]=true
+                    end
+                end
+            end
+        end
+        if rank and type(row.categories)=="table" then
+            for _,category in ipairs(row.categories) do
+                if type(category)=="table" then
+                    add_books(category.lectureBooks or category.books)
+                    if #books>0 then break end
+                end
+            end
+        end
+        if #books==0 then add_books(row.books) end
+        local categories=home_categories(row.categories,rank,0)
+        local title=text(row.name)
+        for _,category in ipairs(categories) do
+            if title:lower()==category.id:lower() then title=category.title; break end
+        end
+        if title~="" and (#books>0 or #categories>0) then
+            sections[#sections+1]={kind=kind,title=title,books=books,categories=categories}
+        end
+    end
+    local hint=type(data.search)=="table" and text(data.search.text) or ""
+    return {sections=sections,search_hint=hint}
 end
 
 function M.shelf_state(data,id,full_shelf)

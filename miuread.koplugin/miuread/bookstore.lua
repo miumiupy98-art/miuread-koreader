@@ -6,6 +6,8 @@ local ReaderList=require("miuread.reader_list_dialog")
 local RawButtonDialog=require("ui/widget/buttondialog")
 local TransientGuard=require("miuread.transient_guard")
 local logger=require("logger")
+local has_socket,socket=pcall(require,"socket")
+local clock=has_socket and socket.gettime or os.time
 local M={}
 local ButtonDialog=RawButtonDialog:extend{modal=true,_miuread_transient=true,_miuread_modal_surface=true}
 function ButtonDialog:handleEvent(event)
@@ -120,7 +122,11 @@ function M.reset(plugin)
         plugin._bookstore_shelf_auth=nil
     end
     local s=plugin._bookstore
-    if s then s.generation=s.generation+1 end
+    if s then
+        s.generation=s.generation+1
+        if s.cover_worker then s.cover_worker:cancel("bookstore reset") end
+        s.cover_view=nil
+    end
     close_view(plugin)
     plugin._bookstore=nil
 end
@@ -129,38 +135,72 @@ local function error_message(plugin,value,label)
     return plugin:_friendly_remote_error(tostring(value or "未知错误"),label)
 end
 
-local function discovery(api)
-    local result={}
-    local function fetch(key,callback)
-        local ok,value=pcall(callback)
-        if ok then result[key]=value end
+local category_rows
+
+local function load_visible_covers(plugin,s,view,items,first,last)
+    if not plugin.library or not plugin:is_online() or not plugin.store.temp_dir then return end
+    local batch,keys,seen={},{},{}
+    s.cover_paths=s.cover_paths or {}
+    s.cover_attempts=s.cover_attempts or {}
+    for i=first,last do
+        for _,card in ipairs(items[i].cards or {}) do
+            local book=card.book
+            if book and book.cover~="" and not seen[book.cover] and not s.cover_attempts[book.cover] then
+                seen[book.cover]=true
+                batch[#batch+1]={bookId=book.bookId,cover=book.cover}
+                keys[#keys+1]=book.cover
+            end
+        end
     end
-    fetch("recommend",function()
-        return Data.page("recommend",api:recommend_books(0,Data.PAGE_SIZE),0,Data.PAGE_SIZE)
+    local signature=table.concat(keys,"\n")
+    if s.cover_view==view and s.cover_batch==signature then return end
+    if s.cover_worker then s.cover_worker:cancel("visible books changed") end
+    s.cover_view,s.cover_batch=view,signature
+    if #batch==0 then return end
+    UIManager:scheduleIn(.20,function()
+        if view.closed or s.cover_view~=view or s.cover_batch~=signature then return end
+        s.cover_worker=s.cover_worker or require("miuread.async"):new(plugin.store,{disable_fallback=true})
+        if not s.cover_worker:available() then return end
+        local covers_dir=plugin.store.covers_dir
+        local started_at=clock()
+        s.cover_worker:run("bookstore_cover_batch",function()
+            local store={covers_dir=covers_dir,auth=function() return {} end,get=function(_,_,default) return default end}
+            local http=require("miuread.http"):new(store)
+            local library=require("miuread.library"):new(nil,http,store)
+            local result={}
+            for _,book in ipairs(batch) do
+                local ok,path=pcall(library.cache_cover,library,book,{thumbnail=true,cache_suffix="store",
+                    persist_index=false,skip_index_lookup=true,retries=0,timeout={3,5}})
+                if ok and path then result[book.cover]=path end
+            end
+            return result
+        end,function(result)
+            if view.closed or s.cover_view~=view or s.cover_batch~=signature then return end
+            logger.info("[MiuRead][Bookstore] covers","count=",#batch,"ms=",math.floor((clock()-started_at)*1000))
+            for _,key in ipairs(keys) do s.cover_attempts[key]=true end
+            if result and result.ok and next(result.value or {}) then
+                for key,path in pairs(result.value) do s.cover_paths[key]=path end
+                ReaderList.refresh(view)
+            end
+        end,38)
     end)
-    fetch("categories",function() return Data.categories(api:store_categories()) end)
-    local first=result.categories and result.categories.ranks[1]
-    if first then
-        fetch("rank",function()
-            local source=first.channel and api:for_channel(first.channel) or api
-            local spec={kind="category",category_id=first.id,rank=true,title=first.title,channel=first.channel}
-            return {spec=spec,page=Data.page("category",source:category_books(first.id,0,true),0,Data.PAGE_SIZE)}
-        end)
-    end
-    return result
 end
 
 function M.open(plugin,force)
+    local started_at=clock()
     close_view(plugin)
     if plugin._shelf_view then plugin:_close_current_shelf() end
     local s=state(plugin)
     local cached=s.cache.discovery
     local logged_in=plugin:logged_in()
     local data=U.copy(cached and cached.value or {})
+    local failed=false
     local loading=logged_in and plugin:is_online()
         and (force==true or not cached or os.time()-cached.at>Data.CACHE_TTL)
     local rows={}
     local function close_discovery()
+        s.cover_view,s.cover_batch=nil,nil
+        if s.cover_worker then s.cover_worker:cancel("bookstore home closed") end
         if plugin._interactive_network_key=="bookstore:discovery" then
             plugin:_cancel_interactive_network("source page closed")
         end
@@ -170,50 +210,93 @@ function M.open(plugin,force)
         plugin:show_book_sources()
     end
     local function reopen() M.open(plugin) end
+    local view
+    local function book_row(book,on_back)
+        return {text=book.title,post_text=book.author,
+            callback=function() close_discovery(); plugin:book_menu(book,on_back) end}
+    end
+    local function open_section(section)
+        local items=category_rows(plugin,section.categories,function() open_section(section) end)
+        for _,book in ipairs(section.books) do
+            items[#items+1]=book_row(book,function() open_section(section) end)
+        end
+        if #section.books==0 and #section.categories==1 and #section.categories[1].children==0 then
+            return items[1].callback()
+        end
+        plugin:_show_miuread_menu(section.title,items,{page_size=8,on_back=reopen})
+    end
     local function render()
         for i=#rows,1,-1 do rows[i]=nil end
-        local function section(title,page,spec)
-            local books=page and page.books or {}
-            if #books==0 then return end
-            rows[#rows+1]={text=title,post_text="更多",callback=function() M.browse(plugin,U.copy(spec)) end}
-            for i=1,math.min(#books,3) do
-                local book=books[i]
-                rows[#rows+1]={text=book.title,post_text=book.author,callback=function()
-                    plugin:book_menu(book,reopen)
-                end}
+        local function add_section(section)
+            local function show_all() close_discovery(); open_section(section) end
+            if #section.books==0 then
+                rows[#rows+1]={text=section.title,bold=true,post_text="查看分类",callback=show_all}
+                return
             end
+            local cards={}
+            local actions={{label="查看全部",callback=show_all}}
+            local offset=s.home_offsets and s.home_offsets[section.kind] or 0
+            for i=1,math.min(#section.books,3) do
+                local book=section.books[(offset+i-1)%#section.books+1]
+                cards[#cards+1]={book=book,title=book.title,callback=book_row(book,reopen).callback,
+                    path=function() return s.cover_paths and s.cover_paths[book.cover] end}
+            end
+            if section.kind==23 and #section.books>3 then
+                table.insert(actions,1,{label="换一批",stay=true,callback=function()
+                    s.home_offsets=s.home_offsets or {}
+                    s.home_offsets[section.kind]=(offset+3)%#section.books
+                    render()
+                end})
+            end
+            rows[#rows+1]={text=section.title,cards=cards,section_actions=actions}
         end
-        section("为你推荐",data.recommend,{kind="recommend",title="为你推荐"})
-        if data.rank then section(data.rank.spec.title,data.rank.page,data.rank.spec) end
+        local recent=plugin._home_cloud_recent
+        if recent and recent.id==plugin:_home_cloud_recent_key() and #recent.books>0 then
+            add_section{title="最近阅读",books=recent.books,categories={}}
+        end
+        for _,section in ipairs(data.sections or {}) do
+            add_section(section)
+        end
         if not logged_in then
             rows[#rows+1]={text="扫码登录",callback=function() plugin:require_login("浏览微信读书",reopen) end}
-        elseif #rows==0 and loading then
-            rows[1]={text="正在加载书单…",enabled=false}
-        elseif #rows==0 or not data.recommend or not data.rank then
-            rows[#rows+1]={text=plugin:is_online() and "刷新书单" or "联网后刷新书单",callback=function()
+        elseif not data.sections and loading then
+            rows[#rows+1]={text="正在加载书城…",enabled=false}
+        elseif not data.sections or failed then
+            rows[#rows+1]={text=plugin:is_online() and "重新加载书城" or "联网后加载书城",callback=function()
                 if plugin:is_online() then M.open(plugin,true) else plugin:toast("请先连接网络",2) end
             end}
         end
     end
     render()
-    local view=plugin:_show_miuread_menu("微信读书",rows,{
-        page_size=8,on_back=back,actions={
-            {label="搜索",callback=function() plugin:search_dialog("搜索微信读书",reopen) end},
-            {label="榜单",callback=function() M.categories(plugin,true) end},
-            {label="分类",callback=function() M.categories(plugin,false) end},
+    view=plugin:_show_miuread_menu("微信读书书城",rows,{
+        page_size=3,card_rows=true,initial_page=s.home_page,on_page_change=function(page) s.home_page=page end,
+        on_visible=function(...) load_visible_covers(plugin,s,...) end,
+        on_back=back,toolbar={
+            {{label="搜索书名、作者",callback=function()
+                close_discovery()
+                plugin:search_dialog("搜索微信读书",reopen)
+            end}},
+            {{label="分类",callback=function() close_discovery(); M.categories(plugin,false) end},
+             {label="榜单",callback=function() close_discovery(); M.categories(plugin,true) end}},
         },
-        on_close=close_discovery,
+        on_dismiss=close_discovery,
     })
+    logger.info("[MiuRead][Bookstore] first frame built","ms=",math.floor((clock()-started_at)*1000))
     if not view or not loading then return view end
-    local started=request(plugin,"discovery","微信读书书单",discovery,function(ok,value)
-        if ok and type(value)=="table" then
-            for key,result in pairs(value) do data[key]=result end
-            if value.categories then cache(s,"categories",value.categories) end
-            if value.rank then cache(s,Data.key(value.rank.spec),value.rank.page) end
-            if value.recommend then cache(s,Data.key{kind="recommend"},value.recommend) end
-            if next(value) then cache(s,"discovery",data) end
+    local started=request(plugin,"discovery","微信读书书城",function(api)
+        local home=Data.home(api:store_home())
+        if #home.sections==0 then error("微信读书书城没有返回可展示的栏目",0) end
+        return home
+    end,function(ok,value)
+        if ok then
+            data=value
+            cache(s,"discovery",data)
+        else
+            failed=true
+            logger.warn("[MiuRead][Bookstore] native homepage load failed",U.first_line(value,120))
         end
         loading=false
+        if view.closed then return end
         render()
         ReaderList.refresh(view)
     end,55,true)
@@ -225,19 +308,19 @@ function M.open(plugin,force)
     return view
 end
 
-local function category_rows(plugin,entries)
+category_rows=function(plugin,entries,on_back)
     local rows={}
     for _,entry in ipairs(entries) do
         local current=entry
         local function browse()
             M.browse(plugin,{kind="category",category_id=current.id,rank=current.rank,title=current.title,
                 channel=current.channel,
-                on_back=function() M.categories(plugin,current.rank) end})
+                on_back=on_back or function() M.categories(plugin,current.rank) end})
         end
         if #current.children>0 then
             rows[#rows+1]={text=current.title,post_text=tostring(#current.children).." 个子分类",
                 sub_item_table_func=function()
-                    local children=category_rows(plugin,current.children)
+                    local children=category_rows(plugin,current.children,on_back)
                     table.insert(children,1,{text="全部 · "..current.title,callback=browse})
                     return children
                 end}
@@ -249,26 +332,56 @@ end
 function M.categories(plugin,rank,force)
     close_view(plugin)
     local s=state(plugin)
-    local function show(data,stale)
-        local entries=rank and data.ranks or data.categories
-        local rows=category_rows(plugin,entries or {})
-        table.insert(rows,1,{text="返回微信读书",callback=function() M.open(plugin) end})
-        rows[#rows+1]={text="刷新分类与榜单",callback=function() M.categories(plugin,rank,true) end}
-        if #entries==0 then table.insert(rows,2,{text="暂时没有可用分类",enabled=false}) end
-        plugin:list((rank and "排行榜" or "分类浏览")..(stale and " · 缓存" or ""),rows)
-    end
     local cached=s.cache.categories
-    if cached and not force then show(U.copy(cached.value),os.time()-cached.at>Data.CACHE_TTL); return true end
-    return request(plugin,"categories","分类与榜单",function(api)
+    local home=s.cache.discovery
+    local title=rank and "榜单" or "分类"
+    local function back() return M.open(plugin) end
+    local function return_to_picker() return M.categories(plugin,rank) end
+    local function home_entries()
+        local entries,seen={},{}
+        for _,section in ipairs(home and home.value.sections or {}) do
+            for _,entry in ipairs(section.categories) do
+                if entry.rank==rank and not seen[entry.id] then
+                    entries[#entries+1]=entry
+                    seen[entry.id]=true
+                end
+            end
+        end
+        return entries
+    end
+    local entries=cached and (rank and cached.value.ranks or cached.value.categories) or home_entries()
+    local rows={}
+    local loading=plugin:is_online() and (force or not cached or os.time()-cached.at>Data.CACHE_TTL)
+    local function render()
+        for i=#rows,1,-1 do rows[i]=nil end
+        for _,row in ipairs(category_rows(plugin,entries,return_to_picker)) do rows[#rows+1]=row end
+        if loading then
+            if #rows==0 then rows[1]={text="正在加载"..title.."…",enabled=false} end
+        elseif #rows==0 then
+            rows[1]={text=plugin:is_online() and "重新加载"..title or "联网后加载"..title,
+                callback=function() if plugin:is_online() then M.categories(plugin,rank,true) end end}
+        end
+    end
+    render()
+    local view=plugin:_show_miuread_menu(title,rows,{page_size=7,on_back=back,on_close=back,dismiss_to_back=true,
+        on_dismiss=function()
+            if plugin._interactive_network_key=="bookstore:categories" then
+                plugin:_cancel_interactive_network("bookstore picker closed")
+            end
+        end})
+    if not view or not loading then return view end
+    local started=request(plugin,"categories",title,function(api)
         return require("miuread.bookstore_data").categories(api:store_categories())
     end,function(ok,value)
-        if not ok then
-            if cached then show(U.copy(cached.value),true) end
-            plugin:info(error_message(plugin,value,"分类加载")); return
+        if ok then
+            cache(s,"categories",value)
+            entries=rank and value.ranks or value.categories
         end
-        cache(s,"categories",value)
-        show(value,false)
-    end)
+        loading=false
+        if not view.closed then render(); ReaderList.refresh(view) end
+    end,40,true)
+    if not started then loading=false; render(); ReaderList.refresh(view) end
+    return view
 end
 
 local function book_status(book)
