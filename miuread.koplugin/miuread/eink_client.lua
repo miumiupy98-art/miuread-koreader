@@ -54,6 +54,7 @@ function M:request(method,path,parameters,stage,request_options)
     local value=self:authorized(function(credentials)
         local options=self:options(credentials,{5,20})
         if request_options and request_options.timeout then options.timeout=request_options.timeout end
+        if request_options and request_options.include_service_error_code then options.include_service_error_code=true end
         if single then
             options.retries,options.rate_limit_retries,options.rate_limit_fail_fast=0,0,true
             options.before_dispatch=function()
@@ -137,10 +138,10 @@ function M:en_read(id,uid,read)
     if value.stopPoll==nil and value.translationProgress~=nil then value.stopPoll=0 end
     return value
 end
-function M:catalog(id)
+function M:catalog(id,refresh)
     id=tostring(id)
     local cache_key = self:cache_key(id)
-    if self.catalogs[cache_key] then return self.catalogs[cache_key] end
+    if not refresh and self.catalogs[cache_key] then return self.catalogs[cache_key] end
     local data = self:authorized(function(credentials)
         -- Request a complete catalog, using parallel arrays for the one book.
         -- Zero versions prevent an incremental/unchanged response from being
@@ -321,7 +322,8 @@ function M:download(book,chapter,path,opt)
         error("微信读书未确认本章离线下载权限",0)
     end
     local resource_key=self:cache_key(id)..":"..version..(opt.eink_only and ":eink-only" or "")
-    local chapters=format=="epub" and not self.resources[resource_key] and uid~="0" and ("0,"..uid) or uid
+    local chapters=format=="epub" and (opt.force_shared_images or not self.resources[resource_key])
+        and uid~="0" and ("0,"..uid) or uid
     local url = BASE.."/book/chapterdownload?bookId="..Protocol.escape(id).."&chapters="..Protocol.escape(chapters)
         .."&bookType="..format.."&bookVersion="..Protocol.escape(version)
         .."&pf=wechat_wx-2001-android-100-weread&pfkey=pfKey&zoneId=1"
@@ -582,33 +584,35 @@ function M:similar_books(id,offset,count,session_id)
     array(value.booksimilar,"books","store")
     return value
 end
-function M:store_categories()
-    -- Native CategoryList carries `updated` on an initial sync; ranks use a
-    -- separate selector on the same endpoint. Preserve the complete Web shape.
-    local categories=self:request("GET","/market/categories",{recommend=0,synckey=0,subtype=0},"store")
-    local ranks=self:request("GET","/market/categories",{ranklist=1,synckey=0,subtype=0},"store")
-    local function rows(value)
-        local list=value.updated or value.data
-        if type(list)~="table" then error("E-Ink 分类列表不完整",0) end
-        return list
+function M:store_categories(rank)
+    local params=rank and {ranklist=1,synckey=0,subtype=0}
+        or {recommend=0,categoryId="",synckey=0,subtype=0}
+    local value=self:request("GET","/market/categories",params,"store")
+    -- CategoryList carries categories and may include a separate updated list.
+    local rows={}
+    local found=false
+    for _,key in ipairs({"categories","data","updated"}) do
+        if type(value[key])=="table" then
+            found=true
+            for _,entry in ipairs(value[key]) do rows[#rows+1]=entry end
+        end
     end
-    local value={data={{categories=rows(categories)},{categories=rows(ranks)}}}
-    local parsed=require("miuread.bookstore_data").categories(value)
-    if #parsed.categories==0 or #parsed.ranks==0 then error("E-Ink 分类与排行未能完整映射",0) end
-    return value
+    if not found then error("E-Ink 分类列表不完整",0) end
+    return {data={{categories=rows,rank=rank==true}}}
 end
 function M:category_books(id,offset,rank)
     id=tostring(id or "")
     if not id:match("^[%w_%-]+$") then error("invalid bookstore category",0) end
     local value=self:request("GET","/market/category",{categoryId=id,maxIdx=offset or 0,count=20,
         rank=rank and 1 or 0,synckey=0},"store")
-    local rows=value.updated or value.data
+    -- CategoryBookList.getData maps to "books" in the official APK.
+    local rows=type(value.books)=="table" and value.books
+        or (type(value.updated)=="table" and value.updated or value.data)
     if type(rows)~="table" then error("E-Ink 分类书籍列表不完整",0) end
-    local result={books=rows,hasMore=value.hasMore,totalCount=value.totalCount or (value.category or {}).totalCount}
-    local page=require("miuread.bookstore_data").page("category",result,offset,20)
-    if (result.hasMore==true or tonumber(result.hasMore)==1 or (result.hasMore==nil and #rows>=20))
-        and page.next_cursor<=(tonumber(offset) or 0) then error("E-Ink 分类分页游标不完整",0) end
-    return result
+    local has_more=value.hasMore
+    if has_more==nil then has_more=value.continueFlag end
+    local category=type(value.category)=="table" and value.category or {}
+    return {books=rows,hasMore=has_more,totalCount=value.totalCount or category.totalCount}
 end
 function M:reading_stats(mode,base_time,options)
     mode=tostring(mode or "monthly")

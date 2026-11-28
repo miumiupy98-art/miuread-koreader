@@ -190,7 +190,8 @@ local runtime={book=book_for_ui,options={chapter_uid="17",chapter_continuous_ope
     login_session_id=auth.login_session_id,online_context=ui_context,open_after=true}
 assert(plugin:_show_weread_locked_chapter(runtime))
 assert(sheet.title=="当前章节需要阅读权限" and sheet.subtitle=="第十七章")
-assert(#sheet.actions==1 and sheet.actions[1].label=="用券解锁本章" and sheet.actions[1].detail=="剩余 2 张")
+assert(#sheet.actions==2 and sheet.actions[1].label=="用券解锁本章" and sheet.actions[1].detail=="剩余 2 张")
+assert(sheet.actions[2].label=="刷新权益并打开本章")
 assert(sheet.footer_action.label=="返回")
 sheet.actions[1].callback()
 assert(type(dialog.ok_callback)=="function" and submitted==0)

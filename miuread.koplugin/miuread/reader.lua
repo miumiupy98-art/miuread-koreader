@@ -529,8 +529,12 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
     xhtml=strip_font_faces(xhtml)
     css=strip_font_faces(css)
     local used_local_src, pending, deferred_keys = {}, {}, {}
-    local function defer_image(source,reason)
+    local function count_image_failure(reason)
+        if not reason then return end
         summary[reason]=(summary[reason] or 0)+1
+    end
+    local function defer_image(source,reason)
+        count_image_failure(reason)
         local plan=state.image_repair
         if not plan then return OPTIONAL_IMAGE_PLACEHOLDER end
         local existing=deferred_keys[source]
@@ -596,7 +600,14 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
             request.max_response_bytes=8*1024*1024
             request.headers.Referer,request.headers.Origin=nil,nil
         end
-        local ok, path_or_error = pcall(reader.http.download_to_file, reader.http, url, target, request)
+        local ok,path_or_error
+        if eink_only and reader._eink_client then
+            ok,path_or_error=pcall(require("miuread.eink_resources").download,reader._eink_client,url,target,{
+                anonymous=true,image_deadline=opt.image_deadline,yield=opt.yield,activity=opt.activity,
+            })
+        else
+            ok,path_or_error=pcall(reader.http.download_to_file,reader.http,url,target,request)
+        end
         if not ok then propagate_control_error(path_or_error) end
         if not ok or not path_or_error or not Util.file_exists(path_or_error) then
             if not ok and is_auth_error(path_or_error) then
@@ -743,6 +754,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
         if state.allow_deferred_images then
             return "<image"..image_set_local_href(attrs,defer_image(clean,reason or "relative_image_unmapped"))..">"
         end
+        if was_remote or state.strict_images then count_image_failure(reason) end
         logger.warn("[MiuRead][Reader] SVG image reference unresolved","src=",Util.redact_url(clean))
         return "<image"..attrs..">"
     end)
@@ -780,16 +792,12 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
                 summary.missing=summary.missing+1
                 return "url('"..defer_image(clean,reason or "relative_image_unmapped").."')"
             end
-            if was_remote then
+            if was_remote or state.strict_images then
                 summary.missing=summary.missing+1
                 summary.required_discovered=summary.required_discovered+1
                 summary.required_missing=summary.required_missing+1
+                count_image_failure(reason)
                 logger.warn("[MiuRead][Reader] CSS image reference unresolved","src=",tostring(clean))
-                return "url('"..clean.."')"
-            end
-            if state.strict_images then
-                summary.required_discovered=summary.required_discovered+1
-                summary.required_missing=summary.required_missing+1
                 return "url('"..clean.."')"
             end
             summary.stale=summary.stale+1
@@ -850,6 +858,7 @@ local function localize_epub_images(reader, xhtml, assets, source_map, state, cs
                 replacement = "<img" .. item.attrs .. ">"
                 summary.missing = summary.missing + 1
                 summary.required_missing = summary.required_missing + 1
+                count_image_failure(item.reason)
                 logger.warn("[MiuRead][Reader] image reference unresolved", "src=", tostring(item.source))
             end
             xhtml = xhtml:gsub(item.marker,function() return replacement end)
@@ -1516,7 +1525,14 @@ function Reader:eink_chapter(book, chapter, format, opt)
                     image_budget_exhausted=state.image_summary.image_budget_exhausted,
                     relative_image_unmapped=state.image_summary.relative_image_unmapped,
                 })
-                if not state.allow_deferred_images then error("E-Ink 正文图片未完整获取 [MiuReadImageMissing]") end
+                if not state.allow_deferred_images then
+                    local missing_shared=(state.image_summary.relative_image_unmapped or 0)>0
+                        or (state.image_summary.archive_name_missing or 0)>0
+                    local recover=not opt.read_online and not opt.force_shared_images and chapter_info
+                        and not chapter_info.includes_shared_resources and missing_shared
+                    error("E-Ink 正文图片未完整获取 [MiuReadImageMissing] missing_images="..required_missing
+                        ..(recover and " [MiuReadSharedImages]" or ""),0)
+                end
             end
             if state.image_repair and #state.image_repair.items==0 then state.image_repair=nil end
         end
@@ -1531,6 +1547,12 @@ function Reader:eink_chapter(book, chapter, format, opt)
     if not ok then
         Util.remove_tree(root)
         self._transient_image_roots[root]=nil
+        if tostring(a):find("[MiuReadSharedImages]",1,true) then
+            local retry=Util.copy(opt)
+            retry.force_shared_images=true
+            logger.info("[MiuRead][Reader] retry chapter with shared images","chapter=",uid)
+            return self:eink_chapter(book,chapter,format,retry)
+        end
         error(tostring(a).." native_stage="..native_stage,0)
     end
     return a,b,c,d

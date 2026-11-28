@@ -332,7 +332,8 @@ end
 function M.categories(plugin,rank,force)
     close_view(plugin)
     local s=state(plugin)
-    local cached=s.cache.categories
+    local key=rank and "ranks" or "categories"
+    local cached=s.cache[key]
     local home=s.cache.discovery
     local title=rank and "榜单" or "分类"
     local function back() return M.open(plugin) end
@@ -365,17 +366,19 @@ function M.categories(plugin,rank,force)
     render()
     local view=plugin:_show_miuread_menu(title,rows,{page_size=7,on_back=back,on_close=back,dismiss_to_back=true,
         on_dismiss=function()
-            if plugin._interactive_network_key=="bookstore:categories" then
+            if plugin._interactive_network_key=="bookstore:"..key then
                 plugin:_cancel_interactive_network("bookstore picker closed")
             end
         end})
     if not view or not loading then return view end
-    local started=request(plugin,"categories",title,function(api)
-        return require("miuread.bookstore_data").categories(api:store_categories())
+    local started=request(plugin,key,title,function(api)
+        return require("miuread.bookstore_data").categories(api:store_categories(rank))
     end,function(ok,value)
         if ok then
-            cache(s,"categories",value)
+            cache(s,key,value)
             entries=rank and value.ranks or value.categories
+        else
+            logger.warn("[MiuRead][Bookstore] picker load failed",key,U.first_line(value,120))
         end
         loading=false
         if not view.closed then render(); ReaderList.refresh(view) end
@@ -466,10 +469,6 @@ end
 function M.browse(plugin,spec,force)
     local s=state(plugin)
     spec=U.copy(spec)
-    if spec.channel=="eink" and s.mode=="web" then
-        plugin:info("接口设置已变化，请重新打开书城后重试。")
-        return false
-    end
     spec.cursor=spec.cursor or 0
     spec.page=spec.page or 1
     local key=Data.key(spec)
@@ -491,6 +490,7 @@ function M.browse(plugin,spec,force)
         return require("miuread.bookstore_data").page(query.kind,raw,query.cursor,Data.PAGE_SIZE)
     end,function(ok,value)
         if not ok then
+            logger.warn("[MiuRead][Bookstore] book list load failed",U.first_line(value,120))
             if cached then show_page(plugin,s,spec,U.copy(cached.value),true) end
             plugin:info(error_message(plugin,value,"书城加载")); return
         end
@@ -541,6 +541,7 @@ function M.shelf_action(plugin,book,on_verified)
     local _,_,entry=pending(plugin,id)
     local present=known_membership(plugin,id)
     return {text=entry and "确认微信书架状态" or (present and "从微信书架移除" or "加入微信书架"),
+        present=present,pending=entry~=nil,
         callback=function()
             if present then M.remove_from_shelf(plugin,book,on_verified) else M.add_to_shelf(plugin,book,on_verified) end
         end}

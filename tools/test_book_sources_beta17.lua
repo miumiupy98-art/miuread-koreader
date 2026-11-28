@@ -10,9 +10,13 @@ local function trim(v) return tostring(v or ""):match("^%s*(.-)%s*$") end
 local U={copy=copy,trim=trim,utf8_truncate=function(v) return v end}
 package.loaded["miuread.util"]=U
 package.loaded["miuread.api_transport"]={preference=function() return "eink" end}
-package.loaded["ui/uimanager"]={close=noop}
-package.loaded["miuread.shelf_view"]={}
-package.loaded["ui/widget/buttondialog"]={extend=function(_,klass) return klass end}
+package.loaded["ui/uimanager"]={close=noop,show=noop}
+local shown_shelf
+package.loaded["miuread.shelf_view"]={show=function(opts) shown_shelf=opts; return opts end}
+package.loaded["ui/widget/buttondialog"]={extend=function(_,klass)
+    klass.new=function(_,instance) return instance end
+    return klass
+end}
 package.loaded["miuread.transient_guard"]={close_all=noop}
 local repaints=0
 package.loaded["miuread.reader_list_dialog"]={refresh=function() repaints=repaints+1 end}
@@ -36,28 +40,34 @@ function api:store_home()
         {type=9999,name="忽略"},
     },updated={{type=23,name="猜你喜欢",books=recommendations}}}
 end
-function api:store_categories()
-    calls[#calls+1]="categories"
-    return {data={{categories={{categoryId="raw-only",title="raw-only"},
-        {categoryId="rising",title="飙升榜"},{categoryId="1",title="文学"}}}}}
+function api:store_categories(rank)
+    calls[#calls+1]=rank and "ranks" or "categories"
+    return {data={{rank=rank,categories=rank and {{categoryId="raw-only",title="raw-only"},
+        {categoryId="rising",title="飙升榜"}} or {{categoryId="fiction",title="文学"}}}}}
+end
+function api:for_channel(channel) assert(channel=="eink"); return self end
+function api:category_books(id,offset,rank)
+    assert(offset==0 and ((rank and id=="rising") or (not rank and id=="fiction")))
+    return {books={{bookInfo={bookId=id,title="测试书单"}}}}
 end
 package.loaded["miuread.api"]={new=function() return api end}
 package.loaded["miuread.reader"]={new=function() end}
 package.loaded["miuread.http"]={new=function() end}
 local menu,opened,online
-local host={store={auth=function() return {account={vid="fixture"},login_session_id="a"} end}}
+local host={store={auth=function() return {account={vid="fixture"},login_session_id="a"} end,
+    get=function(_,_,default) return default end}}
 function host:_interactive_child_store() return {snapshot=function() return {},false end} end
 function host:logged_in() return true end
 function host:is_online() return online end
 function host:_show_miuread_menu(title,rows,opts) menu={title=title,rows=rows,opts=opts}; return menu end
 function host:_run_interactive_network(_,_,worker,done,opts)
-    assert(opts.silent)
     done{ok=true,value=worker()}
     return true
 end
 function host:book_menu(book,back) opened=book; back() end
 function host:show_book_sources() opened="sources" end
 function host:search_dialog(title,back) opened=title; back() end
+function host:_shelf_covers_enabled() return false end
 online=true
 Storefront.open(host)
 assert(#calls==1 and calls[1]=="home" and repaints==1)
@@ -76,12 +86,23 @@ assert(opened.bookId=="r2" and #calls==1,"return to discovery must reuse loaded 
 menu.opts.on_back()
 menu.opts.toolbar[2][2].callback()
 assert(menu.title=="榜单" and #menu.rows==1 and menu.rows[1].text=="飙升榜")
+menu.rows[1].callback()
+assert(shown_shelf.books[1].bookId=="rising")
+shown_shelf.tabs[1].callback()
+assert(menu.title=="榜单")
+menu.opts.on_back()
+menu.opts.toolbar[2][1].callback()
+assert(menu.title=="分类" and menu.rows[1].text=="文学")
+menu.rows[1].callback()
+assert(shown_shelf.books[1].bookId=="fiction")
+shown_shelf.tabs[1].callback()
+assert(menu.title=="分类")
 menu.opts.on_back()
 menu.opts.on_back()
 assert(opened=="sources")
 online=false
 Storefront.open(host)
-assert(menu.rows[2].text=="榜单" and #calls==2)
+assert(menu.rows[2].text=="榜单" and #calls==3 and calls[2]=="ranks" and calls[3]=="categories")
 local home=Data.home(api:store_home())
 assert(home.search_hint=="书城搜索" and #home.sections==3)
 assert(home.sections[2].categories[1].rank and home.sections[2].categories[1].id=="rising"
@@ -109,6 +130,33 @@ assert(cover_runs==1 and finished and repaints==repaint_before)
 menu.opts.on_dismiss()
 finished{ok=true,value={[first_book.cover]="/app/cover.jpg"}}
 assert(repaints==repaint_before and not home_view.rows[1].cards[1].path())
+
+package.loaded["miuread.shelf_client"]={}
+package.loaded["miuread.protocol"]={}
+package.loaded["miuread.json"]={}
+local native=require("miuread.eink_client").new()
+function native:request(method,path,fields,stage)
+    assert(method=="GET" and stage=="store")
+    if path=="/market/categories" then
+        if fields.ranklist then
+            assert(fields.ranklist==1 and fields.categoryId==nil)
+            return {categories={{categoryId="9",title="数字 ID 榜单"}}}
+        end
+        assert(fields.categoryId=="" and fields.recommend==0)
+        return {categories={{categoryId="literature",title="文学"}},updated=newproxy()}
+    end
+    assert(path=="/market/category" and fields.maxIdx==0)
+    assert((fields.rank==1 and fields.categoryId=="9") or
+        (fields.rank==0 and fields.categoryId=="literature"))
+    return {books={{searchIdx=3,bookInfo={bookId="10",title="原生书单"}}},
+        updated=newproxy(),category=newproxy(),continueFlag=1}
+end
+assert(Data.categories(native:store_categories(true)).ranks[1].id=="9")
+assert(Data.categories(native:store_categories(false)).categories[1].id=="literature")
+for _,rank in ipairs({false,true}) do
+    local page=Data.page("category",native:category_books(rank and "9" or "literature",0,rank),0,20)
+    assert(page.books[1].title=="原生书单" and page.has_more and page.next_cursor==3)
+end
 
 local cloud=Data.recent_books({items={
     {book={bookId="fresh",title="云端最新"},readUpdateTime=1800000000000},
