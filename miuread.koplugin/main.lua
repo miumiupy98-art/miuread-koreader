@@ -2515,6 +2515,16 @@ function Plugin:current_book_menu()
     local finished_action=self:_finished_status_action(b)
     if finished_action then items[#items+1]=finished_action end
     if self:logged_in() then
+        if tostring(b.bookId or ""):match("^%d+$") then
+            local shelf=require("miuread.bookstore").shelf_action(self,b,function()
+                self:_show_reader_current_book_panel()
+            end)
+            if shelf then table.insert(items,1,shelf) end
+            table.insert(items,shelf and 2 or 1,{text="用书币兑换",callback=function()
+                local position=self.sync:local_position()
+                self:_show_weread_bookcoins(b,position and position.chapter_uid)
+            end})
+        end
         items[#items+1]={text="查看各通道云端进度",callback=function()
             self:_show_cloud_progress_routes(tostring(b.bookId or ""))
         end}
@@ -9907,13 +9917,14 @@ function Plugin:_annotation_search_excerpt(result)
     result=type(result)=="table" and result or {}
     local text=tostring(result.matched_text or "")
     if text=="" then
-        for _,value in ipairs({result.note,result.selected_text,result.anchor_text,result.text}) do
-            value=tostring(value or "")
+        for _,key in ipairs({"note","selected_text","anchor_text","text"}) do
+            local value=tostring(result[key] or "")
             if value~="" then text=value break end
         end
     end
     text=U.trim(text:gsub("%s+"," "))
-    if text=="" then text="无文字内容" end
+    if text=="" then text=result.page and ("第 "..tostring(result.page).." 页")
+        or (result.kind=="bookmark" and "书签" or "无文字内容") end
     return U.utf8_truncate(text,140,"…")
 end
 
@@ -10046,6 +10057,67 @@ function Plugin:_annotation_search_results(query,results,back_callback)
         on_home=self:_home_enabled() and function() return self:return_to_miuread_home("annotation search") end or nil,
     }
     return true
+end
+
+function Plugin:show_all_bookmarks()
+    local title_map=self:_annotation_book_title_map()
+    local groups,ordered={},{}
+    for _,row in ipairs(LocalAnnotationDatabase.search_all(self.store,"",false,"bookmark") or {}) do
+        local id=tostring(row.book_id)
+        local group=groups[id]
+        if not group then
+            group={info=title_map[id] or {title="微信读书",book=nil},rows={}}
+            groups[id]=group
+            ordered[#ordered+1]=group
+        end
+        group.rows[#group.rows+1]=row
+    end
+    local doc_settings=require("docsettings")
+    local seen={}
+    for _,book in ipairs(self:_home_all_rows()) do
+        local path=book.file or book.path
+        if type(path)=="string" and path~="" and not seen[path]
+            and UnifiedLibrary.canonical_source(book)~="weread" and doc_settings:hasSidecarFile(path) then
+            seen[path]=true
+            local ok,sidecar=pcall(doc_settings.open,doc_settings,path)
+            local records=ok and sidecar and sidecar:readSetting("annotations",{}) or {}
+            local group={info={title=book.title or path:match("[^/]+$"),local_path=path},rows={}}
+            for _,entry in ipairs(type(records)=="table" and records or {}) do
+                if LocalAnnotationDatabase.annotation_kind(entry)=="bookmark" then
+                    group.rows[#group.rows+1]={kind="bookmark",source_path=path,page=tonumber(entry.page),
+                        xpointer=entry.xpointer or (type(entry.page)=="string" and not tonumber(entry.page) and entry.page or nil),
+                        pos0=entry.pos0,datetime=entry.datetime,text=entry.text or entry.chapter}
+                end
+            end
+            if #group.rows>0 then ordered[#ordered+1]=group end
+        end
+    end
+    local items={}
+    for _,group in ipairs(ordered) do
+        items[#items+1]={text=group.info.title,post_text=tostring(#group.rows).." 条",
+            sub_item_table_func=function()
+                local rows={}
+                for _,entry in ipairs(group.rows) do
+                    local text=self:_annotation_search_excerpt(entry)
+                    rows[#rows+1]={text=text,detail=entry.datetime,callback=function()
+                        if group.info.local_path then
+                            self:_annotation_pending_jump(entry,false)
+                            if self:_open_file_direct(group.info.local_path,"local")==false then
+                                HOME_SESSION.pending_annotation_jump=nil
+                            end
+                        else self:_annotation_open_result(entry,group.info,false) end
+                    end}
+                end
+                return rows
+            end}
+    end
+    if #items==0 then items[1]={text="设备上暂无书签",enabled=false} end
+    if self:logged_in() then
+        table.insert(items,1,{text="微信读书云端书签",callback=function()
+            require("miuread.reading_account_ui").notebooks(self,function() self:show_all_bookmarks() end,nil,nil,true)
+        end})
+    end
+    return self:_show_miuread_menu("全部书签",items,{page_size=7,on_back=function() self:show_home_menu() end})
 end
 
 function Plugin:_home_local_book_details(book)
@@ -10463,7 +10535,13 @@ function Plugin:_home_hold_book(book,anchor,primary_only)
     if not available then
         actions[#actions+1]={icon="book",label=visited and "继续阅读" or "阅读",callback=function() self:_home_open_book(target,nil,nil,true) end}
     end
-    actions[#actions+1]=self:_home_variant_download_action(target,false,clean_context)
+    if unified_source=="weread" and not Protocol.is_mp(id) and not pdf then
+        actions[#actions+1]={icon="toc",label="目录",callback=function() self:_open_eink_book_online(target,false,true) end}
+    end
+    local download_action=self:_home_variant_download_action(target,false,clean_context)
+    if clean_context.installed then download_action.label="本机文件"
+    elseif clean_context.task and clean_context.task.status=="active" then download_action.label="查看下载进度" end
+    actions[#actions+1]=download_action
 
     local same_download=tostring(download_state.book_id or download_state.bookId or "")==id
     local task_options=same_download and self:_home_download_task_options(download_state) or nil
@@ -10483,13 +10561,12 @@ function Plugin:_home_hold_book(book,anchor,primary_only)
     local chapter_action={icon="▤",label=chapter_label,detail=chapter_detail,callback=chapter_callback}
     local more_actions={}
     if not pdf then
-        local chapter_actions=clean_context.installed and more_actions or actions
-        chapter_actions[#chapter_actions+1]=chapter_action
+        more_actions[#more_actions+1]=chapter_action
     end
     if not pdf then more_actions[#more_actions+1]=self:_home_variant_download_action(target,true,notes_context) end
     local details=primary_only and more_actions or actions
-    if available or #(local_summary.variants or {})>0 or downloaded_chapters>0 then
-        actions[#actions+1]={icon="▤",label="本机文件",detail="查看或删除本机副本",callback=function()
+    if not clean_context.installed and (available or #(local_summary.variants or {})>0 or downloaded_chapters>0) then
+        more_actions[#more_actions+1]={icon="▤",label="本机文件",detail="查看或删除本机副本",callback=function()
             BookLocalFilesDialog.open_generated(self,id)
         end}
     end
@@ -10500,8 +10577,10 @@ function Plugin:_home_hold_book(book,anchor,primary_only)
         end}
         local shelf_action=require("miuread.bookstore").shelf_action(self,target)
         if shelf_action then
-            details[#details+1]={icon="library",label=shelf_action.text,
+            local collection=(shelf_action.present and not shelf_action.pending) and more_actions or details
+            local row={icon="library",label=shelf_action.text,
                 detail="同步微信书架，保留本机文件",callback=shelf_action.callback}
+            if collection==actions then table.insert(collection,2,row) else collection[#collection+1]=row end
         end
     end
     local finished_action=self:_finished_status_action(target)
@@ -13677,6 +13756,7 @@ end
 function Plugin:tools_menu()
     return {
         {text="浏览已有书籍",callback=function() self:show_home_all_books() end},
+        {text="全部书签",callback=function() self:show_all_bookmarks() end},
         {text="阅读历史",callback=function() self:show_home_reading_history() end},
         {text="文件管理",sub_item_table_func=function() return self:home_file_manager_menu() end},
         {text="搜索批注",callback=function() self:show_annotation_search_dialog() end},
@@ -16489,6 +16569,9 @@ function Plugin:_reader_toolbar_header(title)
         cache_age=math.max(0,os.time()-(tonumber(cache.updated_at) or os.time())),
         total_ms=math.floor((os.clock()-started)*1000+.5),
     }
+    local reader=self.ui
+    local bookmark=reader and reader.bookmark
+    local bookmark_supported=bookmark and type(bookmark.onToggleBookmark)=="function"
     return {
         title=tostring(title or "正在阅读"),
         home_label=self:_home_enabled() and "首页" or "书架",
@@ -16509,6 +16592,10 @@ function Plugin:_reader_toolbar_header(title)
         download_icon=download_action and download_action.icon,
         download_label=download_action and download_action.label,
         download_callback=download_action and download_action.callback,
+        bookmark_active=bookmark_supported and reader.view and reader.view.dogear_visible==true,
+        bookmark_callback=bookmark_supported and function()
+            if self.ui==reader and reader.document then reader:handleEvent(Event:new("ToggleBookmark")) end
+        end or nil,
         more_label="更多",
         more_callback=function() return self:_show_reader_more_panel() end,
         chapter_label="☰ 目录",
@@ -16791,19 +16878,19 @@ end
 
 function Plugin:_reader_goto_annotation(item)
     local ui=self.ui
+    local function available(value) return value~="" and value or nil end
+    local target=item and (available(item.pos0) or available(item.start) or available(item.xpointer))
     local bookmark=ui and ui.bookmark or nil
     if bookmark and type(bookmark.gotoBookmark)=="function" then
         local primary
         if ui and ui.paging then
-            primary=item and (tonumber(item.page) or item.page or item.pos0 or item.start or item.xpointer) or nil
+            primary=item and (tonumber(item.page) or available(item.page) or target) or nil
         else
-            primary=item and (item.pos0 or item.start or item.xpointer or item.page) or nil
+            primary=item and (target or available(item.page)) or nil
         end
-        local marker=item and (item.pos0 or item.start or item.xpointer) or nil
-        local ok,result=pcall(bookmark.gotoBookmark,bookmark,primary,marker)
+        local ok,result=pcall(bookmark.gotoBookmark,bookmark,primary,target)
         if ok and result~=false and primary~=nil and primary~="" then return true end
     end
-    local target=item and (item.pos0 or item.start or item.xpointer)
     if ui and type(ui.handleEvent)=="function" then
         if type(target)=="string" and target~="" then ui:handleEvent(Event:new("GotoXPointer",target)); return true end
         local page=self:_reader_annotation_page(item)
@@ -21947,38 +22034,59 @@ function Plugin:book_menu(b,back_callback)
     end
     local clean_context=self:_home_variant_download_context(b.bookId,false)
     local clean_action=self:_home_variant_download_action(b,false,clean_context)
-    items[#items+1]={text=clean_action.label,icon_key=clean_action.icon,callback=clean_action.callback}
     local more={}
+    local download={text=clean_context.installed and "本机文件" or clean_action.label,
+        icon_key=clean_action.icon,callback=clean_action.callback}
+    if clean_context.task and clean_context.task.status=="active" and not clean_context.installed then
+        download.text="查看下载进度"
+    end
+    local details={text="书籍详情",callback=function()
+        self:book_details(b,function() self:book_menu(b,back_callback) end)
+    end}
+    local storefront=require("miuread.bookstore")
+    local shelf=not Protocol.is_mp(b.bookId) and storefront.shelf_action(self,b,function()
+        self:book_menu(b,back_callback)
+    end)
+    if shelf and (not shelf.present or shelf.pending) then
+        items[#items+1]=shelf
+        items[#items+1]=details
+        items[#items+1]=download
+    else
+        if shelf then
+            if not require("miuread.eink_pdf").is_book(b) then
+                items[#items+1]={text="目录",callback=function() self:_open_eink_book_online(b,false,true) end}
+            end
+            more[#more+1]=shelf
+        end
+        items[#items+1]=download
+        items[#items+1]=details
+    end
     if not require("miuread.eink_pdf").is_book(b) and not (preferred and preferred.document_format=="pdf") then
-        local chapter_actions=clean_context.installed and more or items
-        chapter_actions[#chapter_actions+1]={text="按章节下载",callback=function() self:chapters(b) end}
+        more[#more+1]={text="按章节下载",callback=function() self:chapters(b) end}
         local notes_action=self:_home_variant_download_action(b,true)
         more[#more+1]={text=notes_action.label,icon_key=notes_action.icon,callback=notes_action.callback}
     end
-    more[#more+1]={text="移动到分组",callback=function() self:_move_weread_book_to_group(b) end}
+    if shelf and shelf.present then
+        more[#more+1]={text="移动到分组",callback=function() self:_move_weread_book_to_group(b) end}
+    end
     if self:_has_range_variant(b.bookId) then
-        items[#items+1]={text="扩展已有章节",sub_item_table_func=function() return self:range_extend_menu(b) end}
+        more[#more+1]={text="扩展已有章节",sub_item_table_func=function() return self:range_extend_menu(b) end}
     end
     local local_summary=self.book_delete_service:summary(tostring(b.bookId))
-    if local_summary.has_local==true then
-        items[#items+1]={text="本机文件",callback=function() BookLocalFilesDialog.open_generated(self,tostring(b.bookId)) end}
+    if local_summary.has_local==true and not clean_context.installed then
+        more[#more+1]={text="本机文件",callback=function() BookLocalFilesDialog.open_generated(self,tostring(b.bookId)) end}
     end
-    if #more>0 then items[#items+1]={text="更多",sub_item_table_func=function() return more end} end
-    items[#items+1]={text="书籍详情",callback=function()
-        self:book_details(b,back_callback and function() self:book_menu(b,back_callback) end)
-    end}
     if not Protocol.is_mp(b.bookId) then
-        local action=require("miuread.bookstore").shelf_action(self,b,back_callback)
-        if action then
-            action.text="微信书架 · "..tostring(action.text or "加入 / 移除")
-            items[#items+1]=action
+        if shelf and shelf.present and back_callback then
+            table.insert(items,2,{text="已加入书架",enabled=false,readonly_label=true})
         end
-        items[#items+1]={text="相似推荐",callback=function()
-            require("miuread.bookstore").similar(self,b,function() self:book_menu(b,back_callback) end)
+        more[#more+1]={text="相似推荐",callback=function()
+            storefront.similar(self,b,function() self:book_menu(b,back_callback) end)
         end}
     end
     local finished_action=self:_finished_status_action(b)
-    if finished_action then items[#items+1]=finished_action end
+    if finished_action then more[#more+1]=finished_action end
+    if #more>0 then items[#items+1]={text="更多",sub_item_table_func=function() return more end} end
     if back_callback then return self:_show_miuread_menu(b.title,items,{on_back=back_callback}) end
     return self:list(b.title,items)
 end
@@ -22575,6 +22683,92 @@ function Plugin:_restore_download_after_chapter(previous)
     else self.store:clear_download_state() end
 end
 
+function Plugin:_show_weread_bookcoins(book,chapter_uid,on_owned)
+    local id=tostring(book.bookId or book.book_id or "")
+    local uid=tostring(chapter_uid or "")
+    if not id:match("^%d+$") or not self:require_login() then return false end
+    local auth=self.store:auth()
+    local vid=tostring((auth.account or {}).vid or "")
+    if vid=="" or not auth.login_session_id then
+        self:info("请在账户页确认微信读书登录状态。")
+        return false
+    end
+    local pending_key=vid..":"..id
+    local function pending_orders()
+        return U.copy(self.store:get("weread_bookcoin_pending",{}))
+    end
+    local function save(order)
+        local rows=pending_orders()
+        rows[pending_key]=order
+        return self.store:set("weread_bookcoin_pending",rows)
+    end
+    local coins=require("miuread.eink_bookcoins")
+    local function lookup(api)
+        return coins.quote(require("miuread.eink_client").new(api.http,api.store),id,uid)
+    end
+    local function quote() self:_show_weread_bookcoins(book,uid,on_owned) end
+    local function show(result)
+        if result.state=="owned" then
+            self:toast("已确认微信读书阅读权益",2)
+            if on_owned then on_owned() end
+        elseif result.state=="insufficient" then
+            ActionSheet.show{title="可用书币不足",subtitle="请在手机微信读书处理，完成后回来刷新权益。",
+                actions={{label="刷新权益",callback=quote}}}
+        elseif result.state=="changed" then
+            ActionSheet.show{title="价格或权益已更新",actions={{label="重新查看",callback=quote}}}
+        elseif result.state=="pending" then
+            ActionSheet.show{title="兑换结果待确认",
+                subtitle="请在手机微信读书查看是否已购，再回来核对权益。",
+                actions={{label="核对权益",callback=quote}}}
+        elseif result.state=="chapter_required" then
+            self:info("本书按章兑换，请在需要解锁的章节打开书币兑换。")
+        elseif result.state=="unavailable" then
+            self:info("暂时无法核对可用书币或书价，请稍后重试。")
+        elseif result.state=="unsupported" then
+            self:info("当前书籍或章节没有可用的书币兑换选项。")
+        end
+    end
+    local old=pending_orders()[pending_key]
+    if old then
+        return self:_fetch_eink_display("verify-bookcoins:"..id,"核对权益",function(api,order)
+            return coins.verify(require("miuread.eink_client").new(api.http,api.store),order)
+        end,{old},function(result)
+            if result.state=="owned" then
+                save(nil)
+                if old.scope=="chapter" and old.uid~=uid then return quote() end
+            end
+            show(result)
+        end)
+    end
+    local context=self:_interactive_network_context()
+    return self:_fetch_eink_display("quote-bookcoins:"..id,"用书币兑换",lookup,{},function(order)
+        if order.state~="ready" then return show(order) end
+        local scope=order.scope=="chapter" and ("章节 · "..tostring(order.title or uid)) or "整本"
+        UIManager:show(ConfirmBox:new{
+            text=string.format("《%s》\n%s\n需要 %.2f 书币，可用 %.2f 书币",
+                order.book_title,scope,order.price/100,order.available/100),
+            ok_text="确认兑换",
+            ok_callback=function()
+                if self.store:auth().login_session_id~=auth.login_session_id
+                    or not self:_interactive_network_context_valid(context) then return end
+                if pending_orders()[pending_key] then return quote() end
+                if save({id=id,uid=order.uid,scope=order.scope})~=true then
+                    self:info("兑换记录保存失败，请稍后重试。")
+                    return
+                end
+                local started=self:_fetch_eink_display("spend-bookcoins:"..id,"用书币兑换",function(api,confirmed)
+                    return coins.submit(require("miuread.eink_client").new(api.http,api.store),confirmed)
+                end,{order},function(result)
+                    if result.state~="pending" then save(nil) end
+                    show(result)
+                end,true,function() show{state="pending"} end,
+                {status_title="用书币兑换",status_text="正在提交并核对权益…",timeout=100})
+                if not started then save(nil) end
+            end,
+        })
+    end)
+end
+
 function Plugin:_show_weread_locked_chapter(runtime)
     local book,opt=runtime.book,runtime.options
     local id=tostring(book.bookId or book.book_id or "")
@@ -22621,20 +22815,16 @@ function Plugin:_show_weread_locked_chapter(runtime)
             add_action("用券解锁本章","coupon",state.coupons and ("剩余 "..state.coupons.." 张") or nil)
         end
         if state.can_buy_member then
-            actions[#actions+1]={label="购买会员卡",callback=function()
-                if not current() then return end
-                self:_show_weread_member_qr(function()
-                    self:_fetch_eink_display("chapter-member-refresh","会员卡",lookup,{id,uid},function(updated)
-                        if not current() then return end
-                        if updated.already_paid or updated.member.permanent
-                            or (not updated.member.expired and (updated.member.paid_remaining or 0)>0) then
-                            resume()
-                        else self:info("微信读书尚未返回有效的会员权益。") end
-                    end)
-                end)
+            actions[#actions+1]={label="在手机微信读书开通会员",callback=function()
+                self:info("请在手机微信读书开通会员，然后返回重新加载本章。")
             end}
         end
-        if state.already_paid then actions[#actions+1]={label="重新加载本章",callback=resume} end
+        if not state.already_paid and id:match("^%d+$") then
+            actions[#actions+1]={label="用书币兑换",callback=function()
+                if current() then self:_show_weread_bookcoins(book,uid,resume) end
+            end}
+        end
+        actions[#actions+1]={label="刷新权益并打开本章",callback=resume}
         return ActionSheet.show{title="当前章节需要阅读权限",subtitle=title,
             actions=actions,footer_action={label="返回",callback=function() end}}
     end,nil,function(err)
@@ -23512,7 +23702,9 @@ function Plugin:show_download_status()
     if state.error and state.error~="" then
         local friendly=state.options and state.options.generate_translation_uid and require("miuread.translation_generation").friendly_error(state.error)
         if failure_kind=="image_missing" then
-            lines[#lines+1]="\n部分插图未取得。重试会继续原来的任务。"
+            local missing=tonumber(tostring(state.error):match("missing_images=(%d+)"))
+            lines[#lines+1]=missing and ("\n当前失败章节还有 "..missing.." 张插图未取得。重试会继续原任务。")
+                or "\n部分插图未取得。重试会继续原来的任务。"
         elseif failure_kind=="chapter_access" then
             lines[#lines+1]="\n微信读书暂未确认这部分内容的下载权限。"
         elseif friendly and friendly~="" then
@@ -24393,8 +24585,8 @@ function Plugin:chapters(b)
         self:list("章节下载 · "..tostring(b.title or "未命名"),items,"没有可用章节")
     end,{context=context,eink_only=true,status_text="正在后台读取章节目录…"})
 end
-function Plugin:_open_eink_book_online(book,auth_retried)
-    local function retry_login() self:_open_eink_book_online(book,true) end
+function Plugin:_open_eink_book_online(book,auth_retried,choose_chapter)
+    local function retry_login() self:_open_eink_book_online(book,true,choose_chapter) end
     if require("miuread.eink_pdf").is_book(book) then
         local id=tostring(book.bookId or book.book_id or "")
         local offline=self:_whole_offline_record(id)
@@ -24429,6 +24621,9 @@ function Plugin:_open_eink_book_online(book,auth_retried)
     return self:_request_catalog(book,"eink-open-book",function(rows,progress,progress_failed,toc)
         local id=tostring(book.bookId or book.book_id or "")
         self:_remember_online_toc(id,rows,toc)
+        if choose_chapter then
+            return self:_chapter_list_menu(book,rows,"选择阅读章节",function(_,chapter) open_chapter(chapter) end)
+        end
         local target=require("miuread.eink_client").progress_position(progress,id)
         local session=self.store:session(id) or {}
         local pending=session.pending
@@ -24448,7 +24643,7 @@ function Plugin:_open_eink_book_online(book,auth_retried)
             return self:_chapter_list_menu(book,rows,"选择阅读章节",function(_,chapter) open_chapter(chapter) end)
         end
         return open_chapter(selected,local_resume and pending or nil)
-    end,{eink_only=true,read_progress=true,status_text="正在读取 E-Ink 目录和阅读位置…",
+    end,{eink_only=true,read_progress=not choose_chapter,status_text="正在读取目录…",
         on_error=function(err)
             if not auth_retried and Http.is_auth_error(err) then
                 self:_prompt_weread_login("在线阅读",retry_login)

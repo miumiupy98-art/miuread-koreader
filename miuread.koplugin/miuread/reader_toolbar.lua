@@ -432,6 +432,10 @@ function Toolbar:_top_status_row(root, header, x, y, width, height)
     add("time",{label=header.time_label or "",enabled=true,text_align="center",bold=true})
     add("battery",{icon="battery",label=header.battery_label or "",enabled=true,bold=true})
     add("home",{icon="home",label=header.home_label or "首页",enabled=type(header.home_callback)=="function",bold=true},header.home_callback)
+    if type(header.bookmark_callback)=="function" then
+        add("bookmark",{icon="bookmark",label=header.bookmark_active and "已标记" or "书签",
+            enabled=true,bold=true,multiline=true},header.bookmark_callback)
+    end
     if type(header.download_callback)=="function" then
         add("download",{icon=header.download_icon or "cloud-download",
             label=header.download_label or "下载整本",enabled=true,bold=true,multiline=true},

@@ -24,6 +24,12 @@ package.loaded["miuread.util"]={
     mkdir=make_dir,remove_tree=function() end,xml=xml,redact_url=tostring,
     copy=function(input) local output={} for key,value in pairs(input) do output[key]=value end return output end,
     id_name=function(s) return (tostring(s):gsub("[^%w_.%-]","_")) end,
+    file_exists=function(path)
+        local file=io.open(path,"rb")
+        if not file then return false end
+        file:close()
+        return true
+    end,
     file_size=function(path) if path then local f=io.open(path,"rb"); if f then local n=f:seek("end"); f:close(); return n end end end,
 }
 package.loaded["logger"]={warn=function() end,info=function() end}
@@ -247,6 +253,39 @@ local Epub=require("miuread.epub")
 Epub.build(root.."/eink-fixture.epub",book,{{uid="7",index=1,title="Fixture chapter",body=html}},css,assets,nil,{})
 
 local original_archive_read=package.loaded["miuread.eink_archive"].read
+local before_shared_retry=downloaded
+package.loaded["miuread.eink_archive"].read=function()
+    local with_shared=requests[#requests].url:find("chapters=0,7",1,true)
+    local bundled=with_shared and {
+        {href="images/combined.png",source="shared/only-in-shared.png",data_path=fixture,mime="image/png"},
+    } or {}
+    return '<p>Fixture text <img src="../shared/only-in-shared.png"/></p>',css,bundled
+end
+local shared_ok,repaired_shared=pcall(route.chapter,route,book,chapter,"epub",{})
+assert(shared_ok, tostring(repaired_shared).." "..requests[#requests].url
+    .." relative="..tostring(image_failure and image_failure.relative_image_unmapped)
+    .." archive="..tostring(image_failure and image_failure.archive_name_missing)
+    .." calls="..tostring(downloaded-before_shared_retry))
+assert(repaired_shared:find("images/combined.png",1,true) and downloaded==before_shared_retry+2)
+
+local archive_request=http.request
+function http:request(opt)
+    if opt.url=="https://static.qpic.cn/illustration.png" then
+        assert(opt.auth==false and not opt.headers)
+        return "",302,{Location="https://res.weread.qq.com/assets/fixture-image.png"}
+    elseif opt.url=="https://res.weread.qq.com/assets/fixture-image.png" then
+        assert(opt.auth==false and not opt.headers)
+        write(opt.sink_path,image)
+        return "",200,{["Content-Length"]=tostring(#image)}
+    end
+    return archive_request(self,opt)
+end
+package.loaded["miuread.eink_archive"].read=function()
+    return '<p>Fixture text <img src="https://static.qpic.cn/illustration.png"/></p>',css,{}
+end
+local redirected=route:chapter(book,chapter,"epub",{})
+assert(redirected:find("../images/remote",1,true) and not redirected:find("static.qpic.cn",1,true))
+http.request=archive_request
 package.loaded["miuread.eink_archive"].read=function()
     return '<p><img src="//res.weread.qq.com/wrepub/%63over.png?key=fixture"/></p>',css,{
         {href="images/shadow.png",source="misc/cover.png",data_path=fixture,mime="image/png"},

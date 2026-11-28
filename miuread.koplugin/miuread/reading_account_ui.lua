@@ -77,9 +77,11 @@ local function show_entry(title,text)
     UIManager:show(TextViewer:new{modal=true,title=title,text=text})
 end
 
-local function notebook(plugin,book,back)
-    return plugin:_fetch_eink_display("cloud-notebook:"..book.id,"云端笔记",function(api)
+local function notebook(plugin,book,back,bookmarks_only)
+    local title=bookmarks_only and "云端书签" or "云端笔记"
+    return plugin:_fetch_eink_display("cloud-notebook:"..book.id,title,function(api)
         local AnnotationSync=require("miuread.annotation_sync")
+        if bookmarks_only then return {marks=AnnotationSync.cloud_bookmarks(api,book.id)} end
         local marks_ok,marks=pcall(AnnotationSync.cloud_bookmarks,api,book.id)
         local thoughts_ok,thoughts=pcall(AnnotationSync.cloud_thoughts,api,book.id)
         if not marks_ok and not thoughts_ok then error(marks,0) end
@@ -96,21 +98,24 @@ local function notebook(plugin,book,back)
         end
         for _,row in ipairs(result.marks or {}) do
             local label=row.kind==1 and "划线" or "书签"
-            local text=row.content~="" and row.content or (row.chapter~="" and row.chapter or label)
-            items[#items+1]={text=U.utf8_truncate(text,36,"…"),post_text=label,detail=row.chapter,
-                keep_menu_open=true,callback=function() show_entry(label,text) end}
+            if not bookmarks_only or label=="书签" then
+                local text=row.content~="" and row.content or (row.chapter~="" and row.chapter or label)
+                items[#items+1]={text=U.utf8_truncate(text,36,"…"),post_text=label,detail=row.chapter,
+                    keep_menu_open=true,callback=function() show_entry(label,text) end}
+            end
         end
-        if not result.thoughts then items[#items+1]=readonly("想法暂未取得") end
+        if not bookmarks_only and not result.thoughts then items[#items+1]=readonly("想法暂未取得") end
         if not result.marks then items[#items+1]=readonly("书签和划线暂未取得") end
-        if #items==0 then items[1]=readonly("暂无云端笔记") end
+        if #items==0 then items[1]=readonly("暂无"..title) end
         plugin:_show_miuread_menu(book.title,items,{on_back=back})
     end)
 end
 
-function M.notebooks(plugin,back,cursor,previous)
-    return plugin:_fetch_eink_display("cloud-notebooks","云端笔记","notebooks",{20,cursor or 0},function(value)
+function M.notebooks(plugin,back,cursor,previous,bookmarks_only)
+    local title=bookmarks_only and "云端书签" or "云端笔记"
+    return plugin:_fetch_eink_display("cloud-notebooks",title,"notebooks",{20,cursor or 0},function(value)
         local items={}
-        local function reopen() M.notebooks(plugin,back,cursor,previous) end
+        local function reopen() M.notebooks(plugin,back,cursor,previous,bookmarks_only) end
         local next_cursor
         for _,row in ipairs(value.books or {}) do
             local data=type(row.book)=="table" and row.book or row
@@ -120,16 +125,16 @@ function M.notebooks(plugin,back,cursor,previous)
             if id then
                 local book={id=tostring(id),title=tostring(data.title or row.title or id)}
                 items[#items+1]={text=book.title,detail=tostring(data.author or ""),
-                    callback=function() notebook(plugin,book,reopen) end}
+                    callback=function() notebook(plugin,book,reopen,bookmarks_only) end}
             end
         end
-        if #items==0 then items[1]=readonly("暂无云端笔记") end
+        if #items==0 then items[1]=readonly("暂无"..title) end
         if value.hasMore==true or tonumber(value.hasMore)==1 then
             if next_cursor and next_cursor>0 and (not cursor or next_cursor<cursor) then
-                items[#items+1]={text="加载下一批",callback=function() M.notebooks(plugin,back,next_cursor,reopen) end}
+                items[#items+1]={text="加载下一批",callback=function() M.notebooks(plugin,back,next_cursor,reopen,bookmarks_only) end}
             else items[#items+1]=readonly("暂未取得下一批笔记") end
         end
-        plugin:_show_miuread_menu("云端笔记",items,{on_back=previous or back})
+        plugin:_show_miuread_menu(title,items,{on_back=previous or back})
     end)
 end
 

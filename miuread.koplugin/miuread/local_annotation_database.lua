@@ -778,8 +778,8 @@ end
 -- Read-only full-text search across every cached book annotation database.
 -- Multiple whitespace-separated terms are AND-ed, while each term may occur
 -- in any searchable text field of the same annotation row.
-function LocalAnnotationDatabase.search_all(store, query, limit)
-    limit = math.max(1, math.min(500, tonumber(limit) or 200))
+function LocalAnnotationDatabase.search_all(store, query, limit, kind)
+    limit = limit==false and kind=="bookmark" and -1 or math.max(1, math.min(500, tonumber(limit) or 200))
     local plain_terms, escaped_terms = {}, {}
     for term in tostring(query or ""):gmatch("%S+") do
         if term ~= "" then
@@ -787,13 +787,17 @@ function LocalAnnotationDatabase.search_all(store, query, limit)
             escaped_terms[#escaped_terms + 1] = escape_like(term)
         end
     end
-    if #plain_terms == 0 then return {} end
+    if #plain_terms == 0 and kind~="bookmark" then return {} end
 
     local columns = {
         "selected_text", "note", "anchor_text", "text",
         "context_before", "context_after",
     }
     local clauses, bindings = {}, {}
+    if kind=="bookmark" then
+        clauses[1]="kind = ?"
+        bindings[1]=kind
+    end
     for _, term in ipairs(escaped_terms) do
         local choices = {}
         for _, column in ipairs(columns) do
@@ -887,7 +891,7 @@ function LocalAnnotationDatabase.search_all(store, query, limit)
         if a.book_id ~= b.book_id then return a.book_id < b.book_id end
         return a.local_id < b.local_id
     end)
-    while #out > limit do table.remove(out) end
+    while limit>0 and #out > limit do table.remove(out) end
     return out
 end
 

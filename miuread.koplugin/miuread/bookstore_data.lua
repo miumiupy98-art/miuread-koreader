@@ -73,7 +73,7 @@ function M.categories(data)
         error("bookstore categories response is missing its category list")
     end
     local ranks,categories,seen,visited={},{},{},{}
-    local function parse(row,depth)
+    local function parse(row,depth,group_rank)
         if type(row)~="table" or depth>8 or visited[row] then return nil end
         visited[row]=true
         local id=text(row.CategoryId or row.categoryId)
@@ -81,20 +81,25 @@ function M.categories(data)
         if row.type~=nil and tonumber(row.type)~=0 then return nil end
         local title=category_title(row,id)
         if not title then return nil end
-        local out={id=id,title=title,rank=not id:match("^%d+$"),children={},channel=data._api_channel}
+        local rank=group_rank
+        if rank==nil then rank=not id:match("^%d+$") end
+        local out={id=id,title=title,rank=rank,children={},channel=data._api_channel}
         for _,child in ipairs(type(row.sublist)=="table" and row.sublist or {}) do
-            local entry=parse(child,depth+1)
+            local entry=parse(child,depth+1,group_rank)
             if entry then out.children[#out.children+1]=entry end
         end
         return out
     end
-    local function visit(rows,depth)
+    local function visit(rows,depth,group_rank)
         if type(rows)~="table" or depth>8 then return end
         for _,row in ipairs(rows) do
             if type(row)=="table" then
-                if type(row.categories)=="table" then visit(row.categories,depth+1)
+                if type(row.categories)=="table" then
+                    local rank=group_rank
+                    if type(row.rank)=="boolean" then rank=row.rank end
+                    visit(row.categories,depth+1,rank)
                 else
-                    local entry=parse(row,0)
+                    local entry=parse(row,0,group_rank)
                     if entry and not seen[entry.id] then
                         seen[entry.id]=true
                         local list=entry.rank and ranks or categories

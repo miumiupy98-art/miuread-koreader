@@ -211,21 +211,24 @@ local function action(label)
     for _,item in ipairs(sheet.actions) do if item.label==label then return item end end
 end
 assert(shell:_home_open_book(managed))
-assert(not opened and action("下载整本").icon=="cloud-download" and action("按章节下载"))
+assert(not opened and action("下载整本").icon=="cloud-download" and action("目录"))
+action("更多").callback()
+assert(action("按章节下载"))
+assert(shell:_home_open_book(managed))
 action("阅读").callback()
 assert(chosen=="online")
 
 preferred={file=partial,variant="clean"}
 assert(shell:_home_open_book(managed) and not opened)
-assert(action("按章节下载（已下载 1 章）") and action("下载整本"))
+assert(action("下载整本"))
+action("更多").callback()
+assert(action("按章节下载（已下载 1 章）"))
 
 full={file=complete,complete=true}
 preferred=full
 assert(shell:_home_open_book(managed) and not opened)
-assert(action("整本已下载").icon=="download-complete" and action("本机文件") and not action("按章节下载"))
+assert(action("本机文件").icon=="download-complete" and not action("按章节下载"))
 action("本机文件").callback()
-assert(chosen=="files:book")
-action("整本已下载").callback()
 assert(chosen=="files:book")
 action("更多").callback()
 assert(action("按章节下载"))
@@ -242,8 +245,8 @@ action("整本等待下载").callback()
 assert(chosen=="queue")
 queue=nil
 state={book_id="book",status="active",options={annotations=false}}
-assert(shell:_home_open_book(managed) and action("整本下载中（37%）").icon=="progress")
-action("整本下载中（37%）").callback()
+assert(shell:_home_open_book(managed) and action("查看下载进度").icon=="progress")
+action("查看下载进度").callback()
 assert(chosen=="downloads")
 state.status="failed"
 assert(shell:_home_open_book(managed) and action("继续下载整本").icon=="warning")
@@ -276,3 +279,47 @@ assert(shelf({},{book=true})=="等待下载")
 stored.chapters={}
 assert(shelf()=="未下载" and row.offline_download=="none")
 print("Shelf state separates online cache, partial files, verified whole books, and pending jobs")
+
+local marks={
+    {book_id="remote",kind="bookmark",xpointer="/body/p[1]"},
+    {book_id="remote",kind="bookmark",xpointer="/body/p[2]"},
+}
+local local_path="/library/marked.epub"
+local local_mark="/body/p[3]"
+package.loaded.docsettings={
+    hasSidecarFile=function(_,path) return path==local_path end,
+    open=function() return {readSetting=function()
+        return {{page=local_mark,text="本地书签"},{page="/body/p[4]",drawer="lighten",text="本地划线"}}
+    end} end,
+}
+local bookmarks={}
+load_methods("function Plugin:show_all_bookmarks","function Plugin:_home_local_book_details",bookmarks,{
+    UnifiedLibrary=Library,
+    LocalAnnotationDatabase={search_all=function(_,query,limit,kind)
+        assert(query=="" and limit==false and kind=="bookmark")
+        return marks
+    end,annotation_kind=function(entry) return entry.drawer and "highlight" or "bookmark" end},
+})
+function bookmarks:_annotation_book_title_map() return {remote={title="微信读书样本"}} end
+function bookmarks:_home_all_rows()
+    return {{file=local_path,title="本地样本",source="local"},{file=local_path,source="local"}}
+end
+function bookmarks:_annotation_search_excerpt(entry) return entry.text or entry.xpointer end
+function bookmarks:_annotation_pending_jump(entry) assert(entry.xpointer==local_mark) end
+function bookmarks:_open_file_direct(path,kind) assert(path==local_path and kind=="local"); return true end
+function bookmarks:logged_in() return false end
+function bookmarks:_show_miuread_menu(title,items)
+    assert(title=="全部书签" and #items==2)
+    assert(items[1].text=="微信读书样本" and #items[1].sub_item_table_func()==2)
+    local entries=items[2].sub_item_table_func()
+    assert(items[2].text=="本地样本" and #entries==1 and entries[1].text=="本地书签")
+    entries[1].callback()
+    return true
+end
+assert(bookmarks:show_all_bookmarks())
+load_methods("function Plugin:_reader_goto_annotation","function Plugin:_reader_annotation_index",bookmarks,{})
+bookmarks.ui={bookmark={gotoBookmark=function(_,primary,target)
+    assert(primary==local_mark and target==local_mark)
+end}}
+assert(bookmarks:_reader_goto_annotation({pos0="",start="",xpointer=local_mark}))
+print("Offline bookmarks are grouped and use their stored reader location")

@@ -1283,7 +1283,13 @@ function Http:json(opt)
     if type(data) == "table" then
         local ec = data.errCode or data.errcode
         if ec == nil and tonumber(data.code) and tonumber(data.code) < 0 then ec = data.code end
-        if ec and tonumber(ec) ~= 0 then error(service_error(data, url)) end
+        if ec and tonumber(ec) ~= 0 then
+            local message=service_error(data,url)
+            if opt.include_service_error_code and tonumber(ec) then
+                message="error_code="..tostring(tonumber(ec)).." "..message
+            end
+            error(message)
+        end
     end
     local meta = {
         code = code,
